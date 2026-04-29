@@ -1,0 +1,46 @@
+services:
+  kubo:
+    image: ipfs/kubo:v0.32.1
+    command: ["daemon", "--migrate=true", "--agent-version-suffix=kubus-node"]
+    ports:
+      - "4001:4001/tcp"
+      - "4001:4001/udp"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - kubo-data:/data/ipfs
+    healthcheck:
+      test: ["CMD-SHELL", "ipfs id >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  kubus-node-agent:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      IPFS_RPC_URL: http://kubo:5001
+      IPFS_GATEWAY_URL: http://127.0.0.1:8080
+      LOCAL_STATE_PATH: /var/lib/kubus-node/state.json
+    depends_on:
+      kubo:
+        condition: service_healthy
+    volumes:
+      - node-state:/var/lib/kubus-node
+    healthcheck:
+      test: ["CMD", "node", "dist/src/index.js", "status"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  kubo-data:
+  node-state:
+
+# Production notes:
+# - Do not expose Kubo RPC port 5001 to the host or public internet.
+# - Gateway port 8080 is loopback-bound for local verification only.
+# - Swarm port 4001 can be exposed when operators intend to participate in public IPFS routing.

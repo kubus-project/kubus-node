@@ -1,0 +1,25 @@
+export interface AppConfig {
+  apiBaseUrl: string;
+  operatorToken: string;
+  operatorWallet: string;
+  nodeLabel: string;
+  nodeEndpointUrl: string;
+  ipfsRpcUrl: string;
+  ipfsGatewayUrl: string;
+  localStatePath: string;
+  logLevel: string;
+  heartbeatIntervalMs: number;
+  cidSyncIntervalMs: number;
+  commitmentIntervalMs: number;
+  statusIntervalMs: number;
+  maxPinnedCids: number;
+  cidClassFilters: string[];
+  nodeEnv: string;
+  nodeKey?: string;
+  authMode: 'bearer';
+  devSeedCid?: string;
+  devAllowEmptyCids: boolean;
+  skipPinning: boolean;
+  verifierEndpointUrl?: string;
+  isProduction: boolean;
+}
