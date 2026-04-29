@@ -2,7 +2,7 @@
 
 Base path: `${KUBUS_API_BASE_URL}/api/availability`.
 
-Auth: node write/read ownership routes use `Authorization: Bearer <KUBUS_OPERATOR_TOKEN>`. The token must decode to a wallet accepted by backend availability ownership checks.
+Auth: node write/read ownership routes use `Authorization: Bearer <KUBUS_OPERATOR_TOKEN>`. The token is an opaque scoped `kubus_node_...` operator token created in art.kubus. Backend verification binds it to one wallet, checks expiry/revocation, and enforces route scopes.
 
 Health:
 

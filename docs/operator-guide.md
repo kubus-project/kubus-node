@@ -1,6 +1,8 @@
 # Operator Guide
 
-Install Node.js 20+ and Docker. Configure every required value in `.env.example`, then run:
+Install Node.js 20+ and Docker. In art.kubus, sign in with the operator wallet and open Settings > Wallet > Availability Node. Create a scoped operator token, copy it once, and paste it into `.env` as `KUBUS_OPERATOR_TOKEN`.
+
+Configure every required value in `.env.example`, then run:
 
 ```sh
 npm install
@@ -52,6 +54,6 @@ Backups:
 
 Reset local node state by stopping the agent and deleting the local state file. This generates a new node key unless `KUBUS_NODE_KEY` is configured.
 
-Rotate token by stopping the agent, replacing `KUBUS_OPERATOR_TOKEN`, and restarting. Do not change the operator wallet unless registering a new operator identity.
+Rotate token by creating a new scoped operator token in art.kubus, stopping the agent, replacing `KUBUS_OPERATOR_TOKEN`, and restarting. Revoke the old token after the new node status is healthy. Do not change the operator wallet unless registering a new operator identity.
 
 Expected resources depend on CID count. Start with `MAX_PINNED_CIDS=100`, keep Kubo storage monitored, and raise slowly.
