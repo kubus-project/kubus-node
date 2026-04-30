@@ -19,6 +19,8 @@ Docker:
 docker compose up --build
 ```
 
+Docker Compose keeps the Kubo RPC API private inside the stack; only the local gateway is exposed for verification. The agent runs as the non-root `node` user, so a fresh `node-state` volume must be writable. If you are reusing an older root-owned volume, see the troubleshooting recovery command before restarting the stack.
+
 Useful commands:
 
 ```sh

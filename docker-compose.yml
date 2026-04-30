@@ -1,6 +1,6 @@
 services:
   kubo:
-    image: ipfs/kubo:v0.32.1
+    image: ipfs/kubo:v0.41.0
     command: ["daemon", "--migrate=true", "--agent-version-suffix=kubus-node"]
     ports:
       - "4001:4001/tcp"

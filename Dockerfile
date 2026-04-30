@@ -15,5 +15,7 @@ ENV NODE_ENV=production
 COPY package*.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
+RUN mkdir -p /var/lib/kubus-node \
+	&& chown -R node:node /app /var/lib/kubus-node
 USER node
 CMD ["node", "dist/src/index.js", "start"]

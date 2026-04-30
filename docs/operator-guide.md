@@ -51,8 +51,11 @@ Backups:
 
 - Back up the Docker volume `kubo-data`.
 - Back up `LOCAL_STATE_PATH` or the `node-state` volume.
+- Do not delete either volume unless you intend to reset local IPFS and node identity state. Removing `node-state` clears the generated node key and registration identity; removing `kubo-data` resets the Kubo repository.
 
 Reset local node state by stopping the agent and deleting the local state file. This generates a new node key unless `KUBUS_NODE_KEY` is configured.
+
+The agent container runs as the non-root `node` user. If a reused `node-state` volume is owned by root, fix the ownership with the troubleshooting recovery command and restart the stack.
 
 Rotate token by creating a new scoped operator token in art.kubus, stopping the agent, replacing `KUBUS_OPERATOR_TOKEN`, and restarting. Revoke the old token after the new node status is healthy. Do not change the operator wallet unless registering a new operator identity.
 
