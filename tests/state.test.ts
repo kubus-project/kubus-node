@@ -15,6 +15,24 @@ describe('LocalStore', () => {
     expect(JSON.parse(await readFile(path.join(dir, 'state.json'), 'utf8')).nodeId).toBe('node-1');
   });
 
+  it('persists public pin set metadata separately from rewardables', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'kubus-node-'));
+    const file = path.join(dir, 'state.json');
+    const store = new LocalStore(file);
+    await store.load();
+    await store.update((state) => {
+      state.publicPinSet = [{ id: 'cid-manifest', cid: 'bafymanifest', role: 'manifest', objectType: 'artwork', objectId: 'art-1', version: 1 }];
+      state.desiredCids = state.publicPinSet;
+      state.rewardableCids = [{ id: 'rewardable-1', cid: 'bafyleaf', objectType: 'artwork', objectId: 'art-1', version: 1 }];
+    });
+
+    const reloaded = new LocalStore(file);
+    await expect(reloaded.load()).resolves.toMatchObject({
+      publicPinSet: [{ cid: 'bafymanifest', role: 'manifest' }],
+      rewardableCids: [{ cid: 'bafyleaf' }],
+    });
+  });
+
   it('backs up corrupt state', async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'kubus-node-'));
     const file = path.join(dir, 'state.json');

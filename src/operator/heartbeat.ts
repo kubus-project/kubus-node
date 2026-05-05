@@ -19,10 +19,17 @@ export async function sendHeartbeat(api: KubusApiClient, kubo: KuboClient, store
     trackedCidCount: state.desiredCids.length,
     pinnedCidCount: state.pinnedCids.length,
     failedCidCount: Object.keys(state.failedCids).length,
+    rewardableCidCount: state.rewardableCids.length,
     status,
     metadata: {
       operatorWallet: config.operatorWallet,
       skipPinning: config.skipPinning,
+      publicPinSetCount: state.publicPinSet.length,
+      desiredPublicCidCount: state.desiredCids.length,
+      rewardableCidCount: state.rewardableCids.length,
+      pinnedPublicCidCount: state.pinnedCids.length,
+      failedPublicCidCount: Object.keys(state.failedCids).length,
+      pinningSource: state.policy?.pinning || null,
     },
   });
   await store.update((next) => {

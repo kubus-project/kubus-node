@@ -5,7 +5,7 @@ import { KuboClient } from '../ipfs/kuboClient.js';
 import { getKuboHealth, waitForKubo } from '../ipfs/health.js';
 import { createLogger } from '../logging/logger.js';
 import { ensureRegistered } from '../operator/registerNode.js';
-import { syncRewardableCids, reconcileDesiredPins, refreshCommitments } from '../operator/commitments.js';
+import { syncPublicPinSet, reconcileDesiredPins, refreshCommitments } from '../operator/commitments.js';
 import { sendHeartbeat } from '../operator/heartbeat.js';
 import { refreshRewards } from '../operator/rewards.js';
 import { buildStatusSummary, refreshStatus } from '../operator/status.js';
@@ -47,7 +47,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   }
 
   if (command === 'pin') {
-    await syncRewardableCids(api, store, config);
+    await syncPublicPinSet(api, store, config);
     console.log(JSON.stringify(await reconcileDesiredPins(kubo, store, config), null, 2));
     return;
   }
@@ -79,7 +79,7 @@ async function bootstrapOnce(api: KubusApiClient, kubo: KuboClient, store: Local
   await store.update((state) => {
     state.policy = policy;
   });
-  const desired = await syncRewardableCids(api, store, config);
+  const desired = await syncPublicPinSet(api, store, config);
   if (desired.length > 0) {
     await reconcileDesiredPins(kubo, store, config);
     await refreshCommitments(api, kubo, store, config);

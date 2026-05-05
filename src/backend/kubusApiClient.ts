@@ -6,6 +6,7 @@ import type {
   CommitmentPayload,
   HeartbeatPayload,
   NodeStatusSummary,
+  PinSetResponse,
   RegisterNodePayload,
   RewardableCid,
   RewardsResponse,
@@ -56,6 +57,21 @@ export class KubusApiClient {
 
   getRewardableCids(params: { limit?: number; offset?: number; type?: string; id?: string; cid?: string } = {}): Promise<{ count: number; records: RewardableCid[]; utility?: unknown }> {
     return this.request(`/api/availability/rewardable-cids${queryString(params)}`, { auth: false });
+  }
+
+  getPublicPinSet(params: {
+    limit?: number;
+    offset?: number;
+    entityType?: string;
+    entityId?: string;
+    cid?: string;
+    role?: string;
+    family?: string;
+    verificationClass?: string;
+    rewardableOnly?: boolean;
+    changedSince?: string;
+  } = {}): Promise<PinSetResponse> {
+    return this.request(`/api/availability/public-pin-set${queryString(params)}`, { auth: false });
   }
 
   registerNode(payload: RegisterNodePayload): Promise<AvailabilityNode> {
@@ -176,7 +192,7 @@ function isTransient(error: unknown): boolean {
   return true;
 }
 
-function queryString(params: Record<string, string | number | undefined>): string {
+function queryString(params: Record<string, string | number | boolean | undefined>): string {
   const qs = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
     if (value !== undefined && value !== '') qs.set(key, String(value));

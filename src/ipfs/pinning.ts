@@ -1,5 +1,5 @@
 import type { KuboClient } from './kuboClient.js';
-import type { RewardableCid } from '../backend/models.js';
+import type { PublicPinSetRecord } from '../backend/models.js';
 import { normalizeCid } from '../utils/cid.js';
 
 export interface PinResult {
@@ -8,7 +8,7 @@ export interface PinResult {
   error?: string;
 }
 
-export async function reconcilePins(kubo: KuboClient, cids: RewardableCid[], skipPinning = false): Promise<PinResult[]> {
+export async function reconcilePins(kubo: KuboClient, cids: PublicPinSetRecord[], skipPinning = false): Promise<PinResult[]> {
   const results: PinResult[] = [];
   for (const item of cids) {
     const cid = normalizeCid(item.cid);

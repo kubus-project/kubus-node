@@ -8,6 +8,7 @@ import type {
   AvailabilityNode,
   AvailabilityPolicy,
   NodeStatusSummary,
+  PublicPinSetRecord,
   RewardableCid,
   RewardsResponse,
 } from '../backend/models.js';
@@ -19,8 +20,9 @@ export interface LocalState {
   registeredAt?: string;
   peerId?: string;
   policy?: AvailabilityPolicy;
+  publicPinSet: PublicPinSetRecord[];
   rewardableCids: RewardableCid[];
-  desiredCids: RewardableCid[];
+  desiredCids: PublicPinSetRecord[];
   pinnedCids: string[];
   failedCids: Record<string, { error: string; at: string }>;
   activeCommitments: AvailabilityCommitment[];
@@ -34,6 +36,7 @@ export interface LocalState {
 
 const emptyState = (): LocalState => ({
   version: 1,
+  publicPinSet: [],
   rewardableCids: [],
   desiredCids: [],
   pinnedCids: [],

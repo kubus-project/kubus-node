@@ -25,11 +25,45 @@ export interface RewardableCid {
   metadata?: Record<string, unknown>;
   isActive?: boolean;
   createdAt?: string | null;
+  objectType?: string | null;
+  objectId?: string | null;
+  version?: number;
+  assetPath?: string | null;
+  displayOrder?: number;
+}
+
+export interface PublicPinSetRecord {
+  id: string;
+  cid: string;
+  cidUri?: string | null;
+  role: string;
+  family?: string | null;
+  objectType?: string | null;
+  objectId?: string | null;
+  version?: number;
+  assetPath?: string | null;
+  isCanonical?: boolean;
+  isRewardable?: boolean;
+  rewardableCidId?: string | null;
+  rewardRole?: string | null;
+  verificationClass?: string | null;
+  retrievalHint?: string | null;
+  metadata?: Record<string, unknown>;
+  publishedAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface PinSetResponse {
+  count: number;
+  limit?: number;
+  offset?: number;
+  records: PublicPinSetRecord[];
 }
 
 export interface AvailabilityPolicy {
   version: string;
   rewardableContentSource: string;
+  pinning?: Record<string, unknown>;
   maxPinnedCidsDefault: number;
   commitmentTtlHours: number;
   heartbeatIntervalMs: number;
@@ -60,6 +94,7 @@ export interface AvailabilityHeartbeat {
   trackedCidCount: number;
   pinnedCidCount: number;
   failedCidCount: number;
+  rewardableCidCount?: number;
   status: HeartbeatStatus;
   metadata?: Record<string, unknown>;
   receivedAt?: string | null;
@@ -115,6 +150,7 @@ export interface HeartbeatPayload {
   trackedCidCount?: number;
   pinnedCidCount?: number;
   failedCidCount?: number;
+  rewardableCidCount?: number;
   status?: HeartbeatStatus;
   metadata?: Record<string, unknown>;
 }

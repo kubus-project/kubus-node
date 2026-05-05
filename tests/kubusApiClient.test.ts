@@ -20,4 +20,24 @@ describe('KubusApiClient', () => {
     await expect(client.getCurrentNode()).rejects.toBeInstanceOf(KubusApiError);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it('fetches the public pin set separately from rewardable cids', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      success: true,
+      data: {
+        count: 1,
+        records: [{ id: 'cid-1', cid: 'bafymanifest', role: 'manifest', isRewardable: false }],
+      },
+    })));
+    const client = new KubusApiClient({ baseUrl: 'http://api.test', auth: new BearerAuthProvider('secret'), retries: 0 });
+
+    await expect(client.getPublicPinSet({ limit: 25, entityType: 'artwork' })).resolves.toMatchObject({
+      count: 1,
+      records: [{ cid: 'bafymanifest', role: 'manifest' }],
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://api.test/api/availability/public-pin-set?limit=25&entityType=artwork',
+      expect.objectContaining({ method: 'GET' }),
+    );
+  });
 });

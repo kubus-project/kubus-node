@@ -8,6 +8,7 @@ describe('buildStatusSummary', () => {
       version: 1,
       nodeKey: 'kubus-node-abcdef123456',
       nodeId: 'node',
+      publicPinSet: [],
       rewardableCids: [],
       desiredCids: [],
       pinnedCids: [],
@@ -18,5 +19,6 @@ describe('buildStatusSummary', () => {
     expect(summary.nodeKeyFingerprint).toHaveLength(16);
     expect(JSON.stringify(summary)).not.toContain('abcdef');
     expect(summary.backendHealth).toBe('not_checked');
+    expect(summary.publicPinSetCount).toBe(0);
   });
 });

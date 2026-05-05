@@ -4,7 +4,7 @@ import { BearerAuthProvider } from '../src/backend/operatorAuth.js';
 import { parseEnv, resolveNodeKey } from '../src/config/env.js';
 import { waitForKubo } from '../src/ipfs/health.js';
 import { KuboClient } from '../src/ipfs/kuboClient.js';
-import { reconcileDesiredPins, refreshCommitments, syncRewardableCids } from '../src/operator/commitments.js';
+import { reconcileDesiredPins, refreshCommitments, syncPublicPinSet } from '../src/operator/commitments.js';
 import { sendHeartbeat } from '../src/operator/heartbeat.js';
 import { ensureRegistered } from '../src/operator/registerNode.js';
 import { refreshRewards } from '../src/operator/rewards.js';
@@ -43,14 +43,14 @@ async function main() {
       state.policy = policy;
     });
   });
-  const desired = await step('fetch rewardable cids', () => syncRewardableCids(api, store, config));
+  const desired = await step('fetch public pin set', () => syncPublicPinSet(api, store, config));
   if ((desired as unknown[]).length === 0) {
-    console.log('no rewardable CIDs available');
-    if (config.isProduction || !config.devAllowEmptyCids) throw new Error('No canonical rewardable CIDs available');
+    console.log('no public CIDs available');
+    if (config.isProduction || !config.devAllowEmptyCids) throw new Error('No canonical public CIDs available');
     if (config.devSeedCid) {
       const cid = normalizeCid(config.devSeedCid);
       await store.update((state) => {
-        state.desiredCids = [{ id: 'dev-seed', cid, verificationClass: 'hot', rewardRole: 'dev' }];
+        state.desiredCids = [{ id: 'dev-seed', cid, role: 'leaf', family: 'leaf', verificationClass: 'hot' }];
       });
     }
   }

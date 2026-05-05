@@ -4,7 +4,7 @@ import type { KuboClient } from '../ipfs/kuboClient.js';
 import type { Logger } from '../logging/logger.js';
 import type { LocalStore } from '../state/localStore.js';
 import { sleep, jitterMs } from '../utils/time.js';
-import { syncRewardableCids, reconcileDesiredPins, refreshCommitments } from '../operator/commitments.js';
+import { syncPublicPinSet, reconcileDesiredPins, refreshCommitments } from '../operator/commitments.js';
 import { sendHeartbeat } from '../operator/heartbeat.js';
 import { refreshRewards } from '../operator/rewards.js';
 import { refreshStatus } from '../operator/status.js';
@@ -26,7 +26,7 @@ export class Scheduler {
         });
       }),
       this.loop('cid-sync', this.deps.config.cidSyncIntervalMs, async () => {
-        await syncRewardableCids(this.deps.api, this.deps.store, this.deps.config);
+        await syncPublicPinSet(this.deps.api, this.deps.store, this.deps.config);
       }),
       this.loop('pin-reconcile', Math.max(30000, Math.floor(this.deps.config.cidSyncIntervalMs / 2)), async () => {
         await reconcileDesiredPins(this.deps.kubo, this.deps.store, this.deps.config);
