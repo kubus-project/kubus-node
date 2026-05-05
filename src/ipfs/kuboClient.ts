@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import { normalizeCid } from '../utils/cid.js';
 
 export interface KuboId {
@@ -42,6 +43,12 @@ export class KuboClient {
     return this.post('pin/add', { arg: normalizeCid(cid), progress: 'false' });
   }
 
+  async addBytes(bytes: Uint8Array, filename: string): Promise<{ Hash?: string }> {
+    const form = new FormData();
+    form.set('file', new Blob([Buffer.from(bytes)]), filename);
+    return this.postForm('add', form, { pin: 'true', 'cid-version': '0' });
+  }
+
   async pinLs(cid?: string): Promise<unknown> {
     const params: Record<string, string> = { type: 'recursive' };
     if (cid) params.arg = normalizeCid(cid);
@@ -70,6 +77,19 @@ export class KuboClient {
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
       const response = await fetch(this.url(command, params), { method: 'POST', signal: controller.signal });
+      const text = await response.text();
+      if (!response.ok) throw new Error(`Kubo ${command} failed with HTTP ${response.status}: ${text.slice(0, 200)}`);
+      return (text ? JSON.parse(text) : {}) as T;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private async postForm<T>(command: string, form: FormData, params: Record<string, string> = {}): Promise<T> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const response = await fetch(this.url(command, params), { method: 'POST', body: form, signal: controller.signal });
       const text = await response.text();
       if (!response.ok) throw new Error(`Kubo ${command} failed with HTTP ${response.status}: ${text.slice(0, 200)}`);
       return (text ? JSON.parse(text) : {}) as T;

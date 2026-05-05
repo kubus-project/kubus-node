@@ -2,6 +2,8 @@ services:
   kubo:
     image: ipfs/kubo:v0.41.0
     command: ["daemon", "--migrate=true", "--agent-version-suffix=kubus-node"]
+    environment:
+      IPFS_TELEMETRY: "off"
     ports:
       - "4001:4001/tcp"
       - "4001:4001/udp"

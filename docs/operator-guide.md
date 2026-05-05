@@ -27,6 +27,14 @@ Start with Docker:
 docker compose up --build
 ```
 
+Kubo may migrate an existing `/data/ipfs` repository on first start after an image upgrade. A migration from fs-repo 16 to 18 is expected for Kubo 0.41.0 when it completes successfully. The compose stack disables Kubo anonymous telemetry with `IPFS_TELEMETRY=off`.
+
+If Kubo logs a QUIC UDP receive-buffer warning, the node can still run. Operators who expose public swarm UDP traffic can improve QUIC performance by raising host UDP buffer limits before starting Docker:
+
+```sh
+sudo sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000
+```
+
 Check state:
 
 ```sh

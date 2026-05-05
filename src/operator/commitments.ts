@@ -53,7 +53,7 @@ export const syncRewardableCids = syncPublicPinSet;
 
 export async function reconcileDesiredPins(kubo: KuboClient, store: LocalStore, config: AppConfig) {
   const desired = store.snapshot().desiredCids;
-  const results = await reconcilePins(kubo, desired, config.skipPinning);
+  const results = await reconcilePins(kubo, desired, config.skipPinning, config.apiBaseUrl);
   await store.update((state) => {
     state.pinnedCids = results.filter((result) => result.ok).map((result) => result.cid);
     state.failedCids = Object.fromEntries(

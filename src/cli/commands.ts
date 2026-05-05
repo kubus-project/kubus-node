@@ -80,13 +80,16 @@ async function bootstrapOnce(api: KubusApiClient, kubo: KuboClient, store: Local
     state.policy = policy;
   });
   const desired = await syncPublicPinSet(api, store, config);
-  if (desired.length > 0) {
-    await reconcileDesiredPins(kubo, store, config);
-    await refreshCommitments(api, kubo, store, config);
-  }
   await sendHeartbeat(api, kubo, store, config);
   await refreshStatus(api, kubo, store);
   await refreshRewards(api, store);
+  if (desired.length > 0) {
+    console.log(JSON.stringify({
+      status: 'startup_deferred_pin_reconcile',
+      desiredCidCount: desired.length,
+      message: 'Node registered and heartbeat sent; scheduler will reconcile public pins in the background.',
+    }));
+  }
 }
 
 async function liveStatus(api: KubusApiClient, kubo: KuboClient) {
