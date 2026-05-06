@@ -40,6 +40,7 @@ Check state:
 ```sh
 npm run status
 npm run doctor
+npm run gui
 ```
 
 Maintenance commands:
@@ -68,3 +69,34 @@ The agent container runs as the non-root `node` user. If a reused `node-state` v
 Rotate token by creating a new scoped operator token in art.kubus, stopping the agent, replacing `KUBUS_OPERATOR_TOKEN`, and restarting. Revoke the old token after the new node status is healthy. Do not change the operator wallet unless registering a new operator identity.
 
 Expected resources depend on the public pin set size. `MAX_PINNED_CIDS` caps all canonical public CIDs mirrored by the node, including manifest and record CIDs that are not rewardable. `CID_CLASS_FILTERS` narrows classed pin-set records and reward commitments, but records without a class are still pinned so canonical public metadata is not accidentally excluded. Start with `MAX_PINNED_CIDS=100`, keep Kubo storage monitored, and raise slowly.
+
+## Local GUI
+
+The local GUI is optional and operator-facing. Enable it in `.env`:
+
+```sh
+NODE_GUI_ENABLED=true
+NODE_GUI_HOST=127.0.0.1
+NODE_GUI_PORT=8787
+NODE_GUI_TOKEN=
+NODE_GUI_ALLOW_REMOTE=false
+NODE_GUI_DISPLAY_URL=http://my.node.kubus.site:8787/gui
+```
+
+Open `http://my.node.kubus.site:8787/gui` after adding a hosts-file alias. The fallback URL is `http://127.0.0.1:8787/gui`.
+
+Linux/macOS:
+
+```sh
+sudo sh -c 'echo "127.0.0.1 my.node.kubus.site" >> /etc/hosts'
+```
+
+Windows PowerShell as Administrator:
+
+```powershell
+Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`n127.0.0.1 my.node.kubus.site"
+```
+
+For Docker, the host port is loopback-bound as `127.0.0.1:8787:8787`. If you explicitly bind the GUI inside the container to `0.0.0.0`, set `NODE_GUI_TOKEN`; remote GUI mode refuses to start without it. Tailscale or a reverse proxy is an advanced setup and must still require a GUI token.
+
+The GUI sections are Overview, Pinning, Rewards, Commitments, Logs, and Doctor. Safe actions are sync public pin set, reconcile pins, refresh commitments, send heartbeat, and run doctor checks. The GUI cannot spend funds and never shows `KUBUS_OPERATOR_TOKEN`, Authorization headers, private keys, seed phrases, or raw backend credentials.

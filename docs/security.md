@@ -13,3 +13,11 @@ Arbitrary CIDs are not rewardable. The node only commits CIDs returned by the ca
 `KUBUS_AUTH_MODE` is `bearer` only in v1. Bearer transport carries the scoped `kubus_node_...` token, not a copied app JWT. `KUBUS_SKIP_PINNING` is development-only because it bypasses local pin and retrieval enforcement before commitments.
 
 Firewall expectation: expose only the intended public gateway or reverse proxy. Keep Kubo RPC, local state, and backend credentials private.
+
+## Local GUI Security
+
+The Kubus Node GUI is local/private by default. `NODE_GUI_HOST=127.0.0.1` and Docker Compose maps `127.0.0.1:8787:8787`, so `http://my.node.kubus.site:8787/gui` works only after the operator adds a hosts-file alias to `127.0.0.1`. Do not create public DNS for `my.node.kubus.site`.
+
+If `NODE_GUI_HOST=0.0.0.0` or `NODE_GUI_ALLOW_REMOTE=true`, the agent refuses to start the GUI unless `NODE_GUI_TOKEN` is set. Browser API calls then require `Authorization: Bearer <NODE_GUI_TOKEN>` or the in-memory local session cookie. The GUI token is separate from `KUBUS_OPERATOR_TOKEN` and is not stored in local node state.
+
+GUI responses and logs redact `kubus_node_...` tokens, Authorization headers, token/secret/private-key/seed fields, and backend credentials. The GUI can run safe node operations but cannot spend funds, export keys, handle seed phrases, submit arbitrary rewardable CIDs, or settle KUB8 payouts.

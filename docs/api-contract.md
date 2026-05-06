@@ -35,3 +35,20 @@ Node routes:
 Responses usually wrap data as `{ success: true, data }`. Validation/auth failures are terminal. `503 NODE_NOT_WRITABLE` means the backend is a standby or writes are disabled for this route. `GET /epochs/current` can return `{ epoch: null }`.
 
 Pinning and rewards are distinct. Nodes mirror the public pin set from `/public-pin-set`; reward commitments are created only for active rows from `/rewardable-cids`. Commitment metadata includes pinned bundle CIDs plus manifest, record, and leaf pin booleans for the object/version under verification.
+
+Local GUI endpoints are served by kubus-node itself, not the Kubus backend:
+
+- `GET /gui`
+- `GET /gui/api/status`
+- `GET /gui/api/pinning`
+- `GET /gui/api/rewards`
+- `GET /gui/api/commitments`
+- `GET /gui/api/logs`
+- `DELETE /gui/api/logs`
+- `POST /gui/api/actions/sync`
+- `POST /gui/api/actions/pin`
+- `POST /gui/api/actions/commitments`
+- `POST /gui/api/actions/heartbeat`
+- `POST /gui/api/actions/doctor`
+
+The GUI is local-only by default at `http://my.node.kubus.site:8787/gui` with fallback `http://127.0.0.1:8787/gui`. If it is exposed beyond localhost, `NODE_GUI_TOKEN` is required and GUI API calls must send `Authorization: Bearer <NODE_GUI_TOKEN>`.

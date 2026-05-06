@@ -1,6 +1,6 @@
 # Kubus Node
 
-Kubus Node is the operator runtime for the Kubus Availability Network. It runs next to a private Kubo daemon, registers an operator node with the Kubus backend control plane, pins canonical rewardable CIDs, submits availability commitments, sends liveness heartbeats, and reports status/reward summaries.
+Kubus Node is the operator runtime for the Kubus Availability Network. It runs next to a private Kubo daemon, registers an operator node with the Kubus backend control plane, pins canonical public Kubus CIDs, submits availability commitments for the rewardable subset, sends liveness heartbeats, and reports status/reward summaries.
 
 It is not a payout engine, platform settlement bridge, wallet, or proof oracle. Availability rewards remain pending backend control-plane records until the generic platform-settlement bridge exists.
 
@@ -26,9 +26,43 @@ Useful commands:
 ```sh
 npm run status
 npm run doctor
+npm run gui
 npm run smoke
 npm run start
 ```
+
+## Public Archive Pinning
+
+The node mirrors `/api/availability/public-pin-set`, not only `/api/availability/rewardable-cids`. The public pin set includes active canonical public manifest CIDs, public record CIDs, metadata CIDs, media/image CIDs, AR asset CIDs, and rewardable leaf CIDs. The rewardable endpoint remains a subset used for commitments and KUB8 scoring.
+
+The node never mirrors drafts, private profile fields, private messages, wallet backups, auth/session data, admin data, raw database dumps, deleted/unpublished objects, arbitrary node-submitted CIDs, or third-party URL-only assets without an IPFS/public CID.
+
+## Local GUI
+
+Enable the local GUI with:
+
+```sh
+NODE_GUI_ENABLED=true
+NODE_GUI_HOST=127.0.0.1
+NODE_GUI_PORT=8787
+NODE_GUI_DISPLAY_URL=http://my.node.kubus.site:8787/gui
+```
+
+Then open `http://my.node.kubus.site:8787/gui` after adding a local hosts-file alias, or use the fallback `http://127.0.0.1:8787/gui`. The hostname is local-only and is not public DNS.
+
+Linux/macOS:
+
+```sh
+sudo sh -c 'echo "127.0.0.1 my.node.kubus.site" >> /etc/hosts'
+```
+
+Windows PowerShell as Administrator:
+
+```powershell
+Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`n127.0.0.1 my.node.kubus.site"
+```
+
+The GUI shows Overview, Pinning, Rewards, Commitments, Logs, and Doctor sections. It can trigger safe local sync, pin reconcile, commitment refresh, heartbeat, and doctor actions. It cannot spend funds, export wallet keys, or settle payouts. If the GUI is bound outside localhost or `NODE_GUI_ALLOW_REMOTE=true`, `NODE_GUI_TOKEN` is required. Docker Compose keeps port `8787` loopback-bound on the host.
 
 ## Environment
 

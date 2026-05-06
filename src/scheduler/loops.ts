@@ -2,6 +2,7 @@ import type { KubusApiClient } from '../backend/kubusApiClient.js';
 import type { AppConfig } from '../config/schema.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import type { Logger } from '../logging/logger.js';
+import type { ActionLock } from '../runtime/actionLock.js';
 import type { LocalStore } from '../state/localStore.js';
 import { sleep, jitterMs } from '../utils/time.js';
 import { syncPublicPinSet, reconcileDesiredPins, refreshCommitments } from '../operator/commitments.js';
@@ -14,7 +15,7 @@ export class Scheduler {
   private controllers: Promise<void>[] = [];
 
   constructor(
-    private readonly deps: { api: KubusApiClient; kubo: KuboClient; store: LocalStore; config: AppConfig; logger: Logger },
+    private readonly deps: { api: KubusApiClient; kubo: KuboClient; store: LocalStore; config: AppConfig; logger: Logger; actionLock?: ActionLock },
   ) {}
 
   start(): void {
@@ -72,7 +73,11 @@ export class Scheduler {
   private async loop(name: string, intervalMs: number, task: () => Promise<void>): Promise<void> {
     while (!this.stopped) {
       try {
-        await task();
+        if (this.deps.actionLock) {
+          await this.deps.actionLock.run(`scheduler:${name}`, task);
+        } else {
+          await task();
+        }
       } catch (error) {
         this.deps.logger.warn({ loop: name, error: String((error as Error).message || error) }, 'scheduler loop failed');
       }

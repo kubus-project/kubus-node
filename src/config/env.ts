@@ -16,6 +16,14 @@ function parseIntEnv(env: NodeJS.ProcessEnv, key: string, min: number): number {
   return value;
 }
 
+function parseOptionalIntEnv(env: NodeJS.ProcessEnv, key: string, fallback: number, min: number): number {
+  const raw = env[key]?.trim();
+  if (!raw) return fallback;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isFinite(value) || value < min) throw new Error(`Invalid ${key}: must be >= ${min}`);
+  return value;
+}
+
 function parseUrl(value: string, key: string): string {
   try {
     return new URL(value).toString().replace(/\/$/, '');
@@ -43,6 +51,17 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (isProduction && skipPinning) {
     throw new Error('KUBUS_SKIP_PINNING is not allowed in production');
   }
+  const guiEnabled = boolEnv(env, 'NODE_GUI_ENABLED', false);
+  const guiHost = (env.NODE_GUI_HOST || '127.0.0.1').trim() || '127.0.0.1';
+  const guiPort = parseOptionalIntEnv(env, 'NODE_GUI_PORT', 8787, 1);
+  const guiToken = env.NODE_GUI_TOKEN?.trim() || undefined;
+  const guiAllowRemote = boolEnv(env, 'NODE_GUI_ALLOW_REMOTE', false);
+  const guiDisplayUrl = (env.NODE_GUI_DISPLAY_URL || 'http://my.node.kubus.site:8787/gui').trim();
+  const guiFallbackUrl = `http://127.0.0.1:${guiPort}/gui`;
+  const guiRemoteMode = guiAllowRemote || !isLoopbackHost(guiHost);
+  if (guiEnabled && guiRemoteMode && !guiToken) {
+    throw new Error('NODE_GUI_TOKEN is required when NODE_GUI_HOST is remote or NODE_GUI_ALLOW_REMOTE=true');
+  }
   return {
     apiBaseUrl: parseUrl(requireString(env, 'KUBUS_API_BASE_URL'), 'KUBUS_API_BASE_URL'),
     operatorToken: requireString(env, 'KUBUS_OPERATOR_TOKEN'),
@@ -67,6 +86,13 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
     skipPinning,
     verifierEndpointUrl: env.KUBUS_VERIFIER_ENDPOINT_URL?.trim() || undefined,
     isProduction,
+    guiEnabled,
+    guiHost,
+    guiPort,
+    guiToken,
+    guiAllowRemote,
+    guiDisplayUrl,
+    guiFallbackUrl,
   };
 }
 
@@ -88,4 +114,9 @@ function isPrivateRpcUrl(raw: string): boolean {
   if (/^192\.168\./.test(host)) return true;
   const match172 = host.match(/^172\.(\d+)\./);
   return Boolean(match172 && Number(match172[1]) >= 16 && Number(match172[1]) <= 31);
+}
+
+export function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return ['localhost', '127.0.0.1', '::1'].includes(normalized);
 }

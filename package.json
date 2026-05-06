@@ -16,6 +16,7 @@
     "lint": "tsc -p tsconfig.json --noEmit",
     "status": "tsx src/index.ts status",
     "doctor": "tsx src/index.ts doctor",
+    "gui": "tsx src/index.ts gui",
     "smoke": "tsx scripts/smoke.ts"
   },
   "engines": {

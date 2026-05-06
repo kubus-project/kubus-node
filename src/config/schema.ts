@@ -22,4 +22,11 @@ export interface AppConfig {
   skipPinning: boolean;
   verifierEndpointUrl?: string;
   isProduction: boolean;
+  guiEnabled: boolean;
+  guiHost: string;
+  guiPort: number;
+  guiToken?: string;
+  guiAllowRemote: boolean;
+  guiDisplayUrl: string;
+  guiFallbackUrl: string;
 }

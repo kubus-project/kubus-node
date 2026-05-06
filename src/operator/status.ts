@@ -72,6 +72,13 @@ export function buildStatusSummary(
       state.rewards?.summary?.pendingKub8 ??
       state.latestStatus?.rewardSummary?.pendingKub8 ??
       0,
+    gui: {
+      enabled: config.guiEnabled === true,
+      displayUrl: config.guiDisplayUrl || null,
+      fallbackUrl: config.guiFallbackUrl || null,
+      localhostOnly: !config.guiAllowRemote && ['127.0.0.1', 'localhost', '::1'].includes((config.guiHost || '').toLowerCase()),
+      tokenConfigured: Boolean(config.guiToken),
+    },
     warnings,
     stateUpdatedAt: state.updatedAt || null,
   };

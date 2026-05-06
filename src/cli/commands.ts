@@ -4,11 +4,13 @@ import { parseEnv, resolveNodeKey } from '../config/env.js';
 import { KuboClient } from '../ipfs/kuboClient.js';
 import { getKuboHealth, waitForKubo } from '../ipfs/health.js';
 import { createLogger } from '../logging/logger.js';
+import { startGuiServer, type GuiServerHandle } from '../gui/guiServer.js';
 import { ensureRegistered } from '../operator/registerNode.js';
 import { syncPublicPinSet, reconcileDesiredPins, refreshCommitments } from '../operator/commitments.js';
 import { sendHeartbeat } from '../operator/heartbeat.js';
 import { refreshRewards } from '../operator/rewards.js';
 import { buildStatusSummary, refreshStatus } from '../operator/status.js';
+import { ActionLock } from '../runtime/actionLock.js';
 import { Scheduler } from '../scheduler/loops.js';
 import { LocalStore } from '../state/localStore.js';
 
@@ -20,6 +22,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   await store.load();
   const api = new KubusApiClient({ baseUrl: config.apiBaseUrl, auth: new BearerAuthProvider(config.operatorToken) });
   const kubo = new KuboClient(config.ipfsRpcUrl);
+  const actionLock = new ActionLock();
 
   if (command === 'status') {
     const live = await liveStatus(api, kubo);
@@ -29,6 +32,19 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
 
   if (command === 'doctor') {
     await doctor(api, kubo, config, store);
+    return;
+  }
+
+  if (command === 'gui') {
+    const gui = await startGuiServer({ api, kubo, store, config: { ...config, guiEnabled: true }, logger, actionLock });
+    console.log(JSON.stringify({
+      status: 'gui_started',
+      url: gui.url,
+      fallbackUrl: config.guiFallbackUrl,
+      localhostOnly: !config.guiAllowRemote,
+      tokenConfigured: Boolean(config.guiToken),
+    }, null, 2));
+    await waitForShutdown(null, gui);
     return;
   }
 
@@ -63,11 +79,19 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   }
 
   if (command !== 'start') throw new Error(`Unknown command: ${command}`);
-  await bootstrapOnce(api, kubo, store, config);
-  const scheduler = new Scheduler({ api, kubo, store, config, logger });
-  scheduler.start();
-  logger.info({ nodeId: store.snapshot().nodeId }, 'kubus node started');
-  await waitForShutdown(scheduler);
+  const gui = config.guiEnabled ? await startGuiServer({ api, kubo, store, config, logger, actionLock }) : null;
+  let scheduler: Scheduler | null = null;
+  try {
+    await actionLock.run('startup', () => bootstrapOnce(api, kubo, store, config));
+    scheduler = new Scheduler({ api, kubo, store, config, logger, actionLock });
+    scheduler.start();
+    logger.info({ nodeId: store.snapshot().nodeId }, 'kubus node started');
+  } catch (error) {
+    logger.error({ error: String((error as Error).message || error) }, 'kubus node startup failed');
+    if (!gui) throw error;
+    logger.warn({ guiUrl: gui.url }, 'GUI remains available for local diagnostics; scheduler was not started');
+  }
+  await waitForShutdown(scheduler, gui);
 }
 
 async function bootstrapOnce(api: KubusApiClient, kubo: KuboClient, store: LocalStore, config: ReturnType<typeof parseEnv>) {
@@ -115,11 +139,12 @@ async function doctor(api: KubusApiClient, kubo: KuboClient, config: ReturnType<
   console.log(JSON.stringify(report, null, 2));
 }
 
-async function waitForShutdown(scheduler: Scheduler): Promise<void> {
+async function waitForShutdown(scheduler: Scheduler | null, gui?: GuiServerHandle | null): Promise<void> {
   await new Promise<void>((resolve) => {
     const done = () => resolve();
     process.once('SIGINT', done);
     process.once('SIGTERM', done);
   });
-  await scheduler.stop();
+  await scheduler?.stop();
+  await gui?.close();
 }
