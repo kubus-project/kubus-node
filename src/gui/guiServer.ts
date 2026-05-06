@@ -66,7 +66,12 @@ export async function startGuiServer(deps: GuiDeps): Promise<GuiServerHandle> {
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: GuiDeps): Promise<void> {
   const parsed = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
-  if (req.method === 'GET' && parsed.pathname === '/gui') {
+  if ((req.method === 'GET' || req.method === 'HEAD') && parsed.pathname === '/gui') {
+    if (req.method === 'HEAD') {
+      writeHead(res, 200, 'text/html; charset=utf-8');
+      res.end();
+      return;
+    }
     writeText(res, 200, guiHtml(), 'text/html; charset=utf-8');
     return;
   }
@@ -239,12 +244,16 @@ async function runDoctor(deps: GuiDeps) {
 }
 
 function writeText(res: ServerResponse, statusCode: number, body: string, contentType: string): void {
+  writeHead(res, statusCode, contentType);
+  res.end(body);
+}
+
+function writeHead(res: ServerResponse, statusCode: number, contentType: string): void {
   res.writeHead(statusCode, {
     'content-type': contentType,
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
   });
-  res.end(body);
 }
 
 function writeJson(res: ServerResponse, statusCode: number, payload: unknown): void {

@@ -19,7 +19,7 @@ Docker:
 docker compose up --build
 ```
 
-Docker Compose keeps the Kubo RPC API private inside the stack; only the local gateway is exposed for verification. The agent runs as the non-root `node` user, so a fresh `node-state` volume must be writable. If you are reusing an older root-owned volume, see the troubleshooting recovery command before restarting the stack.
+Docker Compose keeps the Kubo RPC API and Kubo WebUI on port `5001` private inside the stack; only the local Kubo gateway on `8080` and the Kubus Node GUI on `8787` are published to host loopback. The agent runs as the non-root `node` user, so a fresh `node-state` volume must be writable. If you are reusing an older root-owned volume, see the troubleshooting recovery command before restarting the stack.
 
 Useful commands:
 
@@ -43,12 +43,16 @@ Enable the local GUI with:
 
 ```sh
 NODE_GUI_ENABLED=true
-NODE_GUI_HOST=127.0.0.1
+NODE_GUI_HOST=0.0.0.0
 NODE_GUI_PORT=8787
+NODE_GUI_TOKEN=change-this-local-gui-password
+NODE_GUI_ALLOW_REMOTE=false
 NODE_GUI_DISPLAY_URL=http://my.node.kubus.site:8787/gui
 ```
 
 Then open `http://my.node.kubus.site:8787/gui` after adding a local hosts-file alias, or use the fallback `http://127.0.0.1:8787/gui`. The hostname is local-only and is not public DNS.
+
+Docker uses `NODE_GUI_HOST=0.0.0.0` inside the container so Docker port publishing can reach the GUI process. The host publish remains loopback-only as `127.0.0.1:8787:8787`, so the GUI is still local to the operator machine. Because `0.0.0.0` is a broad container bind, `NODE_GUI_TOKEN` is required. The token protects GUI actions and cannot spend funds.
 
 Linux/macOS:
 
@@ -62,7 +66,7 @@ Windows PowerShell as Administrator:
 Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`n127.0.0.1 my.node.kubus.site"
 ```
 
-The GUI shows Overview, Pinning, Rewards, Commitments, Logs, and Doctor sections. It can trigger safe local sync, pin reconcile, commitment refresh, heartbeat, and doctor actions. It cannot spend funds, export wallet keys, or settle payouts. If the GUI is bound outside localhost or `NODE_GUI_ALLOW_REMOTE=true`, `NODE_GUI_TOKEN` is required. Docker Compose keeps port `8787` loopback-bound on the host.
+The GUI shows Overview, Pinning, Rewards, Commitments, Logs, and Doctor sections. It can trigger safe local sync, pin reconcile, commitment refresh, heartbeat, and doctor actions. It cannot spend funds, export wallet keys, or settle payouts. This is different from the Kubo WebUI: Kubo WebUI/RPC on `5001` stays private and is intentionally not exposed by Docker Compose.
 
 ## Environment
 

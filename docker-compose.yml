@@ -26,8 +26,8 @@ services:
       IPFS_RPC_URL: http://kubo:5001
       IPFS_GATEWAY_URL: http://127.0.0.1:8080
       LOCAL_STATE_PATH: /var/lib/kubus-node/state.json
-      NODE_GUI_ENABLED: ${NODE_GUI_ENABLED:-false}
-      NODE_GUI_HOST: ${NODE_GUI_HOST:-127.0.0.1}
+      NODE_GUI_ENABLED: ${NODE_GUI_ENABLED:-true}
+      NODE_GUI_HOST: ${NODE_GUI_HOST:-0.0.0.0}
       NODE_GUI_PORT: ${NODE_GUI_PORT:-8787}
       NODE_GUI_TOKEN: ${NODE_GUI_TOKEN:-}
       NODE_GUI_ALLOW_REMOTE: ${NODE_GUI_ALLOW_REMOTE:-false}
@@ -53,5 +53,7 @@ volumes:
 # Production notes:
 # - Do not expose Kubo RPC port 5001 to the host or public internet.
 # - Gateway port 8080 is loopback-bound for local verification only.
-# - GUI port 8787 is loopback-bound; my.node.kubus.site is a hosts-file alias to 127.0.0.1.
+# - The GUI binds to 0.0.0.0 inside the container so Docker can publish it.
+# - The host port is still loopback-bound at 127.0.0.1:8787, and NODE_GUI_TOKEN is required.
+# - my.node.kubus.site is only a hosts-file alias to 127.0.0.1.
 # - Swarm port 4001 can be exposed when operators intend to participate in public IPFS routing.

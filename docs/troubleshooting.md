@@ -2,7 +2,7 @@
 
 Backend auth failure: verify `KUBUS_OPERATOR_TOKEN` starts with `kubus_node_`, has not expired or been revoked in art.kubus, and belongs to `KUBUS_OPERATOR_WALLET`.
 
-Kubo not reachable: check `IPFS_RPC_URL`, Docker service health, and that the agent is not using `localhost` from inside a container.
+Kubo not reachable: check `IPFS_RPC_URL`, Docker service health, and that the agent is not using `localhost` from inside a container. Kubo RPC/WebUI on `5001` is intentionally private and is not the Kubus Node GUI.
 
 Docker state volume permission error (`EACCES` writing `/var/lib/kubus-node/.state.json.<pid>.<timestamp>.tmp`): this usually means an existing `node-state` volume was created by root before the image started pre-owning the directory. Stop the stack, run the recovery command below, and then restart Docker Compose.
 
@@ -36,6 +36,8 @@ GUI cannot connect to backend: open `http://127.0.0.1:8787/gui`, run Doctor, and
 
 GUI auth token rejected: confirm the browser token matches `NODE_GUI_TOKEN`. The GUI token is not the `kubus_node_...` operator token.
 
+GUI does not open from Docker: ensure `NODE_GUI_ENABLED=true`, `NODE_GUI_HOST=0.0.0.0`, `NODE_GUI_PORT=8787`, and `NODE_GUI_TOKEN` is set. The agent binds to `0.0.0.0` inside the container, while Docker publishes only `127.0.0.1:8787:8787` on the host. If the agent binds to container-local `127.0.0.1`, the host port may not reach it.
+
 `my.node.kubus.site` does not resolve: add the local hosts entry. Linux/macOS: `sudo sh -c 'echo "127.0.0.1 my.node.kubus.site" >> /etc/hosts'`. Windows PowerShell as Administrator: `Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`n127.0.0.1 my.node.kubus.site"`. The fallback URL is `http://127.0.0.1:8787/gui`.
 
-Kubo not reachable from GUI Doctor: inside Docker, use `IPFS_RPC_URL=http://kubo:5001`. On the host, use the loopback Kubo RPC only if you intentionally run Kubo locally. Never expose Kubo RPC port 5001 publicly.
+Kubo not reachable from GUI Doctor: inside Docker, use `IPFS_RPC_URL=http://kubo:5001`. On the host, use the loopback Kubo RPC only if you intentionally run Kubo locally. Never expose Kubo RPC port 5001 publicly. The Kubus Node GUI is on `8787`; the Kubo WebUI is on Kubo RPC port `5001` and remains private.

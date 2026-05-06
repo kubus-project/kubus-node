@@ -27,7 +27,7 @@ Start with Docker:
 docker compose up --build
 ```
 
-Kubo may migrate an existing `/data/ipfs` repository on first start after an image upgrade. A migration from fs-repo 16 to 18 is expected for Kubo 0.41.0 when it completes successfully. The compose stack disables Kubo anonymous telemetry with `IPFS_TELEMETRY=off`.
+Kubo may migrate an existing `/data/ipfs` repository on first start after an image upgrade. A migration from fs-repo 16 to 18 is expected for Kubo 0.41.0 when it completes successfully. The compose stack disables Kubo anonymous telemetry with `IPFS_TELEMETRY=off`. Kubo RPC and Kubo WebUI on port `5001` are intentionally not published to the host.
 
 If Kubo logs a QUIC UDP receive-buffer warning, the node can still run. Operators who expose public swarm UDP traffic can improve QUIC performance by raising host UDP buffer limits before starting Docker:
 
@@ -76,9 +76,9 @@ The local GUI is optional and operator-facing. Enable it in `.env`:
 
 ```sh
 NODE_GUI_ENABLED=true
-NODE_GUI_HOST=127.0.0.1
+NODE_GUI_HOST=0.0.0.0
 NODE_GUI_PORT=8787
-NODE_GUI_TOKEN=
+NODE_GUI_TOKEN=change-this-local-gui-password
 NODE_GUI_ALLOW_REMOTE=false
 NODE_GUI_DISPLAY_URL=http://my.node.kubus.site:8787/gui
 ```
@@ -97,6 +97,6 @@ Windows PowerShell as Administrator:
 Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`n127.0.0.1 my.node.kubus.site"
 ```
 
-For Docker, the host port is loopback-bound as `127.0.0.1:8787:8787`. If you explicitly bind the GUI inside the container to `0.0.0.0`, set `NODE_GUI_TOKEN`; remote GUI mode refuses to start without it. Tailscale or a reverse proxy is an advanced setup and must still require a GUI token.
+For Docker, the GUI must bind to `0.0.0.0:8787` inside the container so Docker can publish the port. The host port is still loopback-bound as `127.0.0.1:8787:8787`, so it remains local-only. Because the container bind is broad, `NODE_GUI_TOKEN` is required whenever the GUI is enabled with this Docker configuration. Tailscale or a reverse proxy is an advanced setup and must still require a GUI token.
 
-The GUI sections are Overview, Pinning, Rewards, Commitments, Logs, and Doctor. Safe actions are sync public pin set, reconcile pins, refresh commitments, send heartbeat, and run doctor checks. The GUI cannot spend funds and never shows `KUBUS_OPERATOR_TOKEN`, Authorization headers, private keys, seed phrases, or raw backend credentials.
+The GUI sections are Overview, Pinning, Rewards, Commitments, Logs, and Doctor. Safe actions are sync public pin set, reconcile pins, refresh commitments, send heartbeat, and run doctor checks. The GUI cannot spend funds and never shows `KUBUS_OPERATOR_TOKEN`, Authorization headers, private keys, seed phrases, or raw backend credentials. This Kubus Node GUI is not the Kubo WebUI; Kubo WebUI/RPC on `5001` stays private.

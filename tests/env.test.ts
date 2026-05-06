@@ -35,4 +35,29 @@ describe('parseEnv', () => {
     expect(() => parseEnv({ ...baseEnv, NODE_ENV: 'production', KUBUS_SKIP_PINNING: 'true' })).toThrow(/SKIP_PINNING/);
     expect(() => parseEnv({ ...baseEnv, NODE_ENV: 'production', IPFS_RPC_URL: 'http://example.com:5001' })).toThrow(/IPFS_RPC_URL/);
   });
+
+  it('requires a GUI token when binding the GUI to all container interfaces', () => {
+    expect(() => parseEnv({
+      ...baseEnv,
+      NODE_GUI_ENABLED: 'true',
+      NODE_GUI_HOST: '0.0.0.0',
+      NODE_GUI_TOKEN: '',
+    })).toThrow(/NODE_GUI_TOKEN/);
+  });
+
+  it('accepts Docker GUI binding when a GUI token is configured', () => {
+    const config = parseEnv({
+      ...baseEnv,
+      NODE_GUI_ENABLED: 'true',
+      NODE_GUI_HOST: '0.0.0.0',
+      NODE_GUI_PORT: '8787',
+      NODE_GUI_TOKEN: 'local-gui-token',
+      NODE_GUI_DISPLAY_URL: 'http://my.node.kubus.site:8787/gui',
+    });
+
+    expect(config.guiEnabled).toBe(true);
+    expect(config.guiHost).toBe('0.0.0.0');
+    expect(config.guiDisplayUrl).toBe('http://my.node.kubus.site:8787/gui');
+    expect(config.guiFallbackUrl).toBe('http://127.0.0.1:8787/gui');
+  });
 });
