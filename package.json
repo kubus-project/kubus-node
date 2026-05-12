@@ -1,6 +1,6 @@
 {
   "name": "@kubus/kubus-node",
-  "version": "0.1.0",
+  "version": "0.6.0",
   "description": "Kubus Availability Network operator runtime",
   "license": "UNLICENSED",
   "type": "module",
@@ -17,7 +17,9 @@
     "status": "tsx src/index.ts status",
     "doctor": "tsx src/index.ts doctor",
     "gui": "tsx src/index.ts gui",
-    "smoke": "tsx scripts/smoke.ts"
+    "smoke": "tsx scripts/smoke.ts",
+    "sync:version": "node scripts/sync_version.mjs",
+    "sync:versions": "npm run sync:version"
   },
   "engines": {
     "node": ">=20.0.0",
