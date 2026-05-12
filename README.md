@@ -1,6 +1,8 @@
 # Kubus Node
 
-Kubus Node is the operator runtime for the Kubus Availability Network. It runs next to a private Kubo daemon, registers an operator node with the Kubus backend control plane, pins canonical public Kubus CIDs, submits availability commitments for the rewardable subset, sends liveness heartbeats, and reports status/reward summaries.
+Kubus Node is the operator runtime for the Kubus Availability Network. It runs next to a private Kubo daemon, registers an operator node with the Kubus backend control plane, pins canonical public Kubus CIDs, submits availability commitments for the rewardable subset, sends liveness heartbeats, and reports public archive contribution and reward summaries.
+
+Rewards are based on verified public archive availability: uptime, public CID coverage, retrieval checks, and priority/rewardable CID bonuses. Priority CIDs add weight, but the public archive itself is the base contribution. Reward rows are pending backend control-plane records until settlement infrastructure exists; Kubus Node is not a wallet or payout engine.
 
 It is not a payout engine, platform settlement bridge, wallet, or proof oracle. Availability rewards remain pending backend control-plane records until the generic platform-settlement bridge exists.
 

@@ -22,7 +22,7 @@ Node routes:
 - `POST /nodes/register` with `{ nodeKey, endpointUrl, label, status, metadata }`
 - `GET /nodes/current`
 - `GET /nodes/me`
-- `POST /heartbeat` with `{ nodeId, peerId, agentVersion, kuboHealth, storage, trackedCidCount, pinnedCidCount, failedCidCount, status, metadata }`; counts describe the desired public pin set, while rewardable counts and bundle details live in `metadata`
+- `POST /heartbeat` with `{ nodeId, peerId, agentVersion, kuboHealth, storage, trackedCidCount, pinnedCidCount, failedCidCount, status, metadata }`; counts describe the desired public pin set, while `metadata` includes public archive coverage, rewardable coverage, latest sync/reconcile/commitment timestamps, GUI state, and node version
 - `POST /nodes/:nodeId/heartbeat` with the same heartbeat body except `nodeId` is in the path
 - `GET /nodes/:nodeId/status`
 - `GET /nodes/:nodeId/heartbeat/latest`
@@ -31,6 +31,8 @@ Node routes:
 - `GET /commitments/current?nodeId=...`
 - `GET /nodes/:nodeId/commitments`
 - `GET /rewards/me?status=&limit=&offset=`
+
+Archive contribution rewards are pending control-plane records. Public CID replication is the base contribution; rewardable CIDs are a priority bonus, not the only reward source.
 
 Responses usually wrap data as `{ success: true, data }`. Validation/auth failures are terminal. `503 NODE_NOT_WRITABLE` means the backend is a standby or writes are disabled for this route. `GET /epochs/current` can return `{ epoch: null }`.
 

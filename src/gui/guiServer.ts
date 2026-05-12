@@ -162,27 +162,65 @@ async function buildGuiStatus(deps: GuiDeps, live: Awaited<ReturnType<typeof liv
 
 function buildPinning(deps: GuiDeps) {
   const state = deps.store.snapshot();
+  const familyCounts = state.desiredCids.reduce<Record<string, number>>((counts, record) => {
+    const key = record.isRewardable ? 'rewardable' : record.role === 'manifest' ? 'manifest' : record.role === 'record' ? 'record' : (record.family || 'media');
+    counts[key] = (counts[key] || 0) + 1;
+    return counts;
+  }, {});
+  const rewardableCidSet = new Set(state.rewardableCids.map((item) => item.cid));
+  const pinnedRewardableCidCount = state.pinnedCids.filter((cid) => rewardableCidSet.has(cid)).length;
   return redactSecrets({
-    publicPinSetCount: state.publicPinSet.length,
+    publicPinSetCount: state.publicPinSetTotal ?? state.publicPinSet.length,
     desiredCidCount: state.desiredCids.length,
     pinnedCidCount: state.pinnedCids.length,
     failedCidCount: Object.keys(state.failedCids).length,
-    rewardableCidCount: state.rewardableCids.length,
+    rewardableCidCount: state.rewardableCidTotal ?? state.rewardableCids.length,
+    pinnedRewardableCidCount,
+    estimatedPublicCoverage: state.desiredCids.length > 0 ? state.pinnedCids.length / state.desiredCids.length : 0,
+    estimatedRewardableCoverage: (state.rewardableCidTotal ?? state.rewardableCids.length) > 0
+      ? pinnedRewardableCidCount / (state.rewardableCidTotal ?? state.rewardableCids.length)
+      : 0,
+    roleCounts: {
+      manifest: familyCounts.manifest || 0,
+      record: familyCounts.record || 0,
+      media: familyCounts.media || familyCounts.leaf || 0,
+      rewardable: familyCounts.rewardable || 0,
+    },
     maxPinnedCids: deps.config.maxPinnedCids,
     cidClassFilters: deps.config.cidClassFilters,
-    latestSyncTime: state.updatedAt || null,
+    latestSyncTime: state.latestPublicPinSetSyncAt || null,
+    latestPinReconcileAt: state.latestPinReconcileAt || null,
     failedPins: Object.entries(state.failedCids).map(([cid, failure]) => ({ cid, ...failure })),
     actionLock: deps.actionLock.snapshot(),
   });
 }
 
 function buildRewards(store: LocalStore) {
-  const rewards = store.snapshot().rewards;
+  const state = store.snapshot();
+  const rewards = state.rewards;
+  const rewardableCidSet = new Set(state.rewardableCids.map((item) => item.cid));
+  const pinnedRewardableCidCount = state.pinnedCids.filter((cid) => rewardableCidSet.has(cid)).length;
+  const publicCoverage = state.desiredCids.length > 0 ? state.pinnedCids.length / state.desiredCids.length : 0;
+  const rewardableCoverage = (state.rewardableCidTotal ?? state.rewardableCids.length) > 0
+    ? pinnedRewardableCidCount / (state.rewardableCidTotal ?? state.rewardableCids.length)
+    : 0;
+  const backendEstimate = state.latestStatus?.archiveContribution || null;
   return redactSecrets({
     count: rewards?.count || 0,
     summary: rewards?.summary || { pendingKub8: 0, settledKub8: 0, noRewardEpochs: 0 },
     rewards: rewards?.rewards || [],
+    estimate: {
+      label: 'local_estimate_only',
+      publicArchiveCoverage: publicCoverage,
+      rewardableCoverage,
+      pinnedPublicCidCount: state.pinnedCids.length,
+      pinnedRewardableCidCount,
+      failedPublicCidCount: Object.keys(state.failedCids).length,
+      estimatedContributionScore: backendEstimate?.effectivePoints ?? null,
+    },
+    verified: backendEstimate,
     settlement: 'pending_control_plane_record',
+    formula: 'Rewards are based on verified public archive availability. Priority CIDs add a bonus, but the public archive itself is rewarded.',
   });
 }
 
@@ -224,6 +262,8 @@ async function runDoctor(deps: GuiDeps) {
   checks.push({ name: 'Kubo health', ok: kubo.reachable, detail: kubo.error || kubo.version });
   const stateWrite = await deps.store.update(() => undefined).then(() => ({ ok: true })).catch((error) => ({ ok: false, detail: String((error as Error).message || error) }));
   checks.push({ name: 'State file write', ...stateWrite });
+  checks.push({ name: 'GUI hostname', ok: deps.config.guiHost === '0.0.0.0' || ['127.0.0.1', 'localhost', '::1'].includes(deps.config.guiHost), detail: deps.config.guiHost });
+  checks.push({ name: 'GUI token', ok: Boolean(deps.config.guiToken), detail: deps.config.guiToken ? 'configured' : 'missing' });
   checks.push({ name: 'Operator token presence', ok: Boolean(deps.config.operatorToken), detail: deps.config.operatorToken ? 'configured' : 'missing' });
   const pinSet = await deps.api.getPublicPinSet({ limit: 1 }).then((data) => ({ ok: true, detail: `${data.count} public CIDs` })).catch((error) => ({ ok: false, detail: String((error as Error).message || error) }));
   checks.push({ name: 'Public pin-set endpoint', ...pinSet });

@@ -5,11 +5,21 @@ import type { KuboClient } from '../ipfs/kuboClient.js';
 import type { LocalStore } from '../state/localStore.js';
 import { AGENT_VERSION } from './registerNode.js';
 
+function clampRatio(value: number): number {
+  return Math.min(Math.max(Number.isFinite(value) ? value : 0, 0), 1);
+}
+
 export async function sendHeartbeat(api: KubusApiClient, kubo: KuboClient, store: LocalStore, config: AppConfig) {
   const state = store.snapshot();
   if (!state.nodeId) throw new Error('Cannot send heartbeat before registration');
   const kuboHealth = await getKuboHealth(kubo);
   const status = kuboHealth.reachable && Object.keys(state.failedCids).length === 0 ? 'healthy' : kuboHealth.reachable ? 'degraded' : 'offline';
+  const rewardableCidSet = new Set(state.rewardableCids.map((item) => item.cid));
+  const pinnedRewardableCidCount = state.pinnedCids.filter((cid) => rewardableCidSet.has(cid)).length;
+  const publicPinSetCount = state.publicPinSetTotal ?? state.publicPinSet.length;
+  const rewardableCidCount = state.rewardableCidTotal ?? state.rewardableCids.length;
+  const estimatedPublicCoverage = clampRatio(state.pinnedCids.length / Math.max(state.desiredCids.length || publicPinSetCount, 1));
+  const estimatedRewardableCoverage = clampRatio(pinnedRewardableCidCount / Math.max(rewardableCidCount, 1));
   const response = await api.sendHeartbeat({
     nodeId: state.nodeId,
     peerId: state.peerId,
@@ -19,22 +29,32 @@ export async function sendHeartbeat(api: KubusApiClient, kubo: KuboClient, store
     trackedCidCount: state.desiredCids.length,
     pinnedCidCount: state.pinnedCids.length,
     failedCidCount: Object.keys(state.failedCids).length,
-    rewardableCidCount: state.rewardableCids.length,
+    rewardableCidCount,
     status,
     metadata: {
       operatorWallet: config.operatorWallet,
       skipPinning: config.skipPinning,
-      publicPinSetCount: state.publicPinSet.length,
+      publicPinSetCount,
+      desiredCidCount: state.desiredCids.length,
       desiredPublicCidCount: state.desiredCids.length,
-      rewardableCidCount: state.rewardableCids.length,
+      rewardableCidCount,
       pinnedPublicCidCount: state.pinnedCids.length,
       failedPublicCidCount: Object.keys(state.failedCids).length,
+      pinnedRewardableCidCount,
+      latestPublicPinSetSyncAt: state.latestPublicPinSetSyncAt || null,
+      latestPinReconcileAt: state.latestPinReconcileAt || null,
+      latestCommitmentRefreshAt: state.latestCommitmentRefreshAt || null,
+      estimatedPublicCoverage,
+      estimatedRewardableCoverage,
+      guiEnabled: config.guiEnabled === true,
+      nodeVersion: AGENT_VERSION,
       pinningSource: state.policy?.pinning || null,
     },
   });
   await store.update((next) => {
     next.latestHeartbeat = response.heartbeat as never;
     next.latestStatus = response.status;
+    next.latestHeartbeatAt = new Date().toISOString();
   });
   return response;
 }

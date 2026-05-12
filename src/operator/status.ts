@@ -5,6 +5,48 @@ import type { KuboClient } from "../ipfs/kuboClient.js";
 import type { LocalStore } from "../state/localStore.js";
 import crypto from "node:crypto";
 
+function clampRatio(value: number): number {
+  return Math.min(Math.max(Number.isFinite(value) ? value : 0, 0), 1);
+}
+
+function hoursSinceStartOfDay(now = new Date()): number {
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  return Math.max((now.getTime() - start.getTime()) / 3600000, 0);
+}
+
+function buildLocalContributionEstimate(state: ReturnType<LocalStore["snapshot"]>, backendStatus?: ReturnType<LocalStore["snapshot"]>["latestStatus"]) {
+  const rewardableCidSet = new Set((state.rewardableCids || []).map((item) => item.cid));
+  const pinnedRewardableCidCount = (state.pinnedCids || []).filter((cid) => rewardableCidSet.has(cid)).length;
+  const desiredCidCount = state.desiredCids?.length || 0;
+  const publicPinSetCount = state.publicPinSetTotal ?? state.publicPinSet?.length ?? 0;
+  const rewardableCidCount = state.rewardableCidTotal ?? state.rewardableCids?.length ?? 0;
+  const estimatedPublicCoverage = clampRatio((state.pinnedCids?.length || 0) / Math.max(desiredCidCount || publicPinSetCount, 1));
+  const estimatedRewardableCoverage = clampRatio(pinnedRewardableCidCount / Math.max(rewardableCidCount, 1));
+  const online = backendStatus?.status === "healthy" || backendStatus?.status === "syncing";
+  const uptimeTodayHours = online ? hoursSinceStartOfDay() : 0;
+  const estimatedPublicCidHours = (state.pinnedCids?.length || 0) * uptimeTodayHours;
+  const estimatedRewardableCidHours = pinnedRewardableCidCount * uptimeTodayHours;
+  const estimatedContributionScore = Math.pow(
+    Math.max(uptimeTodayHours + estimatedPublicCidHours + estimatedRewardableCidHours * 2, 0),
+    0.85,
+  );
+  return {
+    label: "local_estimate_only",
+    uptimeTodayHours,
+    publicArchiveCoverage: estimatedPublicCoverage,
+    rewardableCoverage: estimatedRewardableCoverage,
+    pinnedPublicCidCount: state.pinnedCids?.length || 0,
+    failedPublicCidCount: Object.keys(state.failedCids || {}).length,
+    pinnedRewardableCidCount,
+    estimatedPublicCidHours,
+    estimatedRewardableCidHours,
+    retrievalFailures: Object.keys(state.failedCids || {}).length,
+    estimatedContributionScore,
+    backendVerified: backendStatus?.archiveContribution || null,
+  };
+}
+
 export async function refreshStatus(
   api: KubusApiClient,
   kubo: KuboClient,
@@ -24,6 +66,7 @@ export async function refreshStatus(
     if (status) next.latestStatus = status;
     next.currentEpoch = epoch.epoch;
     next.activeCommitments = commitments.commitments;
+    next.latestStatusRefreshAt = new Date().toISOString();
   });
   return { status, epoch, commitments, kubo: await getKuboHealth(kubo) };
 }
@@ -61,9 +104,18 @@ export function buildStatusSummary(
     policyVersion: state.policy?.version || null,
     publicPinSetCount: state.publicPinSet?.length || 0,
     rewardableCidCount: state.rewardableCids?.length || 0,
+    rewardableCidTotal: state.rewardableCidTotal ?? state.rewardableCids?.length ?? 0,
     desiredCidCount: state.desiredCids?.length || 0,
     pinnedCidCount: state.pinnedCids?.length || 0,
     failedCidCount: Object.keys(state.failedCids || {}).length,
+    publicPinSetTotal: state.publicPinSetTotal ?? state.publicPinSet?.length ?? 0,
+    pinnedRewardableCidCount: state.pinnedCids?.filter((cid) => (state.rewardableCids || []).some((item) => item.cid === cid)).length || 0,
+    archiveContributionEstimate: buildLocalContributionEstimate(state, state.latestStatus),
+    archiveContributionVerified: state.latestStatus?.archiveContribution || null,
+    latestPublicPinSetSyncAt: state.latestPublicPinSetSyncAt || null,
+    latestPinReconcileAt: state.latestPinReconcileAt || null,
+    latestCommitmentRefreshAt: state.latestCommitmentRefreshAt || null,
+    latestRewardsRefreshAt: state.latestRewardsRefreshAt || null,
     activeCommitmentCount: state.activeCommitments?.length || 0,
     lastHeartbeat: state.latestHeartbeat?.receivedAt || null,
     backendNodeStatus: state.latestStatus?.status || null,

@@ -25,6 +25,15 @@ export interface LocalState {
   desiredCids: PublicPinSetRecord[];
   pinnedCids: string[];
   failedCids: Record<string, { error: string; at: string }>;
+  publicPinSetTotal?: number;
+  rewardableCidTotal?: number;
+  latestPublicPinSetSyncAt?: string;
+  latestPinReconcileAt?: string;
+  latestCommitmentRefreshAt?: string;
+  latestHeartbeatAt?: string;
+  latestStatusRefreshAt?: string;
+  latestRewardsRefreshAt?: string;
+  commitmentSkipReasons?: Record<string, string>;
   activeCommitments: AvailabilityCommitment[];
   latestHeartbeat?: AvailabilityHeartbeat;
   latestStatus?: NodeStatusSummary;

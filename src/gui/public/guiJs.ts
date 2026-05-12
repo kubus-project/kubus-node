@@ -41,6 +41,11 @@ function metric(label, value, detail = '') {
   return '<div class="card metric"><div class="metric-label">' + label + '</div><div class="metric-value">' + fmt(value) + '</div><div class="subtle">' + detail + '</div></div>';
 }
 
+function percent(value) {
+  const number = Number(value || 0);
+  return Math.round(number * 1000) / 10 + '%';
+}
+
 function renderShell(data) {
   statusCache = data;
   document.body.innerHTML = '<div class="shell"><aside class="sidebar"><div class="brand">Kubus Node</div><div class="local-note">' + fmt(data.gui.displayUrl) + '<br>' + fmt(data.gui.fallbackUrl) + '<br>my.node.kubus.site is a local alias, not a public service.</div><nav class="nav">' + navTemplate() + '</nav></aside><main class="main"><div class="topbar"><div><h1>Local node health</h1><p class="subtle">Public archive pinning, rewardable commitments, and local operations.</p></div><span class="badge ' + tone(data.status) + '">' + fmt(data.status) + '</span></div><div id="section"></div></main></div>';
@@ -64,13 +69,15 @@ function row(label, value) {
 }
 
 function renderOverview(data) {
+  const estimate = data.archiveContributionEstimate || {};
   return '<section class="section active"><div class="grid">' +
     metric('Node status', data.status, 'latest backend heartbeat') +
-    metric('Backend', data.backendReachable ? 'reachable' : 'offline', data.backendUrl) +
-    metric('Kubo', data.kuboReachable ? 'reachable' : 'offline', short(data.peerId)) +
-    metric('Active commitments', data.activeCommitmentCount, 'rewardable commitments') +
+    metric('Uptime today', (Math.round((estimate.uptimeTodayHours || 0) * 10) / 10) + 'h', 'local estimate') +
+    metric('Public archive coverage', percent(estimate.publicArchiveCoverage), data.pinnedCidCount + ' pinned public CIDs') +
+    metric('Priority CIDs', data.pinnedRewardableCidCount + '/' + data.rewardableCidTotal, 'rewardable bonus subset') +
+    metric('Contribution score', Math.round(estimate.estimatedContributionScore || 0), 'local estimate only') +
     '</div><div class="card"><h2>Node identity</h2>' +
-    row('Label', data.nodeLabel) + row('Node ID', data.nodeId) + row('Peer ID', data.peerId) + row('Operator wallet', short(data.operatorWallet)) + row('Latest heartbeat', data.lastHeartbeat) + row('Current epoch', data.currentEpoch) +
+    row('Label', data.nodeLabel) + row('Node ID', data.nodeId) + row('Peer ID', data.peerId) + row('Operator wallet', short(data.operatorWallet)) + row('Latest heartbeat', data.lastHeartbeat) + row('Current epoch', data.currentEpoch) + row('GUI mode', data.gui.localhostOnly ? 'local only' : 'remote-enabled') +
     '</div></section>';
 }
 
@@ -120,6 +127,33 @@ async function renderDoctor() {
   });
 }
 
+async function renderPinningArchive() {
+  const data = await request('/gui/api/pinning');
+  const failed = data.failedPins.map((item) => '<div class="row"><div class="mono">' + item.cid + '</div><div class="error">' + item.error + '</div><div class="subtle">' + item.at + '</div></div>').join('') || '<div class="subtle">No failed pins.</div>';
+  $('#section').innerHTML = '<section class="section active"><div class="grid">' +
+    metric('Public pin-set', data.publicPinSetCount, 'canonical public CIDs') +
+    metric('Tracked public CIDs', data.desiredCidCount, 'after local caps/filters') +
+    metric('Pinned public CIDs', data.pinnedCidCount, 'successfully pinned') +
+    metric('Archive coverage', percent(data.estimatedPublicCoverage), data.failedCidCount + ' failed public CIDs') +
+    metric('Rewardable CIDs', data.pinnedRewardableCidCount + '/' + data.rewardableCidCount, 'priority bonus subset') +
+    '</div><div class="card"><h2>Public Archive</h2>' +
+    row('Manifest CIDs', data.roleCounts.manifest) + row('Record CIDs', data.roleCounts.record) + row('Media CIDs', data.roleCounts.media) + row('Rewardable leaf CIDs', data.roleCounts.rewardable) +
+    '</div><div class="card"><h2>Safe actions</h2><div class="actions"><button class="button primary" data-action="sync">Sync public pin set</button><button class="button" data-action="pin">Reconcile pins</button><button class="button" data-action="commitments">Refresh commitments</button><button class="button" data-action="heartbeat">Send heartbeat</button></div><p class="subtle">MAX_PINNED_CIDS=' + data.maxPinnedCids + ' - CID_CLASS_FILTERS=' + fmt(data.cidClassFilters.join(',')) + ' - latest sync=' + fmt(data.latestSyncTime) + ' - latest reconcile=' + fmt(data.latestPinReconcileAt) + '</p></div><div class="card"><h2>Failed pins</h2><div class="list">' + failed + '</div></div></section>';
+  bindActions();
+}
+
+async function renderRewardsArchive() {
+  const data = await request('/gui/api/rewards');
+  $('#section').innerHTML = '<section class="section active"><div class="grid">' +
+    metric('Estimated archive points', Math.round(data.estimate.estimatedContributionScore || 0), 'local estimate only') +
+    metric('Public CID-hours', fmt(data.verified?.verifiedPublicCidHours), 'verified by backend') +
+    metric('Rewardable CID-hours', fmt(data.verified?.verifiedRewardableCidHours), 'priority bonus') +
+    metric('Pending KUB8 rewards', data.summary.pendingKub8, 'control-plane record') +
+    metric('Settled KUB8', data.summary.settledKub8, 'not live payout settlement') +
+    metric('No-reward epochs', data.summary.noRewardEpochs, 'below threshold or no checks') +
+    '</div><div class="card"><h2>Rewards</h2><p class="subtle">' + data.formula + '</p><p class="subtle">Payout settlement is pending a control-plane record. This local GUI cannot spend funds.</p></div></section>';
+}
+
 function bindActions() {
   document.querySelectorAll('[data-action]').forEach((button) => {
     button.addEventListener('click', async () => {
@@ -138,8 +172,8 @@ function bindActions() {
 
 async function renderSection() {
   if (activeSection === 'overview') $('#section').innerHTML = renderOverview(statusCache);
-  if (activeSection === 'pinning') await renderPinning();
-  if (activeSection === 'rewards') await renderRewards();
+  if (activeSection === 'pinning') await renderPinningArchive();
+  if (activeSection === 'rewards') await renderRewardsArchive();
   if (activeSection === 'commitments') await renderCommitments();
   if (activeSection === 'logs') await renderLogs();
   if (activeSection === 'doctor') await renderDoctor();

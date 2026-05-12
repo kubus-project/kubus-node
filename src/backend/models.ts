@@ -62,6 +62,8 @@ export interface PinSetResponse {
 
 export interface AvailabilityPolicy {
   version: string;
+  scoringFormulaVersion?: string;
+  archive?: Record<string, unknown>;
   rewardableContentSource: string;
   pinning?: Record<string, unknown>;
   maxPinnedCidsDefault: number;
@@ -71,6 +73,26 @@ export interface AvailabilityPolicy {
   verification: Record<string, unknown>;
   rewards: Record<string, unknown>;
   statuses: Record<string, string[]>;
+}
+
+export interface ArchiveContributionStats {
+  healthyMinutes?: number;
+  verifiedPublicCidCount?: number;
+  verifiedRewardableCidCount?: number;
+  verifiedPublicCidHours?: number;
+  verifiedRewardableCidHours?: number;
+  retrievalChecksTotal?: number;
+  retrievalChecksPassed?: number;
+  uptimeScore?: number;
+  coverageScore?: number;
+  retrievalScore?: number;
+  rewardableBonusScore?: number;
+  rawPoints?: number;
+  effectivePoints?: number;
+  eligible?: boolean;
+  ineligibleReason?: string | null;
+  formulaVersion?: string | null;
+  metadata?: Record<string, unknown>;
 }
 
 export interface AvailabilityCommitment {
@@ -107,6 +129,7 @@ export interface NodeStatusSummary {
   latestHeartbeat?: AvailabilityHeartbeat | null;
   activeCommitmentCount: number;
   activeCommitments: AvailabilityCommitment[];
+  archiveContribution?: ArchiveContributionStats | null;
   rewardSummary?: RewardSummary | null;
 }
 

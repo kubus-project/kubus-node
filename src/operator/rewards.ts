@@ -5,6 +5,7 @@ export async function refreshRewards(api: KubusApiClient, store: LocalStore) {
   const rewards = await api.getMyRewards({ limit: 50, offset: 0 });
   await store.update((state) => {
     state.rewards = rewards;
+    state.latestRewardsRefreshAt = new Date().toISOString();
   });
   return rewards;
 }

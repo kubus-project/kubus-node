@@ -45,6 +45,9 @@ export async function syncPublicPinSet(api: KubusApiClient, store: LocalStore, c
     state.publicPinSet = publicPinSet;
     state.rewardableCids = rewardable;
     state.desiredCids = desired;
+    state.publicPinSetTotal = pinSetResponse.count;
+    state.rewardableCidTotal = rewardableResponse.count;
+    state.latestPublicPinSetSyncAt = new Date().toISOString();
   });
   return desired;
 }
@@ -59,6 +62,7 @@ export async function reconcileDesiredPins(kubo: KuboClient, store: LocalStore, 
     state.failedCids = Object.fromEntries(
       results.filter((result) => !result.ok).map((result) => [result.cid, { error: result.error || 'pin_failed', at: new Date().toISOString() }]),
     );
+    state.latestPinReconcileAt = new Date().toISOString();
   });
   return results;
 }
@@ -68,11 +72,21 @@ export async function refreshCommitments(api: KubusApiClient, kubo: KuboClient, 
   if (!state.nodeId) throw new Error('Cannot create commitments before registration');
   const commitments: AvailabilityCommitment[] = [];
   const desiredCidSet = new Set(state.desiredCids.map((record) => record.cid));
+  const skipReasons: Record<string, string> = {};
   for (const item of state.rewardableCids) {
-    if (!desiredCidSet.has(item.cid)) continue;
-    if (!state.pinnedCids.includes(item.cid) && !config.skipPinning) continue;
+    if (!desiredCidSet.has(item.cid)) {
+      skipReasons[item.cid] = 'not_in_desired_public_pin_set';
+      continue;
+    }
+    if (!state.pinnedCids.includes(item.cid) && !config.skipPinning) {
+      skipReasons[item.cid] = 'rewardable_leaf_not_pinned';
+      continue;
+    }
     const probe = await probeRetrieval(kubo, config.ipfsGatewayUrl, item.cid);
-    if (!['pinned', 'retrievable'].includes(probe.state) && !config.skipPinning) continue;
+    if (!['pinned', 'retrievable'].includes(probe.state) && !config.skipPinning) {
+      skipReasons[item.cid] = `retrieval_${probe.state}`;
+      continue;
+    }
     const bundle = bundleForRewardable(state.desiredCids, item);
     const pinnedBundleCids = bundle
       .filter((record) => state.pinnedCids.includes(record.cid) || config.skipPinning)
@@ -106,6 +120,8 @@ export async function refreshCommitments(api: KubusApiClient, kubo: KuboClient, 
   }
   await store.update((next) => {
     next.activeCommitments = commitments;
+    next.commitmentSkipReasons = skipReasons;
+    next.latestCommitmentRefreshAt = new Date().toISOString();
   });
   return commitments;
 }
