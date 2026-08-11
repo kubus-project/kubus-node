@@ -109,4 +109,12 @@ Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`n127.0.0
 
 For Docker, the GUI must bind to `0.0.0.0:8787` inside the container so Docker can publish the port. The host port is still loopback-bound as `127.0.0.1:8787:8787`, so it remains local-only. Because the container bind is broad, `NODE_GUI_TOKEN` is required whenever the GUI is enabled with this Docker configuration. Tailscale or a reverse proxy is an advanced setup and must still require a GUI token.
 
-The GUI sections are Overview, Pinning, Rewards, Commitments, Logs, and Doctor. Safe actions are sync public pin set, reconcile pins, refresh commitments, send heartbeat, and run doctor checks. The GUI cannot spend funds and never shows `KUBUS_OPERATOR_TOKEN`, Authorization headers, private keys, seed phrases, or raw backend credentials. This Kubus Node GUI is not the Kubo WebUI; Kubo WebUI/RPC on `5001` stays private.
+The GUI sections are Overview, Archive, Spatial, Compute, Contribution, Devices, Diagnostics, and Settings. Archive carries the safe maintenance actions — check for new records (sync public pin set), store missing records (reconcile pins), and report availability (heartbeat). Diagnostics runs the node checks and holds the log viewer. Devices manages pairing with the art.kubus app.
+
+A node that has never been configured opens a short guided setup instead of the dashboard; it reports the real state of each prerequisite and can be skipped at any point.
+
+The GUI cannot spend funds and never shows `KUBUS_OPERATOR_TOKEN`, Authorization headers, private keys, seed phrases, or raw backend credentials. Technical identifiers such as peer IDs and CIDs are truncated for display and copyable in full. This Kubus Node GUI is not the Kubo WebUI; Kubo WebUI/RPC on `5001` stays private.
+
+The GUI loads no fonts, scripts, styles or icons from the internet, so it renders correctly on a node with no outbound connectivity. The pairing QR is generated on the node itself.
+
+To review the interface without a live node, `npx tsx scripts/previewGui.ts [healthy|locked|unconfigured]` serves it against fixtures.

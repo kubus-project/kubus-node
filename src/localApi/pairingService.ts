@@ -83,6 +83,20 @@ export class PairingService {
     return { token, credentialId, scopes };
   }
 
+  /**
+   * Disconnects a paired device. The credential is marked revoked rather than
+   * deleted so `authorize` fails closed for a token that is still in the wild,
+   * and so the record remains available to an audit of past access.
+   */
+  async revoke(credentialId: string): Promise<void> {
+    const credential = this.store.snapshot().localCredentials?.[credentialId];
+    if (!credential || credential.revokedAt) throw localError(404, 'device_not_found');
+    await this.store.update((state) => {
+      const current = state.localCredentials?.[credentialId];
+      if (current) current.revokedAt = new Date().toISOString();
+    });
+  }
+
   async authorize(token: string | undefined, requiredScope: LocalScope): Promise<boolean> {
     if (!token?.startsWith('kubus_local_')) return false;
     const hash = digest(token);

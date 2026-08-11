@@ -17,6 +17,8 @@ import { guiJs } from './public/guiJs.js';
 import { assertGuiConfig, authorizeGuiRequest, guiRemoteMode, sendUnauthorized } from './guiAuth.js';
 import { guiHtml } from './templates/index.js';
 import { handleLocalApi, type LocalApiDeps } from '../localApi/localApiRouter.js';
+import { buildViewModel } from './viewModel.js';
+import { renderQrSvg } from './qr.js';
 
 export interface GuiDeps {
   api: KubusApiClient;
@@ -108,6 +110,26 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     writeJson(res, 200, { success: true, data: await buildGuiStatus(deps, live) });
     return;
   }
+  if (req.method === 'GET' && parsed.pathname === '/gui/api/view') {
+    writeJson(res, 200, { success: true, data: await buildGuiView(deps) });
+    return;
+  }
+  if (req.method === 'PUT' && parsed.pathname === '/gui/api/compute/settings') {
+    const local = requireLocalApi(deps);
+    writeJson(res, 200, { success: true, data: await local.remoteCompute.updateSettings(await readGuiJson(req)) });
+    return;
+  }
+  if (req.method === 'POST' && parsed.pathname === '/gui/api/pairing/session') {
+    writeJson(res, 201, { success: true, data: await createGuiPairing(deps) });
+    return;
+  }
+  const revokeMatch = parsed.pathname.match(/^\/gui\/api\/devices\/([^/]+)$/);
+  if (req.method === 'DELETE' && revokeMatch) {
+    const local = requireLocalApi(deps);
+    await local.pairing.revoke(decodeURIComponent(revokeMatch[1]!));
+    writeJson(res, 200, { success: true, data: { disconnected: true } });
+    return;
+  }
   if (req.method === 'GET' && parsed.pathname === '/gui/api/pinning') {
     writeJson(res, 200, { success: true, data: buildPinning(deps) });
     return;
@@ -170,6 +192,118 @@ async function buildGuiStatus(deps: GuiDeps, live: Awaited<ReturnType<typeof liv
     },
     actionLock: deps.actionLock.snapshot(),
   });
+}
+
+/**
+ * The runtime pieces the redesigned GUI reads from. They are optional on
+ * `GuiDeps` for the benefit of narrow tests, but the CLI always supplies them.
+ */
+function requireLocalApi(deps: GuiDeps): LocalApiDeps {
+  if (!deps.localApi) {
+    const error = new Error('local_runtime_unavailable') as Error & { statusCode?: number; code?: string };
+    error.statusCode = 503;
+    error.code = 'local_runtime_unavailable';
+    throw error;
+  }
+  return deps.localApi;
+}
+
+async function buildGuiView(deps: GuiDeps) {
+  const local = requireLocalApi(deps);
+  const state = deps.store.snapshot();
+  const [participation, live, repo] = await Promise.all([
+    local.participationGate.refresh(),
+    liveStatus(deps.api, deps.kubo),
+    deps.kubo.repoStat().catch(() => ({ RepoSize: 0, StorageMax: 0 })),
+  ]);
+
+  const captures = local.captures.list();
+  const pinnedSet = new Set(state.pinnedCids);
+  const publicReplicaBytes = state.desiredCids
+    .filter((record) => pinnedSet.has(record.cid))
+    .reduce((sum, record) => sum + Number(record.sizeBytes || 0), 0);
+
+  return buildViewModel({
+    state,
+    participation,
+    worker: local.capabilities.getWorkerHealth(),
+    jobs: local.jobs.health(),
+    compute: local.remoteCompute.settings(),
+    storage: {
+      repoBytes: Number(repo.RepoSize || 0),
+      storageMaxBytes: Number(repo.StorageMax || 0),
+      publicReplicaBytes,
+      privateCaptureBytes: captures.reduce((sum, capture) => sum + capture.sizeBytes, 0),
+      maxPinnedBytes: deps.config.maxPinnedBytes,
+    },
+    health: {
+      backendReachable: live.backendHealth.reachable,
+      kuboReachable: live.kuboHealth.reachable,
+      kuboVersion: live.kuboHealth.version ?? null,
+    },
+    config: {
+      nodeLabel: deps.config.nodeLabel,
+      apiBaseUrl: deps.config.apiBaseUrl,
+      maxPinnedCids: deps.config.maxPinnedCids,
+      cidClassFilters: deps.config.cidClassFilters,
+      localApiEnabled: deps.config.localApiEnabled,
+      localApiAllowLan: deps.config.localApiAllowLan,
+      guiRemoteMode: guiRemoteMode(deps.config),
+      guiTokenConfigured: Boolean(deps.config.guiToken),
+      operatorTokenConfigured: Boolean(deps.config.operatorToken),
+    },
+    captureCount: captures.length,
+  });
+}
+
+/**
+ * Starts a pairing session and returns it in renderable form.
+ *
+ * The one-time secret is deliberately returned under `code` rather than
+ * `secret`: the GUI has to display it, and the response-level redaction that
+ * protects every other endpoint would otherwise blank the pairing code. Nothing
+ * else about the session — and no operator credential — is included.
+ */
+async function createGuiPairing(deps: GuiDeps) {
+  const local = requireLocalApi(deps);
+  const session = await local.pairing.createSession();
+  const payload = `kubus-node://pair?e=${encodeURIComponent(session.node.endpoint)}` +
+    `&s=${encodeURIComponent(session.sessionId)}&k=${encodeURIComponent(session.secret)}`;
+  return {
+    code: session.secret,
+    sessionId: session.sessionId,
+    expiresAt: session.expiresAt,
+    qrSvg: renderQrSvg(payload, { title: 'kubus Node pairing code' }),
+    node: {
+      label: session.node.label,
+      // A short fingerprint is enough for the operator to confirm the node in
+      // the app; the full digest is not useful on screen.
+      fingerprint: session.node.fingerprint.slice(0, 12),
+      endpoint: session.node.endpoint,
+    },
+  };
+}
+
+async function readGuiJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const bytes = Buffer.from(chunk as Buffer);
+    size += bytes.length;
+    if (size > 64 * 1024) {
+      const error = new Error('request_too_large') as Error & { statusCode?: number };
+      error.statusCode = 413;
+      throw error;
+    }
+    chunks.push(bytes);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as Record<string, unknown>;
+  } catch {
+    const error = new Error('json_invalid') as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
 }
 
 function buildPinning(deps: GuiDeps) {

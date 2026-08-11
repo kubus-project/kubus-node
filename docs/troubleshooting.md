@@ -20,7 +20,7 @@ No rewardable CIDs: this is valid before canonical public objects are published.
 
 Public pin-set empty: call `/api/availability/public-pin-set`. If it returns `count: 0`, the live backend currently has no active canonical public CID rows in `public_object_cids`, or publication flows are not creating them. Do not add fake CIDs to the node.
 
-Pinned count stays zero: run `npm run dev -- sync`, `npm run dev -- pin`, and `npm run dev -- heartbeat`. If tracked remains zero, the pin set is empty. If tracked is nonzero and pinned is zero, check Kubo reachability, gateway retrieval, and the failed pin list in the GUI Pinning section.
+Pinned count stays zero: run `npm run dev -- sync`, `npm run dev -- pin`, and `npm run dev -- heartbeat`. If tracked remains zero, the pin set is empty. If tracked is nonzero and pinned is zero, check Kubo reachability, gateway retrieval, and the records needing attention in the GUI Archive section.
 
 Pin failure: inspect Kubo logs and repo storage. The CID must be retrievable from IPFS or already present locally.
 
@@ -32,7 +32,7 @@ Status stale: check scheduler logs, backend health, and heartbeat interval.
 
 Docker volume reset: stop compose, remove the target volume, and start again. Removing `node-state` loses generated node key and registration identity.
 
-GUI cannot connect to backend: open `http://127.0.0.1:8787/gui`, run Doctor, and check Backend health plus Public pin-set endpoint. Confirm `KUBUS_API_BASE_URL` and `KUBUS_OPERATOR_TOKEN` are set.
+GUI cannot connect to backend: open `http://127.0.0.1:8787/gui`, go to Diagnostics, run the node checks, and check Backend health plus Public pin-set endpoint. Confirm `KUBUS_API_BASE_URL` and `KUBUS_OPERATOR_TOKEN` are set.
 
 GUI auth token rejected: confirm the browser token matches `NODE_GUI_TOKEN`. The GUI token is not the `kubus_node_...` operator token.
 
@@ -40,4 +40,4 @@ GUI does not open from Docker: ensure `NODE_GUI_ENABLED=true`, `NODE_GUI_HOST=0.
 
 `my.node.kubus.site` does not resolve: add the local hosts entry. Linux/macOS: `sudo sh -c 'echo "127.0.0.1 my.node.kubus.site" >> /etc/hosts'`. Windows PowerShell as Administrator: `Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`n127.0.0.1 my.node.kubus.site"`. The fallback URL is `http://127.0.0.1:8787/gui`.
 
-Kubo not reachable from GUI Doctor: inside Docker, use `IPFS_RPC_URL=http://kubo:5001`. On the host, use the loopback Kubo RPC only if you intentionally run Kubo locally. Never expose Kubo RPC port 5001 publicly. The Kubus Node GUI is on `8787`; the Kubo WebUI is on Kubo RPC port `5001` and remains private.
+Kubo not reachable from the GUI node checks: inside Docker, use `IPFS_RPC_URL=http://kubo:5001`. On the host, use the loopback Kubo RPC only if you intentionally run Kubo locally. Never expose Kubo RPC port 5001 publicly. The Kubus Node GUI is on `8787`; the Kubo WebUI is on Kubo RPC port `5001` and remains private.
