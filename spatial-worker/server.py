@@ -134,4 +134,14 @@ def process(request: ProcessRequest, x_kubus_worker_authorization: str | None = 
             "storageClass": "cold",
         }],
         "viewerDefaults": {"quality": "archive"},
+        "processing": {
+            "protocol": "kubus.spatial-job/1",
+            "workerVersion": "kubus-spatial-worker/1",
+            "reconstruction": {
+                "engine": "nerfstudio",
+                "method": "splatfacto",
+                "iterations": int(iterations),
+                "outputFormat": "ply",
+            },
+        },
     }

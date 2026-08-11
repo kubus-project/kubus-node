@@ -47,7 +47,7 @@ The art.kubus backend is the matchmaking and canonical trust boundary. It does n
 
 The local path is phone → paired node → private capture → local NVIDIA GPU → private preview → user review → optional publication. Raw RGB, camera poses, intrinsics and depth remain below the node's private data root. Local/self jobs create no compute reward.
 
-The worker uses the official Nerfstudio `1.1.5` image, `splatfacto`, and pinned `gsplat 1.5.3`. NVIDIA/CUDA is the only supported reconstruction target in this alpha. CPU reconstruction is not claimed or silently simulated.
+The worker uses the official Nerfstudio `1.1.5` image, `splatfacto`, and its compatible pinned `gsplat 1.4.0`. NVIDIA/CUDA is the only supported reconstruction target in this alpha. CPU reconstruction is not claimed or silently simulated.
 
 ## Distributed GPU compute
 

@@ -5,7 +5,7 @@ import type { CaptureStore } from '../captures/captureStore.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import { localError } from '../localApi/pairingService.js';
 import type { Logger } from '../logging/logger.js';
-import type { SpatialManifest, SpatialVariant } from '../spatial/models.js';
+import { validateSpatialManifest, type SpatialManifest, type SpatialVariant } from '../spatial/models.js';
 import type { LocalStore } from '../state/localStore.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
 import type { WorkerAuthService } from '../spatial/workerAuth.js';
@@ -32,6 +32,7 @@ interface WorkerOutput {
   variants: Array<{ role: SpatialVariant['role']; path: string; mimeType: string; format: string; storageClass: SpatialVariant['storageClass'] }>;
   transform?: SpatialManifest['transform'];
   viewerDefaults?: Record<string, unknown>;
+  processing: SpatialManifest['processing'];
 }
 
 const capabilityFor = (type: JobType) => type === 'spatial.reconstruct' ? 'spatial.reconstruction' : 'spatial.optimization';
@@ -183,9 +184,10 @@ export class JobRuntime {
       artworkId: String(job.input.artworkId || capture.artworkId || ''), markerId: String(job.input.markerId || capture.markerId || '') || undefined,
       captureId: capture.id, captureProvenance: { source: 'localCapture', captureId: capture.id }, capturedAt: capture.capturedAt,
       capturedBy: typeof job.input.capturedBy === 'string' ? job.input.capturedBy : undefined,
-      variants, transform: output.transform, viewerDefaults: output.viewerDefaults, createdAt: new Date().toISOString(),
+      variants, transform: output.transform, viewerDefaults: output.viewerDefaults, processing: output.processing, createdAt: new Date().toISOString(),
     };
     if (!manifest.artworkId) throw new Error('spatial_artwork_required');
+    validateSpatialManifest(manifest);
     const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
     const added = await this.deps.kubo.addBytes(manifestBytes, `${id}.spatial.json`);
     if (!added.Hash) throw new Error('kubo_add_manifest_missing_cid');
