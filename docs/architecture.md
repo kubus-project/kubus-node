@@ -2,6 +2,16 @@
 
 The backend determines what is canonical. Kubus Nodes store, process, retrieve, and serve the public archive. Flutter is the spatial interface.
 
+```mermaid
+flowchart LR
+  A[art.kubus] -->|paired local API| N[kubus Node]
+  N -->|control metadata| B[art.kubus backend]
+  N -->|private signed job| W[spatial worker]
+  N <-->|CID data plane| I[(Kubo / IPFS)]
+  B -->|policy, leases, matching, receipts| N
+  I --> P[canonical public archive]
+```
+
 ## Runtime boundaries
 
 - **Backend control plane:** identity and authorization, ownership, canonical manifests and signed records, public-object registry, network policy, verification, scoring, and pending KUB8 accounting.
@@ -14,6 +24,10 @@ The backend determines what is canonical. Kubus Nodes store, process, retrieve, 
 `JobRuntime` persists job state in the atomic local store, bounds concurrency, recovers interrupted running jobs to queued state, supports cancellation, validates private paths, and imports approved worker outputs into Kubo. GPU jobs never hold `ActionLock`; availability scheduling remains independent.
 
 Public replica state and private local state are separate. Only backend-issued public pin-set records enter byte-aware planning. A processed output stays local until authenticated publication creates a canonical object version.
+
+For remote work, the backend is a control plane only. The requester encrypts the capture, places the ciphertext in IPFS, and sends the CID plus a provider-sealed key envelope through the job record. The provider node temporarily decrypts into an isolated private directory and alone can issue the worker authorization. Output remains private until requester acknowledgement and a separate explicit publication request.
+
+Archive stewardship (`public-archive-stewardship-1/2`) and distributed compute (`spatial-compute-units-1`) are independent accounting rails and pools. A provider may later retain an explicitly published result under normal public pin policy, but compute and hosting evidence are scored separately.
 
 ## Retrieval order
 

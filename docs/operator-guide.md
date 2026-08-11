@@ -27,6 +27,14 @@ Start with Docker:
 docker compose up --build
 ```
 
+Start the current NVIDIA/CUDA spatial worker profile:
+
+```sh
+docker compose --profile spatial up --build
+```
+
+The worker has no published host port. NVIDIA Container Toolkit and a compatible NVIDIA driver are required; CPU reconstruction is not supported. Remote GPU sharing is optional and can be enabled or paused from the paired art.kubus dashboard. Archive participation is always required. Environment defaults and hard bounds are documented in `.env.example`.
+
 Kubo may migrate an existing `/data/ipfs` repository on first start after an image upgrade. A migration from fs-repo 16 to 18 is expected for Kubo 0.41.0 when it completes successfully. The compose stack disables Kubo anonymous telemetry with `IPFS_TELEMETRY=off`. Kubo RPC and Kubo WebUI on port `5001` are intentionally not published to the host.
 
 If Kubo logs a QUIC UDP receive-buffer warning, the node can still run. Operators who expose public swarm UDP traffic can improve QUIC performance by raising host UDP buffer limits before starting Docker:
@@ -69,6 +77,8 @@ The agent container runs as the non-root `node` user. If a reused `node-state` v
 Rotate token by creating a new scoped operator token in art.kubus, stopping the agent, replacing `KUBUS_OPERATOR_TOKEN`, and restarting. Revoke the old token after the new node status is healthy. Do not change the operator wallet unless registering a new operator identity.
 
 Expected resources depend on the public pin set size. `MAX_PINNED_CIDS` caps all canonical public CIDs mirrored by the node, including manifest and record CIDs that are not rewardable. `CID_CLASS_FILTERS` narrows classed pin-set records and reward commitments, but records without a class are still pinned so canonical public metadata is not accidentally excluded. Start with `MAX_PINNED_CIDS=100`, keep Kubo storage monitored, and raise slowly.
+
+`MAX_PINNED_BYTES` must meet the backend policy's `minimumContributionCapacityBytes`; setting it to a token value does not unlock compute. When the current archive is smaller than committed capacity, the node contributes every eligible available byte and remains policy-compliant. `KUBUS_SKIP_PINNING=true` is rejected as participation in production.
 
 ## Local GUI
 

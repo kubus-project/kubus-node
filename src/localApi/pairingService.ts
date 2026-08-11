@@ -10,6 +10,7 @@ export const LOCAL_SCOPES = [
   'jobs:read',
   'spatial:read',
   'spatial:publish-request',
+  'compute:manage',
 ] as const;
 export type LocalScope = typeof LOCAL_SCOPES[number];
 

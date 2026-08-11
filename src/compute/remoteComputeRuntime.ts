@@ -13,6 +13,7 @@ import { validateSpatialManifest, type SpatialManifest } from '../spatial/models
 import type { LocalStore } from '../state/localStore.js';
 import type { ComputeIdentityService } from './computeIdentity.js';
 import { PrivatePayloadTransport, type ComputeKeyEnvelope } from './privatePayloadTransport.js';
+import { effectiveComputeProviderSettings, validateComputeProviderSettings, type ComputeProviderSettings } from './providerSettings.js';
 
 interface RemoteRuntimeRecord {
   backendJobId: string;
@@ -32,13 +33,21 @@ export class RemoteComputeRuntime {
   }) {}
 
   start(): void {
-    if (!this.deps.config.offerRemoteCompute || this.timer) return;
+    if (this.timer) return;
     this.timer = setInterval(() => void this.pollProvider(), 5000);
     this.timer.unref();
     void this.pollProvider();
   }
 
   stop(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
+
+  settings(): ComputeProviderSettings { return effectiveComputeProviderSettings(this.deps.config, this.deps.store.snapshot()); }
+
+  async updateSettings(input: Record<string, unknown>): Promise<ComputeProviderSettings> {
+    const next = validateComputeProviderSettings(input, this.settings());
+    await this.deps.store.update((state) => { state.computeProviderSettings = next; });
+    return next;
+  }
 
   async candidates(authorization: string, options: { type?: string; minimumVramBytes?: number; inputBytes?: number }): Promise<{ nodes: ComputeCandidate[]; protocolVersion: string }> {
     requireUserAuthorization(authorization);
@@ -110,7 +119,8 @@ export class RemoteComputeRuntime {
   }
 
   private async pollProvider(): Promise<void> {
-    if (this.polling || !this.deps.config.offerRemoteCompute || this.deps.config.remoteComputePaused) return;
+    const settings = this.settings();
+    if (this.polling || !settings.enabled || settings.paused) return;
     const nodeId = this.deps.store.snapshot().nodeId;
     if (!nodeId) return;
     this.polling = true;
@@ -126,6 +136,19 @@ export class RemoteComputeRuntime {
     const nodeId = this.deps.store.snapshot().nodeId!;
     if (job.state === 'MATCHED') {
       await this.deps.gate.assertUsefulOperation('remote_compute_acceptance');
+      const settings = this.settings();
+      const active = Object.values(this.deps.store.snapshot().remoteJobs || {}).filter((item) => {
+        const record = item as RemoteRuntimeRecord;
+        return record.role === 'provider' && ['ACCEPTED', 'INPUT_READY', 'RUNNING'].includes(record.state);
+      }).length;
+      if (Number(job.inputBytes || 0) > settings.maxAcceptedInputBytes) {
+        await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'DECLINED', metadata: { code: 'provider_input_too_large' } });
+        return;
+      }
+      if (active >= settings.maxConcurrency + settings.maxQueueDepth) {
+        await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'DECLINED', metadata: { code: 'provider_capacity_full' } });
+        return;
+      }
       await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'ACCEPTED', metadata: { acceptedAt: new Date().toISOString() } });
       job.state = 'ACCEPTED';
     }

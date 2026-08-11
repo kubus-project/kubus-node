@@ -7,6 +7,7 @@ import { AGENT_VERSION } from './registerNode.js';
 import { CapabilityRegistry } from '../capabilities/registry.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
 import type { ComputeIdentityService } from '../compute/computeIdentity.js';
+import { effectiveComputeProviderSettings } from '../compute/providerSettings.js';
 
 function clampRatio(value: number): number {
   return Math.min(Math.max(Number.isFinite(value) ? value : 0, 0), 1);
@@ -30,6 +31,7 @@ export async function sendHeartbeat(api: KubusApiClient, kubo: KuboClient, store
   const publicReplicaBytes = state.desiredCids.filter((item) => state.pinnedCids.includes(item.cid)).reduce((sum, item) => sum + Number(item.sizeBytes || 0), 0);
   const participation = gate ? await gate.refresh() : null;
   const computeIdentity = identity ? await identity.publicIdentity() : null;
+  const providerSettings = effectiveComputeProviderSettings(config, state);
   const response = await api.sendHeartbeat({
     nodeId: state.nodeId,
     peerId: state.peerId,
@@ -69,13 +71,13 @@ export async function sendHeartbeat(api: KubusApiClient, kubo: KuboClient, store
       spatialWorkerHealth: capabilityRegistry.getWorkerHealth(),
       participation,
       remoteCompute: {
-        enabled: config.offerRemoteCompute,
-        accepting: config.offerRemoteCompute && !config.remoteComputePaused && participation?.leaseEligible === true,
-        paused: config.remoteComputePaused,
-        maxConcurrency: config.remoteComputeMaxConcurrency,
-        maxQueueDepth: config.remoteComputeMaxQueueDepth,
-        maxAcceptedInputBytes: config.remoteComputeMaxInputBytes,
-        minimumFreeVramBytes: config.remoteComputeMinimumFreeVramBytes,
+        enabled: providerSettings.enabled,
+        accepting: providerSettings.enabled && !providerSettings.paused && participation?.leaseEligible === true,
+        paused: providerSettings.paused,
+        maxConcurrency: providerSettings.maxConcurrency,
+        maxQueueDepth: providerSettings.maxQueueDepth,
+        maxAcceptedInputBytes: providerSettings.maxAcceptedInputBytes,
+        minimumFreeVramBytes: providerSettings.minimumFreeVramBytes,
         runningJobs: jobs.filter((job) => job.state === 'running' && (job as { input?: { remoteComputeJobId?: string } }).input?.remoteComputeJobId).length,
         queuedJobs: jobs.filter((job) => job.state === 'queued' && (job as { input?: { remoteComputeJobId?: string } }).input?.remoteComputeJobId).length,
         protocolVersion: 'kubus.compute/1',

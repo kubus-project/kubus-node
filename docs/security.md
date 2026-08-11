@@ -29,3 +29,21 @@ The LAN API is disabled unless configured explicitly. The admin GUI stays localh
 Browser origins are rejected to prevent arbitrary LAN websites from calling the API. Pairing and bearer secrets must not be placed in query strings. Logs and heartbeat metadata exclude local paths, filenames, raw frames, pairing credentials, and operator secrets.
 
 Capture directories and job outputs live below the configured private data root with restrictive permissions and safe relative-path validation. They do not enter the network-managed public replica set. Deletion is blocked while an active job references a capture. Publication sends CID metadata to the backend; it never sends raw capture bytes.
+
+## Distributed-compute threat model
+
+| Threat | Implemented protection | Residual limit |
+|---|---|---|
+| Malicious LAN client or leaked pairing token | LAN API off by default, origin rejection, scoped hashed credentials, bounded bodies, no query tokens | A stolen live scoped token works until credentials are reset |
+| Malicious requester / archive bomb | Backend job lease and quotas; ciphertext/input limit; authenticated decryption; safe relative paths; declared-file and expanded-byte limits | A provider still spends some bandwidth before rejecting malicious ciphertext |
+| Malicious provider | Explicit user choice, provider identity keys, signed receipts, output CID verification, requester acknowledgement | Provider sees plaintext and can return poor-but-parseable output; alpha disputes need operator review |
+| Receipt replay or duplicate completion | Job/spec/input/output binding, Ed25519 signature, legal transitions and unique reward record | Sybil identities are not fully prevented |
+| Forged completion or arbitrary reward CID | Backend-issued lease, retrievability check, requester receipt and canonical public-object registry | Gateway/IPFS reachability is a point-in-time observation |
+| Path traversal or worker command injection | No shell interpolation; fixed worker job types; root-confined paths; manifest path validation | Nerfstudio and parsers process untrusted media inside the worker container |
+| Oversized input/output | Local JSON limits, provider configured byte cap, extraction cap and backend job caps | GPU memory exhaustion can still fail an otherwise valid job |
+| Kubo RPC exposure | Compose-private RPC and documented private-host validation | Operator firewall or custom Compose changes can defeat this boundary |
+| Stale discovery | Fresh heartbeat, contributing lease, worker health and queue checks; provider rechecks gate/capacity on acceptance | State can change after matching and is handled as decline/failure |
+| Encrypted payload persistence | Job-specific directory, cleanup in success/failure, input unpin | Backups, filesystem recovery, crash dumps and malicious providers prevent a hard deletion guarantee |
+| Backend compromise | Backend never receives plaintext key; node verifies authenticated ciphertext and provider identity binding | A compromised control plane can mis-match providers or censor jobs and owns canonical/reward policy |
+
+Compute node keys are generated with Node.js standard X25519 and Ed25519 primitives and stored in local state with the same protection as node identity. AES-256-GCM provides payload and key-envelope authenticity; HKDF-SHA-256 domain-separates the wrapping key. Raw keys, envelopes containing private material, pairing secrets and authorization headers are excluded from heartbeat and logs.

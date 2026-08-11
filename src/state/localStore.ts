@@ -73,6 +73,14 @@ export interface LocalState {
     createdAt: string;
   };
   remoteJobs?: Record<string, unknown>;
+  computeProviderSettings?: {
+    enabled: boolean;
+    paused: boolean;
+    maxConcurrency: number;
+    maxQueueDepth: number;
+    maxAcceptedInputBytes: number;
+    minimumFreeVramBytes: number;
+  };
   privateComputeCids?: Record<string, { jobId?: string; role: 'encrypted_input' | 'private_output'; createdAt: string; expiresAt?: string; releasedAt?: string }>;
   updatedAt?: string;
 }

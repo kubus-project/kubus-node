@@ -135,6 +135,15 @@ export async function handleLocalApi(req: IncomingMessage, res: ServerResponse, 
     }));
     return true;
   }
+  if (req.method === 'GET' && parsed.pathname === '/local/v1/compute/settings') {
+    json(res, 200, deps.remoteCompute.settings());
+    return true;
+  }
+  if (req.method === 'PUT' && parsed.pathname === '/local/v1/compute/settings') {
+    if (!await deps.pairing.authorize(token, 'compute:manage')) throw localError(403, 'scope_required');
+    json(res, 200, await deps.remoteCompute.updateSettings(await readJson(req)));
+    return true;
+  }
   if (req.method === 'POST' && parsed.pathname === '/local/v1/compute/jobs') {
     if (!await deps.pairing.authorize(token, 'jobs:create')) throw localError(403, 'scope_required');
     const body = await readJson(req);
