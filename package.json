@@ -1,7 +1,7 @@
 {
   "name": "@kubus/kubus-node",
   "version": "0.7.3",
-  "description": "Kubus Availability Network operator runtime",
+  "description": "Local runtime and public archive node for art.kubus",
   "license": "UNLICENSED",
   "type": "module",
   "bin": {

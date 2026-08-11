@@ -46,24 +46,20 @@ async function pinWithBackendFallback(
   apiBaseUrl?: string,
 ): Promise<void> {
   const cid = normalizeCid(item.cid);
-  if (apiBaseUrl) {
-    try {
-      const bytes = await fetchPublicCid(apiBaseUrl, cid);
-      const added = await kubo.addBytes(bytes, `${cid}.bin`);
-      if (added.Hash && normalizeCid(added.Hash) !== cid) {
-        throw new Error(`HTTP CID bytes hashed to ${added.Hash}, expected ${cid}`);
-      }
-      return;
-    } catch {
-      // Fall through to native Kubo resolution. The caller records the final error if it fails too.
-    }
-  }
   try {
     await kubo.pinAdd(cid);
     return;
   } catch (pinError) {
-    if (!apiBaseUrl) throw pinError;
-    throw pinError;
+    try {
+      const bytes = await fetchPublicCid(apiBaseUrl, cid);
+      const added = await kubo.addBytes(bytes, `${cid}.bin`);
+      if (!added.Hash || normalizeCid(added.Hash) !== cid) {
+        throw new Error(`HTTP CID bytes hashed to ${added.Hash || 'unknown'}, expected ${cid}`);
+      }
+      return;
+    } catch (fallbackError) {
+      throw new Error(`Native Kubo retrieval failed (${String((pinError as Error).message || pinError)}); HTTP fallback failed (${String((fallbackError as Error).message || fallbackError)})`);
+    }
   }
 }
 

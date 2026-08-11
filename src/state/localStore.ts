@@ -40,6 +40,23 @@ export interface LocalState {
   currentEpoch?: AvailabilityEpoch | null;
   rewards?: RewardsResponse;
   node?: AvailabilityNode | null;
+  pairingSessions?: Record<string, {
+    secretHash: string;
+    createdAt: string;
+    expiresAt: string;
+    usedAt?: string;
+  }>;
+  localCredentials?: Record<string, {
+    tokenHash: string;
+    label?: string;
+    scopes: string[];
+    createdAt: string;
+    lastUsedAt?: string;
+    revokedAt?: string;
+  }>;
+  jobs?: Record<string, unknown>;
+  captures?: Record<string, unknown>;
+  spatial?: Record<string, unknown>;
   updatedAt?: string;
 }
 
@@ -51,6 +68,11 @@ const emptyState = (): LocalState => ({
   pinnedCids: [],
   failedCids: {},
   activeCommitments: [],
+  pairingSessions: {},
+  localCredentials: {},
+  jobs: {},
+  captures: {},
+  spatial: {},
 });
 
 export class LocalStore {

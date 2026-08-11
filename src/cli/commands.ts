@@ -13,6 +13,10 @@ import { buildStatusSummary, refreshStatus } from '../operator/status.js';
 import { ActionLock } from '../runtime/actionLock.js';
 import { Scheduler } from '../scheduler/loops.js';
 import { LocalStore } from '../state/localStore.js';
+import { CapabilityRegistry } from '../capabilities/registry.js';
+import { PairingService } from '../localApi/pairingService.js';
+import { CaptureStore } from '../captures/captureStore.js';
+import { JobRuntime } from '../jobs/jobRuntime.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const command = argv[0] || 'start';
@@ -23,6 +27,11 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const api = new KubusApiClient({ baseUrl: config.apiBaseUrl, auth: new BearerAuthProvider(config.operatorToken) });
   const kubo = new KuboClient(config.ipfsRpcUrl);
   const actionLock = new ActionLock();
+  const capabilities = new CapabilityRegistry(kubo, config.spatialWorkerUrl);
+  const pairing = new PairingService(store, config);
+  const captures = new CaptureStore(config.localDataPath, store);
+  const jobs = new JobRuntime({ store, captureStore: captures, kubo, logger, dataRoot: config.localDataPath, workerUrl: config.spatialWorkerUrl, concurrency: config.jobConcurrency });
+  const localApi = { api, kubo, store, config, capabilities, pairing, captures, jobs };
 
   if (command === 'status') {
     const live = await liveStatus(api, kubo);
@@ -36,7 +45,9 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   }
 
   if (command === 'gui') {
-    const gui = await startGuiServer({ api, kubo, store, config: { ...config, guiEnabled: true }, logger, actionLock });
+    await jobs.start();
+    const guiConfig = { ...config, guiEnabled: true };
+    const gui = await startGuiServer({ api, kubo, store, config: guiConfig, logger, actionLock, localApi: { ...localApi, config: guiConfig } });
     console.log(JSON.stringify({
       status: 'gui_started',
       url: gui.url,
@@ -79,7 +90,8 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   }
 
   if (command !== 'start') throw new Error(`Unknown command: ${command}`);
-  const gui = config.guiEnabled ? await startGuiServer({ api, kubo, store, config, logger, actionLock }) : null;
+  await jobs.start();
+  const gui = (config.guiEnabled || config.localApiEnabled) ? await startGuiServer({ api, kubo, store, config, logger, actionLock, localApi }) : null;
   let scheduler: Scheduler | null = null;
   try {
     await actionLock.run('startup', () => bootstrapOnce(api, kubo, store, config));

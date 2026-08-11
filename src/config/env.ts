@@ -24,6 +24,14 @@ function parseOptionalIntEnv(env: NodeJS.ProcessEnv, key: string, fallback: numb
   return value;
 }
 
+function parseOptionalBytesEnv(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
+  const raw = env[key]?.trim();
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`Invalid ${key}: must be a non-negative safe integer`);
+  return value;
+}
+
 function parseUrl(value: string, key: string): string {
   try {
     return new URL(value).toString().replace(/\/$/, '');
@@ -62,6 +70,19 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (guiEnabled && guiRemoteMode && !guiToken) {
     throw new Error('NODE_GUI_TOKEN is required when NODE_GUI_HOST is remote or NODE_GUI_ALLOW_REMOTE=true');
   }
+  const localApiEnabled = boolEnv(env, 'LOCAL_API_ENABLED', true);
+  const localApiHost = (env.LOCAL_API_HOST || guiHost).trim() || guiHost;
+  const localApiPort = parseOptionalIntEnv(env, 'LOCAL_API_PORT', guiPort, 1);
+  const localApiAllowLan = boolEnv(env, 'LOCAL_API_ALLOW_LAN', false);
+  const localApiPublicUrl = env.LOCAL_API_PUBLIC_URL?.trim()
+    ? parseUrl(env.LOCAL_API_PUBLIC_URL.trim(), 'LOCAL_API_PUBLIC_URL')
+    : undefined;
+  if (guiEnabled && localApiEnabled && (localApiPort !== guiPort || localApiHost !== guiHost)) {
+    throw new Error('LOCAL_API_HOST/PORT must match NODE_GUI_HOST/PORT when both services are enabled');
+  }
+  if (localApiEnabled && !isLoopbackHost(localApiHost) && !localApiAllowLan && localApiPort !== guiPort) {
+    throw new Error('LOCAL_API_ALLOW_LAN=true is required when LOCAL_API_HOST is not loopback');
+  }
   return {
     apiBaseUrl: parseUrl(requireString(env, 'KUBUS_API_BASE_URL'), 'KUBUS_API_BASE_URL'),
     operatorToken: requireString(env, 'KUBUS_OPERATOR_TOKEN'),
@@ -77,6 +98,7 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
     commitmentIntervalMs: parseIntEnv(env, 'COMMITMENT_INTERVAL_MS', 30000),
     statusIntervalMs: parseIntEnv(env, 'STATUS_INTERVAL_MS', 10000),
     maxPinnedCids: parseIntEnv(env, 'MAX_PINNED_CIDS', 1),
+    maxPinnedBytes: parseOptionalBytesEnv(env, 'MAX_PINNED_BYTES', 50 * 1024 * 1024 * 1024),
     cidClassFilters: requireString(env, 'CID_CLASS_FILTERS').split(',').map((v) => v.trim()).filter(Boolean),
     nodeEnv,
     nodeKey: env.KUBUS_NODE_KEY?.trim() || undefined,
@@ -93,6 +115,15 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
     guiAllowRemote,
     guiDisplayUrl,
     guiFallbackUrl,
+    localApiEnabled,
+    localApiHost,
+    localApiPort,
+    localApiAllowLan,
+    localApiPublicUrl,
+    pairingSessionTtlMs: parseOptionalIntEnv(env, 'PAIRING_SESSION_TTL_MS', 5 * 60 * 1000, 30000),
+    localDataPath: path.resolve(env.LOCAL_DATA_PATH?.trim() || path.join(path.dirname(requireString(env, 'LOCAL_STATE_PATH')), 'data')),
+    jobConcurrency: parseOptionalIntEnv(env, 'JOB_CONCURRENCY', 1, 1),
+    spatialWorkerUrl: env.SPATIAL_WORKER_URL?.trim() ? parseUrl(env.SPATIAL_WORKER_URL.trim(), 'SPATIAL_WORKER_URL') : undefined,
   };
 }
 

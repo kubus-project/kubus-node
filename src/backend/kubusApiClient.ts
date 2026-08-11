@@ -126,7 +126,11 @@ export class KubusApiClient {
     return this.request(`/api/availability/rewards/me${queryString(params)}`);
   }
 
-  private async request<T>(path: string, init: { method?: string; body?: unknown; auth?: boolean } = {}): Promise<T> {
+  publishExistingSpatial(payload: Record<string, unknown>, userAuthorization: string): Promise<unknown> {
+    return this.request('/api/publications/spatial/cid', { method: 'POST', body: payload, authorization: userAuthorization });
+  }
+
+  private async request<T>(path: string, init: { method?: string; body?: unknown; auth?: boolean; authorization?: string } = {}): Promise<T> {
     const method = init.method ?? 'GET';
     const backoff = new Backoff(500, 5000);
     let last: unknown;
@@ -136,7 +140,8 @@ export class KubusApiClient {
       try {
         const headers: Record<string, string> = { Accept: 'application/json' };
         if (init.body !== undefined) headers['Content-Type'] = 'application/json';
-        if (init.auth !== false) Object.assign(headers, this.options.auth.headers());
+        if (init.authorization) headers.Authorization = init.authorization;
+        else if (init.auth !== false) Object.assign(headers, this.options.auth.headers());
         const response = await fetch(`${this.baseUrl}${path}`, {
           method,
           headers,

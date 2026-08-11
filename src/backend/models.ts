@@ -38,6 +38,9 @@ export interface PublicPinSetRecord {
   cidUri?: string | null;
   role: string;
   family?: string | null;
+  sizeBytes?: number | null;
+  storageClass?: 'hot' | 'warm' | 'cold' | null;
+  replicationPolicy?: Record<string, unknown> | null;
   objectType?: string | null;
   objectId?: string | null;
   version?: number;

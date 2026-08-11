@@ -72,6 +72,18 @@ export class KuboClient {
     }
   }
 
+  async cat(cid: string): Promise<Uint8Array> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), Math.max(this.timeoutMs, 60000));
+    try {
+      const response = await fetch(this.url('cat', { arg: normalizeCid(cid) }), { method: 'POST', signal: controller.signal });
+      if (!response.ok) throw new Error(`Kubo cat failed with HTTP ${response.status}`);
+      return new Uint8Array(await response.arrayBuffer());
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   private async post<T>(command: string, params: Record<string, string> = {}): Promise<T> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);

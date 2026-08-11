@@ -16,6 +16,7 @@ import { guiCss } from './public/guiCss.js';
 import { guiJs } from './public/guiJs.js';
 import { assertGuiConfig, authorizeGuiRequest, guiRemoteMode, sendUnauthorized } from './guiAuth.js';
 import { guiHtml } from './templates/index.js';
+import { handleLocalApi, type LocalApiDeps } from '../localApi/localApiRouter.js';
 
 export interface GuiDeps {
   api: KubusApiClient;
@@ -24,6 +25,7 @@ export interface GuiDeps {
   config: AppConfig;
   logger: Logger;
   actionLock: ActionLock;
+  localApi?: LocalApiDeps;
 }
 
 export interface GuiServerHandle {
@@ -32,7 +34,7 @@ export interface GuiServerHandle {
 }
 
 export async function startGuiServer(deps: GuiDeps): Promise<GuiServerHandle> {
-  assertGuiConfig(deps.config);
+  if (deps.config.guiEnabled) assertGuiConfig(deps.config);
   const server = http.createServer((req, res) => {
     void handleRequest(req, res, deps).catch((error) => {
       writeJson(res, Number((error as Error & { statusCode?: number }).statusCode || 500), {
@@ -43,10 +45,13 @@ export async function startGuiServer(deps: GuiDeps): Promise<GuiServerHandle> {
   });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(deps.config.guiPort, deps.config.guiHost, () => resolve());
+    const port = deps.config.localApiEnabled ? deps.config.localApiPort : deps.config.guiPort;
+    const host = deps.config.localApiEnabled ? deps.config.localApiHost : deps.config.guiHost;
+    server.listen(port, host, () => resolve());
   });
   const address = server.address() as AddressInfo;
-  const url = deps.config.guiPort === 0
+  const listenPort = deps.config.localApiEnabled ? deps.config.localApiPort : deps.config.guiPort;
+  const url = listenPort === 0
     ? `http://127.0.0.1:${address.port}/gui`
     : (deps.config.guiDisplayUrl || `http://${deps.config.guiHost}:${address.port}/gui`);
   deps.logger.info({
@@ -66,6 +71,11 @@ export async function startGuiServer(deps: GuiDeps): Promise<GuiServerHandle> {
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: GuiDeps): Promise<void> {
   const parsed = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
+  if (deps.localApi && await handleLocalApi(req, res, deps.localApi)) return;
+  if (!deps.config.guiEnabled && parsed.pathname.startsWith('/gui')) {
+    writeJson(res, 404, { success: false, error: 'GUI disabled' });
+    return;
+  }
   if ((req.method === 'GET' || req.method === 'HEAD') && parsed.pathname === '/gui') {
     if (req.method === 'HEAD') {
       writeHead(res, 200, 'text/html; charset=utf-8');

@@ -41,7 +41,7 @@ describe('sendHeartbeat', () => {
       ],
       rewardableCids: [{ id: 'rewardable-1', cid: 'bafyleaf' }],
       desiredCids: [
-        { id: 'manifest', cid: 'bafymanifest', role: 'manifest' },
+        { id: 'manifest', cid: 'bafymanifest', role: 'manifest', sizeBytes: 2048 },
         { id: 'record', cid: 'bafyrecord', role: 'record' },
       ],
       pinnedCids: ['bafymanifest'],
@@ -64,6 +64,14 @@ describe('sendHeartbeat', () => {
         publicPinSetCount: 2,
         desiredPublicCidCount: 2,
         rewardableCidCount: 1,
+        nodeVersion: expect.stringContaining('kubus-node/'),
+        capabilities: expect.any(Object),
+        jobsRunning: 0,
+        jobsQueued: 0,
+      }),
+      storage: expect.objectContaining({
+        publicReplicaBytes: 2048,
+        localPrivateSpatialBytes: 0,
       }),
     }));
   });

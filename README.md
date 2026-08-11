@@ -1,89 +1,70 @@
-# Kubus Node
+# Kubus Node — local runtime and public archive node for art.kubus
 
-Kubus Node is the operator runtime for the Kubus Availability Network. It runs next to a private Kubo daemon, registers an operator node with the Kubus backend control plane, pins canonical public Kubus CIDs, submits availability commitments for the rewardable subset, sends liveness heartbeats, and reports public archive contribution and reward summaries.
+Kubus Node runs part of the art.kubus network on hardware you control. It keeps canonical public cultural records available through Kubo/IPFS, provides a securely paired local API for art.kubus apps, and can optionally process private spatial captures on a supported NVIDIA workstation.
 
-Rewards are based on verified public archive availability: uptime, public CID coverage, retrieval checks, and priority/rewardable CID bonuses. Priority CIDs add weight, but the public archive itself is the base contribution. Reward rows are pending backend control-plane records until settlement infrastructure exists; Kubus Node is not a wallet or payout engine.
+The backend remains the canonical control plane. Nodes store, process, retrieve, and serve bytes; they cannot make arbitrary CIDs canonical or rewardable. Raw captures, source frames, unapproved outputs, credentials, messages, drafts, wallet backups, and admin data never enter the public pin set.
 
-It is not a payout engine, platform settlement bridge, wallet, or proof oracle. Availability rewards remain pending backend control-plane records until the generic platform-settlement bridge exists.
+## What it does
 
-## Quick Start
+- Preserves the existing availability network: identity, registration, public pin-set sync, commitments, heartbeats, verification metadata, contribution scoring, and pending KUB8 records.
+- Detects explicit `archive`, `localContentGateway`, `spatial.reconstruction`, `spatial.optimization`, `spatial.gaussianSplat`, and `compute.gpu` capabilities.
+- Exposes versioned `/local/v1` status, content, pairing, capture, job, spatial, and publication-handoff APIs.
+- Retrieves canonical CIDs through local Kubo/IPFS first and uses HTTP gateways only as fallback, verifying a fallback import resolves to the requested CID.
+- Plans network-managed public replicas by byte budget and storage class while keeping private/operator-owned content separate.
+- Runs bounded persistent spatial jobs without holding the availability scheduler's action lock.
 
-1. Install Node.js 20+ and Docker.
-2. In art.kubus, open Settings > Wallet > Availability Node and create a scoped operator token for the wallet that will run the node.
-3. Copy `.env.example` to `.env`.
-4. Paste the one-time token into `KUBUS_OPERATOR_TOKEN` and fill the remaining values: wallet, node label/endpoint, Kubo RPC/gateway URLs, state path, log level, intervals, CID class filters, pin limit, and `NODE_ENV`.
-5. Run `npm install`.
-6. Run `npm run build && npm run smoke`.
+See [architecture](docs/architecture.md), [local API](docs/LOCAL_API.md), [spatial processing](docs/SPATIAL.md), [rewards](docs/REWARDS.md), and [security](docs/security.md).
 
-Docker:
+## Quick start
+
+1. Install Docker with Compose.
+2. Copy `.env.example` to `.env` and set `KUBUS_API_BASE_URL`, the scoped `KUBUS_OPERATOR_TOKEN`, operator identity, and a strong `NODE_GUI_TOKEN`.
+3. Start the lightweight archive node:
 
 ```sh
 docker compose up --build
 ```
 
-Docker Compose keeps the Kubo RPC API and Kubo WebUI on port `5001` private inside the stack; only the local Kubo gateway on `8080` and the Kubus Node GUI on `8787` are published to host loopback. The agent runs as the non-root `node` user, so a fresh `node-state` volume must be writable. If you are reusing an older root-owned volume, see the troubleshooting recovery command before restarting the stack.
+This starts `kubus-node-agent` and `kubo`. Kubo RPC remains private; host ports are loopback-bound by default. The archive runtime continues operating if no spatial worker exists.
 
-Useful commands:
+For local development without Compose:
 
 ```sh
-npm run status
-npm run doctor
-npm run gui
-npm run smoke
+npm install
+npm run build
+npm test
 npm run start
 ```
 
-## Public Archive Pinning
+## Optional spatial profile
 
-The node mirrors `/api/availability/public-pin-set`, not only `/api/availability/rewardable-cids`. The public pin set includes active canonical public manifest CIDs, public record CIDs, metadata CIDs, media/image CIDs, AR asset CIDs, and rewardable leaf CIDs. The rewardable endpoint remains a subset used for commitments and KUB8 scoring.
-
-The node never mirrors drafts, private profile fields, private messages, wallet backups, auth/session data, admin data, raw database dumps, deleted/unpublished objects, arbitrary node-submitted CIDs, or third-party URL-only assets without an IPFS/public CID.
-
-## Local GUI
-
-Enable the local GUI with:
+On a supported NVIDIA/CUDA host:
 
 ```sh
-NODE_GUI_ENABLED=true
-NODE_GUI_HOST=0.0.0.0
-NODE_GUI_PORT=8787
-NODE_GUI_TOKEN=change-this-local-gui-password
-NODE_GUI_ALLOW_REMOTE=false
-NODE_GUI_DISPLAY_URL=http://my.node.kubus.site:8787/gui
+docker compose --profile spatial up --build
 ```
 
-Then open `http://my.node.kubus.site:8787/gui` after adding a local hosts-file alias, or use the fallback `http://127.0.0.1:8787/gui`. The hostname is local-only and is not public DNS.
+The profile adds `kubus-spatial-worker` on a private Compose network. It is based on the official Nerfstudio `1.1.5` image and pins `gsplat 1.5.3`; it reports unsupported hardware rather than pretending CPU reconstruction is available. The Node.js agent remains lightweight and owns auth, paths, jobs, Kubo import, manifests, and publication handoff.
 
-Docker uses `NODE_GUI_HOST=0.0.0.0` inside the container so Docker port publishing can reach the GUI process. The host publish remains loopback-only as `127.0.0.1:8787:8787`, so the GUI is still local to the operator machine. Because `0.0.0.0` is a broad container bind, `NODE_GUI_TOKEN` is required. The token protects GUI actions and cannot spend funds.
+## Local API and device pairing
 
-Linux/macOS:
+The administrative GUI remains localhost-only by default. LAN API exposure is separately controlled with `LOCAL_API_ENABLED`, `LOCAL_API_ALLOW_LAN`, `LOCAL_API_HOST`, and `LOCAL_API_PORT`. Create pairing sessions from loopback or an authenticated GUI request, then scan/paste the one-time payload in art.kubus.
 
-```sh
-sudo sh -c 'echo "127.0.0.1 my.node.kubus.site" >> /etc/hosts'
-```
+Pairing exchanges a short-lived, one-use secret for a hashed-at-rest `kubus_local_...` credential scoped to content, captures, jobs, spatial reads, and publication requests. It never exposes the operator token, node key, wallet key, or settlement credentials. Browser origins are rejected; Flutter Web stays on HTTPS public/network resolution.
 
-Windows PowerShell as Administrator:
+## Archive network and storage policy
 
-```powershell
-Add-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts" -Value "`n127.0.0.1 my.node.kubus.site"
-```
+The node consumes the backend's canonical public pin set. Pin order is deterministic: hot manifests, signed public records, previews and metadata first; warm mobile spatial/media next; cold archival spatial variants last. `MAX_PINNED_BYTES` is the primary capacity budget and `MAX_PINNED_CIDS` remains a secondary guard.
 
-The GUI shows Overview, Pinning, Rewards, Commitments, Logs, and Doctor sections. It can trigger safe local sync, pin reconcile, commitment refresh, heartbeat, and doctor actions. It cannot spend funds, export wallet keys, or settle payouts. This is different from the Kubo WebUI: Kubo WebUI/RPC on `5001` stays private and is intentionally not exposed by Docker Compose.
+Raw captures are stored below the private local data root with restrictive permissions. They are deletable when no active job uses them and are never automatically published, replicated, or rewarded.
 
-## Environment
+## KUB8 contribution
 
-Required values are documented in `.env.example`. `KUBUS_OPERATOR_TOKEN` is an opaque scoped token in the `kubus_node_...` format, created in art.kubus and sent as `Authorization: Bearer <token>`. It is not a normal app session JWT, does not control a wallet, and is never written to local state. If `KUBUS_NODE_KEY` is absent, the agent generates a persistent node key and stores it in `LOCAL_STATE_PATH`.
+Verified hosting of canonical public content can contribute under the backend availability policy. Merely running software, creating a capture, or reconstructing a spatial record earns nothing. Spatial processing itself has no KUB8 reward. Settlement is not active; the backend records pending proportional epoch allocations.
 
-Dev-only options such as `KUBUS_DEV_SEED_CID`, `KUBUS_DEV_ALLOW_EMPTY_CIDS`, and `KUBUS_SKIP_PINNING` are rejected in production. `KUBUS_AUTH_MODE` is currently `bearer` only.
+## Status and limitations
 
-## Logs And State
-
-Logs are structured with pino and redact token fields. Local state is an atomic JSON snapshot containing node identity, peer ID, policy, CID snapshots, pin/commitment state, heartbeats, status, epoch, and reward summaries. It intentionally excludes tokens and private keys.
-
-## Upgrading
-
-Stop the agent, back up `LOCAL_STATE_PATH` and the Kubo volume, install the new package/container, then start the agent. Keep the same node key and operator wallet unless rotating intentionally. To rotate auth, create a new operator token in art.kubus, update `.env`, restart the node, then revoke the old token.
-
-## Known Limitations
-
-The node only consumes node-facing Phase 7 availability APIs. Backend verification/scoring decides reward eligibility. Empty rewardable CID lists are valid in development and fail smoke only in production.
+- HTTP node verification remains available for publicly reachable nodes. Kubo peer identity is advertised, but attributable libp2p peer verification is not yet implemented; the backend fails that mode explicitly instead of treating ordinary gateway retrieval as node proof.
+- `spatial.reconstruct` is implemented by the optional worker. Optimization and preview job types are versioned and persistent but currently fail explicitly as unsupported until their worker implementations ship.
+- AR camera-aligned splat rendering is intentionally not faked. The app's bundled Spark viewer is an orbit viewer; tracked AR remains in ARCore/ARKit.
+- This repository currently carries an `UNLICENSED` pre-launch license. Its source can be inspected, but no open-source license is granted yet.

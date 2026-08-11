@@ -12,6 +12,32 @@ function classFilterAllows(record: { verificationClass?: string | null }, filter
   return filters.length === 0 || !verificationClass || filters.includes(verificationClass);
 }
 
+const CLASS_PRIORITY: Record<string, number> = { hot: 0, warm: 1, cold: 2 };
+const ROLE_PRIORITY: Record<string, number> = { manifest: 0, record: 1, spatial_preview: 2, media: 3, leaf: 3, spatial_mobile: 4, spatial_archive: 5 };
+
+export function planPublicPins(records: PublicPinSetRecord[], maxCids: number, maxBytes: number, filters: string[]): PublicPinSetRecord[] {
+  const sorted = records.filter((record) => classFilterAllows(record, filters)).sort((left, right) => {
+    const leftClass = left.storageClass || (['manifest', 'record'].includes(left.role) ? 'hot' : left.verificationClass) || 'warm';
+    const rightClass = right.storageClass || (['manifest', 'record'].includes(right.role) ? 'hot' : right.verificationClass) || 'warm';
+    return (CLASS_PRIORITY[leftClass] ?? 1) - (CLASS_PRIORITY[rightClass] ?? 1)
+      || (ROLE_PRIORITY[left.role] ?? 10) - (ROLE_PRIORITY[right.role] ?? 10)
+      || String(left.objectType || '').localeCompare(String(right.objectType || ''))
+      || String(left.objectId || '').localeCompare(String(right.objectId || ''))
+      || Number(left.version || 0) - Number(right.version || 0)
+      || left.cid.localeCompare(right.cid);
+  });
+  const selected: PublicPinSetRecord[] = [];
+  let plannedBytes = 0;
+  for (const record of sorted) {
+    if (selected.length >= maxCids) break;
+    const size = Math.max(0, Number(record.sizeBytes || 0));
+    if (size > 0 && plannedBytes + size > maxBytes) continue;
+    selected.push(record);
+    plannedBytes += size;
+  }
+  return selected;
+}
+
 function sameObjectVersion(left: { objectType?: string | null; objectId?: string | null; version?: number }, right: { objectType?: string | null; objectId?: string | null; version?: number }): boolean {
   return Boolean(
     left.objectType &&
@@ -36,9 +62,7 @@ export async function syncPublicPinSet(api: KubusApiClient, store: LocalStore, c
     api.getRewardableCids({ limit: 500, offset: 0 }),
   ]);
   const publicPinSet = pinSetResponse.records || [];
-  const desired = publicPinSet
-    .filter((record) => classFilterAllows(record, config.cidClassFilters))
-    .slice(0, config.maxPinnedCids);
+  const desired = planPublicPins(publicPinSet, config.maxPinnedCids, config.maxPinnedBytes, config.cidClassFilters);
   const rewardable = (rewardableResponse.records || [])
     .filter((record) => classFilterAllows(record, config.cidClassFilters));
   await store.update((state) => {

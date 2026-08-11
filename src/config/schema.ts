@@ -13,6 +13,7 @@ export interface AppConfig {
   commitmentIntervalMs: number;
   statusIntervalMs: number;
   maxPinnedCids: number;
+  maxPinnedBytes: number;
   cidClassFilters: string[];
   nodeEnv: string;
   nodeKey?: string;
@@ -29,4 +30,13 @@ export interface AppConfig {
   guiAllowRemote: boolean;
   guiDisplayUrl: string;
   guiFallbackUrl: string;
+  localApiEnabled: boolean;
+  localApiHost: string;
+  localApiPort: number;
+  localApiAllowLan: boolean;
+  localApiPublicUrl?: string;
+  pairingSessionTtlMs: number;
+  localDataPath: string;
+  jobConcurrency: number;
+  spatialWorkerUrl?: string;
 }

@@ -4,6 +4,7 @@ import { getKuboHealth } from '../ipfs/health.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import type { LocalStore } from '../state/localStore.js';
 import { AGENT_VERSION } from './registerNode.js';
+import { CapabilityRegistry } from '../capabilities/registry.js';
 
 function clampRatio(value: number): number {
   return Math.min(Math.max(Number.isFinite(value) ? value : 0, 0), 1);
@@ -20,12 +21,22 @@ export async function sendHeartbeat(api: KubusApiClient, kubo: KuboClient, store
   const rewardableCidCount = state.rewardableCidTotal ?? state.rewardableCids.length;
   const estimatedPublicCoverage = clampRatio(state.pinnedCids.length / Math.max(state.desiredCids.length || publicPinSetCount, 1));
   const estimatedRewardableCoverage = clampRatio(pinnedRewardableCidCount / Math.max(rewardableCidCount, 1));
+  const capabilityRegistry = new CapabilityRegistry(kubo, config.spatialWorkerUrl);
+  const capabilities = await capabilityRegistry.refresh();
+  const jobs = Object.values(state.jobs || {}) as Array<{ state?: string }>;
+  const privateSpatialBytes = Object.values(state.captures || {}).reduce<number>((sum, value) => sum + Number((value as { sizeBytes?: number }).sizeBytes || 0), 0);
+  const publicReplicaBytes = state.desiredCids.filter((item) => state.pinnedCids.includes(item.cid)).reduce((sum, item) => sum + Number(item.sizeBytes || 0), 0);
   const response = await api.sendHeartbeat({
     nodeId: state.nodeId,
     peerId: state.peerId,
     agentVersion: AGENT_VERSION,
     kuboHealth: kuboHealth as unknown as Record<string, unknown>,
-    storage: (kuboHealth.repo && typeof kuboHealth.repo === 'object' ? kuboHealth.repo : {}) as Record<string, unknown>,
+    storage: {
+      ...(kuboHealth.repo && typeof kuboHealth.repo === 'object' ? kuboHealth.repo : {}),
+      publicReplicaBytes,
+      localPrivateSpatialBytes: privateSpatialBytes,
+      maxPinnedBytes: config.maxPinnedBytes,
+    } as Record<string, unknown>,
     trackedCidCount: state.desiredCids.length,
     pinnedCidCount: state.pinnedCids.length,
     failedCidCount: Object.keys(state.failedCids).length,
@@ -48,6 +59,10 @@ export async function sendHeartbeat(api: KubusApiClient, kubo: KuboClient, store
       estimatedRewardableCoverage,
       guiEnabled: config.guiEnabled === true,
       nodeVersion: AGENT_VERSION,
+      capabilities: Object.fromEntries(capabilities.map((item) => [item.name, { available: item.available, healthy: item.healthy }])),
+      jobsRunning: jobs.filter((job) => job.state === 'running').length,
+      jobsQueued: jobs.filter((job) => job.state === 'queued').length,
+      spatialWorkerHealth: capabilityRegistry.getWorkerHealth(),
       pinningSource: state.policy?.pinning || null,
     },
   });

@@ -26,6 +26,13 @@ services:
       IPFS_RPC_URL: http://kubo:5001
       IPFS_GATEWAY_URL: http://127.0.0.1:8080
       LOCAL_STATE_PATH: /var/lib/kubus-node/state.json
+      LOCAL_DATA_PATH: /var/lib/kubus-node/data
+      LOCAL_API_ENABLED: ${LOCAL_API_ENABLED:-true}
+      LOCAL_API_HOST: ${LOCAL_API_HOST:-0.0.0.0}
+      LOCAL_API_PORT: ${LOCAL_API_PORT:-8787}
+      LOCAL_API_ALLOW_LAN: ${LOCAL_API_ALLOW_LAN:-false}
+      LOCAL_API_PUBLIC_URL: ${LOCAL_API_PUBLIC_URL:-}
+      SPATIAL_WORKER_URL: ${SPATIAL_WORKER_URL:-http://kubus-spatial-worker:8790}
       NODE_GUI_ENABLED: ${NODE_GUI_ENABLED:-true}
       NODE_GUI_HOST: ${NODE_GUI_HOST:-0.0.0.0}
       NODE_GUI_PORT: ${NODE_GUI_PORT:-8787}
@@ -45,6 +52,32 @@ services:
       timeout: 15s
       retries: 5
       start_period: 30s
+
+  kubus-spatial-worker:
+    profiles: ["spatial"]
+    build:
+      context: ./spatial-worker
+    environment:
+      KUBUS_SPATIAL_MAX_ITERATIONS: ${KUBUS_SPATIAL_MAX_ITERATIONS:-15000}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - node-state:/var/lib/kubus-node
+    expose:
+      - "8790"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8790/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
 volumes:
   kubo-data:

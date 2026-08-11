@@ -21,3 +21,11 @@ The Kubus Node GUI is local/private by default. In Docker, `NODE_GUI_HOST=0.0.0.
 If `NODE_GUI_HOST=0.0.0.0` or `NODE_GUI_ALLOW_REMOTE=true`, the agent refuses to start the GUI unless `NODE_GUI_TOKEN` is set. Browser API calls then require `Authorization: Bearer <NODE_GUI_TOKEN>` or the in-memory local session cookie. The GUI token is separate from `KUBUS_OPERATOR_TOKEN`, cannot spend funds, and is not stored in local node state.
 
 GUI responses and logs redact `kubus_node_...` tokens, Authorization headers, token/secret/private-key/seed fields, and backend credentials. The GUI can run safe node operations but cannot spend funds, export keys, handle seed phrases, submit arbitrary rewardable CIDs, or settle KUB8 payouts.
+
+## Pairing and private spatial data
+
+The LAN API is disabled unless configured explicitly. The admin GUI stays localhost-only. Pairing creation requires loopback access or the separate GUI token; exchange secrets expire and cannot be replayed. Device credentials have only local content/capture/job/spatial scopes and are hashed at rest. Operator credentials, node keys, wallet keys, and settlement credentials are never returned by `/local/v1`.
+
+Browser origins are rejected to prevent arbitrary LAN websites from calling the API. Pairing and bearer secrets must not be placed in query strings. Logs and heartbeat metadata exclude local paths, filenames, raw frames, pairing credentials, and operator secrets.
+
+Capture directories and job outputs live below the configured private data root with restrictive permissions and safe relative-path validation. They do not enter the network-managed public replica set. Deletion is blocked while an active job references a capture. Publication sends CID metadata to the backend; it never sends raw capture bytes.

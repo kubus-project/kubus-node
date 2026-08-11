@@ -4,8 +4,9 @@ import type { AppConfig } from '../config/schema.js';
 import type { KuboHealth } from '../ipfs/health.js';
 import type { LocalStore } from '../state/localStore.js';
 import { resolveNodeKey } from '../config/env.js';
+import { KUBUS_VERSION } from '../version.js';
 
-export const AGENT_VERSION = 'kubus-node/0.1.0';
+export const AGENT_VERSION = `kubus-node/${KUBUS_VERSION}`;
 
 export async function registerNode(api: KubusApiClient, store: LocalStore, config: AppConfig, peerId: string, kuboHealth: KuboHealth) {
   const nodeKey = await resolveNodeKey(config, store);
@@ -17,9 +18,19 @@ export async function registerNode(api: KubusApiClient, store: LocalStore, confi
     metadata: {
       agentVersion: AGENT_VERSION,
       peerId,
+      ipfsPeerId: peerId,
       platform: `${os.platform()}-${os.arch()}`,
       kuboVersion: kuboHealth.version,
-      capabilities: ['kubo-rpc', 'pinning', 'gateway-retrieval', 'availability-v1'],
+      capabilityVersion: 1,
+      capabilities: {
+        archive: true,
+        localContentGateway: true,
+        'spatial.reconstruction': Boolean(config.spatialWorkerUrl),
+        'spatial.optimization': Boolean(config.spatialWorkerUrl),
+        'spatial.gaussianSplat': Boolean(config.spatialWorkerUrl),
+        'compute.gpu': false,
+      },
+      availabilityProtocols: ['availability-v1', 'public-archive-stewardship-2'],
       verifierEndpointUrl: config.verifierEndpointUrl || null,
     },
   });
