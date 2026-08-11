@@ -1,6 +1,6 @@
 services:
   kubo:
-    image: ipfs/kubo:v0.41.0
+    image: ipfs/kubo:v0.43.0
     command: ["daemon", "--migrate=true", "--agent-version-suffix=kubus-node"]
     environment:
       IPFS_TELEMETRY: "off"
@@ -33,12 +33,20 @@ services:
       LOCAL_API_ALLOW_LAN: ${LOCAL_API_ALLOW_LAN:-false}
       LOCAL_API_PUBLIC_URL: ${LOCAL_API_PUBLIC_URL:-}
       SPATIAL_WORKER_URL: ${SPATIAL_WORKER_URL:-http://kubus-spatial-worker:8790}
+      WORKER_AUTH_KEY_PATH: /var/lib/kubus-node/worker-auth.key
       NODE_GUI_ENABLED: ${NODE_GUI_ENABLED:-true}
       NODE_GUI_HOST: ${NODE_GUI_HOST:-0.0.0.0}
       NODE_GUI_PORT: ${NODE_GUI_PORT:-8787}
       NODE_GUI_TOKEN: ${NODE_GUI_TOKEN:-}
       NODE_GUI_ALLOW_REMOTE: ${NODE_GUI_ALLOW_REMOTE:-false}
       NODE_GUI_DISPLAY_URL: ${NODE_GUI_DISPLAY_URL:-http://my.node.kubus.site:8787/gui}
+      OFFER_REMOTE_COMPUTE: ${OFFER_REMOTE_COMPUTE:-false}
+      REMOTE_COMPUTE_PAUSED: ${REMOTE_COMPUTE_PAUSED:-false}
+      REMOTE_COMPUTE_MAX_CONCURRENCY: ${REMOTE_COMPUTE_MAX_CONCURRENCY:-1}
+      REMOTE_COMPUTE_MAX_QUEUE_DEPTH: ${REMOTE_COMPUTE_MAX_QUEUE_DEPTH:-2}
+      REMOTE_COMPUTE_MAX_INPUT_BYTES: ${REMOTE_COMPUTE_MAX_INPUT_BYTES:-21474836480}
+      REMOTE_COMPUTE_MINIMUM_FREE_VRAM_BYTES: ${REMOTE_COMPUTE_MINIMUM_FREE_VRAM_BYTES:-2147483648}
+      PARTICIPATION_GRACE_MS: ${PARTICIPATION_GRACE_MS:-900000}
     depends_on:
       kubo:
         condition: service_healthy
@@ -61,6 +69,7 @@ services:
       KUBUS_SPATIAL_MAX_ITERATIONS: ${KUBUS_SPATIAL_MAX_ITERATIONS:-15000}
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      WORKER_AUTH_KEY_PATH: /var/lib/kubus-node/worker-auth.key
     volumes:
       - node-state:/var/lib/kubus-node
     expose:

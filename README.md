@@ -1,70 +1,126 @@
-# Kubus Node — local runtime and public archive node for art.kubus
+# kubus Node
 
-Kubus Node runs part of the art.kubus network on hardware you control. It keeps canonical public cultural records available through Kubo/IPFS, provides a securely paired local API for art.kubus apps, and can optionally process private spatial captures on a supported NVIDIA workstation.
+### Local & distributed Gaussian splatting for a decentralised spatial archive.
 
-The backend remains the canonical control plane. Nodes store, process, retrieve, and serve bytes; they cannot make arbitrary CIDs canonical or rewardable. Raw captures, source frames, unapproved outputs, credentials, messages, drafts, wallet backups, and admin data never enter the public pin set.
+Process spatial captures on your own GPU — or use an available GPU on the
+Kubus network. Published spatial archives are distributed through
+community-run nodes instead of depending on a single storage provider.
 
-## What it does
+**Your GPU when you have one. The Kubus network when you don't.**
 
-- Preserves the existing availability network: identity, registration, public pin-set sync, commitments, heartbeats, verification metadata, contribution scoring, and pending KUB8 records.
-- Detects explicit `archive`, `localContentGateway`, `spatial.reconstruction`, `spatial.optimization`, `spatial.gaussianSplat`, and `compute.gpu` capabilities.
-- Exposes versioned `/local/v1` status, content, pairing, capture, job, spatial, and publication-handoff APIs.
-- Retrieves canonical CIDs through local Kubo/IPFS first and uses HTTP gateways only as fallback, verifying a fallback import resolves to the requested CID.
-- Plans network-managed public replicas by byte budget and storage class while keeping private/operator-owned content separate.
-- Runs bounded persistent spatial jobs without holding the availability scheduler's action lock.
+> kubus Node is a network participant, not a standalone Gaussian-splatting
+> utility. The official runtime makes spatial-processing functionality
+> available while the node is actively contributing storage and availability
+> to the public art archive.
 
-See [architecture](docs/architecture.md), [local API](docs/LOCAL_API.md), [spatial processing](docs/SPATIAL.md), [rewards](docs/REWARDS.md), and [security](docs/security.md).
+**Private compute in exchange for public infrastructure.** Operators receive local reconstruction, private local jobs, spatial-archive access and optional distributed GPU access. In return, every active official runtime must contribute backend-policy-compliant capacity to the canonical public archive.
+
+```mermaid
+flowchart TD
+  C[Spatial capture] --> N[kubus Node]
+  N -->|compatible local GPU| L[Local Gaussian reconstruction]
+  N -->|network processing| P[Selected compute kubus Node]
+  P --> G[Private Gaussian-splat result]
+  L --> R[Review]
+  G --> R
+  R -->|explicit publish| A[Canonical spatial archive]
+  A --> A1[Node A]
+  A --> A2[Node B]
+  A --> A3[Node C]
+  A1 --> K1[Archive KUB8]
+  P --> K2[Compute KUB8]
+```
+
+## In 30 seconds
+
+kubus Node combines five boundaries in one source-available runtime:
+
+- a Kubo/IPFS public archive participant with deterministic, byte-aware HOT/WARM/COLD replication;
+- a paired `/local/v1` API for art.kubus without exposing operator credentials;
+- an optional NVIDIA/CUDA Nerfstudio + gsplat worker for local Gaussian-splat reconstruction;
+- an optional distributed-compute provider that receives encrypted temporary IPFS payloads under backend-issued leases;
+- deliberate CID-first publication: private inputs and outputs are never canonical merely because a node reports them.
+
+The art.kubus backend is the matchmaking and canonical trust boundary. It does not proxy large capture bytes and it is not a central Gaussian-processing server.
+
+## Local Gaussian splatting
+
+The local path is phone → paired node → private capture → local NVIDIA GPU → private preview → user review → optional publication. Raw RGB, camera poses, intrinsics and depth remain below the node's private data root. Local/self jobs create no compute reward.
+
+The worker uses the official Nerfstudio `1.1.5` image, `splatfacto`, and pinned `gsplat 1.5.3`. NVIDIA/CUDA is the only supported reconstruction target in this alpha. CPU reconstruction is not claimed or silently simulated.
+
+## Distributed GPU compute
+
+GPU sharing is opt-in. A requester discovers fresh, contributing, compatible nodes; chooses automatic ranking or a specific provider; encrypts the capture locally with AES-256-GCM; wraps the data key to the provider's X25519 key through HKDF; and adds only encrypted bytes to Kubo. The provider temporarily pins, decrypts and processes those bytes, returns content-addressed output, and removes its plaintext work directory.
+
+The remote provider necessarily sees plaintext source data while running the job. Transport encryption protects the path and backend, not against the selected provider. For maximum privacy, process locally.
+
+## Mandatory network participation
+
+`NetworkParticipationGate` exposes `UNCONFIGURED`, `JOINING`, `CONTRIBUTING`, `DEGRADED`, and `LOCKED`. New useful jobs require an active participation lease backed by registration, backend policy, healthy Kubo, policy-minimum configured capacity, current canonical pin reconciliation, a scheduler, and an accepted heartbeat. `MAX_PINNED_BYTES=1`, production skip-pinning, `kubus-node gui`, and direct local API calls do not bypass the gate.
+
+A short outage enters `DEGRADED`: running work is not killed, canonical public content remains readable, and diagnostics remain available. New work locks after the grace period. See [participation](docs/PARTICIPATION.md).
 
 ## Quick start
 
-1. Install Docker with Compose.
-2. Copy `.env.example` to `.env` and set `KUBUS_API_BASE_URL`, the scoped `KUBUS_OPERATOR_TOKEN`, operator identity, and a strong `NODE_GUI_TOKEN`.
-3. Start the lightweight archive node:
-
 ```sh
+cp .env.example .env
 docker compose up --build
 ```
 
-This starts `kubus-node-agent` and `kubo`. Kubo RPC remains private; host ports are loopback-bound by default. The archive runtime continues operating if no spatial worker exists.
+Set a scoped operator token, operator identity, node label, reachable endpoint and strong local GUI token. The backend policy currently controls the minimum committed public-archive capacity; the example allocates 50 GiB.
 
-For local development without Compose:
-
-```sh
-npm install
-npm run build
-npm test
-npm run start
-```
-
-## Optional spatial profile
-
-On a supported NVIDIA/CUDA host:
+Spatial-capable NVIDIA/CUDA host:
 
 ```sh
 docker compose --profile spatial up --build
 ```
 
-The profile adds `kubus-spatial-worker` on a private Compose network. It is based on the official Nerfstudio `1.1.5` image and pins `gsplat 1.5.3`; it reports unsupported hardware rather than pretending CPU reconstruction is available. The Node.js agent remains lightweight and owns auth, paths, jobs, Kubo import, manifests, and publication handoff.
+Kubo RPC and worker HTTP remain private to the Compose network. The Kubo gateway and node UI are loopback-bound by default.
 
-## Local API and device pairing
+## Hardware
 
-The administrative GUI remains localhost-only by default. LAN API exposure is separately controlled with `LOCAL_API_ENABLED`, `LOCAL_API_ALLOW_LAN`, `LOCAL_API_HOST`, and `LOCAL_API_PORT`. Create pairing sessions from loopback or an authenticated GUI request, then scan/paste the one-time payload in art.kubus.
+- Archive-only: any current x86-64/ARM64 Docker host with enough disk for the configured contribution.
+- Reconstruction/provider: Linux Docker host, NVIDIA GPU and driver compatible with the pinned Nerfstudio CUDA image, plus adequate VRAM for the requested tier.
+- Remote-provider mode: explicitly set `OFFER_REMOTE_COMPUTE=true`; use concurrency, queue, input-size and free-VRAM limits from `.env.example`.
 
-Pairing exchanges a short-lived, one-use secret for a hashed-at-rest `kubus_local_...` credential scoped to content, captures, jobs, spatial reads, and publication requests. It never exposes the operator token, node key, wallet key, or settlement credentials. Browser origins are rejected; Flutter Web stays on HTTPS public/network resolution.
+## Capture privacy and publication
 
-## Archive network and storage policy
+Private captures, encrypted temporary inputs and unpublished outputs never enter the public object registry or public pin set. Publication requires an authenticated artwork owner (or authorised moderator), valid CID/size/MIME roles, retrievability where policy requires it, and backend canonicalisation. Supported spatial roles are `spatial_preview` (HOT), `spatial_mobile` (WARM), and `spatial_archive` (COLD), grouped under one object/version bundle.
 
-The node consumes the backend's canonical public pin set. Pin order is deterministic: hot manifests, signed public records, previews and metadata first; warm mobile spatial/media next; cold archival spatial variants last. `MAX_PINNED_BYTES` is the primary capacity budget and `MAX_PINNED_CIDS` remains a secondary guard.
+CID identity is canonical. Retrieval is local Kubo first, then IPFS/provider discovery and Kubus peers, then configured HTTP gateways with CID verification; legacy backend files are a final compatibility fallback where still required. No architecture depends on `ipfs.io`.
 
-Raw captures are stored below the private local data root with restrictive permissions. They are deletable when no active job uses them and are never automatically published, replicated, or rewarded.
+## Two KUB8 contribution rails
 
-## KUB8 contribution
+Archive availability uses the historical `public-archive-stewardship-1` records unchanged and current `public-archive-stewardship-2` bundle-aware scoring. Verified canonical bytes, retrieval, reliability, policy classes, capped logarithmic weighting and diminishing returns drive an independent archive pool.
 
-Verified hosting of canonical public content can contribute under the backend availability policy. Merely running software, creating a capture, or reconstructing a spatial record earns nothing. Spatial processing itself has no KUB8 reward. Settlement is not active; the backend records pending proportional epoch allocations.
+Distributed compute uses backend-issued leases, distinct requester/provider operators, signed provider receipts, retrievable output, requester acknowledgement, `spatial-compute-units-1`, fraud caps and a separate compute pool. Raw GPU seconds, owning hardware, local jobs, failed/expired/cancelled work and duplicate receipts earn zero.
 
-## Status and limitations
+Both are pending control-plane records. Settlement is not active; KUB8 has no guaranteed payout or market return.
 
-- HTTP node verification remains available for publicly reachable nodes. Kubo peer identity is advertised, but attributable libp2p peer verification is not yet implemented; the backend fails that mode explicitly instead of treating ordinary gateway retrieval as node proof.
-- `spatial.reconstruct` is implemented by the optional worker. Optimization and preview job types are versioned and persistent but currently fail explicitly as unsupported until their worker implementations ship.
-- AR camera-aligned splat rendering is intentionally not faked. The app's bundled Spark viewer is an orbit viewer; tracked AR remains in ARCore/ARKit.
-- This repository currently carries an `UNLICENSED` pre-launch license. Its source can be inspected, but no open-source license is granted yet.
+## Architecture and APIs
+
+- [Architecture](docs/architecture.md)
+- [Local API](docs/LOCAL_API.md)
+- [Spatial processing](docs/SPATIAL.md)
+- [Participation gate](docs/PARTICIPATION.md)
+- [Distributed compute](docs/DISTRIBUTED_COMPUTE.md)
+- [Rewards](docs/REWARDS.md)
+- [Privacy](docs/PRIVACY.md)
+- [Security](docs/security.md)
+- [Operator guide](docs/operator-guide.md)
+- [Release channels](docs/RELEASES.md)
+
+## Current limitations
+
+- Alpha transport uses encrypted temporary IPFS payloads; direct QUIC/libp2p job transfer is not yet the preferred implementation.
+- A selected compute provider sees plaintext while processing. Secure hardware/provider-proof privacy is not claimed.
+- Reconstruction currently exports the archival PLY variant. Additional preview/mobile optimisation remains renderer-version dependent.
+- Browser clients do not call insecure LAN nodes from HTTPS; Flutter Web uses browser-safe public resolution.
+- KUB8 settlement is pending-record-only. The alpha abuse controls are not claimed to be Sybil-proof.
+
+## Releases and source status
+
+Channels are `alpha → edge`, `beta → beta`, and stable → `latest`; an alpha image never updates `latest`. Exact SemVer tags and image tags are immutable.
+
+This repository is source available and publicly inspectable, but it remains `UNLICENSED`. No MIT, Apache, GPL or other open-source grant applies to kubus Node itself. Nerfstudio and gsplat retain their Apache-2.0 licenses; other third-party notices are documented separately.

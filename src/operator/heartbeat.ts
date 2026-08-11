@@ -5,12 +5,14 @@ import type { KuboClient } from '../ipfs/kuboClient.js';
 import type { LocalStore } from '../state/localStore.js';
 import { AGENT_VERSION } from './registerNode.js';
 import { CapabilityRegistry } from '../capabilities/registry.js';
+import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
+import type { ComputeIdentityService } from '../compute/computeIdentity.js';
 
 function clampRatio(value: number): number {
   return Math.min(Math.max(Number.isFinite(value) ? value : 0, 0), 1);
 }
 
-export async function sendHeartbeat(api: KubusApiClient, kubo: KuboClient, store: LocalStore, config: AppConfig) {
+export async function sendHeartbeat(api: KubusApiClient, kubo: KuboClient, store: LocalStore, config: AppConfig, gate?: NetworkParticipationGate, identity?: ComputeIdentityService) {
   const state = store.snapshot();
   if (!state.nodeId) throw new Error('Cannot send heartbeat before registration');
   const kuboHealth = await getKuboHealth(kubo);
@@ -26,6 +28,8 @@ export async function sendHeartbeat(api: KubusApiClient, kubo: KuboClient, store
   const jobs = Object.values(state.jobs || {}) as Array<{ state?: string }>;
   const privateSpatialBytes = Object.values(state.captures || {}).reduce<number>((sum, value) => sum + Number((value as { sizeBytes?: number }).sizeBytes || 0), 0);
   const publicReplicaBytes = state.desiredCids.filter((item) => state.pinnedCids.includes(item.cid)).reduce((sum, item) => sum + Number(item.sizeBytes || 0), 0);
+  const participation = gate ? await gate.refresh() : null;
+  const computeIdentity = identity ? await identity.publicIdentity() : null;
   const response = await api.sendHeartbeat({
     nodeId: state.nodeId,
     peerId: state.peerId,
@@ -63,6 +67,21 @@ export async function sendHeartbeat(api: KubusApiClient, kubo: KuboClient, store
       jobsRunning: jobs.filter((job) => job.state === 'running').length,
       jobsQueued: jobs.filter((job) => job.state === 'queued').length,
       spatialWorkerHealth: capabilityRegistry.getWorkerHealth(),
+      participation,
+      remoteCompute: {
+        enabled: config.offerRemoteCompute,
+        accepting: config.offerRemoteCompute && !config.remoteComputePaused && participation?.leaseEligible === true,
+        paused: config.remoteComputePaused,
+        maxConcurrency: config.remoteComputeMaxConcurrency,
+        maxQueueDepth: config.remoteComputeMaxQueueDepth,
+        maxAcceptedInputBytes: config.remoteComputeMaxInputBytes,
+        minimumFreeVramBytes: config.remoteComputeMinimumFreeVramBytes,
+        runningJobs: jobs.filter((job) => job.state === 'running' && (job as { input?: { remoteComputeJobId?: string } }).input?.remoteComputeJobId).length,
+        queuedJobs: jobs.filter((job) => job.state === 'queued' && (job as { input?: { remoteComputeJobId?: string } }).input?.remoteComputeJobId).length,
+        protocolVersion: 'kubus.compute/1',
+        encryptionPublicKey: computeIdentity?.encryptionPublicKey,
+        signingPublicKey: computeIdentity?.signingPublicKey,
+      },
       pinningSource: state.policy?.pinning || null,
     },
   });
@@ -71,5 +90,6 @@ export async function sendHeartbeat(api: KubusApiClient, kubo: KuboClient, store
     next.latestStatus = response.status;
     next.latestHeartbeatAt = new Date().toISOString();
   });
+  await gate?.recordHeartbeatAccepted();
   return response;
 }

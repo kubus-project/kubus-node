@@ -101,4 +101,17 @@ export class CaptureStore {
     await fs.rm(record.directory, { recursive: true, force: true });
     await this.store.update((state) => { if (state.captures) delete state.captures[id]; });
   }
+
+  async registerRemote(record: CaptureRecord): Promise<CaptureRecord> {
+    if (!record.private || record.schema !== 'kubus.capture/1' || !path.isAbsolute(record.directory)) throw localError(400, 'remote_capture_invalid');
+    await fs.access(record.directory);
+    await this.store.update((state) => { (state.captures ??= {})[record.id] = record; });
+    return structuredClone(record);
+  }
+
+  async removeRemote(id: string): Promise<void> {
+    const record = this.get(id);
+    await fs.rm(record.directory, { recursive: true, force: true });
+    await this.store.update((state) => { if (state.captures) delete state.captures[id]; });
+  }
 }

@@ -8,6 +8,8 @@ import type { JobRuntime, JobType } from '../jobs/jobRuntime.js';
 import { isValidCidLike, normalizeCid } from '../utils/cid.js';
 import type { LocalStore } from '../state/localStore.js';
 import { PairingService, type LocalScope, localError } from './pairingService.js';
+import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
+import type { RemoteComputeRuntime } from '../compute/remoteComputeRuntime.js';
 
 export interface LocalApiDeps {
   api: KubusApiClient;
@@ -18,6 +20,8 @@ export interface LocalApiDeps {
   pairing: PairingService;
   captures: CaptureStore;
   jobs: JobRuntime;
+  participationGate: NetworkParticipationGate;
+  remoteCompute: RemoteComputeRuntime;
 }
 
 const SCOPE_BY_ROUTE: Array<[RegExp, LocalScope]> = [
@@ -25,6 +29,7 @@ const SCOPE_BY_ROUTE: Array<[RegExp, LocalScope]> = [
   [/^\/local\/v1\/captures(?:\/|$)/, 'captures:read'],
   [/^\/local\/v1\/jobs(?:\/|$)/, 'jobs:read'],
   [/^\/local\/v1\/spatial(?:\/|$)/, 'spatial:read'],
+  [/^\/local\/v1\/compute(?:\/|$)/, 'jobs:read'],
 ];
 
 export async function handleLocalApi(req: IncomingMessage, res: ServerResponse, deps: LocalApiDeps): Promise<boolean> {
@@ -57,7 +62,11 @@ export async function handleLocalApi(req: IncomingMessage, res: ServerResponse, 
   }
   if (req.method === 'GET' && parsed.pathname === '/local/v1/status') {
     const state = deps.store.snapshot();
-    json(res, 200, { status: state.latestStatus?.status || 'offline', lastHeartbeat: state.latestHeartbeatAt || null, jobs: deps.jobs.health(), captures: deps.captures.list().length, worker: deps.capabilities.getWorkerHealth() });
+    json(res, 200, { status: state.latestStatus?.status || 'offline', lastHeartbeat: state.latestHeartbeatAt || null, participation: await deps.participationGate.refresh(), jobs: deps.jobs.health(), captures: deps.captures.list().length, worker: deps.capabilities.getWorkerHealth() });
+    return true;
+  }
+  if (req.method === 'GET' && parsed.pathname === '/local/v1/participation') {
+    json(res, 200, await deps.participationGate.refresh());
     return true;
   }
   if (req.method === 'GET' && parsed.pathname === '/local/v1/capabilities') {
@@ -103,11 +112,65 @@ export async function handleLocalApi(req: IncomingMessage, res: ServerResponse, 
     json(res, 201, await deps.jobs.create(String(body.type || '') as JobType, (body.input && typeof body.input === 'object' ? body.input : {}) as Record<string, unknown>));
     return true;
   }
-  if (req.method === 'GET' && parsed.pathname === '/local/v1/jobs') { json(res, 200, { jobs: deps.jobs.list() }); return true; }
+  if (req.method === 'GET' && parsed.pathname === '/local/v1/jobs') {
+    const gate = await deps.participationGate.refresh();
+    const jobs = deps.jobs.list().map((job) => gate.leaseEligible || !job.output ? job : { ...job, output: undefined });
+    json(res, 200, { jobs }); return true;
+  }
   const cancelMatch = parsed.pathname.match(/^\/local\/v1\/jobs\/([^/]+)\/cancel$/);
   if (req.method === 'POST' && cancelMatch) { json(res, 200, await deps.jobs.cancel(cancelMatch[1]!)); return true; }
   const jobMatch = parsed.pathname.match(/^\/local\/v1\/jobs\/([^/]+)$/);
-  if (req.method === 'GET' && jobMatch) { json(res, 200, deps.jobs.get(jobMatch[1]!)); return true; }
+  if (req.method === 'GET' && jobMatch) {
+    const job = deps.jobs.get(jobMatch[1]!);
+    if (job.output) await deps.participationGate.assertUsefulOperation('private_job_result_read');
+    json(res, 200, job); return true;
+  }
+  if (req.method === 'POST' && parsed.pathname === '/local/v1/compute/candidates') {
+    const body = await readJson(req);
+    const authorization = String(body.backendAuthorization || '');
+    json(res, 200, await deps.remoteCompute.candidates(authorization, {
+      type: typeof body.type === 'string' ? body.type : 'spatial.reconstruct',
+      minimumVramBytes: Number(body.minimumVramBytes || 0),
+      inputBytes: Number(body.inputBytes || 0),
+    }));
+    return true;
+  }
+  if (req.method === 'POST' && parsed.pathname === '/local/v1/compute/jobs') {
+    if (!await deps.pairing.authorize(token, 'jobs:create')) throw localError(403, 'scope_required');
+    const body = await readJson(req);
+    json(res, 201, await deps.remoteCompute.requestJob({
+      authorization: String(body.backendAuthorization || ''),
+      captureId: String(body.captureId || ''),
+      provider: (body.provider && typeof body.provider === 'object' ? body.provider : {}) as never,
+      requirements: (body.requirements && typeof body.requirements === 'object' ? body.requirements : {}) as Record<string, unknown>,
+      type: typeof body.type === 'string' ? body.type : undefined,
+    }));
+    return true;
+  }
+  const remoteStatusMatch = parsed.pathname.match(/^\/local\/v1\/compute\/jobs\/([^/]+)\/status$/);
+  if (req.method === 'POST' && remoteStatusMatch) {
+    const body = await readJson(req);
+    json(res, 200, await deps.remoteCompute.getRequesterJob(remoteStatusMatch[1]!, String(body.backendAuthorization || '')));
+    return true;
+  }
+  const remoteRetrieveMatch = parsed.pathname.match(/^\/local\/v1\/compute\/jobs\/([^/]+)\/retrieve$/);
+  if (req.method === 'POST' && remoteRetrieveMatch) {
+    const body = await readJson(req);
+    json(res, 200, await deps.remoteCompute.retrieveRequesterOutput(remoteRetrieveMatch[1]!, String(body.backendAuthorization || '')));
+    return true;
+  }
+  const remoteAcknowledgeMatch = parsed.pathname.match(/^\/local\/v1\/compute\/jobs\/([^/]+)\/acknowledge$/);
+  if (req.method === 'POST' && remoteAcknowledgeMatch) {
+    const body = await readJson(req);
+    json(res, 200, await deps.remoteCompute.acknowledgeRequesterOutput(remoteAcknowledgeMatch[1]!, String(body.backendAuthorization || ''), body.accepted === true, typeof body.reason === 'string' ? body.reason : undefined));
+    return true;
+  }
+  const remoteCancelMatch = parsed.pathname.match(/^\/local\/v1\/compute\/jobs\/([^/]+)\/cancel$/);
+  if (req.method === 'POST' && remoteCancelMatch) {
+    const body = await readJson(req);
+    json(res, 200, await deps.remoteCompute.cancelRequesterJob(remoteCancelMatch[1]!, String(body.backendAuthorization || '')));
+    return true;
+  }
   const publishMatch = parsed.pathname.match(/^\/local\/v1\/spatial\/([^/]+)\/publish$/);
   if (req.method === 'POST' && publishMatch) {
     if (!await deps.pairing.authorize(token, 'spatial:publish-request')) throw localError(403, 'scope_required');
@@ -127,6 +190,7 @@ export async function handleLocalApi(req: IncomingMessage, res: ServerResponse, 
   }
   const spatialMatch = parsed.pathname.match(/^\/local\/v1\/spatial\/([^/]+)$/);
   if (req.method === 'GET' && spatialMatch) {
+    await deps.participationGate.assertUsefulOperation('private_spatial_result_read');
     const value = deps.store.snapshot().spatial?.[spatialMatch[1]!];
     if (!value) throw localError(404, 'spatial_not_found');
     json(res, 200, value);

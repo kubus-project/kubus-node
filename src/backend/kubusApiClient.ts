@@ -10,6 +10,8 @@ import type {
   RegisterNodePayload,
   RewardableCid,
   RewardsResponse,
+  ComputeCandidate,
+  RemoteComputeJob,
 } from './models.js';
 import type { AuthProvider } from './operatorAuth.js';
 import { Backoff } from '../scheduler/backoff.js';
@@ -128,6 +130,42 @@ export class KubusApiClient {
 
   publishExistingSpatial(payload: Record<string, unknown>, userAuthorization: string): Promise<unknown> {
     return this.request('/api/publications/spatial/cid', { method: 'POST', body: payload, authorization: userAuthorization });
+  }
+
+  getComputeCandidates(params: { type?: string; minimumVramBytes?: number; inputBytes?: number }, userAuthorization: string): Promise<{ nodes: ComputeCandidate[]; protocolVersion: string }> {
+    return this.request(`/api/compute/nodes/available${queryString(params)}`, { authorization: userAuthorization });
+  }
+
+  createRemoteComputeJob(payload: Record<string, unknown>, userAuthorization: string): Promise<RemoteComputeJob> {
+    return this.request('/api/compute/jobs', { method: 'POST', body: payload, authorization: userAuthorization });
+  }
+
+  getRemoteComputeJob(jobId: string, userAuthorization: string): Promise<RemoteComputeJob> {
+    return this.request(`/api/compute/jobs/${encodeURIComponent(jobId)}`, { authorization: userAuthorization });
+  }
+
+  acknowledgeRemoteComputeJob(jobId: string, payload: Record<string, unknown>, userAuthorization: string): Promise<RemoteComputeJob> {
+    return this.request(`/api/compute/jobs/${encodeURIComponent(jobId)}/acknowledge`, { method: 'POST', body: payload, authorization: userAuthorization });
+  }
+
+  cancelRemoteComputeJob(jobId: string, userAuthorization: string): Promise<RemoteComputeJob> {
+    return this.request(`/api/compute/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST', body: {}, authorization: userAuthorization });
+  }
+
+  getProviderComputeJobs(nodeId: string, states: string[] = []): Promise<{ jobs: RemoteComputeJob[] }> {
+    return this.request(`/api/compute/provider/jobs?nodeId=${encodeURIComponent(nodeId)}&states=${encodeURIComponent(states.join(','))}`);
+  }
+
+  getProviderComputeRewards(nodeId: string): Promise<{ role: string; formulaVersion: string; pendingKub8: number; settledKub8: number; verifiedComputeUnits: number; recordCount: number; settlement: string }> {
+    return this.request(`/api/compute/provider/rewards?nodeId=${encodeURIComponent(nodeId)}`);
+  }
+
+  transitionProviderComputeJob(jobId: string, payload: Record<string, unknown>): Promise<RemoteComputeJob> {
+    return this.request(`/api/compute/provider/jobs/${encodeURIComponent(jobId)}/transition`, { method: 'POST', body: payload });
+  }
+
+  submitProviderComputeOutput(jobId: string, payload: Record<string, unknown>): Promise<RemoteComputeJob> {
+    return this.request(`/api/compute/provider/jobs/${encodeURIComponent(jobId)}/output`, { method: 'POST', body: payload });
   }
 
   private async request<T>(path: string, init: { method?: string; body?: unknown; auth?: boolean; authorization?: string } = {}): Promise<T> {

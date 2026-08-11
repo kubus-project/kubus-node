@@ -18,7 +18,10 @@ describe('private spatial runtime', () => {
     const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: [{ path: 'frames/0001.jpg', contentBase64: Buffer.from('frame').toString('base64') }] });
     expect(capture.private).toBe(true);
     expect(store.snapshot().desiredCids).toEqual([]);
-    const jobs = new JobRuntime({ store, captureStore: captures, kubo: {} as never, logger: { warn: () => undefined } as never, dataRoot: dir, concurrency: 1 });
+    const jobs = new JobRuntime({ store, captureStore: captures, kubo: {} as never, logger: { warn: () => undefined } as never, dataRoot: dir, concurrency: 1,
+      participationGate: { assertUsefulOperation: async () => undefined } as never,
+      workerAuth: { issue: async () => 'token' } as never,
+    });
     await jobs.start();
     const job = await jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' });
     await new Promise((resolve) => setTimeout(resolve, 20));

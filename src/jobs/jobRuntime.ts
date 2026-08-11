@@ -7,6 +7,8 @@ import { localError } from '../localApi/pairingService.js';
 import type { Logger } from '../logging/logger.js';
 import type { SpatialManifest, SpatialVariant } from '../spatial/models.js';
 import type { LocalStore } from '../state/localStore.js';
+import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
+import type { WorkerAuthService } from '../spatial/workerAuth.js';
 
 export type JobType = 'spatial.reconstruct' | 'spatial.optimize' | 'spatial.generate_preview';
 export type JobState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
@@ -46,6 +48,8 @@ export class JobRuntime {
       dataRoot: string;
       workerUrl?: string;
       concurrency: number;
+      participationGate: NetworkParticipationGate;
+      workerAuth: WorkerAuthService;
     },
   ) {}
 
@@ -75,6 +79,7 @@ export class JobRuntime {
   }
 
   async create(type: JobType, input: Record<string, unknown>): Promise<LocalJob> {
+    await this.deps.participationGate.assertUsefulOperation(type);
     if (!['spatial.reconstruct', 'spatial.optimize', 'spatial.generate_preview'].includes(type)) throw localError(400, 'job_type_unsupported');
     const captureId = typeof input.captureId === 'string' ? input.captureId : '';
     if (!captureId) throw localError(400, 'job_capture_required');
@@ -138,7 +143,7 @@ export class JobRuntime {
         current.logs.push({ at: current.updatedAt, level: 'info', message: 'Spatial worker started' });
       });
       const response = await fetch(`${this.deps.workerUrl}/v1/process`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Kubus-Worker-Authorization': await this.deps.workerAuth.issue(id, job.type) }, signal: controller.signal,
         body: JSON.stringify({ jobId: id, type: job.type, captureDirectory: capture.directory, outputDirectory, input: job.input }),
       });
       const body = await response.json().catch(() => ({})) as WorkerOutput & { error?: string };

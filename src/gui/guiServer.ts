@@ -40,6 +40,8 @@ export async function startGuiServer(deps: GuiDeps): Promise<GuiServerHandle> {
       writeJson(res, Number((error as Error & { statusCode?: number }).statusCode || 500), {
         success: false,
         error: String((error as Error).message || error),
+        code: (error as Error & { code?: string }).code,
+        details: (error as Error & { details?: Record<string, unknown> }).details,
       });
     });
   });

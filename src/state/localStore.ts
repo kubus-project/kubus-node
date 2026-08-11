@@ -39,6 +39,7 @@ export interface LocalState {
   latestStatus?: NodeStatusSummary;
   currentEpoch?: AvailabilityEpoch | null;
   rewards?: RewardsResponse;
+  computeRewards?: { role: string; formulaVersion: string; pendingKub8: number; settledKub8: number; verifiedComputeUnits: number; recordCount: number; settlement: string };
   node?: AvailabilityNode | null;
   pairingSessions?: Record<string, {
     secretHash: string;
@@ -57,6 +58,22 @@ export interface LocalState {
   jobs?: Record<string, unknown>;
   captures?: Record<string, unknown>;
   spatial?: Record<string, unknown>;
+  participation?: {
+    state: 'UNCONFIGURED' | 'JOINING' | 'CONTRIBUTING' | 'DEGRADED' | 'LOCKED';
+    reason?: string;
+    lastVerifiedAt?: string;
+    leaseExpiresAt?: string;
+    graceExpiresAt?: string;
+  };
+  computeIdentity?: {
+    encryptionPublicKey: string;
+    encryptionPrivateKey: string;
+    signingPublicKey: string;
+    signingPrivateKey: string;
+    createdAt: string;
+  };
+  remoteJobs?: Record<string, unknown>;
+  privateComputeCids?: Record<string, { jobId?: string; role: 'encrypted_input' | 'private_output'; createdAt: string; expiresAt?: string; releasedAt?: string }>;
   updatedAt?: string;
 }
 
@@ -73,6 +90,8 @@ const emptyState = (): LocalState => ({
   jobs: {},
   captures: {},
   spatial: {},
+  remoteJobs: {},
+  privateComputeCids: {},
 });
 
 export class LocalStore {

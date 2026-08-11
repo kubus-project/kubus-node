@@ -39,4 +39,12 @@ export interface AppConfig {
   localDataPath: string;
   jobConcurrency: number;
   spatialWorkerUrl?: string;
+  offerRemoteCompute: boolean;
+  remoteComputePaused: boolean;
+  remoteComputeMaxConcurrency: number;
+  remoteComputeMaxQueueDepth: number;
+  remoteComputeMaxInputBytes: number;
+  remoteComputeMinimumFreeVramBytes: number;
+  participationGraceMs: number;
+  workerAuthKeyPath: string;
 }

@@ -124,6 +124,14 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
     localDataPath: path.resolve(env.LOCAL_DATA_PATH?.trim() || path.join(path.dirname(requireString(env, 'LOCAL_STATE_PATH')), 'data')),
     jobConcurrency: parseOptionalIntEnv(env, 'JOB_CONCURRENCY', 1, 1),
     spatialWorkerUrl: env.SPATIAL_WORKER_URL?.trim() ? parseUrl(env.SPATIAL_WORKER_URL.trim(), 'SPATIAL_WORKER_URL') : undefined,
+    offerRemoteCompute: boolEnv(env, 'OFFER_REMOTE_COMPUTE', false),
+    remoteComputePaused: boolEnv(env, 'REMOTE_COMPUTE_PAUSED', false),
+    remoteComputeMaxConcurrency: parseOptionalIntEnv(env, 'REMOTE_COMPUTE_MAX_CONCURRENCY', 1, 1),
+    remoteComputeMaxQueueDepth: parseOptionalIntEnv(env, 'REMOTE_COMPUTE_MAX_QUEUE_DEPTH', 2, 1),
+    remoteComputeMaxInputBytes: parseOptionalBytesEnv(env, 'REMOTE_COMPUTE_MAX_INPUT_BYTES', 20 * 1024 * 1024 * 1024),
+    remoteComputeMinimumFreeVramBytes: parseOptionalBytesEnv(env, 'REMOTE_COMPUTE_MINIMUM_FREE_VRAM_BYTES', 2 * 1024 * 1024 * 1024),
+    participationGraceMs: parseOptionalIntEnv(env, 'PARTICIPATION_GRACE_MS', 15 * 60 * 1000, 60000),
+    workerAuthKeyPath: path.resolve(env.WORKER_AUTH_KEY_PATH?.trim() || path.join(path.dirname(requireString(env, 'LOCAL_STATE_PATH')), 'worker-auth.key')),
   };
 }
 

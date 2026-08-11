@@ -1,14 +1,19 @@
 import glob
+import base64
+import hashlib
+import hmac
+import json
 import os
 import pathlib
 import subprocess
 from typing import Any
 
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+WORKER_AUTH_KEY_PATH = os.environ.get("WORKER_AUTH_KEY_PATH", "/var/lib/kubus-node/worker-auth.key")
 
 
 class ProcessRequest(BaseModel):
@@ -21,10 +26,17 @@ class ProcessRequest(BaseModel):
 
 def gpu_info() -> dict[str, Any]:
     available = bool(torch.cuda.is_available())
+    properties = torch.cuda.get_device_properties(0) if available else None
+    free_memory = torch.cuda.mem_get_info(0)[0] if available else None
     return {
         "available": available,
         "name": torch.cuda.get_device_name(0) if available else None,
+        "vendor": "NVIDIA" if available else None,
+        "model": torch.cuda.get_device_name(0) if available else None,
         "cuda": torch.version.cuda,
+        "totalVramBytes": int(properties.total_memory) if properties else None,
+        "usableVramBytes": int(free_memory) if free_memory else None,
+        "tier": ("24GB+" if properties and properties.total_memory >= 24 * 1024**3 else "12GB+" if properties and properties.total_memory >= 12 * 1024**3 else "8GB+") if properties else None,
     }
 
 
@@ -54,8 +66,32 @@ def ensure_child(root: pathlib.Path, candidate: str) -> pathlib.Path:
     return resolved
 
 
+def decode_urlsafe(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def authorize_worker(token: str | None, request: ProcessRequest) -> None:
+    if not token or "." not in token:
+        raise HTTPException(status_code=401, detail="worker_authorization_required")
+    try:
+        payload_raw, signature = token.split(".", 1)
+        secret = pathlib.Path(WORKER_AUTH_KEY_PATH).read_bytes()
+        expected = base64.urlsafe_b64encode(hmac.new(secret, payload_raw.encode(), hashlib.sha256).digest()).decode().rstrip("=")
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("signature")
+        payload = json.loads(decode_urlsafe(payload_raw))
+        if payload.get("jobId") != request.jobId or payload.get("type") != request.type:
+            raise ValueError("binding")
+        now = int(__import__("time").time())
+        if int(payload.get("exp", 0)) < now or int(payload.get("iat", now + 1)) > now + 30:
+            raise ValueError("expiry")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=401, detail="worker_authorization_invalid")
+
+
 @app.post("/v1/process")
-def process(request: ProcessRequest) -> dict[str, Any]:
+def process(request: ProcessRequest, x_kubus_worker_authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    authorize_worker(x_kubus_worker_authorization, request)
     if not torch.cuda.is_available():
         raise HTTPException(status_code=503, detail="gpu_unsupported")
     shared_root = pathlib.Path("/var/lib/kubus-node").resolve()

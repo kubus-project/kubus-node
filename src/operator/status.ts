@@ -124,6 +124,13 @@ export function buildStatusSummary(
       state.rewards?.summary?.pendingKub8 ??
       state.latestStatus?.rewardSummary?.pendingKub8 ??
       0,
+    contributionRewards: {
+      archive: {
+        pendingKub8: state.rewards?.summary?.pendingKub8 ?? state.latestStatus?.rewardSummary?.pendingKub8 ?? 0,
+        settledKub8: state.rewards?.summary?.settledKub8 ?? state.latestStatus?.rewardSummary?.settledKub8 ?? 0,
+      },
+      compute: state.computeRewards || { pendingKub8: 0, settledKub8: 0, verifiedComputeUnits: 0, recordCount: 0, settlement: 'pending_control_plane_record' },
+    },
     gui: {
       enabled: config.guiEnabled === true,
       displayUrl: config.guiDisplayUrl || null,

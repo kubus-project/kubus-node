@@ -70,6 +70,9 @@ export interface AvailabilityPolicy {
   rewardableContentSource: string;
   pinning?: Record<string, unknown>;
   maxPinnedCidsDefault: number;
+  minimumContributionCapacityBytes?: number;
+  participationLeaseSeconds?: number;
+  participationGraceSeconds?: number;
   commitmentTtlHours: number;
   heartbeatIntervalMs: number;
   cidSyncIntervalMs: number;
@@ -187,4 +190,43 @@ export interface CommitmentPayload {
   cid?: string;
   expiresAt?: string;
   metadata?: Record<string, unknown>;
+}
+
+export interface ComputeCandidate {
+  nodeId: string;
+  label: string;
+  gpu: { vendor?: string | null; model?: string | null; totalVramBytes: number; usableVramBytes: number; tier?: string | null };
+  worker: { status: string; version?: string | null; supportedJobTypes: string[] };
+  queue: { running: number; queued: number; maxConcurrency: number };
+  reliability: { successfulJobRate: number; completedJobs: number; failedJobs: number };
+  encryptionPublicKey: string;
+  signingPublicKey: string;
+  protocolVersion: string;
+  maxAcceptedInputBytes: number;
+  score: number;
+}
+
+export interface RemoteComputeJob {
+  id: string;
+  requesterNodeId?: string | null;
+  providerNodeId: string;
+  type: string;
+  protocolVersion: string;
+  jobSpecVersion: string;
+  requirements: Record<string, unknown>;
+  inputCid: string;
+  inputBytes: number;
+  inputHash: string;
+  inputKeyEnvelope: Record<string, unknown>;
+  canonicalJobSpec: Record<string, unknown>;
+  jobSpecHash: string;
+  state: string;
+  createdAt: string;
+  expiresAt: string;
+  outputManifestCid?: string | null;
+  outputCids: string[];
+  providerReceipt?: Record<string, unknown>;
+  requesterReceipt?: Record<string, unknown>;
+  verification?: Record<string, unknown>;
+  failure?: Record<string, unknown>;
 }

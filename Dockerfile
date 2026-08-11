@@ -10,6 +10,10 @@ COPY scripts ./scripts
 RUN npm run build
 
 FROM node:22-alpine
+LABEL org.opencontainers.image.title="kubus Node" \
+      org.opencontainers.image.description="Local and distributed Gaussian splatting plus IPFS spatial archive runtime for art.kubus" \
+      org.opencontainers.image.source="https://github.com/kubus-project/kubus-node" \
+      org.opencontainers.image.version="0.8.0-alpha.1"
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package*.json ./

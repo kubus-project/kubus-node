@@ -96,6 +96,6 @@ export class PairingService {
   }
 }
 
-export function localError(statusCode: number, code: string): Error & { statusCode: number; code: string } {
-  return Object.assign(new Error(code), { statusCode, code });
+export function localError(statusCode: number, code: string, details?: Record<string, unknown>): Error & { statusCode: number; code: string; details?: Record<string, unknown> } {
+  return Object.assign(new Error(code), { statusCode, code, details });
 }

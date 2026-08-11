@@ -43,6 +43,10 @@ export class KuboClient {
     return this.post('pin/add', { arg: normalizeCid(cid), progress: 'false' });
   }
 
+  async pinRm(cid: string): Promise<unknown> {
+    return this.post('pin/rm', { arg: normalizeCid(cid), recursive: 'true' });
+  }
+
   async addBytes(bytes: Uint8Array, filename: string): Promise<{ Hash?: string }> {
     const form = new FormData();
     form.set('file', new Blob([Buffer.from(bytes)]), filename);

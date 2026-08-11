@@ -62,8 +62,8 @@ function validateManifest(manifest) {
     throw new Error('version.json must be a JSON object');
   }
   const { version, buildNumber, buildDate } = manifest;
-  if (!/^\d+\.\d+\.\d+$/.test(String(version || ''))) {
-    throw new Error('version must use semantic format X.Y.Z');
+  if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*)?(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?$/.test(String(version || ''))) {
+    throw new Error('version must be a valid SemVer version, including optional prerelease/build metadata');
   }
   normalizeBuildNumber(buildNumber);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(buildDate || ''))) {
@@ -114,6 +114,15 @@ export const KUBUS_BUILD_DATE = '${manifest.buildDate}'
 export const KUBUS_CHANNEL = '${manifest.channel || 'beta'}'
 `;
     fs.writeFileSync(versionTsPath, versionTs, 'utf8');
+  }
+
+  const dockerfilePath = path.join(rootDir, 'Dockerfile');
+  if (fs.existsSync(dockerfilePath)) {
+    const dockerfile = fs.readFileSync(dockerfilePath, 'utf8').replace(
+      /LABEL org\.opencontainers\.image\.version="[^"]+"/,
+      `LABEL org.opencontainers.image.version="${manifest.version}"`,
+    );
+    fs.writeFileSync(dockerfilePath, dockerfile, 'utf8');
   }
 
   process.stdout.write(

@@ -44,6 +44,8 @@ describe('local/v1 authorization', () => {
       pairing,
       captures: { list: () => [] } as never,
       jobs: { health: () => ({ running: 0, queued: 0 }), list: () => [] } as never,
+      participationGate: { refresh: async () => ({ state: 'CONTRIBUTING', leaseEligible: true }), assertUsefulOperation: async () => undefined } as never,
+      remoteCompute: {} as never,
     };
     const server = await startGuiServer({
       api: {} as never,

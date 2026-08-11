@@ -17,6 +17,11 @@ import { CapabilityRegistry } from '../capabilities/registry.js';
 import { PairingService } from '../localApi/pairingService.js';
 import { CaptureStore } from '../captures/captureStore.js';
 import { JobRuntime } from '../jobs/jobRuntime.js';
+import { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
+import { WorkerAuthService } from '../spatial/workerAuth.js';
+import { ComputeIdentityService } from '../compute/computeIdentity.js';
+import { PrivatePayloadTransport } from '../compute/privatePayloadTransport.js';
+import { RemoteComputeRuntime } from '../compute/remoteComputeRuntime.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const command = argv[0] || 'start';
@@ -28,10 +33,17 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const kubo = new KuboClient(config.ipfsRpcUrl);
   const actionLock = new ActionLock();
   const capabilities = new CapabilityRegistry(kubo, config.spatialWorkerUrl);
+  const participationGate = new NetworkParticipationGate({ store, config, kubo });
+  const workerAuth = new WorkerAuthService(config.workerAuthKeyPath);
+  await workerAuth.initialize();
+  const computeIdentity = new ComputeIdentityService(store);
+  await computeIdentity.initialize();
   const pairing = new PairingService(store, config);
   const captures = new CaptureStore(config.localDataPath, store);
-  const jobs = new JobRuntime({ store, captureStore: captures, kubo, logger, dataRoot: config.localDataPath, workerUrl: config.spatialWorkerUrl, concurrency: config.jobConcurrency });
-  const localApi = { api, kubo, store, config, capabilities, pairing, captures, jobs };
+  const jobs = new JobRuntime({ store, captureStore: captures, kubo, logger, dataRoot: config.localDataPath, workerUrl: config.spatialWorkerUrl, concurrency: config.jobConcurrency, participationGate, workerAuth });
+  const privateTransport = new PrivatePayloadTransport({ captures, kubo, store, identity: computeIdentity, dataRoot: config.localDataPath, maxInputBytes: config.remoteComputeMaxInputBytes });
+  const remoteCompute = new RemoteComputeRuntime({ api, kubo, store, config, captures, jobs, gate: participationGate, identity: computeIdentity, transport: privateTransport, logger });
+  const localApi = { api, kubo, store, config, capabilities, pairing, captures, jobs, participationGate, remoteCompute };
 
   if (command === 'status') {
     const live = await liveStatus(api, kubo);
@@ -45,6 +57,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   }
 
   if (command === 'gui') {
+    participationGate.setSchedulerActive(false);
     await jobs.start();
     const guiConfig = { ...config, guiEnabled: true };
     const gui = await startGuiServer({ api, kubo, store, config: guiConfig, logger, actionLock, localApi: { ...localApi, config: guiConfig } });
@@ -90,23 +103,25 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   }
 
   if (command !== 'start') throw new Error(`Unknown command: ${command}`);
+  participationGate.setSchedulerActive(true);
   await jobs.start();
   const gui = (config.guiEnabled || config.localApiEnabled) ? await startGuiServer({ api, kubo, store, config, logger, actionLock, localApi }) : null;
   let scheduler: Scheduler | null = null;
   try {
-    await actionLock.run('startup', () => bootstrapOnce(api, kubo, store, config));
-    scheduler = new Scheduler({ api, kubo, store, config, logger, actionLock });
+    await actionLock.run('startup', () => bootstrapOnce(api, kubo, store, config, participationGate, computeIdentity));
+    scheduler = new Scheduler({ api, kubo, store, config, logger, gate: participationGate, identity: computeIdentity, actionLock });
     scheduler.start();
+    remoteCompute.start();
     logger.info({ nodeId: store.snapshot().nodeId }, 'kubus node started');
   } catch (error) {
     logger.error({ error: String((error as Error).message || error) }, 'kubus node startup failed');
     if (!gui) throw error;
     logger.warn({ guiUrl: gui.url }, 'GUI remains available for local diagnostics; scheduler was not started');
   }
-  await waitForShutdown(scheduler, gui);
+  await waitForShutdown(scheduler, gui, remoteCompute);
 }
 
-async function bootstrapOnce(api: KubusApiClient, kubo: KuboClient, store: LocalStore, config: ReturnType<typeof parseEnv>) {
+async function bootstrapOnce(api: KubusApiClient, kubo: KuboClient, store: LocalStore, config: ReturnType<typeof parseEnv>, gate?: NetworkParticipationGate, identity?: ComputeIdentityService) {
   await api.getHealth();
   const kuboHealth = await waitForKubo(kubo);
   await resolveNodeKey(config, store);
@@ -116,7 +131,7 @@ async function bootstrapOnce(api: KubusApiClient, kubo: KuboClient, store: Local
     state.policy = policy;
   });
   const desired = await syncPublicPinSet(api, store, config);
-  await sendHeartbeat(api, kubo, store, config);
+  await sendHeartbeat(api, kubo, store, config, gate, identity);
   await refreshStatus(api, kubo, store);
   await refreshRewards(api, store);
   if (desired.length > 0) {
@@ -151,12 +166,13 @@ async function doctor(api: KubusApiClient, kubo: KuboClient, config: ReturnType<
   console.log(JSON.stringify(report, null, 2));
 }
 
-async function waitForShutdown(scheduler: Scheduler | null, gui?: GuiServerHandle | null): Promise<void> {
+async function waitForShutdown(scheduler: Scheduler | null, gui?: GuiServerHandle | null, remoteCompute?: RemoteComputeRuntime): Promise<void> {
   await new Promise<void>((resolve) => {
     const done = () => resolve();
     process.once('SIGINT', done);
     process.once('SIGTERM', done);
   });
   await scheduler?.stop();
+  remoteCompute?.stop();
   await gui?.close();
 }

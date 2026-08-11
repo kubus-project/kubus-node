@@ -6,7 +6,8 @@ export type CapabilityName =
   | 'spatial.reconstruction'
   | 'spatial.optimization'
   | 'spatial.gaussianSplat'
-  | 'compute.gpu';
+  | 'compute.gpu'
+  | 'compute.remoteJobs';
 
 export interface CapabilityStatus {
   name: CapabilityName;
@@ -18,7 +19,7 @@ export interface CapabilityStatus {
 
 export interface SpatialWorkerHealth {
   status: 'ready' | 'unavailable' | 'unsupported' | 'degraded';
-  gpu: { available: boolean; name?: string; cuda?: string };
+  gpu: { available: boolean; name?: string; vendor?: string; model?: string; cuda?: string; totalVramBytes?: number; usableVramBytes?: number; tier?: string };
   capabilities: string[];
   version?: string;
   detail?: string;
@@ -52,6 +53,7 @@ export class CapabilityRegistry {
       { name: 'spatial.optimization', available: supports('spatial.optimize'), healthy: workerReady, reason: workerReady ? undefined : this.workerHealth.detail },
       { name: 'spatial.gaussianSplat', available: supports('spatial.gaussianSplat'), healthy: workerReady, reason: workerReady ? undefined : this.workerHealth.detail },
       { name: 'compute.gpu', available: this.workerHealth.gpu.available, healthy: workerReady && this.workerHealth.gpu.available, reason: this.workerHealth.gpu.available ? undefined : this.workerHealth.detail, metadata: this.workerHealth.gpu },
+      { name: 'compute.remoteJobs', available: this.workerHealth.gpu.available, healthy: workerReady && this.workerHealth.gpu.available, reason: workerReady ? undefined : this.workerHealth.detail },
     ];
   }
 
