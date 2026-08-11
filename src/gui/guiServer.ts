@@ -267,8 +267,14 @@ async function buildGuiView(deps: GuiDeps) {
 async function createGuiPairing(deps: GuiDeps) {
   const local = requireLocalApi(deps);
   const session = await local.pairing.createSession();
+  // The app shows the node's name and fingerprint for confirmation before it
+  // exchanges the credential, so both travel in the code itself — otherwise the
+  // person is asked to trust a bare host and port. The fingerprint is the short
+  // form; it is for recognition, not verification.
+  const fingerprint = session.node.fingerprint.slice(0, 12);
   const payload = `kubus-node://pair?e=${encodeURIComponent(session.node.endpoint)}` +
-    `&s=${encodeURIComponent(session.sessionId)}&k=${encodeURIComponent(session.secret)}`;
+    `&s=${encodeURIComponent(session.sessionId)}&k=${encodeURIComponent(session.secret)}` +
+    `&l=${encodeURIComponent(session.node.label.slice(0, 40))}&f=${fingerprint}`;
   return {
     code: session.secret,
     sessionId: session.sessionId,
@@ -276,9 +282,9 @@ async function createGuiPairing(deps: GuiDeps) {
     qrSvg: renderQrSvg(payload, { title: 'kubus Node pairing code' }),
     node: {
       label: session.node.label,
-      // A short fingerprint is enough for the operator to confirm the node in
+      // A short fingerprint is enough for the operator to recognise the node in
       // the app; the full digest is not useful on screen.
-      fingerprint: session.node.fingerprint.slice(0, 12),
+      fingerprint,
       endpoint: session.node.endpoint,
     },
   };
