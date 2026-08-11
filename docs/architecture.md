@@ -25,7 +25,9 @@ flowchart LR
 
 Public replica state and private local state are separate. Only backend-issued public pin-set records enter byte-aware planning. A processed output stays local until authenticated publication creates a canonical object version.
 
-For remote work, the backend is a control plane only. The requester encrypts the capture, places the ciphertext in IPFS, and sends the CID plus a provider-sealed key envelope through the job record. The provider node temporarily decrypts into an isolated private directory and alone can issue the worker authorization. Output remains private until requester acknowledgement and a separate explicit publication request.
+For remote work, the backend is a control plane only. The requester encrypts the capture, places the ciphertext in IPFS, and sends the CID plus a provider-sealed key envelope through the job record. The provider node temporarily decrypts into an isolated private directory and alone can issue the worker authorization. Content-addressed output remains unpublished and outside the canonical public archive until a separate explicit publication request; ordinary IPFS output is not cryptographically private from a party who knows its CID.
+
+The participation lease is issued only after a successful heartbeat coincides with verified archive reconciliation and every other current gate requirement. Heartbeat liveness never creates trust by itself. Persisted verification generation distinguishes a fresh node from a previously contributing node, so only the latter can use degraded grace after an outage.
 
 Archive stewardship (`public-archive-stewardship-1/2`) and distributed compute (`spatial-compute-units-1`) are independent accounting rails and pools. A provider may later retain an explicitly published result under normal public pin policy, but compute and hosting evidence are scored separately.
 

@@ -134,6 +134,7 @@ export class JobRuntime {
 
   private async run(id: string, controller: AbortController): Promise<void> {
     try {
+      await this.deps.participationGate.assertUsefulOperation(this.get(id).type);
       if (!this.deps.workerUrl) throw Object.assign(new Error('Spatial worker is not configured'), { code: 'worker_unavailable' });
       const job = this.get(id);
       const capture = this.deps.captureStore.get(String(job.input.captureId));

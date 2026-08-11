@@ -64,6 +64,7 @@ export interface LocalState {
     lastVerifiedAt?: string;
     leaseExpiresAt?: string;
     graceExpiresAt?: string;
+    verificationGeneration?: number;
   };
   computeIdentity?: {
     encryptionPublicKey: string;

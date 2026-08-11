@@ -25,7 +25,6 @@ The remote provider necessarily sees plaintext source data while processing. Enc
 
 ## Output and verification
 
-The provider signs a receipt binding job, input hash, job-spec hash, output CIDs, worker/protocol version and completion time. The requester retrieves the manifest and variants by CID, checks membership/retrievability, previews the private result, then signs acceptance or rejection. Publication is a separate authenticated CID-first request through the canonical spatial-publication service.
+The provider signs a receipt binding job, input hash, job-spec hash, output CIDs, worker/protocol version and completion time. The requester retrieves the manifest and variants by CID, checks membership/retrievability, previews the unpublished result, then signs acceptance or rejection. The backend verifies both signatures against the identities captured for the assignment and checks the exact job, hashes, output CID set, decision, timestamps and protocol version. Publication is a separate authenticated CID-first request through the canonical spatial-publication service.
 
 Rewards require a completed verified job and use `spatial-compute-units-1`; see [REWARDS.md](REWARDS.md). Direct libp2p/QUIC negotiation is not yet an attributable compute transport. Encrypted temporary IPFS payloads are the implemented alpha data plane.
-

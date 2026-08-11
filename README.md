@@ -45,7 +45,7 @@ The art.kubus backend is the matchmaking and canonical trust boundary. It does n
 
 ## Local Gaussian splatting
 
-The local path is phone → paired node → private capture → local NVIDIA GPU → private preview → user review → optional publication. Raw RGB, camera poses, intrinsics and depth remain below the node's private data root. Local/self jobs create no compute reward.
+The local path is phone → paired node → private capture → local NVIDIA GPU → unpublished preview → user review → optional publication. Raw RGB, camera poses, intrinsics and depth remain below the node's private data root. Local/self jobs create no compute reward.
 
 The worker uses the official Nerfstudio `1.1.5` image, `splatfacto`, and its compatible pinned `gsplat 1.4.0`. NVIDIA/CUDA is the only supported reconstruction target in this alpha. CPU reconstruction is not claimed or silently simulated.
 
@@ -57,9 +57,9 @@ The remote provider necessarily sees plaintext source data while running the job
 
 ## Mandatory network participation
 
-`NetworkParticipationGate` exposes `UNCONFIGURED`, `JOINING`, `CONTRIBUTING`, `DEGRADED`, and `LOCKED`. New useful jobs require an active participation lease backed by registration, backend policy, healthy Kubo, policy-minimum configured capacity, current canonical pin reconciliation, a scheduler, and an accepted heartbeat. `MAX_PINNED_BYTES=1`, production skip-pinning, `kubus-node gui`, and direct local API calls do not bypass the gate.
+kubus Node is a network participant, not a standalone Gaussian-splatting utility. `NetworkParticipationGate` exposes `UNCONFIGURED`, `JOINING`, `CONTRIBUTING`, `DEGRADED`, and `LOCKED`. Spatial processing becomes available only after the node has verified its contribution to the public art archive: registration, backend policy, healthy Kubo, policy-minimum configured capacity, a synchronized non-empty canonical pin plan, successful reconciliation of every planned CID, an active scheduler, and an accepted current heartbeat must coincide. A heartbeat alone establishes liveness, not participation. `MAX_PINNED_BYTES=1`, production skip-pinning, `kubus-node gui`, and direct local API calls do not bypass the gate.
 
-A short outage enters `DEGRADED`: running work is not killed, canonical public content remains readable, and diagnostics remain available. New work locks after the grace period. See [participation](docs/PARTICIPATION.md).
+A short outage may enter `DEGRADED` only after successful participation was previously verified: running work is not killed, canonical public content remains readable, and diagnostics remain available. New work locks after the grace period. A fresh or never-verified node remains `JOINING`. See [participation](docs/PARTICIPATION.md).
 
 ## Quick start
 
@@ -86,7 +86,7 @@ Kubo RPC and worker HTTP remain private to the Compose network. The Kubo gateway
 
 ## Capture privacy and publication
 
-Private captures, encrypted temporary inputs and unpublished outputs never enter the public object registry or public pin set. Publication requires an authenticated artwork owner (or authorised moderator), valid CID/size/MIME roles, retrievability where policy requires it, and backend canonicalisation. Supported spatial roles are `spatial_preview` (HOT), `spatial_mobile` (WARM), and `spatial_archive` (COLD), grouped under one object/version bundle.
+Private captures and encrypted temporary inputs never enter the public object registry or public pin set. Processed output added to the node's ordinary Kubo is **unpublished and unlisted, not cryptographically private**: it is not canonical or replicated by archive policy, but a party who learns its CID may be able to retrieve it. Publication requires an authenticated artwork owner (or authorised moderator), valid CID/size/MIME roles, retrievability where policy requires it, and backend canonicalisation. Supported spatial roles are `spatial_preview` (HOT), `spatial_mobile` (WARM), and `spatial_archive` (COLD), grouped under one object/version bundle.
 
 CID identity is canonical. Retrieval is local Kubo first, then IPFS/provider discovery and Kubus peers, then configured HTTP gateways with CID verification; legacy backend files are a final compatibility fallback where still required. No architecture depends on `ipfs.io`.
 
@@ -94,7 +94,7 @@ CID identity is canonical. Retrieval is local Kubo first, then IPFS/provider dis
 
 Archive availability uses the historical `public-archive-stewardship-1` records unchanged and current `public-archive-stewardship-2` bundle-aware scoring. Verified canonical bytes, retrieval, reliability, policy classes, capped logarithmic weighting and diminishing returns drive an independent archive pool.
 
-Distributed compute uses backend-issued leases, distinct requester/provider operators, signed provider receipts, retrievable output, requester acknowledgement, `spatial-compute-units-1`, fraud caps and a separate compute pool. Raw GPU seconds, owning hardware, local jobs, failed/expired/cancelled work and duplicate receipts earn zero.
+Distributed compute uses backend-issued leases, distinct requester/provider operators, signed provider receipts, a separately signed requester acknowledgement, retrievable output, `spatial-compute-units-1`, fraud caps and a separate compute pool. Raw GPU seconds, owning hardware, local jobs, failed/expired/cancelled work and duplicate receipts earn zero.
 
 Both are pending control-plane records. Settlement is not active; KUB8 has no guaranteed payout or market return.
 

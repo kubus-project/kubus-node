@@ -59,7 +59,7 @@ const PARTICIPATION: Record<ParticipationState, StateDescription> = {
   },
   JOINING: {
     title: 'Joining network',
-    body: 'Your node is registering and synchronising the public archive.',
+    body: 'kubus Node is synchronising and verifying its public archive contribution.',
     severity: 'neutral',
   },
   DEGRADED: {
@@ -106,6 +106,7 @@ const REQUIREMENT_LABELS: Record<string, string> = {
   contributionCapacity: 'Allocated archive capacity meets the minimum',
   canonicalPinSetSynchronized: 'Public archive index synchronised',
   pinReconciliationHealthy: 'Archive contents reconciled',
+  actualContributionStateVerified: 'Planned public archive records stored locally',
   schedulerActive: 'Background tasks running',
   heartbeatAccepted: 'Recent heartbeat accepted by the network',
   productionPinningSafe: 'Production pinning configuration is safe',

@@ -6,7 +6,7 @@ Never paste seed phrases, private keys, or live operator tokens into docs, logs,
 
 The full scoped token is shown once in art.kubus. Later views display only the token prefix, expiry, status, and last-used time. Revoke lost or retired tokens from the same Availability Node setup screen.
 
-Heartbeats are not proof. They only report liveness and diagnostics. Backend verification and scoring determine reward eligibility.
+Heartbeats are not proof. They only report liveness and diagnostics. The runtime issues or renews a useful-operation lease only when an accepted heartbeat coincides with synchronized, successfully reconciled public pins and every other participation requirement. A never-verified node cannot enter degraded grace. Backend verification and scoring independently determine reward eligibility.
 
 Arbitrary CIDs are not rewardable. The node only commits CIDs returned by the canonical public-object registry. Dev seed CID mode can pin a CID locally, but it does not create a backend rewardable commitment.
 
@@ -28,7 +28,7 @@ The LAN API is disabled unless configured explicitly. The admin GUI stays localh
 
 Browser origins are rejected to prevent arbitrary LAN websites from calling the API. Pairing and bearer secrets must not be placed in query strings. Logs and heartbeat metadata exclude local paths, filenames, raw frames, pairing credentials, and operator secrets.
 
-Capture directories and job outputs live below the configured private data root with restrictive permissions and safe relative-path validation. They do not enter the network-managed public replica set. Deletion is blocked while an active job references a capture. Publication sends CID metadata to the backend; it never sends raw capture bytes.
+Capture directories and worker job outputs live below the configured private data root with restrictive permissions and safe relative-path validation. Raw captures never enter Kubo. Processed variants are added to ordinary local Kubo for content-addressed review but do not enter the network-managed public replica set until explicit publication; those unpublished CIDs are unlisted rather than cryptographically private. Deletion is blocked while an active job references a capture. Publication sends selected processed CID metadata to the backend; it never sends raw capture bytes.
 
 ## Distributed-compute threat model
 

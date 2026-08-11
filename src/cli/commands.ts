@@ -103,7 +103,6 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   }
 
   if (command !== 'start') throw new Error(`Unknown command: ${command}`);
-  participationGate.setSchedulerActive(true);
   await jobs.start();
   const gui = (config.guiEnabled || config.localApiEnabled) ? await startGuiServer({ api, kubo, store, config, logger, actionLock, localApi }) : null;
   let scheduler: Scheduler | null = null;

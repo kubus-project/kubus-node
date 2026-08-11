@@ -111,6 +111,8 @@ For Docker, the GUI must bind to `0.0.0.0:8787` inside the container so Docker c
 
 The GUI sections are Overview, Archive, Spatial, Compute, Contribution, Devices, Diagnostics, and Settings. Archive carries the safe maintenance actions — check for new records (sync public pin set), store missing records (reconcile pins), and report availability (heartbeat). Diagnostics runs the node checks and holds the log viewer. Devices manages pairing with the art.kubus app.
 
+Spatial processing is available only to kubus Nodes participating in the public archive. A fresh node shows **Joining network** while it synchronises and verifies real archive replicas. An accepted heartbeat alone does not unlock processing; the scheduler must complete a successful public-pin reconciliation first. Only a node that was previously verified may use the temporary degraded grace state.
+
 A node that has never been configured opens a short guided setup instead of the dashboard; it reports the real state of each prerequisite and can be skipped at any point.
 
 The GUI cannot spend funds and never shows `KUBUS_OPERATOR_TOKEN`, Authorization headers, private keys, seed phrases, or raw backend credentials. Technical identifiers such as peer IDs and CIDs are truncated for display and copyable in full. This Kubus Node GUI is not the Kubo WebUI; Kubo WebUI/RPC on `5001` stays private.

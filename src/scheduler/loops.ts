@@ -21,6 +21,7 @@ export class Scheduler {
   ) {}
 
   start(): void {
+    this.deps.gate.setSchedulerActive(true);
     this.controllers = [
       this.loop('policy', this.deps.config.cidSyncIntervalMs, async () => {
         const policy = await this.deps.api.getPolicies();
@@ -69,6 +70,7 @@ export class Scheduler {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.deps.gate.setSchedulerActive(false);
     await Promise.race([Promise.allSettled(this.controllers), sleep(10000)]);
   }
 
