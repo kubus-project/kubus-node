@@ -58,6 +58,10 @@ export interface PublicPinSetRecord {
 
 export interface PinSetResponse {
   count: number;
+  /** True only when the response represents the complete canonical set. */
+  complete?: boolean;
+  generatedAt?: string;
+  policyVersion?: string;
   limit?: number;
   offset?: number;
   records: PublicPinSetRecord[];
