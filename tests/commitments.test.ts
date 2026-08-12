@@ -44,6 +44,7 @@ describe('availability pin set commitments', () => {
     const api = {
       getPublicPinSet: vi.fn(async () => ({
         count: 3,
+        complete: true,
         records: [
           { id: 'manifest', cid: 'bafymanifest', role: 'manifest', objectType: 'artwork', objectId: 'art-1', version: 1 },
           { id: 'record', cid: 'bafyrecord', role: 'record', objectType: 'artwork', objectId: 'art-1', version: 1 },
