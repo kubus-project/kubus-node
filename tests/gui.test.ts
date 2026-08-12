@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { IncomingMessage } from 'node:http';
 import type { AppConfig } from '../src/config/schema.js';
+import type { SpatialWorkerHealth } from '../src/capabilities/registry.js';
 import { ActionLock } from '../src/runtime/actionLock.js';
 import { assertGuiConfig, authorizeGuiRequest } from '../src/gui/guiAuth.js';
 import { startGuiServer } from '../src/gui/guiServer.js';
@@ -165,7 +166,10 @@ describe('local GUI safety helpers', () => {
       localCredentials: {},
     };
 
-    async function startNode() {
+    const readyWorker: SpatialWorkerHealth = { status: 'ready', gpu: { available: true, model: 'RTX 3080 Ti', totalVramBytes: 12 * 1024 ** 3 }, capabilities: [] };
+
+    function startNode(options: { workerHealth?: SpatialWorkerHealth; onRefresh?: () => void } = {}) {
+      const workerHealth = options.workerHealth ?? readyWorker;
       return startGuiServer({
         api: { getHealth: async () => ({ ok: true }) } as never,
         kubo: {
@@ -182,7 +186,10 @@ describe('local GUI safety helpers', () => {
         actionLock: new ActionLock(),
         localApi: {
           participationGate: { refresh: async () => ({ state: 'CONTRIBUTING', reason: 'ok', leaseEligible: true, requirements: { registered: true } }) },
-          capabilities: { getWorkerHealth: () => ({ status: 'ready', gpu: { available: true, model: 'RTX 3080 Ti', totalVramBytes: 12 * 1024 ** 3 }, capabilities: [] }) },
+          capabilities: {
+            getWorkerHealth: () => workerHealth,
+            refreshIfStale: async () => { options.onRefresh?.(); return []; },
+          },
           jobs: { health: () => ({ configured: true, running: 0, queued: 0, concurrency: 1 }) },
           remoteCompute: {
             settings: () => ({ enabled: false, paused: false, maxConcurrency: 1, maxQueueDepth: 2, maxAcceptedInputBytes: 1024 ** 3, minimumFreeVramBytes: 0 }),
@@ -267,6 +274,69 @@ describe('local GUI safety helpers', () => {
       try {
         const response = await fetch(server.url.replace('/gui', '/gui/api/view'));
         expect(response.status).toBe(401);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('refreshes capability state before rendering the view', async () => {
+      let refreshed = false;
+      const server = await startNode({ onRefresh: () => { refreshed = true; } });
+      try {
+        await fetch(server.url.replace('/gui', '/gui/api/view'), { headers });
+        expect(refreshed).toBe(true);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('shows Ready with the GPU label for a healthy worker', async () => {
+      const server = await startNode({ workerHealth: readyWorker });
+      try {
+        const response = await fetch(server.url.replace('/gui', '/gui/api/view'), { headers });
+        const model = (await response.json()).data;
+        expect(model.spatial.title).toBe('Ready');
+        expect(model.spatial.gpu).toBe('RTX 3080 Ti · 12.0 GB');
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('shows Worker unavailable, never "No compatible NVIDIA GPU detected", when the worker cannot be reached', async () => {
+      const server = await startNode({
+        workerHealth: { status: 'unavailable', gpu: { available: false }, capabilities: [], detail: 'connect ECONNREFUSED' },
+      });
+      try {
+        const response = await fetch(server.url.replace('/gui', '/gui/api/view'), { headers });
+        const model = (await response.json()).data;
+        expect(model.spatial.title).toBe('Worker unavailable');
+        expect(model.spatial.body).not.toContain('No compatible NVIDIA GPU');
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('shows GPU unavailable when the worker responded but reports no CUDA device', async () => {
+      const server = await startNode({
+        workerHealth: { status: 'unsupported', gpu: { available: false }, capabilities: [], detail: 'A CUDA-capable NVIDIA GPU is required for local reconstruction' },
+      });
+      try {
+        const response = await fetch(server.url.replace('/gui', '/gui/api/view'), { headers });
+        const model = (await response.json()).data;
+        expect(model.spatial.title).toBe('GPU unavailable');
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('shows Degraded when the worker responds with a reported problem', async () => {
+      const server = await startNode({
+        workerHealth: { status: 'degraded', gpu: { available: true }, capabilities: [], detail: 'CUDA error 999: unknown' },
+      });
+      try {
+        const response = await fetch(server.url.replace('/gui', '/gui/api/view'), { headers });
+        const model = (await response.json()).data;
+        expect(model.spatial.title).toBe('Degraded');
       } finally {
         await server.close();
       }

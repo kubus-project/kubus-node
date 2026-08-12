@@ -62,6 +62,7 @@ export async function handleLocalApi(req: IncomingMessage, res: ServerResponse, 
   }
   if (req.method === 'GET' && parsed.pathname === '/local/v1/status') {
     const state = deps.store.snapshot();
+    await deps.capabilities.refreshIfStale();
     json(res, 200, { status: state.latestStatus?.status || 'offline', lastHeartbeat: state.latestHeartbeatAt || null, participation: await deps.participationGate.refresh(), jobs: deps.jobs.health(), captures: deps.captures.list().length, worker: deps.capabilities.getWorkerHealth() });
     return true;
   }
@@ -70,7 +71,7 @@ export async function handleLocalApi(req: IncomingMessage, res: ServerResponse, 
     return true;
   }
   if (req.method === 'GET' && parsed.pathname === '/local/v1/capabilities') {
-    json(res, 200, { capabilities: await deps.capabilities.refresh(), worker: deps.capabilities.getWorkerHealth() });
+    json(res, 200, { capabilities: await deps.capabilities.refreshIfStale(), worker: deps.capabilities.getWorkerHealth() });
     return true;
   }
   if (req.method === 'GET' && parsed.pathname === '/local/v1/network') {

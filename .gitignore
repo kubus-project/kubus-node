@@ -6,3 +6,4 @@ dist/
 data/
 *.log
 coverage/
+__pycache__/

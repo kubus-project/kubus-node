@@ -18,24 +18,72 @@ export interface CapabilityStatus {
 }
 
 export interface SpatialWorkerHealth {
-  status: 'ready' | 'unavailable' | 'unsupported' | 'degraded';
+  status: 'ready' | 'unavailable' | 'unsupported' | 'degraded' | 'unconfigured';
   gpu: { available: boolean; name?: string; vendor?: string; model?: string; cuda?: string; totalVramBytes?: number; usableVramBytes?: number; tier?: string };
   capabilities: string[];
   version?: string;
   detail?: string;
 }
 
+/** Default staleness budget for {@link CapabilityRegistry.refreshIfStale}. */
+const DEFAULT_REFRESH_TTL_MS = 5000;
+
+/**
+ * The single authoritative source of runtime capability state (Kubo health,
+ * spatial worker health, derived capability flags) for this kubus Node
+ * process. GUI, local API, heartbeat and job eligibility all read through the
+ * same instance so they can never disagree about whether the worker is up.
+ *
+ * Probing is demand-driven rather than a background timer: callers ask for
+ * fresh-enough state via `refreshIfStale`, and concurrent callers share a
+ * single in-flight probe instead of hammering the worker.
+ */
 export class CapabilityRegistry {
-  private workerHealth: SpatialWorkerHealth = {
-    status: 'unavailable',
-    gpu: { available: false },
-    capabilities: [],
-    detail: 'Spatial worker is not configured',
-  };
+  private workerHealth: SpatialWorkerHealth;
+  private capabilitiesSnapshot: CapabilityStatus[];
+  private lastRefreshAt = 0;
+  private refreshPromise: Promise<CapabilityStatus[]> | null = null;
 
-  constructor(private readonly kubo: KuboClient, private readonly workerUrl?: string) {}
+  constructor(private readonly kubo: KuboClient, private readonly workerUrl?: string) {
+    // "Never configured" and "configured but not yet probed" are different
+    // situations for the operator: the former is a normal archive-only node,
+    // the latter should read as "not responding" the moment a probe fails.
+    this.workerHealth = this.workerUrl
+      ? { status: 'unavailable', gpu: { available: false }, capabilities: [], detail: 'Spatial worker has not been probed yet' }
+      : { status: 'unconfigured', gpu: { available: false }, capabilities: [], detail: 'Spatial worker is not configured' };
+    this.capabilitiesSnapshot = this.buildCapabilities(this.workerHealth, false);
+  }
 
+  /** Force a fresh probe. Concurrent callers share one in-flight probe. */
   async refresh(): Promise<CapabilityStatus[]> {
+    if (!this.refreshPromise) {
+      this.refreshPromise = this.performRefresh().finally(() => {
+        this.refreshPromise = null;
+      });
+    }
+    return this.refreshPromise;
+  }
+
+  /**
+   * Return cached state when it is younger than `maxAgeMs`; otherwise probe.
+   * Pass `0` to always force a fresh probe (still concurrency-safe).
+   */
+  async refreshIfStale(maxAgeMs = DEFAULT_REFRESH_TTL_MS): Promise<CapabilityStatus[]> {
+    if (this.refreshPromise) return this.refreshPromise;
+    if (this.lastRefreshAt > 0 && Date.now() - this.lastRefreshAt < maxAgeMs) return this.capabilitiesSnapshot;
+    return this.refresh();
+  }
+
+  getWorkerHealth(): SpatialWorkerHealth {
+    return structuredClone(this.workerHealth);
+  }
+
+  /** Last computed capability list, without triggering a probe. */
+  getCapabilities(): CapabilityStatus[] {
+    return structuredClone(this.capabilitiesSnapshot);
+  }
+
+  private async performRefresh(): Promise<CapabilityStatus[]> {
     let kuboHealthy = false;
     try {
       await this.kubo.id();
@@ -44,21 +92,23 @@ export class CapabilityRegistry {
       kuboHealthy = false;
     }
     this.workerHealth = await this.detectWorker();
-    const workerReady = this.workerHealth.status === 'ready';
-    const supports = (name: string) => workerReady && this.workerHealth.capabilities.includes(name);
+    this.capabilitiesSnapshot = this.buildCapabilities(this.workerHealth, kuboHealthy);
+    this.lastRefreshAt = Date.now();
+    return this.capabilitiesSnapshot;
+  }
+
+  private buildCapabilities(workerHealth: SpatialWorkerHealth, kuboHealthy: boolean): CapabilityStatus[] {
+    const workerReady = workerHealth.status === 'ready';
+    const supports = (name: string) => workerReady && workerHealth.capabilities.includes(name);
     return [
       { name: 'archive', available: true, healthy: kuboHealthy, reason: kuboHealthy ? undefined : 'Kubo is unavailable' },
       { name: 'localContentGateway', available: true, healthy: kuboHealthy, reason: kuboHealthy ? undefined : 'Kubo is unavailable' },
-      { name: 'spatial.reconstruction', available: supports('spatial.reconstruct'), healthy: workerReady, reason: workerReady ? undefined : this.workerHealth.detail },
-      { name: 'spatial.optimization', available: supports('spatial.optimize'), healthy: workerReady, reason: workerReady ? undefined : this.workerHealth.detail },
-      { name: 'spatial.gaussianSplat', available: supports('spatial.gaussianSplat'), healthy: workerReady, reason: workerReady ? undefined : this.workerHealth.detail },
-      { name: 'compute.gpu', available: this.workerHealth.gpu.available, healthy: workerReady && this.workerHealth.gpu.available, reason: this.workerHealth.gpu.available ? undefined : this.workerHealth.detail, metadata: this.workerHealth.gpu },
-      { name: 'compute.remoteJobs', available: this.workerHealth.gpu.available, healthy: workerReady && this.workerHealth.gpu.available, reason: workerReady ? undefined : this.workerHealth.detail },
+      { name: 'spatial.reconstruction', available: supports('spatial.reconstruct'), healthy: workerReady, reason: workerReady ? undefined : workerHealth.detail },
+      { name: 'spatial.optimization', available: supports('spatial.optimize'), healthy: workerReady, reason: workerReady ? undefined : workerHealth.detail },
+      { name: 'spatial.gaussianSplat', available: supports('spatial.gaussianSplat'), healthy: workerReady, reason: workerReady ? undefined : workerHealth.detail },
+      { name: 'compute.gpu', available: workerHealth.gpu.available, healthy: workerReady && workerHealth.gpu.available, reason: workerHealth.gpu.available ? undefined : workerHealth.detail, metadata: workerHealth.gpu },
+      { name: 'compute.remoteJobs', available: workerHealth.gpu.available, healthy: workerReady && workerHealth.gpu.available, reason: workerReady ? undefined : workerHealth.detail },
     ];
-  }
-
-  getWorkerHealth(): SpatialWorkerHealth {
-    return structuredClone(this.workerHealth);
   }
 
   private async detectWorker(): Promise<SpatialWorkerHealth> {

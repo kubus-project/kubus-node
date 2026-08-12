@@ -4,6 +4,7 @@ import { BearerAuthProvider } from '../src/backend/operatorAuth.js';
 import { parseEnv, resolveNodeKey } from '../src/config/env.js';
 import { waitForKubo } from '../src/ipfs/health.js';
 import { KuboClient } from '../src/ipfs/kuboClient.js';
+import { CapabilityRegistry } from '../src/capabilities/registry.js';
 import { reconcileDesiredPins, refreshCommitments, syncPublicPinSet } from '../src/operator/commitments.js';
 import { sendHeartbeat } from '../src/operator/heartbeat.js';
 import { ensureRegistered } from '../src/operator/registerNode.js';
@@ -31,6 +32,7 @@ async function main() {
   await store.load();
   const api = new KubusApiClient({ baseUrl: config.apiBaseUrl, auth: new BearerAuthProvider(config.operatorToken) });
   const kubo = new KuboClient(config.ipfsRpcUrl);
+  const capabilities = new CapabilityRegistry(kubo, config.spatialWorkerUrl);
 
   await step('backend health', () => api.getHealth());
   const kuboHealth = await step('kubo health', () => waitForKubo(kubo));
@@ -60,7 +62,7 @@ async function main() {
   } else if (store.snapshot().desiredCids[0]?.id === 'dev-seed') {
     await step('dev seed pin only', () => reconcileDesiredPins(kubo, store, config));
   }
-  await step('send heartbeat', () => sendHeartbeat(api, kubo, store, config));
+  await step('send heartbeat', () => sendHeartbeat(api, kubo, store, config, capabilities));
   await step('fetch current commitments', () => (node as { id: string }).id ? api.getCurrentCommitments((node as { id: string }).id) : Promise.resolve());
   await step('fetch node status/current epoch', () => refreshStatus(api, kubo, store));
   await step('fetch rewards', () => refreshRewards(api, store));

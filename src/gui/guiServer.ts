@@ -215,6 +215,7 @@ async function buildGuiView(deps: GuiDeps) {
     local.participationGate.refresh(),
     liveStatus(deps.api, deps.kubo),
     deps.kubo.repoStat().catch(() => ({ RepoSize: 0, StorageMax: 0 })),
+    local.capabilities.refreshIfStale(),
   ]);
 
   const captures = local.captures.list();
@@ -396,7 +397,8 @@ async function runAction(action: string, deps: GuiDeps): Promise<unknown> {
     return deps.actionLock.run('gui:refresh-commitments', () => refreshCommitments(deps.api, deps.kubo, deps.store, deps.config));
   }
   if (action === 'heartbeat') {
-    return deps.actionLock.run('gui:heartbeat', () => sendHeartbeat(deps.api, deps.kubo, deps.store, deps.config));
+    const local = requireLocalApi(deps);
+    return deps.actionLock.run('gui:heartbeat', () => sendHeartbeat(deps.api, deps.kubo, deps.store, deps.config, local.capabilities));
   }
   if (action === 'doctor') {
     return deps.actionLock.run('gui:doctor', () => runDoctor(deps));

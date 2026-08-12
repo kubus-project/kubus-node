@@ -129,13 +129,33 @@ export function describeRequirements(requirements: Record<string, boolean>): Arr
  * CUDA/driver detail stays in `detail` and is only rendered behind disclosure.
  */
 export function describeWorker(worker: SpatialWorkerHealth): StateDescription {
-  if (worker.status === 'ready' && worker.gpu.available) {
-    return { title: 'Ready', body: 'Gaussian reconstruction available.', severity: 'good' };
+  if (worker.status === 'ready') {
+    if (worker.gpu.available) {
+      return { title: 'Ready', body: 'Gaussian reconstruction available.', severity: 'good' };
+    }
+    // Malformed data: the worker claims readiness without a GPU. Never
+    // invent a confident-looking state for that — treat it as degraded.
+    return {
+      title: 'Degraded',
+      body: 'The spatial worker responded but reported a problem.',
+      severity: 'attention',
+      action: { label: 'Details', section: 'diagnostics' },
+    };
+  }
+  if (worker.status === 'unconfigured') {
+    return {
+      title: 'Not configured',
+      body: 'Spatial processing is not set up on this node.',
+      severity: 'neutral',
+      action: { label: 'View requirements', section: 'diagnostics' },
+    };
   }
   if (worker.status === 'unsupported') {
+    // The worker was reachable and answered — this is the one case where the
+    // data actually establishes the hardware is the problem, not the network.
     return {
-      title: 'Unavailable',
-      body: 'No compatible NVIDIA GPU detected.',
+      title: 'GPU unavailable',
+      body: 'The spatial worker is running, but CUDA cannot access a compatible NVIDIA GPU.',
       severity: 'neutral',
       action: { label: 'View requirements', section: 'diagnostics' },
     };
@@ -148,6 +168,10 @@ export function describeWorker(worker: SpatialWorkerHealth): StateDescription {
       action: { label: 'Details', section: 'diagnostics' },
     };
   }
+  // status === 'unavailable': the worker could not be reached at all (down,
+  // unreachable, timed out). We have no data on the GPU, so we never guess at
+  // hardware incompatibility here — that would misdiagnose an offline
+  // container as unsupported hardware.
   if (worker.gpu.available) {
     return {
       title: 'Worker unavailable',
@@ -157,10 +181,10 @@ export function describeWorker(worker: SpatialWorkerHealth): StateDescription {
     };
   }
   return {
-    title: 'Unavailable',
-    body: 'No compatible NVIDIA GPU detected.',
-    severity: 'neutral',
-    action: { label: 'View requirements', section: 'diagnostics' },
+    title: 'Worker unavailable',
+    body: 'The spatial worker is not responding.',
+    severity: 'attention',
+    action: { label: 'View diagnostics', section: 'diagnostics' },
   };
 }
 

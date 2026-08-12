@@ -12,6 +12,8 @@ import torch
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 
+from gpu_tier import classify_vram_tier
+
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 WORKER_AUTH_KEY_PATH = os.environ.get("WORKER_AUTH_KEY_PATH", "/var/lib/kubus-node/worker-auth.key")
 
@@ -36,7 +38,7 @@ def gpu_info() -> dict[str, Any]:
         "cuda": torch.version.cuda,
         "totalVramBytes": int(properties.total_memory) if properties else None,
         "usableVramBytes": int(free_memory) if free_memory else None,
-        "tier": ("24GB+" if properties and properties.total_memory >= 24 * 1024**3 else "12GB+" if properties and properties.total_memory >= 12 * 1024**3 else "8GB+") if properties else None,
+        "tier": classify_vram_tier(properties.total_memory) if properties else None,
     }
 
 

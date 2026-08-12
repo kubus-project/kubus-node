@@ -11,13 +11,14 @@ import { refreshRewards } from '../operator/rewards.js';
 import { refreshStatus } from '../operator/status.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
 import type { ComputeIdentityService } from '../compute/computeIdentity.js';
+import type { CapabilityRegistry } from '../capabilities/registry.js';
 
 export class Scheduler {
   private stopped = false;
   private controllers: Promise<void>[] = [];
 
   constructor(
-    private readonly deps: { api: KubusApiClient; kubo: KuboClient; store: LocalStore; config: AppConfig; logger: Logger; gate: NetworkParticipationGate; identity: ComputeIdentityService; actionLock?: ActionLock },
+    private readonly deps: { api: KubusApiClient; kubo: KuboClient; store: LocalStore; config: AppConfig; logger: Logger; gate: NetworkParticipationGate; identity: ComputeIdentityService; capabilities: CapabilityRegistry; actionLock?: ActionLock },
   ) {}
 
   start(): void {
@@ -52,7 +53,7 @@ export class Scheduler {
         this.deps.logger.info({ activeCommitmentCount: this.deps.store.snapshot().activeCommitments.length }, 'reward commitments refreshed');
       }),
       this.loop('heartbeat', this.deps.config.heartbeatIntervalMs, async () => {
-        await sendHeartbeat(this.deps.api, this.deps.kubo, this.deps.store, this.deps.config, this.deps.gate, this.deps.identity);
+        await sendHeartbeat(this.deps.api, this.deps.kubo, this.deps.store, this.deps.config, this.deps.capabilities, this.deps.gate, this.deps.identity);
         const state = this.deps.store.snapshot();
         this.deps.logger.info({
           status: state.latestStatus?.status,

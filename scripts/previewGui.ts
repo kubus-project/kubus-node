@@ -91,7 +91,7 @@ const server = await startGuiServer({
   actionLock: { snapshot: () => ({}), run: async (_n: string, f: () => unknown) => f() } as never,
   localApi: {
     participationGate: { refresh: async () => participationByScenario[scenario] },
-    capabilities: { getWorkerHealth: () => workerByScenario[scenario] },
+    capabilities: { getWorkerHealth: () => workerByScenario[scenario], refreshIfStale: async () => [] },
     jobs: { health: () => ({ configured: true, running: scenario === 'healthy' ? 1 : 0, queued: 0, concurrency: 2 }) },
     remoteCompute: {
       settings: () => ({ enabled: scenario === 'healthy', paused: false, maxConcurrency: 2, maxQueueDepth: 4, maxAcceptedInputBytes: 2 * 1024 ** 3, minimumFreeVramBytes: 2 * 1024 ** 3 }),

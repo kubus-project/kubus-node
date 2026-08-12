@@ -40,7 +40,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   await computeIdentity.initialize();
   const pairing = new PairingService(store, config);
   const captures = new CaptureStore(config.localDataPath, store);
-  const jobs = new JobRuntime({ store, captureStore: captures, kubo, logger, dataRoot: config.localDataPath, workerUrl: config.spatialWorkerUrl, concurrency: config.jobConcurrency, participationGate, workerAuth });
+  const jobs = new JobRuntime({ store, captureStore: captures, kubo, logger, dataRoot: config.localDataPath, workerUrl: config.spatialWorkerUrl, concurrency: config.jobConcurrency, participationGate, workerAuth, capabilities });
   const privateTransport = new PrivatePayloadTransport({ captures, kubo, store, identity: computeIdentity, dataRoot: config.localDataPath, maxInputBytes: config.remoteComputeMaxInputBytes });
   const remoteCompute = new RemoteComputeRuntime({ api, kubo, store, config, captures, jobs, gate: participationGate, identity: computeIdentity, transport: privateTransport, logger });
   const localApi = { api, kubo, store, config, capabilities, pairing, captures, jobs, participationGate, remoteCompute };
@@ -59,6 +59,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   if (command === 'gui') {
     participationGate.setSchedulerActive(false);
     await jobs.start();
+    await capabilities.refresh();
     const guiConfig = { ...config, guiEnabled: true };
     const gui = await startGuiServer({ api, kubo, store, config: guiConfig, logger, actionLock, localApi: { ...localApi, config: guiConfig } });
     console.log(JSON.stringify({
@@ -81,7 +82,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   }
 
   if (command === 'sync') {
-    await bootstrapOnce(api, kubo, store, config);
+    await bootstrapOnce(api, kubo, store, config, capabilities);
     console.log(JSON.stringify(buildStatusSummary(config, store.snapshot()), null, 2));
     return;
   }
@@ -93,7 +94,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   }
 
   if (command === 'heartbeat') {
-    console.log(JSON.stringify(await sendHeartbeat(api, kubo, store, config), null, 2));
+    console.log(JSON.stringify(await sendHeartbeat(api, kubo, store, config, capabilities), null, 2));
     return;
   }
 
@@ -104,11 +105,12 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
 
   if (command !== 'start') throw new Error(`Unknown command: ${command}`);
   await jobs.start();
+  await capabilities.refresh();
   const gui = (config.guiEnabled || config.localApiEnabled) ? await startGuiServer({ api, kubo, store, config, logger, actionLock, localApi }) : null;
   let scheduler: Scheduler | null = null;
   try {
-    await actionLock.run('startup', () => bootstrapOnce(api, kubo, store, config, participationGate, computeIdentity));
-    scheduler = new Scheduler({ api, kubo, store, config, logger, gate: participationGate, identity: computeIdentity, actionLock });
+    await actionLock.run('startup', () => bootstrapOnce(api, kubo, store, config, capabilities, participationGate, computeIdentity));
+    scheduler = new Scheduler({ api, kubo, store, config, logger, gate: participationGate, identity: computeIdentity, capabilities, actionLock });
     scheduler.start();
     remoteCompute.start();
     logger.info({ nodeId: store.snapshot().nodeId }, 'kubus node started');
@@ -120,7 +122,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   await waitForShutdown(scheduler, gui, remoteCompute);
 }
 
-async function bootstrapOnce(api: KubusApiClient, kubo: KuboClient, store: LocalStore, config: ReturnType<typeof parseEnv>, gate?: NetworkParticipationGate, identity?: ComputeIdentityService) {
+async function bootstrapOnce(api: KubusApiClient, kubo: KuboClient, store: LocalStore, config: ReturnType<typeof parseEnv>, capabilities: CapabilityRegistry, gate?: NetworkParticipationGate, identity?: ComputeIdentityService) {
   await api.getHealth();
   const kuboHealth = await waitForKubo(kubo);
   await resolveNodeKey(config, store);
@@ -130,7 +132,7 @@ async function bootstrapOnce(api: KubusApiClient, kubo: KuboClient, store: Local
     state.policy = policy;
   });
   const desired = await syncPublicPinSet(api, store, config);
-  await sendHeartbeat(api, kubo, store, config, gate, identity);
+  await sendHeartbeat(api, kubo, store, config, capabilities, gate, identity);
   await refreshStatus(api, kubo, store);
   await refreshRewards(api, store);
   if (desired.length > 0) {

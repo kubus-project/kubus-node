@@ -196,15 +196,27 @@ describe('spatial', () => {
     expect(model.spatial.gpu).toBe('RTX 3080 Ti · 12.0 GB');
   });
 
-  it('separates "no GPU" from "worker not responding"', () => {
-    const noGpu = buildViewModel(input({ worker: { status: 'unavailable', gpu: { available: false }, capabilities: [] } }));
-    expect(noGpu.spatial.title).toBe('Unavailable');
-    expect(noGpu.spatial.body).toBe('No compatible NVIDIA GPU detected.');
-    expect(noGpu.spatial.severity).toBe('neutral');
+  it('never blames the GPU when the worker could not be reached at all', () => {
+    const unreachable = buildViewModel(input({ worker: { status: 'unavailable', gpu: { available: false }, capabilities: [] } }));
+    expect(unreachable.spatial.title).toBe('Worker unavailable');
+    expect(unreachable.spatial.body).toBe('The spatial worker is not responding.');
+    expect(unreachable.spatial.severity).toBe('attention');
 
     const noWorker = buildViewModel(input({ worker: { status: 'unavailable', gpu: { available: true, model: 'RTX 4090' }, capabilities: [] } }));
     expect(noWorker.spatial.title).toBe('Worker unavailable');
     expect(noWorker.spatial.severity).toBe('attention');
+  });
+
+  it('only reports incompatible hardware when the worker actually answered', () => {
+    const unsupported = buildViewModel(input({ worker: { status: 'unsupported', gpu: { available: false }, capabilities: [] } }));
+    expect(unsupported.spatial.title).toBe('GPU unavailable');
+    expect(unsupported.spatial.severity).toBe('neutral');
+  });
+
+  it('treats a never-configured worker as a neutral setup step', () => {
+    const unconfigured = buildViewModel(input({ worker: { status: 'unconfigured', gpu: { available: false }, capabilities: [], detail: 'Spatial worker is not configured' } }));
+    expect(unconfigured.spatial.title).toBe('Not configured');
+    expect(unconfigured.spatial.severity).toBe('neutral');
   });
 
   it('keeps driver detail out of the headline', () => {

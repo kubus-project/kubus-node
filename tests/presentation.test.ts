@@ -66,17 +66,39 @@ describe('spatial worker language', () => {
 
   it('answers "can I process right now"', () => {
     expect(describeWorker(worker({ status: 'ready', gpu: { available: true } })).title).toBe('Ready');
-    expect(describeWorker(worker({ status: 'unsupported' })).title).toBe('Unavailable');
+    expect(describeWorker(worker({ status: 'unsupported' })).title).toBe('GPU unavailable');
   });
 
-  it('separates "no GPU" from "GPU present but worker down"', () => {
-    const noGpu = describeWorker(worker({ status: 'unavailable' }));
-    expect(noGpu.body).toBe('No compatible NVIDIA GPU detected.');
-    expect(noGpu.severity).toBe('neutral');
+  it('never blames the GPU for a worker it could not reach', () => {
+    const unreachable = describeWorker(worker({ status: 'unavailable' }));
+    expect(unreachable.title).toBe('Worker unavailable');
+    expect(unreachable.body).toBe('The spatial worker is not responding.');
+    expect(unreachable.body).not.toContain('No compatible NVIDIA GPU');
+    expect(unreachable.severity).toBe('attention');
 
     const workerDown = describeWorker(worker({ status: 'unavailable', gpu: { available: true, model: 'RTX 3080 Ti' } }));
     expect(workerDown.title).toBe('Worker unavailable');
     expect(workerDown.severity).toBe('attention');
+  });
+
+  it('only blames the GPU when the worker actually responded and reported no CUDA device', () => {
+    const unsupported = describeWorker(worker({ status: 'unsupported' }));
+    expect(unsupported.title).toBe('GPU unavailable');
+    expect(unsupported.body).toContain('CUDA cannot access a compatible NVIDIA GPU');
+    expect(unsupported.severity).toBe('neutral');
+  });
+
+  it('describes a never-configured worker as a neutral setup step, not an error', () => {
+    const unconfigured = describeWorker(worker({ status: 'unconfigured' }));
+    expect(unconfigured.title).toBe('Not configured');
+    expect(unconfigured.severity).toBe('neutral');
+    expect(unconfigured.body).not.toContain('No compatible NVIDIA GPU');
+  });
+
+  it('reports a degraded worker distinctly from unavailable or unsupported', () => {
+    const degraded = describeWorker(worker({ status: 'degraded' }));
+    expect(degraded.title).toBe('Degraded');
+    expect(degraded.severity).toBe('attention');
   });
 
   it('formats a GPU summary and returns null when there is nothing to say', () => {

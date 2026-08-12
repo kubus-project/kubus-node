@@ -9,6 +9,7 @@ import { validateSpatialManifest, type SpatialManifest, type SpatialVariant } fr
 import type { LocalStore } from '../state/localStore.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
 import type { WorkerAuthService } from '../spatial/workerAuth.js';
+import type { CapabilityRegistry } from '../capabilities/registry.js';
 
 export type JobType = 'spatial.reconstruct' | 'spatial.optimize' | 'spatial.generate_preview';
 export type JobState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
@@ -51,6 +52,8 @@ export class JobRuntime {
       concurrency: number;
       participationGate: NetworkParticipationGate;
       workerAuth: WorkerAuthService;
+      /** Shared runtime capability state; when supplied, dispatch confirms freshness before talking to the worker. */
+      capabilities?: CapabilityRegistry;
     },
   ) {}
 
@@ -136,6 +139,13 @@ export class JobRuntime {
     try {
       await this.deps.participationGate.assertUsefulOperation(this.get(id).type);
       if (!this.deps.workerUrl) throw Object.assign(new Error('Spatial worker is not configured'), { code: 'worker_unavailable' });
+      if (this.deps.capabilities) {
+        await this.deps.capabilities.refreshIfStale();
+        const health = this.deps.capabilities.getWorkerHealth();
+        if (health.status !== 'ready') {
+          throw Object.assign(new Error(health.detail || 'Spatial worker is not ready'), { code: 'worker_unavailable' });
+        }
+      }
       const job = this.get(id);
       const capture = this.deps.captureStore.get(String(job.input.captureId));
       const outputDirectory = path.join(this.deps.dataRoot, 'private', 'jobs', id);
