@@ -49,10 +49,10 @@ export class NetworkParticipationGate {
       contributionCapacity: this.deps.config.maxPinnedBytes >= policyMinimum,
       canonicalPinSetSynchronized: fresh(state.latestPublicPinSetSyncAt),
       pinReconciliationHealthy: fresh(state.latestPinReconcileAt)
-        && state.desiredCids.length > 0
+        && state.publicPinSetComplete === true
         && Object.keys(state.failedCids).length === 0
         && state.desiredCids.every((record) => state.pinnedCids.includes(record.cid)),
-      actualContributionStateVerified: state.desiredCids.length > 0
+      actualContributionStateVerified: state.publicPinSetComplete === true
         && state.desiredCids.every((record) => state.pinnedCids.includes(record.cid)),
       schedulerActive: this.schedulerActive,
       heartbeatAccepted: fresh(state.latestHeartbeatAt),

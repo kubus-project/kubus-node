@@ -42,6 +42,7 @@ async function fixture(options: {
       state.desiredCids = [{ id: 'pin-1', cid: `Qm${'a'.repeat(44)}`, role: 'record' }];
       state.pinnedCids = [state.desiredCids[0]!.cid];
       state.latestPinReconcileAt = now.toISOString();
+      state.publicPinSetComplete = true;
     }
   });
   return {
@@ -70,6 +71,25 @@ describe('NetworkParticipationGate', () => {
     expect(snapshot.requirements.contributionCapacity).toBe(true);
     expect(snapshot.requirements.actualContributionStateVerified).toBe(false);
     expect(snapshot.leaseEligible).toBe(false);
+  });
+
+  it('accepts an explicitly complete empty canonical archive after reconciliation', async () => {
+    const { gate, store } = await fixture({ archiveReconciled: false });
+    await store.update((state) => {
+      state.publicPinSetTotal = 0;
+      state.publicPinSetComplete = true;
+      state.latestPinReconcileAt = new Date('2026-08-11T12:00:00.000Z').toISOString();
+    });
+    expect((await gate.recordHeartbeatAccepted()).state).toBe('CONTRIBUTING');
+  });
+
+  it('rejects an empty pin set whose completeness is unknown', async () => {
+    const { gate, store } = await fixture({ archiveReconciled: false });
+    await store.update((state) => {
+      state.publicPinSetTotal = 0;
+      state.latestPinReconcileAt = new Date('2026-08-11T12:00:00.000Z').toISOString();
+    });
+    expect((await gate.recordHeartbeatAccepted()).state).toBe('JOINING');
   });
 
   it('does not grant a useful-operation lease when pinning is skipped', async () => {

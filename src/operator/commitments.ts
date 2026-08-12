@@ -56,12 +56,31 @@ function bundleForRewardable(publicPinSet: PublicPinSetRecord[], rewardable: Rew
 }
 
 export async function syncPublicPinSet(api: KubusApiClient, store: LocalStore, config: AppConfig) {
-  const limit = Math.min(config.maxPinnedCids, 1000);
-  const [pinSetResponse, rewardableResponse] = await Promise.all([
-    api.getPublicPinSet({ limit, offset: 0 }),
+  const pageSize = 1000;
+  const [firstPinSetPage, rewardableResponse] = await Promise.all([
+    api.getPublicPinSet({ limit: pageSize, offset: 0 }),
     api.getRewardableCids({ limit: 500, offset: 0 }),
   ]);
-  const publicPinSet = pinSetResponse.records || [];
+  // The server's completeness bit is authoritative. Fetch every page before
+  // establishing the local desired plan, so a capacity-limited plan is never
+  // confused with an incomplete canonical response.
+  const allRecords = [...(firstPinSetPage.records || [])];
+  const total = Number(firstPinSetPage.count || 0);
+  for (let offset = allRecords.length; offset < total; offset += pageSize) {
+    const page = await api.getPublicPinSet({ limit: pageSize, offset });
+    if (page.complete !== true || Number(page.count) !== total) {
+      throw new Error('The canonical public pin set changed during synchronization.');
+    }
+    allRecords.push(...(page.records || []));
+  }
+  const pinSetResponse = firstPinSetPage;
+  const publicPinSet = allRecords;
+  // A partial first page must never be treated as the canonical archive.  This
+  // also makes an explicitly complete, genuinely empty archive distinguishable
+  // from an unavailable or incomplete response.
+  if (pinSetResponse.complete !== true || total !== publicPinSet.length) {
+    throw new Error('The canonical public pin set is incomplete.');
+  }
   const desired = planPublicPins(publicPinSet, config.maxPinnedCids, config.maxPinnedBytes, config.cidClassFilters);
   const rewardable = (rewardableResponse.records || [])
     .filter((record) => classFilterAllows(record, config.cidClassFilters));
@@ -70,6 +89,7 @@ export async function syncPublicPinSet(api: KubusApiClient, store: LocalStore, c
     state.rewardableCids = rewardable;
     state.desiredCids = desired;
     state.publicPinSetTotal = pinSetResponse.count;
+    state.publicPinSetComplete = pinSetResponse.complete === true;
     state.rewardableCidTotal = rewardableResponse.count;
     state.latestPublicPinSetSyncAt = new Date().toISOString();
   });

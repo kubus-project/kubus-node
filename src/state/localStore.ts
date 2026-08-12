@@ -26,6 +26,8 @@ export interface LocalState {
   pinnedCids: string[];
   failedCids: Record<string, { error: string; at: string }>;
   publicPinSetTotal?: number;
+  /** Authoritative completeness marker for the last canonical pin-set sync. */
+  publicPinSetComplete?: boolean;
   rewardableCidTotal?: number;
   latestPublicPinSetSyncAt?: string;
   latestPinReconcileAt?: string;
