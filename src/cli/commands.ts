@@ -40,6 +40,13 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   await computeIdentity.initialize();
   const pairing = new PairingService(store, config);
   const captures = new CaptureStore(config.localDataPath, store);
+  // Streaming-upload drafts are in-memory, so a restart mid-transfer leaves a
+  // capture directory with no owner. Reclaim those before serving, or every
+  // interrupted upload permanently consumes disk.
+  const reclaimedCaptures = await captures.reclaimOrphanedDirectories();
+  if (reclaimedCaptures > 0) {
+    logger.info(`captures: reclaimed ${reclaimedCaptures} orphaned capture ${reclaimedCaptures === 1 ? 'directory' : 'directories'}`);
+  }
   const jobs = new JobRuntime({ store, captureStore: captures, kubo, logger, dataRoot: config.localDataPath, workerUrl: config.spatialWorkerUrl, concurrency: config.jobConcurrency, participationGate, workerAuth, capabilities });
   const privateTransport = new PrivatePayloadTransport({ captures, kubo, store, identity: computeIdentity, dataRoot: config.localDataPath, maxInputBytes: config.remoteComputeMaxInputBytes });
   const remoteCompute = new RemoteComputeRuntime({ api, kubo, store, config, captures, jobs, gate: participationGate, identity: computeIdentity, transport: privateTransport, logger });
