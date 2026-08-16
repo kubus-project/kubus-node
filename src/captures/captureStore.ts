@@ -62,6 +62,16 @@ interface DraftEntry {
   draft: CaptureDraft;
   payload: CaptureDraftPayload;
   files: Map<string, { bytes: number; mimeType?: string }>;
+
+  /**
+   * Serializes mutations of this draft.
+   *
+   * Accounting is a read-modify-write around filesystem awaits, so concurrent
+   * uploads to the same draft would otherwise each compute a total from the
+   * same pre-write value and the last writer would clobber the rest. That both
+   * under-reports size and lets the file and byte ceilings be exceeded.
+   */
+  lock: Promise<unknown>;
 }
 
 export class CaptureStore {
@@ -147,7 +157,12 @@ export class CaptureStore {
       fileCount: 0,
       sizeBytes: 0,
     };
-    this.drafts.set(id, { draft, payload, files: new Map() });
+    this.drafts.set(id, {
+      draft,
+      payload,
+      files: new Map(),
+      lock: Promise.resolve(),
+    });
     return structuredClone(draft);
   }
 
@@ -165,6 +180,24 @@ export class CaptureStore {
   ): Promise<CaptureDraft> {
     const entry = this.drafts.get(id);
     if (!entry) throw localError(404, 'capture_draft_not_found');
+
+    // Queue behind any in-flight mutation of this draft. Chained on the entry
+    // so uploads to different drafts still proceed in parallel.
+    const result = entry.lock.then(
+      () => this.writeDraftFileExclusive(entry, rawPath, bytes, mimeType),
+    );
+    // Keep the chain alive even if this write rejects, so one failed upload
+    // does not poison every later one.
+    entry.lock = result.catch(() => undefined);
+    return result;
+  }
+
+  private async writeDraftFileExclusive(
+    entry: DraftEntry,
+    rawPath: string,
+    bytes: Buffer,
+    mimeType?: string,
+  ): Promise<CaptureDraft> {
     const relative = safeRelativePath(rawPath);
     const target = path.join(entry.draft.directory, relative);
     if (!target.startsWith(`${entry.draft.directory}${path.sep}`)) {
@@ -233,6 +266,53 @@ export class CaptureStore {
     if (!entry) throw localError(404, 'capture_draft_not_found');
     this.drafts.delete(id);
     await fs.rm(entry.draft.directory, { recursive: true, force: true });
+  }
+
+  /**
+   * Deletes capture directories that no longer belong to anything.
+   *
+   * Drafts are in-memory, so a node restart between the first upload and the
+   * commit leaves a directory on disk with no state entry and no way for the
+   * client to reach it. Without this sweep every interrupted transfer would
+   * strand up to the per-capture ceiling and eventually exhaust the disk.
+   *
+   * Only directories unknown to both `state.captures` and the live draft map
+   * are removed, so a committed capture and an upload in progress are never
+   * touched. Returns the number reclaimed.
+   */
+  async reclaimOrphanedDirectories(): Promise<number> {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(this.root);
+    } catch {
+      // No capture root yet: nothing to reclaim.
+      return 0;
+    }
+
+    const known = new Set(Object.keys(this.store.snapshot().captures || {}));
+    let removed = 0;
+    for (const name of entries) {
+      if (known.has(name) || this.drafts.has(name)) continue;
+      const directory = path.join(this.root, name);
+      try {
+        const stat = await fs.stat(directory);
+        if (!stat.isDirectory()) continue;
+        await fs.rm(directory, { recursive: true, force: true });
+        removed += 1;
+      } catch {
+        // A directory that cannot be removed is left for the next sweep
+        // rather than failing startup.
+      }
+    }
+    return removed;
+  }
+
+  /**
+   * Drops in-memory drafts without touching disk, reproducing what a node
+   * restart leaves behind.
+   */
+  async forgetDraftsForTesting(): Promise<void> {
+    this.drafts.clear();
   }
 
   /** Draft progress, so a client can resume without re-uploading. */

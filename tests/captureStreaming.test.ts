@@ -167,6 +167,115 @@ describe('streaming capture validation', () => {
   });
 });
 
+describe('concurrent draft accounting', () => {
+  it('parallel uploads to one draft do not lose size', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+
+    // Read-modify-write around filesystem awaits: without serialization both
+    // requests compute their total from the same pre-write value and the last
+    // writer clobbers the other, reporting 100 bytes for 200 written.
+    await Promise.all([
+      store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(100)),
+      store.writeDraftFile(draft.id, 'rgb/00001.jpg', Buffer.alloc(100)),
+    ]);
+
+    const progress = store.getDraft(draft.id);
+    expect(progress.fileCount).toBe(2);
+    expect(progress.sizeBytes).toBe(200);
+  });
+
+  it('many parallel uploads stay consistent', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+
+    await Promise.all(
+      Array.from({ length: 25 }, (_, i) =>
+        store.writeDraftFile(draft.id, `rgb/${String(i).padStart(5, '0')}.jpg`, Buffer.alloc(10)),
+      ),
+    );
+
+    const progress = store.getDraft(draft.id);
+    expect(progress.fileCount).toBe(25);
+    expect(progress.sizeBytes).toBe(250);
+    expect(progress.files).toHaveLength(25);
+  });
+
+  it('parallel overwrites of one path settle on a single file', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+
+    await Promise.all([
+      store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(30)),
+      store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(30)),
+    ]);
+
+    const progress = store.getDraft(draft.id);
+    expect(progress.fileCount).toBe(1);
+    expect(progress.sizeBytes).toBe(30);
+  });
+
+  it('a rejected upload does not poison later uploads on the same draft', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+
+    await expect(
+      store.writeDraftFile(draft.id, '../escape.jpg', Buffer.alloc(4)),
+    ).rejects.toBeTruthy();
+
+    const progress = await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(12));
+    expect(progress.fileCount).toBe(1);
+    expect(progress.sizeBytes).toBe(12);
+  });
+});
+
+describe('orphaned draft reclamation', () => {
+  it('removes a capture directory left by a restart mid-upload', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+    await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(64));
+
+    // Simulate a restart: the in-memory draft is gone, the directory is not.
+    await store.forgetDraftsForTesting();
+    await expect(fs.access(draft.directory)).resolves.toBeUndefined();
+
+    const reclaimed = await store.reclaimOrphanedDirectories();
+
+    expect(reclaimed).toBe(1);
+    await expect(fs.access(draft.directory)).rejects.toThrow();
+  });
+
+  it('never removes a committed capture', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+    await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(8));
+    const record = await store.commitDraft(draft.id);
+
+    const reclaimed = await store.reclaimOrphanedDirectories();
+
+    expect(reclaimed).toBe(0);
+    await expect(fs.access(record.directory)).resolves.toBeUndefined();
+    expect(store.get(record.id).id).toBe(record.id);
+  });
+
+  it('never removes an upload still in progress', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+    await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(8));
+
+    const reclaimed = await store.reclaimOrphanedDirectories();
+
+    expect(reclaimed).toBe(0);
+    await expect(fs.access(draft.directory)).resolves.toBeUndefined();
+  });
+
+  it('is safe to run when no captures exist', async () => {
+    const store = await newStore();
+
+    await expect(store.reclaimOrphanedDirectories()).resolves.toBe(0);
+  });
+});
+
 describe('streaming capture lifecycle', () => {
   it('discarding a draft deletes everything uploaded', async () => {
     const store = await newStore();
