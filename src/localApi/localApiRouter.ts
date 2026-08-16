@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { KubusApiClient } from '../backend/kubusApiClient.js';
 import type { CapabilityRegistry } from '../capabilities/registry.js';
-import type { CapturePackagePayload, CaptureStore } from '../captures/captureStore.js';
+import type { CaptureDraftPayload, CapturePackagePayload, CaptureStore } from '../captures/captureStore.js';
 import type { AppConfig } from '../config/schema.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import type { JobRuntime, JobType } from '../jobs/jobRuntime.js';
@@ -104,6 +104,49 @@ export async function handleLocalApi(req: IncomingMessage, res: ServerResponse, 
     json(res, 201, await deps.captures.create(await readJson(req, 256 * 1024 * 1024) as unknown as CapturePackagePayload));
     return true;
   }
+  // Streaming capture upload. Additive: the JSON endpoint above is unchanged,
+  // so existing clients keep working. Files are sent as raw bytes rather than
+  // base64 inside one document, so neither side holds the whole capture in
+  // memory and an interrupted transfer can resume.
+  if (req.method === 'POST' && parsed.pathname === '/local/v1/captures/drafts') {
+    if (!await deps.pairing.authorize(token, 'captures:create')) throw localError(403, 'scope_required');
+    const body = await readJson(req, 64 * 1024) as unknown as CaptureDraftPayload;
+    json(res, 201, await deps.captures.beginDraft(body));
+    return true;
+  }
+  const draftFileMatch = parsed.pathname.match(/^\/local\/v1\/captures\/drafts\/([^/]+)\/files$/);
+  if (req.method === 'PUT' && draftFileMatch) {
+    if (!await deps.pairing.authorize(token, 'captures:create')) throw localError(403, 'scope_required');
+    const filePath = parsed.searchParams.get('path');
+    if (!filePath) throw localError(400, 'capture_file_path_invalid');
+    const bytes = await readBinary(req, 128 * 1024 * 1024);
+    const mimeType = req.headers['content-type'];
+    json(res, 200, await deps.captures.writeDraftFile(
+      draftFileMatch[1]!,
+      filePath,
+      bytes,
+      typeof mimeType === 'string' && mimeType !== 'application/octet-stream' ? mimeType : undefined,
+    ));
+    return true;
+  }
+  const draftMatch = parsed.pathname.match(/^\/local\/v1\/captures\/drafts\/([^/]+)$/);
+  if (req.method === 'GET' && draftMatch) {
+    json(res, 200, deps.captures.getDraft(draftMatch[1]!));
+    return true;
+  }
+  if (req.method === 'DELETE' && draftMatch) {
+    if (!await deps.pairing.authorize(token, 'captures:create')) throw localError(403, 'scope_required');
+    await deps.captures.discardDraft(draftMatch[1]!);
+    json(res, 200, { discarded: true });
+    return true;
+  }
+  const draftCommitMatch = parsed.pathname.match(/^\/local\/v1\/captures\/drafts\/([^/]+)\/commit$/);
+  if (req.method === 'POST' && draftCommitMatch) {
+    if (!await deps.pairing.authorize(token, 'captures:create')) throw localError(403, 'scope_required');
+    json(res, 201, await deps.captures.commitDraft(draftCommitMatch[1]!));
+    return true;
+  }
+
   const captureMatch = parsed.pathname.match(/^\/local\/v1\/captures\/([^/]+)$/);
   if (captureMatch && req.method === 'GET') { json(res, 200, deps.captures.get(captureMatch[1]!)); return true; }
   if (captureMatch && req.method === 'DELETE') { await deps.captures.delete(captureMatch[1]!); json(res, 200, { deleted: true }); return true; }
@@ -214,6 +257,25 @@ function matchesGuiToken(req: IncomingMessage, expected?: string): boolean { ret
 function isLoopback(address?: string): boolean { return ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address || ''); }
 function securityHeaders(res: ServerResponse): void { res.setHeader('Access-Control-Allow-Origin', 'null'); res.setHeader('Referrer-Policy', 'no-referrer'); res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Cache-Control', 'no-store'); }
 function json(res: ServerResponse, status: number, value: unknown): void { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(`${JSON.stringify({ success: true, data: value })}\n`); }
+/**
+ * Reads a raw request body.
+ *
+ * Used by the streaming capture upload so file bytes never pass through
+ * base64, which inflates a package by roughly a third on the wire.
+ */
+async function readBinary(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const bytes = Buffer.from(chunk);
+    size += bytes.length;
+    if (size > maxBytes) throw localError(413, 'request_too_large');
+    chunks.push(bytes);
+  }
+  if (size === 0) throw localError(400, 'capture_file_empty');
+  return Buffer.concat(chunks);
+}
+
 async function readJson(req: IncomingMessage, maxBytes = 1024 * 1024): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = []; let size = 0;
   for await (const chunk of req) { const bytes = Buffer.from(chunk); size += bytes.length; if (size > maxBytes) throw localError(413, 'request_too_large'); chunks.push(bytes); }

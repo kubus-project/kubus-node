@@ -1,0 +1,208 @@
+import { afterEach, describe, expect, it } from 'vitest';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { CaptureStore, type CaptureDraftPayload } from '../src/captures/captureStore.js';
+import { LocalStore } from '../src/state/localStore.js';
+
+const dirs: string[] = [];
+afterEach(async () =>
+  Promise.all(dirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true }))),
+);
+
+async function newStore(): Promise<CaptureStore> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-capture-stream-'));
+  dirs.push(dir);
+  const local = new LocalStore(path.join(dir, 'state.json'));
+  await local.load();
+  return new CaptureStore(dir, local);
+}
+
+const draftPayload: CaptureDraftPayload = {
+  schema: 'kubus.capture/1',
+  artworkId: 'art-1',
+  capturedAt: '2026-01-01T00:00:00.000Z',
+  metadata: { source: 'art.kubus-mobile-tracking', private: true },
+};
+
+describe('streaming capture upload', () => {
+  it('stores files as raw bytes without base64 on the wire', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+
+    const payload = Buffer.from([0xff, 0xd8, 0xff, 0x00, 0x01]);
+    await store.writeDraftFile(draft.id, 'rgb/00000.jpg', payload, 'image/jpeg');
+    const record = await store.commitDraft(draft.id);
+
+    const written = await fs.readFile(path.join(record.directory, 'rgb/00000.jpg'));
+    expect(written.equals(payload)).toBe(true);
+    expect(record.sizeBytes).toBe(payload.byteLength);
+    expect(record.fileCount).toBe(1);
+    expect(record.state).toBe('stored');
+    expect(record.private).toBe(true);
+  });
+
+  it('accumulates size and file count across appends', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+
+    await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(100));
+    const progress = await store.writeDraftFile(draft.id, 'depth/00000.bin', Buffer.alloc(50));
+
+    expect(progress.fileCount).toBe(2);
+    expect(progress.sizeBytes).toBe(150);
+  });
+
+  it('re-uploading a path overwrites instead of duplicating', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+
+    await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(100));
+    const progress = await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(40));
+
+    // A client retrying an interrupted transfer must converge, not double up.
+    expect(progress.fileCount).toBe(1);
+    expect(progress.sizeBytes).toBe(40);
+  });
+
+  it('reports progress so an interrupted transfer can resume', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+    await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(10));
+    await store.writeDraftFile(draft.id, 'rgb/00001.jpg', Buffer.alloc(10));
+
+    const progress = store.getDraft(draft.id);
+
+    expect(progress.files).toEqual(['rgb/00000.jpg', 'rgb/00001.jpg']);
+    expect(progress.sizeBytes).toBe(20);
+  });
+
+  it('writes a manifest listing every uploaded file', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+    await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(4), 'image/jpeg');
+    await store.writeDraftFile(draft.id, 'transforms.json', Buffer.from('{}'), 'application/json');
+
+    const record = await store.commitDraft(draft.id);
+
+    const manifest = JSON.parse(
+      await fs.readFile(path.join(record.directory, 'capture.json'), 'utf8'),
+    );
+    expect(manifest.schema).toBe('kubus.capture/1');
+    expect(manifest.artworkId).toBe('art-1');
+    expect(manifest.files).toEqual([
+      { path: 'rgb/00000.jpg', mimeType: 'image/jpeg' },
+      { path: 'transforms.json', mimeType: 'application/json' },
+    ]);
+    // The manifest records paths only: bytes live on disk, never inline.
+    expect(JSON.stringify(manifest)).not.toContain('contentBase64');
+  });
+
+  it('a committed capture is retrievable like any other', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+    await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(8));
+
+    const record = await store.commitDraft(draft.id);
+
+    expect(store.get(record.id).id).toBe(record.id);
+    expect(store.list().map((r) => r.id)).toContain(record.id);
+  });
+});
+
+describe('streaming capture validation', () => {
+  it('rejects a path escaping the capture directory', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+
+    await expect(
+      store.writeDraftFile(draft.id, '../escape.jpg', Buffer.alloc(4)),
+    ).rejects.toMatchObject({ statusCode: 400, code: 'capture_file_path_invalid' });
+  });
+
+  it('contains an absolute-looking path inside the capture directory', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+
+    // Leading slashes are stripped rather than rejected, so the write lands
+    // under the capture directory instead of escaping to a system path.
+    await store.writeDraftFile(draft.id, '/etc/passwd', Buffer.alloc(4));
+    const record = await store.commitDraft(draft.id);
+
+    const written = path.join(record.directory, 'etc/passwd');
+    await expect(fs.access(written)).resolves.toBeUndefined();
+    expect(written.startsWith(record.directory)).toBe(true);
+  });
+
+  it('rejects a Windows-style path escaping the capture directory', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+
+    await expect(
+      store.writeDraftFile(draft.id, '..\\..\\escape.jpg', Buffer.alloc(4)),
+    ).rejects.toMatchObject({ statusCode: 400, code: 'capture_file_path_invalid' });
+  });
+
+  it('rejects an invalid draft payload', async () => {
+    const store = await newStore();
+
+    await expect(
+      store.beginDraft({ ...draftPayload, capturedAt: '' }),
+    ).rejects.toMatchObject({ statusCode: 400, code: 'capture_package_invalid' });
+  });
+
+  it('rejects writes to an unknown draft', async () => {
+    const store = await newStore();
+
+    await expect(
+      store.writeDraftFile('nope', 'rgb/0.jpg', Buffer.alloc(4)),
+    ).rejects.toMatchObject({ statusCode: 404, code: 'capture_draft_not_found' });
+  });
+
+  it('refuses to commit an empty capture', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+
+    await expect(store.commitDraft(draft.id)).rejects.toMatchObject({ statusCode: 400, code: 'capture_package_empty' });
+  });
+});
+
+describe('streaming capture lifecycle', () => {
+  it('discarding a draft deletes everything uploaded', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+    await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(16));
+
+    await store.discardDraft(draft.id);
+
+    await expect(fs.access(draft.directory)).rejects.toThrow();
+    expect(() => store.getDraft(draft.id)).toThrow();
+  });
+
+  it('a committed draft can no longer be appended to', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+    await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(4));
+    await store.commitDraft(draft.id);
+
+    await expect(
+      store.writeDraftFile(draft.id, 'rgb/00001.jpg', Buffer.alloc(4)),
+    ).rejects.toMatchObject({ statusCode: 404, code: 'capture_draft_not_found' });
+  });
+
+  it('the existing JSON endpoint is unchanged', async () => {
+    const store = await newStore();
+
+    // Additive change: the base64 package path must keep working for clients
+    // that have not migrated.
+    const record = await store.create({
+      schema: 'kubus.capture/1',
+      capturedAt: '2026-01-01T00:00:00.000Z',
+      metadata: { private: true },
+      files: [{ path: 'rgb/00000.jpg', contentBase64: Buffer.alloc(6).toString('base64') }],
+    });
+
+    expect(record.fileCount).toBe(1);
+    expect(record.sizeBytes).toBe(6);
+  });
+});
