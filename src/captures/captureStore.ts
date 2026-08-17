@@ -47,6 +47,27 @@ export interface CaptureRecord {
   fileCount: number;
   directory: string;
   retention?: { deleteAfter?: string };
+
+  /**
+   * Client-supplied idempotency key from `metadata.localCaptureId`.
+   *
+   * Lets a retry after a lost commit response converge on the same capture
+   * instead of creating a duplicate.
+   */
+  localCaptureId?: string;
+}
+
+/**
+ * Client-supplied idempotency key, if present.
+ *
+ * Optional: clients that do not send one keep the previous behaviour, where
+ * every commit creates a new capture.
+ */
+function localCaptureIdOf(payload: { metadata?: Record<string, unknown> }): string | undefined {
+  const raw = payload.metadata?.localCaptureId;
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 && trimmed.length <= 200 ? trimmed : undefined;
 }
 
 function safeRelativePath(raw: string): string {
@@ -219,11 +240,32 @@ export class CaptureStore {
     return structuredClone(entry.draft);
   }
 
-  /** Finalizes a draft into a stored capture. */
+  /**
+   * Finalizes a draft into a stored capture.
+   *
+   * Idempotent on `metadata.localCaptureId` when the client supplies one. If
+   * the commit response is lost the client cannot tell success from failure,
+   * and its retry would otherwise upload a fresh draft and produce a second
+   * durable capture plus duplicate processing work. Returning the existing
+   * record instead makes the retry converge.
+   */
   async commitDraft(id: string): Promise<CaptureRecord> {
     const entry = this.drafts.get(id);
     if (!entry) throw localError(404, 'capture_draft_not_found');
     if (entry.files.size === 0) throw localError(400, 'capture_package_empty');
+
+    const localCaptureId = localCaptureIdOf(entry.payload);
+    if (localCaptureId) {
+      const existing = (Object.values(this.store.snapshot().captures || {}) as CaptureRecord[])
+        .find((record) => record.localCaptureId === localCaptureId);
+      if (existing) {
+        // A retry of an already-committed capture. Drop the redundant upload
+        // rather than leaving its directory stranded on disk.
+        this.drafts.delete(id);
+        await fs.rm(entry.draft.directory, { recursive: true, force: true });
+        return structuredClone(existing);
+      }
+    }
 
     const { draft, payload } = entry;
     try {
@@ -244,6 +286,7 @@ export class CaptureStore {
         fileCount: entry.files.size,
         directory: draft.directory,
         retention: payload.retention,
+        localCaptureId,
       };
       await fs.writeFile(
         path.join(draft.directory, 'capture.json'),
