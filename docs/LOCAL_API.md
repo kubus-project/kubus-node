@@ -55,4 +55,6 @@ The draft routes are an additive alternative. The JSON endpoint is unchanged and
 
 The same limits apply as the JSON path: 5000 files and 5 GiB per capture. Path traversal is rejected; leading slashes are stripped so a path can only resolve inside the capture directory.
 
+Set `metadata.localCaptureId` to a stable client-side id. Commit is idempotent on it: if the commit response is lost, the client cannot tell success from failure, and a retry that uploads a fresh draft would otherwise create a second durable capture and duplicate processing work. With the key present, a repeat commit returns the existing record and discards the redundant upload. Clients that omit it keep the previous behaviour, where every commit creates a new capture.
+
 Drafts are in-memory: a draft is a transfer in progress, not durable state. A node restart mid-upload abandons the draft and the client retries, the same as any other interrupted transfer. Committed captures are durable and private exactly as before.

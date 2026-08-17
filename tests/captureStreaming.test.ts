@@ -276,6 +276,68 @@ describe('orphaned draft reclamation', () => {
   });
 });
 
+describe('commit idempotency', () => {
+  const keyed: CaptureDraftPayload = {
+    ...draftPayload,
+    metadata: { ...draftPayload.metadata, localCaptureId: 'capture-local-1' },
+  };
+
+  it('a retry after a lost commit response returns the same capture', async () => {
+    const store = await newStore();
+    const first = await store.beginDraft(keyed);
+    await store.writeDraftFile(first.id, 'rgb/00000.jpg', Buffer.alloc(8));
+    const committed = await store.commitDraft(first.id);
+
+    // The client never saw the response, so it uploads a fresh draft and
+    // commits again with the same local capture id.
+    const retry = await store.beginDraft(keyed);
+    await store.writeDraftFile(retry.id, 'rgb/00000.jpg', Buffer.alloc(8));
+    const second = await store.commitDraft(retry.id);
+
+    expect(second.id).toBe(committed.id);
+    expect(store.list()).toHaveLength(1);
+  });
+
+  it('a redundant retry leaves no stranded directory', async () => {
+    const store = await newStore();
+    const first = await store.beginDraft(keyed);
+    await store.writeDraftFile(first.id, 'rgb/00000.jpg', Buffer.alloc(8));
+    await store.commitDraft(first.id);
+
+    const retry = await store.beginDraft(keyed);
+    await store.writeDraftFile(retry.id, 'rgb/00000.jpg', Buffer.alloc(8));
+    await store.commitDraft(retry.id);
+
+    await expect(fs.access(retry.directory)).rejects.toThrow();
+    expect(await store.reclaimOrphanedDirectories()).toBe(0);
+  });
+
+  it('distinct local capture ids still create distinct captures', async () => {
+    const store = await newStore();
+    for (const id of ['capture-local-1', 'capture-local-2']) {
+      const draft = await store.beginDraft({
+        ...draftPayload,
+        metadata: { ...draftPayload.metadata, localCaptureId: id },
+      });
+      await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(8));
+      await store.commitDraft(draft.id);
+    }
+
+    expect(store.list()).toHaveLength(2);
+  });
+
+  it('captures without an idempotency key keep the previous behaviour', async () => {
+    const store = await newStore();
+    for (let i = 0; i < 2; i++) {
+      const draft = await store.beginDraft(draftPayload);
+      await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(8));
+      await store.commitDraft(draft.id);
+    }
+
+    expect(store.list()).toHaveLength(2);
+  });
+});
+
 describe('streaming capture lifecycle', () => {
   it('discarding a draft deletes everything uploaded', async () => {
     const store = await newStore();
