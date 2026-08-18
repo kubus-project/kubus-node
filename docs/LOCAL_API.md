@@ -11,7 +11,7 @@ The local API shares services and one HTTP listener with the GUI, but authentica
 | GET | `/local/v1/network` | `content:read` |
 | GET | `/local/v1/storage` | `content:read` |
 | GET | `/local/v1/content/:cid` | `content:read` |
-| POST | `/local/v1/pairing/session` | loopback or GUI admin token |
+| POST | `/local/v1/pairing/session` | GUI admin token (always required) |
 | POST | `/local/v1/pairing/exchange` | valid one-time secret |
 | POST | `/local/v1/captures` | `captures:create` |
 | POST | `/local/v1/captures/drafts` | `captures:create` |
@@ -34,6 +34,8 @@ The local API shares services and one HTTP listener with the GUI, but authentica
 | POST | `/local/v1/compute/jobs/:id/cancel` | `jobs:read` |
 
 Pairing secrets expire after `PAIRING_SESSION_TTL_SECONDS`, are single-use, and are stored only as SHA-256 hashes. Local credentials are returned once and stored only as hashes by the node. The Flutter app stores its credential in platform secure storage.
+
+Normal operator activation happens through the authenticated `/gui/api/pairing/session` action. Direct `/local/v1/pairing/session` bootstrap always requires `NODE_GUI_TOKEN`, even from loopback, because a public reverse proxy may itself connect to the node over loopback.
 
 Set `LOCAL_API_ALLOW_LAN=true` intentionally for phone pairing and configure `LOCAL_API_LAN_URL` to a phone-reachable private address. Never advertise loopback or a wildcard bind. For remote access, configure `LOCAL_API_REMOTE_URL` to an operator-managed **HTTPS** reverse proxy or tunnel (Tailscale Serve/Funnel, Cloudflare Tunnel, Caddy/nginx, or an equivalent). The Node API can remain loopback-bound behind that proxy; provider choice is not part of the application protocol. Keep the operator GUI localhost/private by default. The API rejects browser `Origin` requests and does not enable permissive CORS. Never put tokens in URLs or logs.
 

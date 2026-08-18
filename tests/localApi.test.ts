@@ -28,6 +28,7 @@ describe('local/v1 authorization', () => {
       localApiAllowLan: false,
       localApiLanUrl: 'http://192.168.1.24:8787',
       localApiRemoteUrl: 'https://node.example.test',
+      guiToken: 'pairing-activation-token',
       nodeLabel: 'test-node',
       pairingSessionTtlMs: 60_000,
     } as AppConfig;
@@ -63,7 +64,12 @@ describe('local/v1 authorization', () => {
       const unauthorized = await fetch(`${base}/local/v1/info`);
       expect(unauthorized.status).toBe(401);
 
-      const sessionResponse = await fetch(`${base}/local/v1/pairing/session`, { method: 'POST' });
+      const unactivatedSession = await fetch(`${base}/local/v1/pairing/session`, { method: 'POST' });
+      expect(unactivatedSession.status).toBe(401);
+      const sessionResponse = await fetch(`${base}/local/v1/pairing/session`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer pairing-activation-token' },
+      });
       const sessionBody = await sessionResponse.json() as { data: { sessionId: string; secret: string } };
       const exchangeResponse = await fetch(`${base}/local/v1/pairing/exchange`, {
         method: 'POST',
@@ -107,6 +113,7 @@ describe('local/v1 capability state', () => {
       guiEnabled: false, guiHost: '127.0.0.1', guiPort: 0,
       localApiEnabled: true, localApiHost: '127.0.0.1', localApiPort: 0, localApiAllowLan: false, localApiLanUrl: 'http://192.168.1.24:8787',
       localApiRemoteUrl: 'https://node.example.test',
+      guiToken: 'pairing-activation-token',
       nodeLabel: 'test-node', pairingSessionTtlMs: 60_000,
     } as AppConfig;
     const kubo = { id: async () => ({ ID: 'peer-1' }), version: async () => ({ Version: '0.41.0' }), repoStat: async () => ({ RepoSize: 0, StorageMax: 0 }) };
@@ -124,7 +131,10 @@ describe('local/v1 capability state', () => {
       logger: { info: () => undefined } as never, actionLock: new ActionLock(), localApi,
     });
     const base = server.url.replace('/gui', '');
-    const sessionResponse = await fetch(`${base}/local/v1/pairing/session`, { method: 'POST' });
+    const sessionResponse = await fetch(`${base}/local/v1/pairing/session`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer pairing-activation-token' },
+    });
     const sessionBody = await sessionResponse.json() as { data: { sessionId: string; secret: string } };
     const exchangeResponse = await fetch(`${base}/local/v1/pairing/exchange`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(sessionBody.data),

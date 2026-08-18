@@ -43,7 +43,11 @@ export async function handleLocalApi(req: IncomingMessage, res: ServerResponse, 
   if (!deps.config.localApiAllowLan && !isLoopback(req.socket.remoteAddress)) throw localError(403, 'lan_api_disabled');
 
   if (req.method === 'POST' && parsed.pathname === '/local/v1/pairing/session') {
-    if (!isLoopback(req.socket.remoteAddress) && !matchesGuiToken(req, deps.config.guiToken)) throw localError(401, 'pairing_activation_required');
+    // Do not trust the peer socket for activation: a public reverse proxy can
+    // legitimately connect from loopback. The normal local UI calls the
+    // pairing service internally; this API bootstrap requires the separate
+    // GUI administrator credential on every interface.
+    if (!matchesGuiToken(req, deps.config.guiToken)) throw localError(401, 'pairing_activation_required');
     json(res, 201, await deps.pairing.createSession());
     return true;
   }

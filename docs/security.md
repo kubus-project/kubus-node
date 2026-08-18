@@ -24,7 +24,7 @@ GUI responses and logs redact `kubus_node_...` tokens, Authorization headers, to
 
 ## Pairing and private spatial data
 
-The LAN API is disabled unless configured explicitly. The admin GUI stays localhost-only. Pairing creation requires loopback access or the separate GUI token; exchange secrets expire and cannot be replayed. Device credentials have only local content/capture/job/spatial scopes and are hashed at rest. Operator credentials, node keys, wallet keys, and settlement credentials are never returned by `/local/v1`.
+The LAN API is disabled unless configured explicitly. The admin GUI stays localhost-only. The GUI creates pairing sessions through its authenticated internal action; direct local-API pairing creation always requires the separate GUI token, including on loopback, so a reverse proxy cannot mint credentials. Exchange secrets expire and cannot be replayed. Device credentials have only local content/capture/job/spatial scopes and are hashed at rest. Operator credentials, node keys, wallet keys, and settlement credentials are never returned by `/local/v1`.
 
 Browser origins are rejected to prevent arbitrary LAN websites from calling the API. Pairing and bearer secrets must not be placed in query strings. Logs and heartbeat metadata exclude local paths, filenames, raw frames, pairing credentials, and operator secrets.
 
