@@ -191,7 +191,7 @@ function isPrivateLanHost(host: string): boolean {
   if (isLoopbackHost(normalized) || ['0.0.0.0', '::'].includes(normalized)) return false;
   if (normalized.endsWith('.local') || normalized.endsWith('.internal')) return true;
   // RFC 4193 IPv6 unique-local addresses (fc00::/7).
-  if (/^f[cd][0-9a-f]{0,2}:/.test(normalized)) return true;
+  if (/^f[cd][0-9a-f]{2}:/.test(normalized)) return true;
   if (/^10\./.test(normalized) || /^192\.168\./.test(normalized)) return true;
   const match172 = normalized.match(/^172\.(\d+)\./);
   return Boolean(match172 && Number(match172[1]) >= 16 && Number(match172[1]) <= 31);
@@ -215,5 +215,5 @@ function isPrivateRpcUrl(raw: string): boolean {
 
 export function isLoopbackHost(host: string): boolean {
   const normalized = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
-  return ['localhost', '127.0.0.1', '::1'].includes(normalized);
+  return normalized === 'localhost' || /^127\./.test(normalized) || normalized === '::1';
 }

@@ -71,6 +71,8 @@ describe('parseEnv', () => {
     for (const endpoint of [
       'https://localhost:8787',
       'https://127.0.0.1:8787',
+      'https://127.0.0.2:8787',
+      'https://127.255.255.255:8787',
       'https://0.0.0.0:8787',
       'https://[::1]:8787',
       'https://[::]:8787',
@@ -106,6 +108,20 @@ describe('parseEnv', () => {
       LOCAL_API_PUBLIC_URL: 'http://[fcab::42]:8787',
     });
     expect(legacy.localApiLanUrl).toBe('http://[fcab::42]:8787');
+  });
+
+  it('rejects IPv6 addresses outside the exact RFC 4193 ULA range', () => {
+    for (const endpoint of [
+      'http://[fc::1]:8787',
+      'http://[fcd::1]:8787',
+      'http://[fe00::1]:8787',
+    ]) {
+      expect(() => parseEnv({
+        ...baseEnv,
+        LOCAL_API_ALLOW_LAN: 'true',
+        LOCAL_API_LAN_URL: endpoint,
+      })).toThrow(/private LAN host/);
+    }
   });
 
   it('brackets a derived IPv6 unique-local endpoint', () => {
