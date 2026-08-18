@@ -74,12 +74,18 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const localApiHost = (env.LOCAL_API_HOST || guiHost).trim() || guiHost;
   const localApiPort = parseOptionalIntEnv(env, 'LOCAL_API_PORT', guiPort, 1);
   const localApiAllowLan = boolEnv(env, 'LOCAL_API_ALLOW_LAN', false);
-  const legacyLocalApiUrl = parseLegacyApiUrl(env.LOCAL_API_PUBLIC_URL?.trim());
-  const localApiLanUrl = env.LOCAL_API_LAN_URL?.trim()
-    ? parseLanApiUrl(env.LOCAL_API_LAN_URL.trim(), 'LOCAL_API_LAN_URL')
+  const explicitLanUrl = env.LOCAL_API_LAN_URL?.trim();
+  const explicitRemoteUrl = env.LOCAL_API_REMOTE_URL?.trim();
+  const legacyLocalApiUrl = parseLegacyApiUrl(
+    env.LOCAL_API_PUBLIC_URL?.trim(),
+    !explicitLanUrl,
+    !explicitRemoteUrl,
+  );
+  const localApiLanUrl = explicitLanUrl
+    ? parseLanApiUrl(explicitLanUrl, 'LOCAL_API_LAN_URL')
     : legacyLocalApiUrl.lanUrl ?? deriveLanApiUrl(localApiHost, localApiPort, localApiAllowLan);
-  const localApiRemoteUrl = env.LOCAL_API_REMOTE_URL?.trim()
-    ? parseRemoteApiUrl(env.LOCAL_API_REMOTE_URL.trim(), 'LOCAL_API_REMOTE_URL')
+  const localApiRemoteUrl = explicitRemoteUrl
+    ? parseRemoteApiUrl(explicitRemoteUrl, 'LOCAL_API_REMOTE_URL')
     : legacyLocalApiUrl.remoteUrl;
   if (guiEnabled && localApiEnabled && (localApiPort !== guiPort || localApiHost !== guiHost)) {
     throw new Error('LOCAL_API_HOST/PORT must match NODE_GUI_HOST/PORT when both services are enabled');
@@ -154,18 +160,26 @@ function parseRemoteApiUrl(value: string, key: string): string {
   return parsed.toString().replace(/\/$/, '');
 }
 
-function parseLegacyApiUrl(value: string | undefined): { lanUrl?: string; remoteUrl?: string } {
+function parseLegacyApiUrl(
+  value: string | undefined,
+  acceptLan = true,
+  acceptRemote = true,
+): { lanUrl?: string; remoteUrl?: string } {
   if (!value) return {};
+  if (!acceptLan && !acceptRemote) return {};
   const parsed = new URL(parseUrl(value, 'LOCAL_API_PUBLIC_URL'));
   if (isPrivateLanHost(parsed.hostname)) {
+    if (!acceptLan) return {};
     return { lanUrl: parseLanApiUrl(value, 'LOCAL_API_PUBLIC_URL') };
   }
+  if (!acceptRemote) return {};
   return { remoteUrl: parseRemoteApiUrl(value, 'LOCAL_API_PUBLIC_URL') };
 }
 
 function deriveLanApiUrl(host: string, port: number, enabled: boolean): string | undefined {
   if (!enabled || !isPrivateLanHost(host)) return undefined;
-  return `http://${host}:${port}`;
+  const urlHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+  return `http://${urlHost}:${port}`;
 }
 
 function isPrivateLanHost(host: string): boolean {

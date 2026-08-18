@@ -94,4 +94,33 @@ describe('parseEnv', () => {
     });
     expect(legacy.localApiLanUrl).toBe('http://[fcab::42]:8787');
   });
+
+  it('brackets a derived IPv6 unique-local endpoint', () => {
+    const config = parseEnv({
+      ...baseEnv,
+      LOCAL_API_ALLOW_LAN: 'true',
+      LOCAL_API_HOST: 'fd00::1',
+      LOCAL_API_PORT: '8787',
+    });
+    expect(config.localApiLanUrl).toBe('http://[fd00::1]:8787');
+  });
+
+  it('ignores a stale legacy value when its endpoint slot is replaced', () => {
+    const remote = parseEnv({
+      ...baseEnv,
+      LOCAL_API_PUBLIC_URL: 'http://public.example.test',
+      LOCAL_API_REMOTE_URL: 'https://current.example.test',
+    });
+    expect(remote.localApiRemoteUrl).toBe('https://current.example.test');
+
+    const complete = parseEnv({
+      ...baseEnv,
+      LOCAL_API_PUBLIC_URL: 'not-a-url',
+      LOCAL_API_ALLOW_LAN: 'true',
+      LOCAL_API_LAN_URL: 'http://192.168.1.24:8787',
+      LOCAL_API_REMOTE_URL: 'https://current.example.test',
+    });
+    expect(complete.localApiLanUrl).toBe('http://192.168.1.24:8787');
+    expect(complete.localApiRemoteUrl).toBe('https://current.example.test');
+  });
 });
