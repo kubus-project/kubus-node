@@ -159,7 +159,7 @@ function parseRemoteApiUrl(value: string, key: string): string {
   const parsed = new URL(parseUrl(value, key));
   if (parsed.protocol !== 'https:') throw new Error(`${key} must use HTTPS`);
   const host = parsed.hostname.toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
-  if (isLoopbackHost(host) || ['0.0.0.0', '::'].includes(host)) {
+  if (isLoopbackHost(host) || isWildcardHost(host)) {
     throw new Error(`${key} must use a phone-reachable host, never loopback or a wildcard bind`);
   }
   return parsed.toString().replace(/\/$/, '');
@@ -189,17 +189,39 @@ function deriveLanApiUrl(host: string, port: number, enabled: boolean): string |
 
 function isPrivateLanHost(host: string): boolean {
   const normalized = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
-  if (isLoopbackHost(normalized) || ['0.0.0.0', '::'].includes(normalized)) return false;
+  if (isLoopbackHost(normalized) || isWildcardHost(normalized)) return false;
   if (normalized.endsWith('.local') || normalized.endsWith('.internal')) return true;
+  const ipv4 = ipv4Octets(normalized);
+  if (ipv4) {
+    const first = ipv4[0] ?? -1;
+    const second = ipv4[1] ?? -1;
+    return first === 10 ||
+      (first === 192 && second === 168) ||
+      (first === 172 && second >= 16 && second <= 31);
+  }
   // RFC 4193 IPv6 unique-local addresses (fc00::/7).
   if (isIP(normalized) === 6) return /^f[cd][0-9a-f]{2}:/.test(normalized);
-  if (isIP(normalized) !== 4) return false;
-  const octets = normalized.split('.').map(Number);
-  const first = octets[0] ?? -1;
-  const second = octets[1] ?? -1;
-  return first === 10 ||
-    (first === 192 && second === 168) ||
-    (first === 172 && second >= 16 && second <= 31);
+  return false;
+}
+
+function ipv4Octets(host: string): number[] | undefined {
+  if (isIP(host) === 4) return host.split('.').map(Number);
+  if (isIP(host) !== 6 || !host.startsWith('::ffff:')) return undefined;
+  const suffix = host.slice('::ffff:'.length);
+  if (isIP(suffix) === 4) return suffix.split('.').map(Number);
+  const groups = suffix.split(':');
+  if (groups.length !== 2) return undefined;
+  const high = Number.parseInt(groups[0] || '', 16);
+  const low = Number.parseInt(groups[1] || '', 16);
+  if (!Number.isFinite(high) || !Number.isFinite(low)) return undefined;
+  return [high >>> 8, high & 0xff, low >>> 8, low & 0xff];
+}
+
+function isWildcardHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
+  if (normalized === '::') return true;
+  const ipv4 = ipv4Octets(normalized);
+  return Boolean(ipv4 && ipv4.every((octet) => octet === 0));
 }
 
 export async function resolveNodeKey(config: AppConfig, store: LocalStore): Promise<string> {
@@ -220,7 +242,7 @@ function isPrivateRpcUrl(raw: string): boolean {
 
 export function isLoopbackHost(host: string): boolean {
   const normalized = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
-  return normalized === 'localhost' ||
-    (isIP(normalized) === 4 && normalized.split('.')[0] === '127') ||
-    normalized === '::1';
+  if (normalized === 'localhost' || normalized === '::1') return true;
+  const ipv4 = ipv4Octets(normalized);
+  return Boolean(ipv4 && ipv4[0] === 127);
 }

@@ -77,6 +77,9 @@ describe('parseEnv', () => {
       'https://0.0.0.0:8787',
       'https://[::1]:8787',
       'https://[::]:8787',
+      'https://[::ffff:127.0.0.1]:8787',
+      'https://[::ffff:127.255.255.255]:8787',
+      'https://[::ffff:0.0.0.0]:8787',
     ]) {
       expect(() => parseEnv({ ...baseEnv, LOCAL_API_REMOTE_URL: endpoint }))
         .toThrow(/phone-reachable/);
@@ -137,6 +140,20 @@ describe('parseEnv', () => {
         LOCAL_API_LAN_URL: endpoint,
       })).toThrow(/private LAN host/);
     }
+  });
+
+  it('applies RFC1918 rules to IPv4-mapped IPv6 LAN addresses', () => {
+    const config = parseEnv({
+      ...baseEnv,
+      LOCAL_API_ALLOW_LAN: 'true',
+      LOCAL_API_LAN_URL: 'http://[::ffff:192.168.1.24]:8787',
+    });
+    expect(config.localApiLanUrl).toBe('http://[::ffff:c0a8:118]:8787');
+    expect(() => parseEnv({
+      ...baseEnv,
+      LOCAL_API_ALLOW_LAN: 'true',
+      LOCAL_API_LAN_URL: 'http://[::ffff:203.0.113.1]:8787',
+    })).toThrow(/private LAN host/);
   });
 
   it('leaves the optional sample remote endpoint disabled', () => {
