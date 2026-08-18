@@ -461,6 +461,12 @@ function renderPairingArea() {
     '<div class="countdown t-body" id="pairingCountdown"></div>' +
     '<button class="button" id="cancelPairing">Cancel</button>' +
     '</div></section>';
+  const copyPairing = area.querySelector('[data-copy]');
+  copyPairing.addEventListener('click', async () => {
+    await navigator.clipboard.writeText(copyPairing.dataset.copy).catch(() => null);
+    announce('Copied');
+    copyPairing.textContent = 'Copied';
+  });
   $('#cancelPairing').addEventListener('click', stopPairing);
   tickPairing();
 }

@@ -157,6 +157,10 @@ function parseLanApiUrl(value: string, key: string): string {
 function parseRemoteApiUrl(value: string, key: string): string {
   const parsed = new URL(parseUrl(value, key));
   if (parsed.protocol !== 'https:') throw new Error(`${key} must use HTTPS`);
+  const host = parsed.hostname.toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
+  if (isLoopbackHost(host) || ['0.0.0.0', '::'].includes(host)) {
+    throw new Error(`${key} must use a phone-reachable host, never loopback or a wildcard bind`);
+  }
   return parsed.toString().replace(/\/$/, '');
 }
 
@@ -210,6 +214,6 @@ function isPrivateRpcUrl(raw: string): boolean {
 }
 
 export function isLoopbackHost(host: string): boolean {
-  const normalized = host.trim().toLowerCase();
+  const normalized = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
   return ['localhost', '127.0.0.1', '::1'].includes(normalized);
 }

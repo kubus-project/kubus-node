@@ -66,6 +66,15 @@ describe('local GUI safety helpers', () => {
     expect(() => new Function(guiJs)).not.toThrow();
   });
 
+  it('binds the copy action inserted with an active pairing session', () => {
+    const pairingRenderer = guiJs.slice(
+      guiJs.indexOf('function renderPairingArea()'),
+      guiJs.indexOf('function renderDiagnostics()'),
+    );
+    expect(pairingRenderer).toContain("area.querySelector('[data-copy]')");
+    expect(pairingRenderer).toContain('navigator.clipboard.writeText(copyPairing.dataset.copy)');
+  });
+
   it('escapes with the same rules as the server', () => {
     // The client carries its own copy of escapeHtml because it cannot import
     // from the runtime. If one side is ever weakened, the two diverge here.

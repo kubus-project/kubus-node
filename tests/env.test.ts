@@ -67,6 +67,19 @@ describe('parseEnv', () => {
       .toBe('https://node.example.test');
   });
 
+  it('rejects loopback and wildcard HTTPS remote endpoints', () => {
+    for (const endpoint of [
+      'https://localhost:8787',
+      'https://127.0.0.1:8787',
+      'https://0.0.0.0:8787',
+      'https://[::1]:8787',
+      'https://[::]:8787',
+    ]) {
+      expect(() => parseEnv({ ...baseEnv, LOCAL_API_REMOTE_URL: endpoint }))
+        .toThrow(/phone-reachable/);
+    }
+  });
+
   it('preserves the legacy public endpoint while deployments migrate', () => {
     expect(parseEnv({ ...baseEnv, LOCAL_API_PUBLIC_URL: 'https://legacy.example.test' }).localApiRemoteUrl)
       .toBe('https://legacy.example.test');
