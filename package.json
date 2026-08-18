@@ -1,6 +1,6 @@
 {
   "name": "@kubus/kubus-node",
-  "version": "0.8.0-alpha.4",
+  "version": "0.8.0",
   "description": "Local runtime and public archive node for art.kubus",
   "license": "UNLICENSED",
   "type": "module",
