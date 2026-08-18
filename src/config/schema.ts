@@ -38,6 +38,8 @@ export interface AppConfig {
   localApiLanUrl?: string;
   /** Optional provider-neutral HTTPS URL supplied by the operator's proxy/tunnel. */
   localApiRemoteUrl?: string;
+  /** Exact proxy peer IPs permitted to reach the API when direct LAN access is disabled. */
+  localApiTrustedProxyAddresses: string[];
   pairingSessionTtlMs: number;
   localDataPath: string;
   jobConcurrency: number;

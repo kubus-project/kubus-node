@@ -100,6 +100,23 @@ describe('parseEnv', () => {
     }).localApiRemoteUrl).toBe('https://current.example.test');
   });
 
+  it('accepts only exact trusted proxy IPs for a configured remote endpoint', () => {
+    expect(parseEnv({
+      ...baseEnv,
+      LOCAL_API_REMOTE_URL: 'https://node.example.test',
+      LOCAL_API_TRUSTED_PROXY_ADDRESSES: '172.17.0.1, ::ffff:172.17.0.1, fd00::1',
+    }).localApiTrustedProxyAddresses).toEqual(['172.17.0.1', 'fd00::1']);
+    expect(() => parseEnv({
+      ...baseEnv,
+      LOCAL_API_TRUSTED_PROXY_ADDRESSES: '172.17.0.1',
+    })).toThrow(/requires LOCAL_API_REMOTE_URL/);
+    expect(() => parseEnv({
+      ...baseEnv,
+      LOCAL_API_REMOTE_URL: 'https://node.example.test',
+      LOCAL_API_TRUSTED_PROXY_ADDRESSES: 'proxy.internal',
+    })).toThrow(/exact IP addresses/);
+  });
+
   it('accepts explicit and legacy IPv6 unique-local LAN endpoints', () => {
     const explicit = parseEnv({
       ...baseEnv,

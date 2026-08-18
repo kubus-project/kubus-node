@@ -40,7 +40,7 @@ export async function handleLocalApi(req: IncomingMessage, res: ServerResponse, 
   securityHeaders(res);
   if (!deps.config.localApiEnabled) throw localError(503, 'local_api_disabled');
   if (req.headers.origin) throw localError(403, 'browser_origin_not_allowed');
-  if (!deps.config.localApiAllowLan && !isLoopback(req.socket.remoteAddress)) throw localError(403, 'lan_api_disabled');
+  if (!isAllowedLocalApiPeer(deps.config, req.socket.remoteAddress)) throw localError(403, 'lan_api_disabled');
 
   if (req.method === 'POST' && parsed.pathname === '/local/v1/pairing/session') {
     // Do not trust the peer socket for activation: a public reverse proxy can
@@ -293,7 +293,21 @@ export async function handleLocalApi(req: IncomingMessage, res: ServerResponse, 
 
 function bearer(req: IncomingMessage): string | undefined { const value = req.headers.authorization || ''; return value.startsWith('Bearer ') ? value.slice(7).trim() : undefined; }
 function matchesGuiToken(req: IncomingMessage, expected?: string): boolean { return Boolean(expected && bearer(req) === expected); }
-function isLoopback(address?: string): boolean { return ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address || ''); }
+export function isAllowedLocalApiPeer(config: AppConfig, address?: string): boolean {
+  if (config.localApiAllowLan) return true;
+  const normalized = normalizePeerAddress(address);
+  if (normalized === '127.0.0.1' || normalized === '::1') return true;
+  return Boolean(
+    config.localApiRemoteUrl &&
+    config.localApiTrustedProxyAddresses?.some((candidate) => normalizePeerAddress(candidate) === normalized),
+  );
+}
+function normalizePeerAddress(address?: string): string {
+  const normalized = (address || '').trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '').split('%', 1)[0] || '';
+  return normalized.startsWith('::ffff:') && /^\d+\.\d+\.\d+\.\d+$/.test(normalized.slice(7))
+    ? normalized.slice(7)
+    : normalized;
+}
 function securityHeaders(res: ServerResponse): void { res.setHeader('Access-Control-Allow-Origin', 'null'); res.setHeader('Referrer-Policy', 'no-referrer'); res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Cache-Control', 'no-store'); }
 function json(res: ServerResponse, status: number, value: unknown): void { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(`${JSON.stringify({ success: true, data: value })}\n`); }
 /**

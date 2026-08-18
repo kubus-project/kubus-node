@@ -6,6 +6,7 @@ import type { AppConfig } from '../src/config/schema.js';
 import { CapabilityRegistry } from '../src/capabilities/registry.js';
 import { startGuiServer } from '../src/gui/guiServer.js';
 import { PairingService, localError } from '../src/localApi/pairingService.js';
+import { isAllowedLocalApiPeer } from '../src/localApi/localApiRouter.js';
 import { ActionLock } from '../src/runtime/actionLock.js';
 import { LocalStore } from '../src/state/localStore.js';
 
@@ -13,6 +14,19 @@ const dirs: string[] = [];
 afterEach(async () => Promise.all(dirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true }))));
 
 describe('local/v1 authorization', () => {
+  it('admits only configured reverse-proxy peers when direct LAN access is disabled', () => {
+    const config = {
+      localApiAllowLan: false,
+      localApiRemoteUrl: 'https://node.example.test',
+      localApiTrustedProxyAddresses: ['172.17.0.1'],
+    } as AppConfig;
+    expect(isAllowedLocalApiPeer(config, '127.0.0.1')).toBe(true);
+    expect(isAllowedLocalApiPeer(config, '::ffff:127.0.0.1')).toBe(true);
+    expect(isAllowedLocalApiPeer(config, '172.17.0.1')).toBe(true);
+    expect(isAllowedLocalApiPeer(config, '::ffff:172.17.0.1')).toBe(true);
+    expect(isAllowedLocalApiPeer(config, '192.168.1.20')).toBe(false);
+  });
+
   it('requires a scoped local credential after one-time pairing', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-local-api-')); dirs.push(dir);
     const store = new LocalStore(path.join(dir, 'state.json'));

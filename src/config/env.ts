@@ -88,6 +88,10 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const localApiRemoteUrl = explicitRemoteUrl
     ? parseRemoteApiUrl(explicitRemoteUrl, 'LOCAL_API_REMOTE_URL')
     : legacyLocalApiUrl.remoteUrl;
+  const localApiTrustedProxyAddresses = parseTrustedProxyAddresses(
+    env.LOCAL_API_TRUSTED_PROXY_ADDRESSES,
+    Boolean(localApiRemoteUrl),
+  );
   if (guiEnabled && localApiEnabled && (localApiPort !== guiPort || localApiHost !== guiHost)) {
     throw new Error('LOCAL_API_HOST/PORT must match NODE_GUI_HOST/PORT when both services are enabled');
   }
@@ -132,6 +136,7 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
     localApiAllowLan,
     localApiLanUrl,
     localApiRemoteUrl,
+    localApiTrustedProxyAddresses,
     pairingSessionTtlMs: parseOptionalIntEnv(env, 'PAIRING_SESSION_TTL_MS', 5 * 60 * 1000, 30000),
     localDataPath: path.resolve(env.LOCAL_DATA_PATH?.trim() || path.join(path.dirname(requireString(env, 'LOCAL_STATE_PATH')), 'data')),
     jobConcurrency: parseOptionalIntEnv(env, 'JOB_CONCURRENCY', 1, 1),
@@ -249,4 +254,21 @@ export function isLoopbackHost(host: string): boolean {
 
 function normalizeHost(host: string): string {
   return host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '').replace(/\.$/, '');
+}
+
+function parseTrustedProxyAddresses(value: string | undefined, remoteConfigured: boolean): string[] {
+  const addresses = [...new Set((value || '').split(',').map(normalizePeerAddress).filter(Boolean))];
+  if (addresses.length > 0 && !remoteConfigured) {
+    throw new Error('LOCAL_API_TRUSTED_PROXY_ADDRESSES requires LOCAL_API_REMOTE_URL');
+  }
+  if (addresses.some((address) => isIP(address) === 0)) {
+    throw new Error('LOCAL_API_TRUSTED_PROXY_ADDRESSES must contain exact IP addresses');
+  }
+  return addresses;
+}
+
+function normalizePeerAddress(address: string): string {
+  const normalized = normalizeHost(address).split('%', 1)[0] || '';
+  const mapped = ipv4Octets(normalized);
+  return mapped ? mapped.join('.') : normalized;
 }
