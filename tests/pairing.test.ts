@@ -59,6 +59,19 @@ describe('PairingService', () => {
     expect(() => limiter.assertAllowed('expiring', 15)).not.toThrow();
   });
 
+  it('rate limits a flood that rotates random session IDs', () => {
+    const limiter = new PairingAttemptLimiter(5, 60_000, 4096, 3);
+    for (let index = 0; index < 3; index += 1) {
+      const key = pairingAttemptKey('10.0.0.10', `random-${index}`);
+      limiter.assertAllowed(key, 100 + index);
+      limiter.failed(key, 100 + index);
+    }
+    expect(() => limiter.assertAllowed(pairingAttemptKey('10.0.0.10', 'random-4'), 104))
+      .toThrow('pairing_rate_limited');
+    expect(() => limiter.assertAllowed(pairingAttemptKey('10.0.0.10', 'after-window'), 60_101))
+      .not.toThrow();
+  });
+
   it('creates a stable persisted identity before an unregistered GUI pairs', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-pairing-fresh-')); dirs.push(dir);
     const statePath = path.join(dir, 'state.json');

@@ -25,32 +25,37 @@ export interface PairingSessionResponse {
 
 /** Bounded, in-memory protection for a remotely exposed pairing exchange. */
 export class PairingAttemptLimiter {
-  private readonly attempts = new Map<string, number[]>();
+  private readonly attempts = new Map<string, { windowStartedAt: number; count: number }>();
+  private globalWindowStartedAt: number | undefined;
+  private globalCount = 0;
 
   constructor(
     private readonly maxAttempts = 5,
     private readonly windowMs = 60_000,
     private readonly maxTrackedKeys = 4096,
+    private readonly maxGlobalAttempts = 120,
   ) {}
 
-  private prune(now: number): void {
-    for (const [client, values] of this.attempts) {
-      const current = values.filter((attempt) => now - attempt < this.windowMs);
-      if (current.length === 0) this.attempts.delete(client);
-      else if (current.length !== values.length) this.attempts.set(client, current);
-    }
-  }
-
   assertAllowed(client: string, now = Date.now()): void {
-    this.prune(now);
-    const attempts = this.attempts.get(client) || [];
-    if (attempts.length >= this.maxAttempts) throw localError(429, 'pairing_rate_limited');
+    if (this.globalWindowStartedAt === undefined || now - this.globalWindowStartedAt >= this.windowMs) {
+      this.globalWindowStartedAt = now;
+      this.globalCount = 0;
+    }
+    if (this.globalCount >= this.maxGlobalAttempts) throw localError(429, 'pairing_rate_limited');
+    this.globalCount += 1;
+
+    const attempts = this.attempts.get(client);
+    if (attempts && now - attempts.windowStartedAt < this.windowMs && attempts.count >= this.maxAttempts) {
+      throw localError(429, 'pairing_rate_limited');
+    }
+    if (attempts && now - attempts.windowStartedAt >= this.windowMs) this.attempts.delete(client);
   }
 
   failed(client: string, now = Date.now()): void {
-    this.prune(now);
-    const attempts = this.attempts.get(client) || [];
-    attempts.push(now);
+    const previous = this.attempts.get(client);
+    const attempts = previous && now - previous.windowStartedAt < this.windowMs
+      ? { ...previous, count: previous.count + 1 }
+      : { windowStartedAt: now, count: 1 };
     if (!this.attempts.has(client) && this.attempts.size >= this.maxTrackedKeys) {
       const oldest = this.attempts.keys().next().value as string | undefined;
       if (oldest) this.attempts.delete(oldest);
@@ -66,9 +71,10 @@ export class PairingAttemptLimiter {
 const digest = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
 
 /**
- * Limits a proxy-shared client only for the pairing session it is attempting.
- * A random invalid session cannot exhaust the budget for a legitimate session
- * coming through the same reverse proxy address.
+ * Session-specific keys keep one bad pairing from immediately consuming a
+ * legitimate session's small budget. PairingAttemptLimiter also applies a
+ * higher process-wide admission bound so rotating random IDs cannot bypass
+ * throttling or create unbounded work behind a shared reverse proxy.
  */
 export const pairingAttemptKey = (client: string, sessionId: string): string =>
   `${client}:${digest(sessionId).slice(0, 24)}`;
