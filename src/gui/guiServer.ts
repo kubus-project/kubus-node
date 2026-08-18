@@ -120,7 +120,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     return;
   }
   if (req.method === 'POST' && parsed.pathname === '/gui/api/pairing/session') {
-    writeJson(res, 201, { success: true, data: await createGuiPairing(deps) });
+    const pairing = await createGuiPairing(deps);
+    writeJson(res, 201, { success: true, data: pairing }, pairing.code);
     return;
   }
   const revokeMatch = parsed.pathname.match(/^\/gui\/api\/devices\/([^/]+)$/);
@@ -447,11 +448,25 @@ function writeHead(res: ServerResponse, statusCode: number, contentType: string)
   });
 }
 
-function writeJson(res: ServerResponse, statusCode: number, payload: unknown): void {
+function writeJson(
+  res: ServerResponse,
+  statusCode: number,
+  payload: unknown,
+  canonicalPairingCode?: string,
+): void {
   res.writeHead(statusCode, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
   });
-  res.end(JSON.stringify(redactSecrets(payload)));
+  const sanitized = redactSecrets(payload) as Record<string, unknown>;
+  if (canonicalPairingCode && sanitized && typeof sanitized === 'object') {
+    const data = sanitized.data;
+    if (data && typeof data === 'object') {
+      // This is the sole intentional exemption from GUI value redaction: the
+      // one-time canonical URI must remain byte-identical to the QR input.
+      (data as Record<string, unknown>).code = canonicalPairingCode;
+    }
+  }
+  res.end(JSON.stringify(sanitized));
 }

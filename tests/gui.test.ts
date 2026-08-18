@@ -219,7 +219,7 @@ describe('local GUI safety helpers', () => {
               sessionId: 'session-1',
               secret: 'pairing-one-time-secret',
               expiresAt: new Date(Date.now() + 300000).toISOString(),
-              payload: 'kubus-node://pair?v=2&e=https%3A%2F%2Fnode.example.test&s=session-1&k=pairing-one-time-secret&l=ROK-DESKTOP&f=abcdef012345',
+              payload: 'kubus-node://pair?v=2&e=https%3A%2F%2Fnode.example.test&s=session-1&k=pairing-one-time-secret&l=kubus_node_studio&f=abcdef012345',
               node: { id: 'node-1', label: 'ROK-DESKTOP', endpoint: 'https://node.example.test', endpoints: ['https://node.example.test'], fingerprint: 'abcdef0123456789' },
             }),
           },
@@ -265,6 +265,8 @@ describe('local GUI safety helpers', () => {
         expect(body.data.qrSvg).not.toContain('<image');
         // Manual copy and rendered QR use the exact same canonical payload.
         expect(body.data.code).toContain('kubus-node://pair?v=2');
+        expect(body.data.code).toContain('l=kubus_node_studio');
+        expect(body.data.code).not.toContain('[redacted]');
         expect(body.data.qrSvg).toContain('viewBox=');
         expect(body.data.node.fingerprint).toHaveLength(12);
         expect(JSON.stringify(body)).not.toContain('kubus_node_operator_secret');
