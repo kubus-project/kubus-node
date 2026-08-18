@@ -71,7 +71,9 @@ describe('parseEnv', () => {
   it('rejects loopback and wildcard HTTPS remote endpoints', () => {
     for (const endpoint of [
       'https://localhost:8787',
+      'https://localhost.:8787',
       'https://127.0.0.1:8787',
+      'https://127.0.0.1.:8787',
       'https://127.0.0.2:8787',
       'https://127.255.255.255:8787',
       'https://0.0.0.0:8787',

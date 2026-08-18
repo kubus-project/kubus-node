@@ -158,7 +158,7 @@ function parseLanApiUrl(value: string, key: string): string {
 function parseRemoteApiUrl(value: string, key: string): string {
   const parsed = new URL(parseUrl(value, key));
   if (parsed.protocol !== 'https:') throw new Error(`${key} must use HTTPS`);
-  const host = parsed.hostname.toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
+  const host = normalizeHost(parsed.hostname);
   if (isLoopbackHost(host) || isWildcardHost(host)) {
     throw new Error(`${key} must use a phone-reachable host, never loopback or a wildcard bind`);
   }
@@ -188,7 +188,7 @@ function deriveLanApiUrl(host: string, port: number, enabled: boolean): string |
 }
 
 function isPrivateLanHost(host: string): boolean {
-  const normalized = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
+  const normalized = normalizeHost(host);
   if (isLoopbackHost(normalized) || isWildcardHost(normalized)) return false;
   if (normalized.endsWith('.local') || normalized.endsWith('.internal')) return true;
   const ipv4 = ipv4Octets(normalized);
@@ -218,7 +218,7 @@ function ipv4Octets(host: string): number[] | undefined {
 }
 
 function isWildcardHost(host: string): boolean {
-  const normalized = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
+  const normalized = normalizeHost(host);
   if (normalized === '::') return true;
   const ipv4 = ipv4Octets(normalized);
   return Boolean(ipv4 && ipv4.every((octet) => octet === 0));
@@ -235,14 +235,18 @@ export async function resolveNodeKey(config: AppConfig, store: LocalStore): Prom
 }
 
 function isPrivateRpcUrl(raw: string): boolean {
-  const host = new URL(raw).hostname.toLowerCase();
+  const host = normalizeHost(new URL(raw).hostname);
   if (['localhost', '127.0.0.1', '::1', 'kubo', 'ipfs'].includes(host)) return true;
   return isPrivateLanHost(host);
 }
 
 export function isLoopbackHost(host: string): boolean {
-  const normalized = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
+  const normalized = normalizeHost(host);
   if (normalized === 'localhost' || normalized === '::1') return true;
   const ipv4 = ipv4Octets(normalized);
   return Boolean(ipv4 && ipv4[0] === 127);
+}
+
+function normalizeHost(host: string): string {
+  return host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '').replace(/\.$/, '');
 }
