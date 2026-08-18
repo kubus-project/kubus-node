@@ -72,7 +72,15 @@ describe('local GUI safety helpers', () => {
       guiJs.indexOf('function renderDiagnostics()'),
     );
     expect(pairingRenderer).toContain("area.querySelector('[data-copy]')");
-    expect(pairingRenderer).toContain('navigator.clipboard.writeText(copyPairing.dataset.copy)');
+    expect(pairingRenderer).toContain('copyText(copyPairing.dataset.copy)');
+    expect(pairingRenderer).toContain('Copy failed. Select the pairing code');
+  });
+
+  it('falls back when the Clipboard API is unavailable or denied', () => {
+    expect(guiJs).toContain("typeof navigator.clipboard.writeText === 'function'");
+    expect(guiJs).toContain("document.createElement('textarea')");
+    expect(guiJs).toContain("document.execCommand('copy')");
+    expect(guiJs).toContain('return copied;');
   });
 
   it('escapes with the same rules as the server', () => {
