@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { isIP } from 'node:net';
 import path from 'node:path';
 import type { LocalStore } from '../state/localStore.js';
 import type { AppConfig } from './schema.js';
@@ -191,10 +192,14 @@ function isPrivateLanHost(host: string): boolean {
   if (isLoopbackHost(normalized) || ['0.0.0.0', '::'].includes(normalized)) return false;
   if (normalized.endsWith('.local') || normalized.endsWith('.internal')) return true;
   // RFC 4193 IPv6 unique-local addresses (fc00::/7).
-  if (/^f[cd][0-9a-f]{2}:/.test(normalized)) return true;
-  if (/^10\./.test(normalized) || /^192\.168\./.test(normalized)) return true;
-  const match172 = normalized.match(/^172\.(\d+)\./);
-  return Boolean(match172 && Number(match172[1]) >= 16 && Number(match172[1]) <= 31);
+  if (isIP(normalized) === 6) return /^f[cd][0-9a-f]{2}:/.test(normalized);
+  if (isIP(normalized) !== 4) return false;
+  const octets = normalized.split('.').map(Number);
+  const first = octets[0] ?? -1;
+  const second = octets[1] ?? -1;
+  return first === 10 ||
+    (first === 192 && second === 168) ||
+    (first === 172 && second >= 16 && second <= 31);
 }
 
 export async function resolveNodeKey(config: AppConfig, store: LocalStore): Promise<string> {
@@ -215,5 +220,7 @@ function isPrivateRpcUrl(raw: string): boolean {
 
 export function isLoopbackHost(host: string): boolean {
   const normalized = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
-  return normalized === 'localhost' || /^127\./.test(normalized) || normalized === '::1';
+  return normalized === 'localhost' ||
+    (isIP(normalized) === 4 && normalized.split('.')[0] === '127') ||
+    normalized === '::1';
 }

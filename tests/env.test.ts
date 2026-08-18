@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { parseEnv } from '../src/config/env.js';
 
 const baseEnv = {
@@ -122,6 +123,25 @@ describe('parseEnv', () => {
         LOCAL_API_LAN_URL: endpoint,
       })).toThrow(/private LAN host/);
     }
+  });
+
+  it('does not accept private-looking public hostnames as LAN addresses', () => {
+    for (const endpoint of [
+      'http://10.attacker.example:8787',
+      'http://192.168.attacker.example:8787',
+      'http://172.16.attacker.example:8787',
+    ]) {
+      expect(() => parseEnv({
+        ...baseEnv,
+        LOCAL_API_ALLOW_LAN: 'true',
+        LOCAL_API_LAN_URL: endpoint,
+      })).toThrow(/private LAN host/);
+    }
+  });
+
+  it('leaves the optional sample remote endpoint disabled', () => {
+    const sample = readFileSync(new URL('../.env.example', import.meta.url), 'utf8');
+    expect(sample).toMatch(/^LOCAL_API_REMOTE_URL=$/m);
   });
 
   it('brackets a derived IPv6 unique-local endpoint', () => {
