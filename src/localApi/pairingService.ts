@@ -15,23 +15,105 @@ export const LOCAL_SCOPES = [
 export type LocalScope = typeof LOCAL_SCOPES[number];
 
 export interface PairingSessionResponse {
+  version: 2;
   sessionId: string;
   secret: string;
   expiresAt: string;
-  node: { id: string | null; label: string; endpoint: string; fingerprint: string };
+  payload: string;
+  node: { id: string | null; label: string; endpoint: string; endpoints: string[]; fingerprint: string };
+}
+
+/** Bounded, in-memory protection for a remotely exposed pairing exchange. */
+export class PairingAttemptLimiter {
+  private readonly attempts = new Map<string, { windowStartedAt: number; count: number }>();
+  private globalWindowStartedAt: number | undefined;
+  private globalCount = 0;
+
+  constructor(
+    private readonly maxAttempts = 5,
+    private readonly windowMs = 60_000,
+    private readonly maxTrackedKeys = 4096,
+    private readonly maxGlobalAttempts = 120,
+  ) {}
+
+  assertAllowed(client: string, now = Date.now()): void {
+    if (this.globalWindowStartedAt === undefined || now - this.globalWindowStartedAt >= this.windowMs) {
+      this.globalWindowStartedAt = now;
+      this.globalCount = 0;
+    }
+    if (this.globalCount >= this.maxGlobalAttempts) throw localError(429, 'pairing_rate_limited');
+    this.globalCount += 1;
+
+    const attempts = this.attempts.get(client);
+    if (attempts && now - attempts.windowStartedAt < this.windowMs && attempts.count >= this.maxAttempts) {
+      throw localError(429, 'pairing_rate_limited');
+    }
+    if (attempts && now - attempts.windowStartedAt >= this.windowMs) this.attempts.delete(client);
+  }
+
+  failed(client: string, now = Date.now()): void {
+    const previous = this.attempts.get(client);
+    const attempts = previous && now - previous.windowStartedAt < this.windowMs
+      ? { ...previous, count: previous.count + 1 }
+      : { windowStartedAt: now, count: 1 };
+    if (!this.attempts.has(client) && this.attempts.size >= this.maxTrackedKeys) {
+      const oldest = this.attempts.keys().next().value as string | undefined;
+      if (oldest) this.attempts.delete(oldest);
+    }
+    this.attempts.set(client, attempts);
+  }
+
+  succeeded(client: string): void {
+    this.attempts.delete(client);
+  }
 }
 
 const digest = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
+
+/**
+ * Session-specific keys keep one bad pairing from immediately consuming a
+ * legitimate session's small budget. PairingAttemptLimiter also applies a
+ * higher process-wide admission bound so rotating random IDs cannot bypass
+ * throttling or create unbounded work behind a shared reverse proxy.
+ */
+export const pairingAttemptKey = (client: string, sessionId: string): string =>
+  `${client}:${digest(sessionId).slice(0, 24)}`;
+
 const safeEqual = (left: string, right: string) => {
   const a = Buffer.from(left, 'hex');
   const b = Buffer.from(right, 'hex');
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 };
 
+/** One versioned serialization for the QR, copy action, and API response. */
+export function serializePairingPayload(input: {
+  endpoint: string;
+  alternateEndpoints: string[];
+  sessionId: string;
+  secret: string;
+  nodeId: string;
+  label: string;
+  fingerprint: string;
+}): string {
+  const uri = new URL('kubus-node://pair');
+  uri.searchParams.set('v', '2');
+  uri.searchParams.set('e', input.endpoint);
+  uri.searchParams.set('s', input.sessionId);
+  uri.searchParams.set('k', input.secret);
+  uri.searchParams.set('n', input.nodeId);
+  uri.searchParams.set('l', input.label.slice(0, 80));
+  uri.searchParams.set('f', input.fingerprint);
+  for (const endpoint of input.alternateEndpoints) uri.searchParams.append('a', endpoint);
+  return uri.toString();
+}
+
 export class PairingService {
   constructor(private readonly store: LocalStore, private readonly config: AppConfig) {}
 
   async createSession(): Promise<PairingSessionResponse> {
+    // Pairing is available before public registration, so ensure the durable
+    // local identity exists even for the standalone `kubus-node gui` command.
+    const nodeKey = await this.store.getOrCreateNodeKey(this.config.nodeKey);
     const id = crypto.randomUUID();
     const secret = crypto.randomBytes(32).toString('base64url');
     const now = Date.now();
@@ -44,16 +126,31 @@ export class PairingService {
       sessions[id] = { secretHash: digest(secret), createdAt: new Date(now).toISOString(), expiresAt };
     });
     const state = this.store.snapshot();
-    const nodeKey = state.nodeKey || '';
+    const endpoints = [
+      this.config.localApiAllowLan ? this.config.localApiLanUrl : undefined,
+      this.config.localApiRemoteUrl,
+    ]
+      .filter((endpoint): endpoint is string => Boolean(endpoint));
+    if (endpoints.length === 0) throw localError(409, 'pairing_endpoint_unavailable');
+    const fingerprint = digest(`kubus-local-identity:${nodeKey}`);
+    // A Node can pair before it has registered with the public availability
+    // service. Its local identity remains stable because it is derived from
+    // the persisted node key; registration later upgrades only the public ID.
+    const nodeId = state.nodeId || `local-${fingerprint}`;
+    const [endpoint, ...alternateEndpoints] = endpoints;
+    const payload = serializePairingPayload({ endpoint: endpoint!, alternateEndpoints, sessionId: id, secret, nodeId, label: this.config.nodeLabel, fingerprint });
     return {
+      version: 2,
       sessionId: id,
       secret,
       expiresAt,
+      payload,
       node: {
-        id: state.nodeId || null,
+        id: nodeId,
         label: this.config.nodeLabel,
-        endpoint: this.config.localApiPublicUrl || `http://127.0.0.1:${this.config.localApiPort}`,
-        fingerprint: digest(`kubus-local-identity:${nodeKey}`),
+        endpoint: endpoint!,
+        endpoints,
+        fingerprint,
       },
     };
   }

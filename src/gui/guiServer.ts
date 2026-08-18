@@ -120,7 +120,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     return;
   }
   if (req.method === 'POST' && parsed.pathname === '/gui/api/pairing/session') {
-    writeJson(res, 201, { success: true, data: await createGuiPairing(deps) });
+    const pairing = await createGuiPairing(deps);
+    writeJson(res, 201, { success: true, data: pairing }, pairing.code);
     return;
   }
   const revokeMatch = parsed.pathname.match(/^\/gui\/api\/devices\/([^/]+)$/);
@@ -273,14 +274,11 @@ async function createGuiPairing(deps: GuiDeps) {
   // person is asked to trust a bare host and port. The fingerprint is the short
   // form; it is for recognition, not verification.
   const fingerprint = session.node.fingerprint.slice(0, 12);
-  const payload = `kubus-node://pair?e=${encodeURIComponent(session.node.endpoint)}` +
-    `&s=${encodeURIComponent(session.sessionId)}&k=${encodeURIComponent(session.secret)}` +
-    `&l=${encodeURIComponent(session.node.label.slice(0, 40))}&f=${fingerprint}`;
   return {
-    code: session.secret,
+    code: session.payload,
     sessionId: session.sessionId,
     expiresAt: session.expiresAt,
-    qrSvg: renderQrSvg(payload, { title: 'kubus Node pairing code' }),
+    qrSvg: await renderQrSvg(session.payload, { title: 'kubus Node pairing code' }),
     node: {
       label: session.node.label,
       // A short fingerprint is enough for the operator to recognise the node in
@@ -450,11 +448,25 @@ function writeHead(res: ServerResponse, statusCode: number, contentType: string)
   });
 }
 
-function writeJson(res: ServerResponse, statusCode: number, payload: unknown): void {
+function writeJson(
+  res: ServerResponse,
+  statusCode: number,
+  payload: unknown,
+  canonicalPairingCode?: string,
+): void {
   res.writeHead(statusCode, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
   });
-  res.end(JSON.stringify(redactSecrets(payload)));
+  const sanitized = redactSecrets(payload) as Record<string, unknown>;
+  if (canonicalPairingCode && sanitized && typeof sanitized === 'object') {
+    const data = sanitized.data;
+    if (data && typeof data === 'object') {
+      // This is the sole intentional exemption from GUI value redaction: the
+      // one-time canonical URI must remain byte-identical to the QR input.
+      (data as Record<string, unknown>).code = canonicalPairingCode;
+    }
+  }
+  res.end(JSON.stringify(sanitized));
 }

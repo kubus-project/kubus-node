@@ -62,6 +62,29 @@ function announce(message) {
   if (live) live.textContent = message;
 }
 
+async function copyText(value) {
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch (_error) {
+    // Fall through to the selection-based path used by non-secure local HTTP.
+  }
+  const field = document.createElement('textarea');
+  field.value = value;
+  field.setAttribute('readonly', '');
+  field.style.position = 'fixed';
+  field.style.opacity = '0';
+  document.body.appendChild(field);
+  field.select();
+  field.setSelectionRange(0, field.value.length);
+  let copied = false;
+  try { copied = document.execCommand('copy'); } catch (_error) { copied = false; }
+  field.remove();
+  return copied;
+}
+
 async function request(path, options) {
   options = options || {};
   const token = localStorage.getItem(TOKEN_KEY) || '';
@@ -455,11 +478,21 @@ function renderPairingArea() {
     '<div class="qr-frame">' + pairing.qrSvg + '</div>' +
     '<details class="disclosure"><summary>Enter code manually</summary>' +
     '<div class="stack-sm"><div class="pairing-code">' + h(pairing.code) + '</div>' +
+    '<button class="button small" data-copy="' + h(pairing.code) + '">Copy pairing code</button>' +
     '<div class="t-meta">Node ' + h(pairing.node.label) + ' · fingerprint ' + h(pairing.node.fingerprint) + '</div>' +
     '</div></details>' +
     '<div class="countdown t-body" id="pairingCountdown"></div>' +
     '<button class="button" id="cancelPairing">Cancel</button>' +
     '</div></section>';
+  const copyPairing = area.querySelector('[data-copy]');
+  copyPairing.addEventListener('click', async () => {
+    if (!await copyText(copyPairing.dataset.copy)) {
+      announce('Copy failed. Select the pairing code and copy it manually.');
+      return;
+    }
+    announce('Copied');
+    copyPairing.textContent = 'Copied';
+  });
   $('#cancelPairing').addEventListener('click', stopPairing);
   tickPairing();
 }
@@ -661,7 +694,10 @@ function bindSectionEvents() {
 
   $$('[data-copy]').forEach((button) => {
     button.addEventListener('click', async () => {
-      await navigator.clipboard.writeText(button.dataset.copy).catch(() => null);
+      if (!await copyText(button.dataset.copy)) {
+        announce('Copy failed. Select the value and copy it manually.');
+        return;
+      }
       announce('Copied');
       const original = button.textContent;
       button.textContent = 'Copied';

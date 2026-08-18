@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { isIP } from 'node:net';
 import path from 'node:path';
 import type { LocalStore } from '../state/localStore.js';
 import type { AppConfig } from './schema.js';
@@ -74,9 +75,23 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const localApiHost = (env.LOCAL_API_HOST || guiHost).trim() || guiHost;
   const localApiPort = parseOptionalIntEnv(env, 'LOCAL_API_PORT', guiPort, 1);
   const localApiAllowLan = boolEnv(env, 'LOCAL_API_ALLOW_LAN', false);
-  const localApiPublicUrl = env.LOCAL_API_PUBLIC_URL?.trim()
-    ? parseUrl(env.LOCAL_API_PUBLIC_URL.trim(), 'LOCAL_API_PUBLIC_URL')
-    : undefined;
+  const explicitLanUrl = env.LOCAL_API_LAN_URL?.trim();
+  const explicitRemoteUrl = env.LOCAL_API_REMOTE_URL?.trim();
+  const legacyLocalApiUrl = parseLegacyApiUrl(
+    env.LOCAL_API_PUBLIC_URL?.trim(),
+    !explicitLanUrl,
+    !explicitRemoteUrl,
+  );
+  const localApiLanUrl = explicitLanUrl
+    ? parseLanApiUrl(explicitLanUrl, 'LOCAL_API_LAN_URL')
+    : legacyLocalApiUrl.lanUrl ?? deriveLanApiUrl(localApiHost, localApiPort, localApiAllowLan);
+  const localApiRemoteUrl = explicitRemoteUrl
+    ? parseRemoteApiUrl(explicitRemoteUrl, 'LOCAL_API_REMOTE_URL')
+    : legacyLocalApiUrl.remoteUrl;
+  const localApiTrustedProxyAddresses = parseTrustedProxyAddresses(
+    env.LOCAL_API_TRUSTED_PROXY_ADDRESSES,
+    Boolean(localApiRemoteUrl),
+  );
   if (guiEnabled && localApiEnabled && (localApiPort !== guiPort || localApiHost !== guiHost)) {
     throw new Error('LOCAL_API_HOST/PORT must match NODE_GUI_HOST/PORT when both services are enabled');
   }
@@ -119,7 +134,9 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
     localApiHost,
     localApiPort,
     localApiAllowLan,
-    localApiPublicUrl,
+    localApiLanUrl,
+    localApiRemoteUrl,
+    localApiTrustedProxyAddresses,
     pairingSessionTtlMs: parseOptionalIntEnv(env, 'PAIRING_SESSION_TTL_MS', 5 * 60 * 1000, 30000),
     localDataPath: path.resolve(env.LOCAL_DATA_PATH?.trim() || path.join(path.dirname(requireString(env, 'LOCAL_STATE_PATH')), 'data')),
     jobConcurrency: parseOptionalIntEnv(env, 'JOB_CONCURRENCY', 1, 1),
@@ -135,6 +152,83 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
   };
 }
 
+function parseLanApiUrl(value: string, key: string): string {
+  const parsed = new URL(parseUrl(value, key));
+  if (!['http:', 'https:'].includes(parsed.protocol) || !isPrivateLanHost(parsed.hostname)) {
+    throw new Error(`${key} must be an HTTP(S) URL on a private LAN host, never loopback or public internet`);
+  }
+  return parsed.toString().replace(/\/$/, '');
+}
+
+function parseRemoteApiUrl(value: string, key: string): string {
+  const parsed = new URL(parseUrl(value, key));
+  if (parsed.protocol !== 'https:') throw new Error(`${key} must use HTTPS`);
+  const host = normalizeHost(parsed.hostname);
+  if (isLoopbackHost(host) || isWildcardHost(host)) {
+    throw new Error(`${key} must use a phone-reachable host, never loopback or a wildcard bind`);
+  }
+  return parsed.toString().replace(/\/$/, '');
+}
+
+function parseLegacyApiUrl(
+  value: string | undefined,
+  acceptLan = true,
+  acceptRemote = true,
+): { lanUrl?: string; remoteUrl?: string } {
+  if (!value) return {};
+  if (!acceptLan && !acceptRemote) return {};
+  const parsed = new URL(parseUrl(value, 'LOCAL_API_PUBLIC_URL'));
+  if (isPrivateLanHost(parsed.hostname)) {
+    if (!acceptLan) return {};
+    return { lanUrl: parseLanApiUrl(value, 'LOCAL_API_PUBLIC_URL') };
+  }
+  if (!acceptRemote) return {};
+  return { remoteUrl: parseRemoteApiUrl(value, 'LOCAL_API_PUBLIC_URL') };
+}
+
+function deriveLanApiUrl(host: string, port: number, enabled: boolean): string | undefined {
+  if (!enabled || !isPrivateLanHost(host)) return undefined;
+  const urlHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+  return `http://${urlHost}:${port}`;
+}
+
+function isPrivateLanHost(host: string): boolean {
+  const normalized = normalizeHost(host);
+  if (isLoopbackHost(normalized) || isWildcardHost(normalized)) return false;
+  if (normalized.endsWith('.local') || normalized.endsWith('.internal')) return true;
+  const ipv4 = ipv4Octets(normalized);
+  if (ipv4) {
+    const first = ipv4[0] ?? -1;
+    const second = ipv4[1] ?? -1;
+    return first === 10 ||
+      (first === 192 && second === 168) ||
+      (first === 172 && second >= 16 && second <= 31);
+  }
+  // RFC 4193 IPv6 unique-local addresses (fc00::/7).
+  if (isIP(normalized) === 6) return /^f[cd][0-9a-f]{2}:/.test(normalized);
+  return false;
+}
+
+function ipv4Octets(host: string): number[] | undefined {
+  if (isIP(host) === 4) return host.split('.').map(Number);
+  if (isIP(host) !== 6 || !host.startsWith('::ffff:')) return undefined;
+  const suffix = host.slice('::ffff:'.length);
+  if (isIP(suffix) === 4) return suffix.split('.').map(Number);
+  const groups = suffix.split(':');
+  if (groups.length !== 2) return undefined;
+  const high = Number.parseInt(groups[0] || '', 16);
+  const low = Number.parseInt(groups[1] || '', 16);
+  if (!Number.isFinite(high) || !Number.isFinite(low)) return undefined;
+  return [high >>> 8, high & 0xff, low >>> 8, low & 0xff];
+}
+
+function isWildcardHost(host: string): boolean {
+  const normalized = normalizeHost(host);
+  if (normalized === '::') return true;
+  const ipv4 = ipv4Octets(normalized);
+  return Boolean(ipv4 && ipv4.every((octet) => octet === 0));
+}
+
 export async function resolveNodeKey(config: AppConfig, store: LocalStore): Promise<string> {
   if (config.isProduction && config.devSeedCid) {
     throw new Error('KUBUS_DEV_SEED_CID is not allowed in production');
@@ -146,16 +240,35 @@ export async function resolveNodeKey(config: AppConfig, store: LocalStore): Prom
 }
 
 function isPrivateRpcUrl(raw: string): boolean {
-  const host = new URL(raw).hostname.toLowerCase();
+  const host = normalizeHost(new URL(raw).hostname);
   if (['localhost', '127.0.0.1', '::1', 'kubo', 'ipfs'].includes(host)) return true;
-  if (host.endsWith('.local') || host.endsWith('.internal')) return true;
-  if (/^10\./.test(host)) return true;
-  if (/^192\.168\./.test(host)) return true;
-  const match172 = host.match(/^172\.(\d+)\./);
-  return Boolean(match172 && Number(match172[1]) >= 16 && Number(match172[1]) <= 31);
+  return isPrivateLanHost(host);
 }
 
 export function isLoopbackHost(host: string): boolean {
-  const normalized = host.trim().toLowerCase();
-  return ['localhost', '127.0.0.1', '::1'].includes(normalized);
+  const normalized = normalizeHost(host);
+  if (normalized === 'localhost' || normalized === '::1') return true;
+  const ipv4 = ipv4Octets(normalized);
+  return Boolean(ipv4 && ipv4[0] === 127);
+}
+
+function normalizeHost(host: string): string {
+  return host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '').replace(/\.$/, '');
+}
+
+function parseTrustedProxyAddresses(value: string | undefined, remoteConfigured: boolean): string[] {
+  const addresses = [...new Set((value || '').split(',').map(normalizePeerAddress).filter(Boolean))];
+  if (addresses.length > 0 && !remoteConfigured) {
+    throw new Error('LOCAL_API_TRUSTED_PROXY_ADDRESSES requires LOCAL_API_REMOTE_URL');
+  }
+  if (addresses.some((address) => isIP(address) === 0)) {
+    throw new Error('LOCAL_API_TRUSTED_PROXY_ADDRESSES must contain exact IP addresses');
+  }
+  return addresses;
+}
+
+function normalizePeerAddress(address: string): string {
+  const normalized = normalizeHost(address).split('%', 1)[0] || '';
+  const mapped = ipv4Octets(normalized);
+  return mapped ? mapped.join('.') : normalized;
 }

@@ -34,7 +34,12 @@ export interface AppConfig {
   localApiHost: string;
   localApiPort: number;
   localApiAllowLan: boolean;
-  localApiPublicUrl?: string;
+  /** A phone-reachable private LAN URL, never loopback or a wildcard bind. */
+  localApiLanUrl?: string;
+  /** Optional provider-neutral HTTPS URL supplied by the operator's proxy/tunnel. */
+  localApiRemoteUrl?: string;
+  /** Exact proxy peer IPs permitted to reach the API when direct LAN access is disabled. */
+  localApiTrustedProxyAddresses: string[];
   pairingSessionTtlMs: number;
   localDataPath: string;
   jobConcurrency: number;

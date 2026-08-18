@@ -5,7 +5,8 @@ import path from 'node:path';
 import type { AppConfig } from '../src/config/schema.js';
 import { CapabilityRegistry } from '../src/capabilities/registry.js';
 import { startGuiServer } from '../src/gui/guiServer.js';
-import { PairingService } from '../src/localApi/pairingService.js';
+import { PairingService, localError } from '../src/localApi/pairingService.js';
+import { isAllowedLocalApiPeer } from '../src/localApi/localApiRouter.js';
 import { ActionLock } from '../src/runtime/actionLock.js';
 import { LocalStore } from '../src/state/localStore.js';
 
@@ -13,6 +14,19 @@ const dirs: string[] = [];
 afterEach(async () => Promise.all(dirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true }))));
 
 describe('local/v1 authorization', () => {
+  it('admits only configured reverse-proxy peers when direct LAN access is disabled', () => {
+    const config = {
+      localApiAllowLan: false,
+      localApiRemoteUrl: 'https://node.example.test',
+      localApiTrustedProxyAddresses: ['172.17.0.1'],
+    } as AppConfig;
+    expect(isAllowedLocalApiPeer(config, '127.0.0.1')).toBe(true);
+    expect(isAllowedLocalApiPeer(config, '::ffff:127.0.0.1')).toBe(true);
+    expect(isAllowedLocalApiPeer(config, '172.17.0.1')).toBe(true);
+    expect(isAllowedLocalApiPeer(config, '::ffff:172.17.0.1')).toBe(true);
+    expect(isAllowedLocalApiPeer(config, '192.168.1.20')).toBe(false);
+  });
+
   it('requires a scoped local credential after one-time pairing', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-local-api-')); dirs.push(dir);
     const store = new LocalStore(path.join(dir, 'state.json'));
@@ -26,6 +40,9 @@ describe('local/v1 authorization', () => {
       localApiHost: '127.0.0.1',
       localApiPort: 0,
       localApiAllowLan: false,
+      localApiLanUrl: 'http://192.168.1.24:8787',
+      localApiRemoteUrl: 'https://node.example.test',
+      guiToken: 'pairing-activation-token',
       nodeLabel: 'test-node',
       pairingSessionTtlMs: 60_000,
     } as AppConfig;
@@ -61,7 +78,12 @@ describe('local/v1 authorization', () => {
       const unauthorized = await fetch(`${base}/local/v1/info`);
       expect(unauthorized.status).toBe(401);
 
-      const sessionResponse = await fetch(`${base}/local/v1/pairing/session`, { method: 'POST' });
+      const unactivatedSession = await fetch(`${base}/local/v1/pairing/session`, { method: 'POST' });
+      expect(unactivatedSession.status).toBe(401);
+      const sessionResponse = await fetch(`${base}/local/v1/pairing/session`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer pairing-activation-token' },
+      });
       const sessionBody = await sessionResponse.json() as { data: { sessionId: string; secret: string } };
       const exchangeResponse = await fetch(`${base}/local/v1/pairing/exchange`, {
         method: 'POST',
@@ -74,6 +96,17 @@ describe('local/v1 authorization', () => {
       });
       expect(authorized.status).toBe(200);
       expect(await authorized.text()).toContain('test-node');
+
+      vi.spyOn(pairing, 'exchange').mockRejectedValueOnce(
+        localError(500, 'state_write_failed'),
+      );
+      const operationalFailure = await fetch(`${base}/local/v1/pairing/exchange`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: 'valid-shape', secret: 'redacted' }),
+      });
+      expect(operationalFailure.status).toBe(500);
+      expect(await operationalFailure.text()).toContain('state_write_failed');
     } finally {
       await server.close();
     }
@@ -92,7 +125,9 @@ describe('local/v1 capability state', () => {
     await store.getOrCreateNodeKey();
     const config = {
       guiEnabled: false, guiHost: '127.0.0.1', guiPort: 0,
-      localApiEnabled: true, localApiHost: '127.0.0.1', localApiPort: 0, localApiAllowLan: false,
+      localApiEnabled: true, localApiHost: '127.0.0.1', localApiPort: 0, localApiAllowLan: false, localApiLanUrl: 'http://192.168.1.24:8787',
+      localApiRemoteUrl: 'https://node.example.test',
+      guiToken: 'pairing-activation-token',
       nodeLabel: 'test-node', pairingSessionTtlMs: 60_000,
     } as AppConfig;
     const kubo = { id: async () => ({ ID: 'peer-1' }), version: async () => ({ Version: '0.41.0' }), repoStat: async () => ({ RepoSize: 0, StorageMax: 0 }) };
@@ -110,7 +145,10 @@ describe('local/v1 capability state', () => {
       logger: { info: () => undefined } as never, actionLock: new ActionLock(), localApi,
     });
     const base = server.url.replace('/gui', '');
-    const sessionResponse = await fetch(`${base}/local/v1/pairing/session`, { method: 'POST' });
+    const sessionResponse = await fetch(`${base}/local/v1/pairing/session`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer pairing-activation-token' },
+    });
     const sessionBody = await sessionResponse.json() as { data: { sessionId: string; secret: string } };
     const exchangeResponse = await fetch(`${base}/local/v1/pairing/exchange`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(sessionBody.data),

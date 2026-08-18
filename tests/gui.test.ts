@@ -66,6 +66,23 @@ describe('local GUI safety helpers', () => {
     expect(() => new Function(guiJs)).not.toThrow();
   });
 
+  it('binds the copy action inserted with an active pairing session', () => {
+    const pairingRenderer = guiJs.slice(
+      guiJs.indexOf('function renderPairingArea()'),
+      guiJs.indexOf('function renderDiagnostics()'),
+    );
+    expect(pairingRenderer).toContain("area.querySelector('[data-copy]')");
+    expect(pairingRenderer).toContain('copyText(copyPairing.dataset.copy)');
+    expect(pairingRenderer).toContain('Copy failed. Select the pairing code');
+  });
+
+  it('falls back when the Clipboard API is unavailable or denied', () => {
+    expect(guiJs).toContain("typeof navigator.clipboard.writeText === 'function'");
+    expect(guiJs).toContain("document.createElement('textarea')");
+    expect(guiJs).toContain("document.execCommand('copy')");
+    expect(guiJs).toContain('return copied;');
+  });
+
   it('escapes with the same rules as the server', () => {
     // The client carries its own copy of escapeHtml because it cannot import
     // from the runtime. If one side is ever weakened, the two diverge here.
@@ -198,10 +215,12 @@ describe('local GUI safety helpers', () => {
           captures: { list: () => [{ sizeBytes: 512 * 1024 ** 2 }] },
           pairing: {
             createSession: async () => ({
+              version: 2,
               sessionId: 'session-1',
               secret: 'pairing-one-time-secret',
               expiresAt: new Date(Date.now() + 300000).toISOString(),
-              node: { id: 'node-1', label: 'ROK-DESKTOP', endpoint: 'http://127.0.0.1:8787', fingerprint: 'abcdef0123456789' },
+              payload: 'kubus-node://pair?v=2&e=https%3A%2F%2Fnode.example.test&s=session-1&k=pairing-one-time-secret&l=kubus_node_studio&f=abcdef012345',
+              node: { id: 'node-1', label: 'ROK-DESKTOP', endpoint: 'https://node.example.test', endpoints: ['https://node.example.test'], fingerprint: 'abcdef0123456789' },
             }),
           },
         } as never,
@@ -244,8 +263,11 @@ describe('local GUI safety helpers', () => {
         // The QR is rendered locally: self-contained SVG, no network reference.
         expect(body.data.qrSvg.startsWith('<svg')).toBe(true);
         expect(body.data.qrSvg).not.toContain('<image');
-        // The one-time pairing code must survive response redaction to be shown.
-        expect(body.data.code).toBe('pairing-one-time-secret');
+        // Manual copy and rendered QR use the exact same canonical payload.
+        expect(body.data.code).toContain('kubus-node://pair?v=2');
+        expect(body.data.code).toContain('l=kubus_node_studio');
+        expect(body.data.code).not.toContain('[redacted]');
+        expect(body.data.qrSvg).toContain('viewBox=');
         expect(body.data.node.fingerprint).toHaveLength(12);
         expect(JSON.stringify(body)).not.toContain('kubus_node_operator_secret');
       } finally {
