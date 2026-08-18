@@ -500,7 +500,7 @@ details.disclosure > .stack, details.disclosure > .stack-sm { margin-top: var(--
   border-radius: var(--k-radius-md);
   line-height: 0;
 }
-.qr-frame svg { display: block; width: min(260px, 60vw); height: auto; image-rendering: pixelated; }
+.qr-frame svg { display: block; width: min(360px, 78vw); height: auto; image-rendering: pixelated; }
 .pairing-code {
   font-family: var(--k-font-mono);
   font-size: 18px;

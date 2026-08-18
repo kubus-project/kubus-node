@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { KubusApiClient } from '../backend/kubusApiClient.js';
 import type { CapabilityRegistry } from '../capabilities/registry.js';
@@ -7,7 +8,7 @@ import type { KuboClient } from '../ipfs/kuboClient.js';
 import type { JobRuntime, JobType } from '../jobs/jobRuntime.js';
 import { isValidCidLike, normalizeCid } from '../utils/cid.js';
 import type { LocalStore } from '../state/localStore.js';
-import { PairingService, type LocalScope, localError } from './pairingService.js';
+import { PairingAttemptLimiter, PairingService, pairingAttemptKey, type LocalScope, localError } from './pairingService.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
 import type { RemoteComputeRuntime } from '../compute/remoteComputeRuntime.js';
 
@@ -31,6 +32,7 @@ const SCOPE_BY_ROUTE: Array<[RegExp, LocalScope]> = [
   [/^\/local\/v1\/spatial(?:\/|$)/, 'spatial:read'],
   [/^\/local\/v1\/compute(?:\/|$)/, 'jobs:read'],
 ];
+const pairingAttempts = new PairingAttemptLimiter();
 
 export async function handleLocalApi(req: IncomingMessage, res: ServerResponse, deps: LocalApiDeps): Promise<boolean> {
   const parsed = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
@@ -47,7 +49,30 @@ export async function handleLocalApi(req: IncomingMessage, res: ServerResponse, 
   }
   if (req.method === 'POST' && parsed.pathname === '/local/v1/pairing/exchange') {
     const body = await readJson(req);
-    json(res, 201, await deps.pairing.exchange(String(body.sessionId || ''), String(body.secret || ''), typeof body.label === 'string' ? body.label : undefined));
+    const sessionId = String(body.sessionId || '');
+    const client = pairingAttemptKey(req.socket.remoteAddress || 'unknown', sessionId);
+    pairingAttempts.assertAllowed(client);
+    try {
+      const result = await deps.pairing.exchange(sessionId, String(body.secret || ''), typeof body.label === 'string' ? body.label : undefined);
+      pairingAttempts.succeeded(client);
+      json(res, 201, result);
+    } catch (error) {
+      const code = (error as Error & { code?: string }).code;
+      if (code && [
+        'invalid_pairing_session',
+        'pairing_session_replayed',
+        'pairing_session_expired',
+        'invalid_pairing_secret',
+      ].includes(code)) {
+        pairingAttempts.failed(client);
+        // A remote caller must not learn which credential check failed. The
+        // pairing secret itself never reaches logs.
+        throw localError(401, 'pairing_exchange_failed');
+      }
+      // Storage and other operational failures must remain observable and do
+      // not consume the caller's authentication-failure budget.
+      throw error;
+    }
     return true;
   }
 
@@ -56,8 +81,18 @@ export async function handleLocalApi(req: IncomingMessage, res: ServerResponse, 
   if (!await deps.pairing.authorize(token, routeScope)) throw localError(401, 'local_credential_required');
 
   if (req.method === 'GET' && parsed.pathname === '/local/v1/info') {
+    const nodeKey = await deps.store.getOrCreateNodeKey(deps.config.nodeKey);
     const state = deps.store.snapshot();
-    json(res, 200, { apiVersion: 'local/v1', nodeId: state.nodeId || null, label: deps.config.nodeLabel, peerId: state.peerId || null, version: state.latestHeartbeat?.agentVersion || null });
+    const fingerprint = crypto.createHash('sha256').update(`kubus-local-identity:${nodeKey}`).digest('hex');
+    json(res, 200, {
+      apiVersion: 'local/v1', nodeId: state.nodeId || `local-${fingerprint}`, label: deps.config.nodeLabel, peerId: state.peerId || null,
+      fingerprint,
+      endpoints: [
+        deps.config.localApiRemoteUrl,
+        deps.config.localApiAllowLan ? deps.config.localApiLanUrl : undefined,
+      ].filter(Boolean),
+      version: state.latestHeartbeat?.agentVersion || null,
+    });
     return true;
   }
   if (req.method === 'GET' && parsed.pathname === '/local/v1/status') {

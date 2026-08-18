@@ -35,7 +35,7 @@ The local API shares services and one HTTP listener with the GUI, but authentica
 
 Pairing secrets expire after `PAIRING_SESSION_TTL_SECONDS`, are single-use, and are stored only as SHA-256 hashes. Local credentials are returned once and stored only as hashes by the node. The Flutter app stores its credential in platform secure storage.
 
-Set `LOCAL_API_ALLOW_LAN=true` intentionally for phone pairing. Keep the admin GUI localhost-bound. The API rejects browser `Origin` requests and does not enable permissive CORS. Never put tokens in URLs or logs.
+Set `LOCAL_API_ALLOW_LAN=true` intentionally for phone pairing and configure `LOCAL_API_LAN_URL` to a phone-reachable private address. Never advertise loopback or a wildcard bind. For remote access, configure `LOCAL_API_REMOTE_URL` to an operator-managed **HTTPS** reverse proxy or tunnel (Tailscale Serve/Funnel, Cloudflare Tunnel, Caddy/nginx, or an equivalent). The Node API can remain loopback-bound behind that proxy; provider choice is not part of the application protocol. Keep the operator GUI localhost/private by default. The API rejects browser `Origin` requests and does not enable permissive CORS. Never put tokens in URLs or logs.
 
 Compute calls that contact the control plane accept the signed-in app's short-lived `backendAuthorization` only in the JSON body over the paired LAN session. The node forwards it and never persists or logs it. Useful compute and private result routes return HTTP `423` with `code: NETWORK_PARTICIPATION_REQUIRED` when no valid participation lease exists. Setup, status, pairing and diagnostics remain available.
 

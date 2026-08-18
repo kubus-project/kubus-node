@@ -5,7 +5,7 @@ import path from 'node:path';
 import type { AppConfig } from '../src/config/schema.js';
 import { CapabilityRegistry } from '../src/capabilities/registry.js';
 import { startGuiServer } from '../src/gui/guiServer.js';
-import { PairingService } from '../src/localApi/pairingService.js';
+import { PairingService, localError } from '../src/localApi/pairingService.js';
 import { ActionLock } from '../src/runtime/actionLock.js';
 import { LocalStore } from '../src/state/localStore.js';
 
@@ -26,6 +26,8 @@ describe('local/v1 authorization', () => {
       localApiHost: '127.0.0.1',
       localApiPort: 0,
       localApiAllowLan: false,
+      localApiLanUrl: 'http://192.168.1.24:8787',
+      localApiRemoteUrl: 'https://node.example.test',
       nodeLabel: 'test-node',
       pairingSessionTtlMs: 60_000,
     } as AppConfig;
@@ -74,6 +76,17 @@ describe('local/v1 authorization', () => {
       });
       expect(authorized.status).toBe(200);
       expect(await authorized.text()).toContain('test-node');
+
+      vi.spyOn(pairing, 'exchange').mockRejectedValueOnce(
+        localError(500, 'state_write_failed'),
+      );
+      const operationalFailure = await fetch(`${base}/local/v1/pairing/exchange`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: 'valid-shape', secret: 'redacted' }),
+      });
+      expect(operationalFailure.status).toBe(500);
+      expect(await operationalFailure.text()).toContain('state_write_failed');
     } finally {
       await server.close();
     }
@@ -92,7 +105,8 @@ describe('local/v1 capability state', () => {
     await store.getOrCreateNodeKey();
     const config = {
       guiEnabled: false, guiHost: '127.0.0.1', guiPort: 0,
-      localApiEnabled: true, localApiHost: '127.0.0.1', localApiPort: 0, localApiAllowLan: false,
+      localApiEnabled: true, localApiHost: '127.0.0.1', localApiPort: 0, localApiAllowLan: false, localApiLanUrl: 'http://192.168.1.24:8787',
+      localApiRemoteUrl: 'https://node.example.test',
       nodeLabel: 'test-node', pairingSessionTtlMs: 60_000,
     } as AppConfig;
     const kubo = { id: async () => ({ ID: 'peer-1' }), version: async () => ({ Version: '0.41.0' }), repoStat: async () => ({ RepoSize: 0, StorageMax: 0 }) };

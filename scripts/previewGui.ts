@@ -6,9 +6,22 @@
  *
  * Development tooling: it never touches the node's real state file.
  */
+import crypto from 'node:crypto';
 import { startGuiServer } from '../src/gui/guiServer.js';
+import { serializePairingPayload } from '../src/localApi/pairingService.js';
 
 const scenario = process.argv[2] || 'healthy';
+const previewSecret = Buffer.from(Array.from({ length: 32 }, (_, index) => index + 1)).toString('base64url');
+const previewFingerprint = crypto.createHash('sha256').update('kubus-node-preview-identity').digest('hex');
+const previewPairingPayload = serializePairingPayload({
+  endpoint: 'http://192.168.1.24:8787',
+  alternateEndpoints: ['https://node.example.test'],
+  sessionId: 'session-1',
+  secret: previewSecret,
+  nodeId: 'node-1',
+  label: 'ROK-DESKTOP',
+  fingerprint: previewFingerprint,
+});
 
 const config = {
   guiHost: '127.0.0.1',
@@ -100,10 +113,18 @@ const server = await startGuiServer({
     captures: { list: () => Array.from({ length: scenario === 'healthy' ? 6 : 0 }, () => ({ sizeBytes: 800 * 1024 ** 2 })) },
     pairing: {
       createSession: async () => ({
+        version: 2,
         sessionId: 'session-1',
-        secret: 'ZmFrZS1wYWlyaW5nLXNlY3JldC1mb3ItcHJldmlldw',
+        secret: previewSecret,
         expiresAt: new Date(Date.now() + 292_000).toISOString(),
-        node: { id: 'node-1', label: 'ROK-DESKTOP', endpoint: 'http://192.168.1.24:8787', fingerprint: 'a91f4c7d2e8b0356' },
+        payload: previewPairingPayload,
+        node: {
+          id: 'node-1',
+          label: 'ROK-DESKTOP',
+          endpoint: 'http://192.168.1.24:8787',
+          endpoints: ['http://192.168.1.24:8787', 'https://node.example.test'],
+          fingerprint: previewFingerprint,
+        },
       }),
       revoke: async () => undefined,
     },

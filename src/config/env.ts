@@ -74,9 +74,13 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const localApiHost = (env.LOCAL_API_HOST || guiHost).trim() || guiHost;
   const localApiPort = parseOptionalIntEnv(env, 'LOCAL_API_PORT', guiPort, 1);
   const localApiAllowLan = boolEnv(env, 'LOCAL_API_ALLOW_LAN', false);
-  const localApiPublicUrl = env.LOCAL_API_PUBLIC_URL?.trim()
-    ? parseUrl(env.LOCAL_API_PUBLIC_URL.trim(), 'LOCAL_API_PUBLIC_URL')
-    : undefined;
+  const legacyLocalApiUrl = parseLegacyApiUrl(env.LOCAL_API_PUBLIC_URL?.trim());
+  const localApiLanUrl = env.LOCAL_API_LAN_URL?.trim()
+    ? parseLanApiUrl(env.LOCAL_API_LAN_URL.trim(), 'LOCAL_API_LAN_URL')
+    : legacyLocalApiUrl.lanUrl ?? deriveLanApiUrl(localApiHost, localApiPort, localApiAllowLan);
+  const localApiRemoteUrl = env.LOCAL_API_REMOTE_URL?.trim()
+    ? parseRemoteApiUrl(env.LOCAL_API_REMOTE_URL.trim(), 'LOCAL_API_REMOTE_URL')
+    : legacyLocalApiUrl.remoteUrl;
   if (guiEnabled && localApiEnabled && (localApiPort !== guiPort || localApiHost !== guiHost)) {
     throw new Error('LOCAL_API_HOST/PORT must match NODE_GUI_HOST/PORT when both services are enabled');
   }
@@ -119,7 +123,8 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
     localApiHost,
     localApiPort,
     localApiAllowLan,
-    localApiPublicUrl,
+    localApiLanUrl,
+    localApiRemoteUrl,
     pairingSessionTtlMs: parseOptionalIntEnv(env, 'PAIRING_SESSION_TTL_MS', 5 * 60 * 1000, 30000),
     localDataPath: path.resolve(env.LOCAL_DATA_PATH?.trim() || path.join(path.dirname(requireString(env, 'LOCAL_STATE_PATH')), 'data')),
     jobConcurrency: parseOptionalIntEnv(env, 'JOB_CONCURRENCY', 1, 1),
@@ -135,6 +140,45 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
   };
 }
 
+function parseLanApiUrl(value: string, key: string): string {
+  const parsed = new URL(parseUrl(value, key));
+  if (!['http:', 'https:'].includes(parsed.protocol) || !isPrivateLanHost(parsed.hostname)) {
+    throw new Error(`${key} must be an HTTP(S) URL on a private LAN host, never loopback or public internet`);
+  }
+  return parsed.toString().replace(/\/$/, '');
+}
+
+function parseRemoteApiUrl(value: string, key: string): string {
+  const parsed = new URL(parseUrl(value, key));
+  if (parsed.protocol !== 'https:') throw new Error(`${key} must use HTTPS`);
+  return parsed.toString().replace(/\/$/, '');
+}
+
+function parseLegacyApiUrl(value: string | undefined): { lanUrl?: string; remoteUrl?: string } {
+  if (!value) return {};
+  const parsed = new URL(parseUrl(value, 'LOCAL_API_PUBLIC_URL'));
+  if (isPrivateLanHost(parsed.hostname)) {
+    return { lanUrl: parseLanApiUrl(value, 'LOCAL_API_PUBLIC_URL') };
+  }
+  return { remoteUrl: parseRemoteApiUrl(value, 'LOCAL_API_PUBLIC_URL') };
+}
+
+function deriveLanApiUrl(host: string, port: number, enabled: boolean): string | undefined {
+  if (!enabled || !isPrivateLanHost(host)) return undefined;
+  return `http://${host}:${port}`;
+}
+
+function isPrivateLanHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
+  if (isLoopbackHost(normalized) || ['0.0.0.0', '::'].includes(normalized)) return false;
+  if (normalized.endsWith('.local') || normalized.endsWith('.internal')) return true;
+  // RFC 4193 IPv6 unique-local addresses (fc00::/7).
+  if (/^f[cd][0-9a-f]{0,2}:/.test(normalized)) return true;
+  if (/^10\./.test(normalized) || /^192\.168\./.test(normalized)) return true;
+  const match172 = normalized.match(/^172\.(\d+)\./);
+  return Boolean(match172 && Number(match172[1]) >= 16 && Number(match172[1]) <= 31);
+}
+
 export async function resolveNodeKey(config: AppConfig, store: LocalStore): Promise<string> {
   if (config.isProduction && config.devSeedCid) {
     throw new Error('KUBUS_DEV_SEED_CID is not allowed in production');
@@ -148,11 +192,7 @@ export async function resolveNodeKey(config: AppConfig, store: LocalStore): Prom
 function isPrivateRpcUrl(raw: string): boolean {
   const host = new URL(raw).hostname.toLowerCase();
   if (['localhost', '127.0.0.1', '::1', 'kubo', 'ipfs'].includes(host)) return true;
-  if (host.endsWith('.local') || host.endsWith('.internal')) return true;
-  if (/^10\./.test(host)) return true;
-  if (/^192\.168\./.test(host)) return true;
-  const match172 = host.match(/^172\.(\d+)\./);
-  return Boolean(match172 && Number(match172[1]) >= 16 && Number(match172[1]) <= 31);
+  return isPrivateLanHost(host);
 }
 
 export function isLoopbackHost(host: string): boolean {

@@ -15,23 +15,99 @@ export const LOCAL_SCOPES = [
 export type LocalScope = typeof LOCAL_SCOPES[number];
 
 export interface PairingSessionResponse {
+  version: 2;
   sessionId: string;
   secret: string;
   expiresAt: string;
-  node: { id: string | null; label: string; endpoint: string; fingerprint: string };
+  payload: string;
+  node: { id: string | null; label: string; endpoint: string; endpoints: string[]; fingerprint: string };
+}
+
+/** Bounded, in-memory protection for a remotely exposed pairing exchange. */
+export class PairingAttemptLimiter {
+  private readonly attempts = new Map<string, number[]>();
+
+  constructor(
+    private readonly maxAttempts = 5,
+    private readonly windowMs = 60_000,
+    private readonly maxTrackedKeys = 4096,
+  ) {}
+
+  private prune(now: number): void {
+    for (const [client, values] of this.attempts) {
+      const current = values.filter((attempt) => now - attempt < this.windowMs);
+      if (current.length === 0) this.attempts.delete(client);
+      else if (current.length !== values.length) this.attempts.set(client, current);
+    }
+  }
+
+  assertAllowed(client: string, now = Date.now()): void {
+    this.prune(now);
+    const attempts = this.attempts.get(client) || [];
+    if (attempts.length >= this.maxAttempts) throw localError(429, 'pairing_rate_limited');
+  }
+
+  failed(client: string, now = Date.now()): void {
+    this.prune(now);
+    const attempts = this.attempts.get(client) || [];
+    attempts.push(now);
+    if (!this.attempts.has(client) && this.attempts.size >= this.maxTrackedKeys) {
+      const oldest = this.attempts.keys().next().value as string | undefined;
+      if (oldest) this.attempts.delete(oldest);
+    }
+    this.attempts.set(client, attempts);
+  }
+
+  succeeded(client: string): void {
+    this.attempts.delete(client);
+  }
 }
 
 const digest = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
+
+/**
+ * Limits a proxy-shared client only for the pairing session it is attempting.
+ * A random invalid session cannot exhaust the budget for a legitimate session
+ * coming through the same reverse proxy address.
+ */
+export const pairingAttemptKey = (client: string, sessionId: string): string =>
+  `${client}:${digest(sessionId).slice(0, 24)}`;
+
 const safeEqual = (left: string, right: string) => {
   const a = Buffer.from(left, 'hex');
   const b = Buffer.from(right, 'hex');
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 };
 
+/** One versioned serialization for the QR, copy action, and API response. */
+export function serializePairingPayload(input: {
+  endpoint: string;
+  alternateEndpoints: string[];
+  sessionId: string;
+  secret: string;
+  nodeId: string;
+  label: string;
+  fingerprint: string;
+}): string {
+  const uri = new URL('kubus-node://pair');
+  uri.searchParams.set('v', '2');
+  uri.searchParams.set('e', input.endpoint);
+  uri.searchParams.set('s', input.sessionId);
+  uri.searchParams.set('k', input.secret);
+  uri.searchParams.set('n', input.nodeId);
+  uri.searchParams.set('l', input.label.slice(0, 80));
+  uri.searchParams.set('f', input.fingerprint);
+  for (const endpoint of input.alternateEndpoints) uri.searchParams.append('a', endpoint);
+  return uri.toString();
+}
+
 export class PairingService {
   constructor(private readonly store: LocalStore, private readonly config: AppConfig) {}
 
   async createSession(): Promise<PairingSessionResponse> {
+    // Pairing is available before public registration, so ensure the durable
+    // local identity exists even for the standalone `kubus-node gui` command.
+    const nodeKey = await this.store.getOrCreateNodeKey(this.config.nodeKey);
     const id = crypto.randomUUID();
     const secret = crypto.randomBytes(32).toString('base64url');
     const now = Date.now();
@@ -44,16 +120,31 @@ export class PairingService {
       sessions[id] = { secretHash: digest(secret), createdAt: new Date(now).toISOString(), expiresAt };
     });
     const state = this.store.snapshot();
-    const nodeKey = state.nodeKey || '';
+    const endpoints = [
+      this.config.localApiAllowLan ? this.config.localApiLanUrl : undefined,
+      this.config.localApiRemoteUrl,
+    ]
+      .filter((endpoint): endpoint is string => Boolean(endpoint));
+    if (endpoints.length === 0) throw localError(409, 'pairing_endpoint_unavailable');
+    const fingerprint = digest(`kubus-local-identity:${nodeKey}`);
+    // A Node can pair before it has registered with the public availability
+    // service. Its local identity remains stable because it is derived from
+    // the persisted node key; registration later upgrades only the public ID.
+    const nodeId = state.nodeId || `local-${fingerprint}`;
+    const [endpoint, ...alternateEndpoints] = endpoints;
+    const payload = serializePairingPayload({ endpoint: endpoint!, alternateEndpoints, sessionId: id, secret, nodeId, label: this.config.nodeLabel, fingerprint });
     return {
+      version: 2,
       sessionId: id,
       secret,
       expiresAt,
+      payload,
       node: {
-        id: state.nodeId || null,
+        id: nodeId,
         label: this.config.nodeLabel,
-        endpoint: this.config.localApiPublicUrl || `http://127.0.0.1:${this.config.localApiPort}`,
-        fingerprint: digest(`kubus-local-identity:${nodeKey}`),
+        endpoint: endpoint!,
+        endpoints,
+        fingerprint,
       },
     };
   }

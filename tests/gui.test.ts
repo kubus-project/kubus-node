@@ -198,10 +198,12 @@ describe('local GUI safety helpers', () => {
           captures: { list: () => [{ sizeBytes: 512 * 1024 ** 2 }] },
           pairing: {
             createSession: async () => ({
+              version: 2,
               sessionId: 'session-1',
               secret: 'pairing-one-time-secret',
               expiresAt: new Date(Date.now() + 300000).toISOString(),
-              node: { id: 'node-1', label: 'ROK-DESKTOP', endpoint: 'http://127.0.0.1:8787', fingerprint: 'abcdef0123456789' },
+              payload: 'kubus-node://pair?v=2&e=https%3A%2F%2Fnode.example.test&s=session-1&k=pairing-one-time-secret&l=ROK-DESKTOP&f=abcdef012345',
+              node: { id: 'node-1', label: 'ROK-DESKTOP', endpoint: 'https://node.example.test', endpoints: ['https://node.example.test'], fingerprint: 'abcdef0123456789' },
             }),
           },
         } as never,
@@ -244,8 +246,9 @@ describe('local GUI safety helpers', () => {
         // The QR is rendered locally: self-contained SVG, no network reference.
         expect(body.data.qrSvg.startsWith('<svg')).toBe(true);
         expect(body.data.qrSvg).not.toContain('<image');
-        // The one-time pairing code must survive response redaction to be shown.
-        expect(body.data.code).toBe('pairing-one-time-secret');
+        // Manual copy and rendered QR use the exact same canonical payload.
+        expect(body.data.code).toContain('kubus-node://pair?v=2');
+        expect(body.data.qrSvg).toContain('viewBox=');
         expect(body.data.node.fingerprint).toHaveLength(12);
         expect(JSON.stringify(body)).not.toContain('kubus_node_operator_secret');
       } finally {

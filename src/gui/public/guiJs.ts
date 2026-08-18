@@ -455,6 +455,7 @@ function renderPairingArea() {
     '<div class="qr-frame">' + pairing.qrSvg + '</div>' +
     '<details class="disclosure"><summary>Enter code manually</summary>' +
     '<div class="stack-sm"><div class="pairing-code">' + h(pairing.code) + '</div>' +
+    '<button class="button small" data-copy="' + h(pairing.code) + '">Copy pairing code</button>' +
     '<div class="t-meta">Node ' + h(pairing.node.label) + ' · fingerprint ' + h(pairing.node.fingerprint) + '</div>' +
     '</div></details>' +
     '<div class="countdown t-body" id="pairingCountdown"></div>' +

@@ -60,4 +60,38 @@ describe('parseEnv', () => {
     expect(config.guiDisplayUrl).toBe('http://my.node.kubus.site:8787/gui');
     expect(config.guiFallbackUrl).toBe('http://127.0.0.1:8787/gui');
   });
+
+  it('requires HTTPS for a configured remote phone API endpoint', () => {
+    expect(() => parseEnv({ ...baseEnv, LOCAL_API_REMOTE_URL: 'http://node.example.test' })).toThrow(/HTTPS/);
+    expect(parseEnv({ ...baseEnv, LOCAL_API_REMOTE_URL: 'https://node.example.test' }).localApiRemoteUrl)
+      .toBe('https://node.example.test');
+  });
+
+  it('preserves the legacy public endpoint while deployments migrate', () => {
+    expect(parseEnv({ ...baseEnv, LOCAL_API_PUBLIC_URL: 'https://legacy.example.test' }).localApiRemoteUrl)
+      .toBe('https://legacy.example.test');
+    expect(parseEnv({ ...baseEnv, LOCAL_API_PUBLIC_URL: 'http://192.168.1.24:8787' }).localApiLanUrl)
+      .toBe('http://192.168.1.24:8787');
+    expect(parseEnv({
+      ...baseEnv,
+      LOCAL_API_PUBLIC_URL: 'https://legacy.example.test',
+      LOCAL_API_REMOTE_URL: 'https://current.example.test',
+    }).localApiRemoteUrl).toBe('https://current.example.test');
+  });
+
+  it('accepts explicit and legacy IPv6 unique-local LAN endpoints', () => {
+    const explicit = parseEnv({
+      ...baseEnv,
+      LOCAL_API_ALLOW_LAN: 'true',
+      LOCAL_API_LAN_URL: 'http://[fd00::1]:8787',
+    });
+    expect(explicit.localApiLanUrl).toBe('http://[fd00::1]:8787');
+
+    const legacy = parseEnv({
+      ...baseEnv,
+      LOCAL_API_ALLOW_LAN: 'true',
+      LOCAL_API_PUBLIC_URL: 'http://[fcab::42]:8787',
+    });
+    expect(legacy.localApiLanUrl).toBe('http://[fcab::42]:8787');
+  });
 });

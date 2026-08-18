@@ -273,14 +273,11 @@ async function createGuiPairing(deps: GuiDeps) {
   // person is asked to trust a bare host and port. The fingerprint is the short
   // form; it is for recognition, not verification.
   const fingerprint = session.node.fingerprint.slice(0, 12);
-  const payload = `kubus-node://pair?e=${encodeURIComponent(session.node.endpoint)}` +
-    `&s=${encodeURIComponent(session.sessionId)}&k=${encodeURIComponent(session.secret)}` +
-    `&l=${encodeURIComponent(session.node.label.slice(0, 40))}&f=${fingerprint}`;
   return {
-    code: session.secret,
+    code: session.payload,
     sessionId: session.sessionId,
     expiresAt: session.expiresAt,
-    qrSvg: renderQrSvg(payload, { title: 'kubus Node pairing code' }),
+    qrSvg: await renderQrSvg(session.payload, { title: 'kubus Node pairing code' }),
     node: {
       label: session.node.label,
       // A short fingerprint is enough for the operator to recognise the node in
