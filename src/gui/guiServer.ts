@@ -4,6 +4,7 @@ import type { KubusApiClient } from '../backend/kubusApiClient.js';
 import type { AppConfig } from '../config/schema.js';
 import { getKuboHealth } from '../ipfs/health.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
+import { probeRetrieval, RETRIEVAL_AVAILABLE_STATES, type RetrievalProbe } from '../ipfs/retrieval.js';
 import { getBufferedLogs, clearBufferedLogs, redactSecrets } from '../logging/logBuffer.js';
 import type { Logger } from '../logging/logger.js';
 import { syncPublicPinSet, reconcileDesiredPins, refreshCommitments } from '../operator/commitments.js';
@@ -406,6 +407,33 @@ async function runAction(action: string, deps: GuiDeps): Promise<unknown> {
   throw error;
 }
 
+/**
+ * Actionable, specific copy for each typed retrieval outcome (Part 13.3) —
+ * replaces the previous behaviour of surfacing whatever Node's raw `fetch`
+ * threw, which for a DNS/TLS/connection failure is literally the string
+ * "fetch failed" and tells the operator nothing they can act on.
+ */
+function describeRetrievalProbe(probe: RetrievalProbe): string {
+  switch (probe.state) {
+    case 'pinned':
+      return 'Pinned locally';
+    case 'local_retrievable':
+      return 'Available from local Kubo';
+    case 'gateway_retrievable':
+      return 'Reachable via the configured gateway';
+    case 'gateway_timeout':
+      return 'Gateway timed out — the configured gateway did not respond in time';
+    case 'gateway_unreachable':
+      return `Gateway unreachable — could not connect (${probe.errorClass || 'unknown'}). Local content is unaffected.`;
+    case 'gateway_http_error':
+      return `Gateway returned HTTP ${probe.httpStatus} for this CID`;
+    case 'gateway_not_found':
+      return 'Gateway returned 404 for this CID';
+    case 'invalid_cid':
+      return 'CID is not valid';
+  }
+}
+
 async function runDoctor(deps: GuiDeps) {
   const checks: Array<{ name: string; ok: boolean; detail?: string }> = [];
   const backend = await deps.api.getHealth().then(() => ({ ok: true })).catch((error) => ({ ok: false, detail: String((error as Error).message || error) }));
@@ -423,10 +451,8 @@ async function runDoctor(deps: GuiDeps) {
   checks.push({ name: 'Rewardable endpoint', ...rewardable });
   const cid = deps.store.snapshot().pinnedCids[0];
   if (cid) {
-    const gateway = await fetch(`${deps.config.ipfsGatewayUrl.replace(/\/+$/, '')}/ipfs/${encodeURIComponent(cid)}`, { method: 'GET' })
-      .then((response) => ({ ok: response.ok, detail: `HTTP ${response.status}` }))
-      .catch((error) => ({ ok: false, detail: String((error as Error).message || error) }));
-    checks.push({ name: 'Gateway retrieval', ...gateway });
+    const probe = await probeRetrieval(deps.kubo, deps.config.ipfsGatewayUrl, cid);
+    checks.push({ name: 'Gateway retrieval', ok: RETRIEVAL_AVAILABLE_STATES.includes(probe.state), detail: describeRetrievalProbe(probe) });
   } else {
     checks.push({ name: 'Gateway retrieval', ok: true, detail: 'No pinned CID available yet' });
   }

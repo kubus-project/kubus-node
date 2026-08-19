@@ -9,6 +9,7 @@ vi.mock('../src/ipfs/retrieval.js', () => ({
     state: 'pinned',
     checkedAt: '2026-05-01T00:00:00.000Z',
   })),
+  RETRIEVAL_AVAILABLE_STATES: ['pinned', 'local_retrievable', 'gateway_retrievable'],
 }));
 
 const config = {

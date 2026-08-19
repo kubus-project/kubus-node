@@ -10,6 +10,8 @@ import { localError } from '../localApi/pairingService.js';
 import type { Logger } from '../logging/logger.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
 import { validateSpatialManifest, type SpatialManifest } from '../spatial/models.js';
+import { redactSecrets } from '../logging/logBuffer.js';
+import { Backoff } from '../scheduler/backoff.js';
 import type { LocalStore } from '../state/localStore.js';
 import type { ComputeIdentityService } from './computeIdentity.js';
 import { PrivatePayloadTransport, type ComputeKeyEnvelope } from './privatePayloadTransport.js';
@@ -24,22 +26,48 @@ interface RemoteRuntimeRecord {
   updatedAt: string;
 }
 
+const POLL_INTERVAL_MS = 5000;
+const POLL_MAX_BACKOFF_MS = 60000;
+/** Re-emit a "still failing" summary at most this often, instead of one warning per tick. */
+const FAILURE_SUMMARY_INTERVAL_MS = 60000;
+
 export class RemoteComputeRuntime {
   private timer?: NodeJS.Timeout;
   private polling = false;
+  private stopped = true;
+  private readonly backoff = new Backoff(POLL_INTERVAL_MS, POLL_MAX_BACKOFF_MS);
+  private consecutiveFailures = 0;
+  private lastFailureLoggedAt = 0;
+
   constructor(private readonly deps: {
     api: KubusApiClient; kubo: KuboClient; store: LocalStore; config: AppConfig; captures: CaptureStore; jobs: JobRuntime;
     gate: NetworkParticipationGate; identity: ComputeIdentityService; transport: PrivatePayloadTransport; logger: Logger;
   }) {}
 
   start(): void {
-    if (this.timer) return;
-    this.timer = setInterval(() => void this.pollProvider(), 5000);
-    this.timer.unref();
-    void this.pollProvider();
+    if (!this.stopped) return;
+    this.stopped = false;
+    this.scheduleNextPoll(0);
   }
 
-  stop(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
+  stop(): void {
+    this.stopped = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+  }
+
+  private scheduleNextPoll(delayMs: number): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => void this.runPollCycle(), delayMs);
+    this.timer.unref();
+  }
+
+  private async runPollCycle(): Promise<void> {
+    if (this.stopped) return;
+    const nextDelay = await this.pollProvider();
+    if (this.stopped) return;
+    this.scheduleNextPoll(nextDelay);
+  }
 
   settings(): ComputeProviderSettings { return effectiveComputeProviderSettings(this.deps.config, this.deps.store.snapshot()); }
 
@@ -118,18 +146,57 @@ export class RemoteComputeRuntime {
     await this.releaseRequesterInput(job); await this.updateRecord(job.id, 'requester', job.state); return job;
   }
 
-  private async pollProvider(): Promise<void> {
+  /** Returns the delay before the next poll: the normal interval on success, a growing backoff on failure. */
+  private async pollProvider(): Promise<number> {
     const settings = this.settings();
-    if (this.polling || !settings.enabled || settings.paused) return;
+    if (this.polling || !settings.enabled || settings.paused) return POLL_INTERVAL_MS;
     const nodeId = this.deps.store.snapshot().nodeId;
-    if (!nodeId) return;
+    if (!nodeId) return POLL_INTERVAL_MS;
     this.polling = true;
     try {
       const { jobs } = await this.deps.api.getProviderComputeJobs(nodeId, ['MATCHED', 'ACCEPTED', 'INPUT_READY', 'RUNNING', 'OUTPUT_READY']);
       for (const job of jobs) await this.handleProviderJob(job).catch((error) => this.failProviderJob(job, error));
+      this.onPollSucceeded();
+      return POLL_INTERVAL_MS;
     } catch (error) {
-      this.deps.logger.warn({ code: (error as { code?: string }).code }, 'remote compute provider poll failed');
-    } finally { this.polling = false; }
+      return this.onPollFailed(error);
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  private onPollSucceeded(): void {
+    if (this.consecutiveFailures > 0) {
+      this.deps.logger.info(
+        { op: 'remote_compute_poll', consecutiveFailures: this.consecutiveFailures },
+        'remote compute provider poll recovered',
+      );
+    }
+    this.consecutiveFailures = 0;
+    this.lastFailureLoggedAt = 0;
+    this.backoff.success();
+  }
+
+  /** Records the failure, decides whether this tick is loud or silent, and returns the next retry delay. */
+  private onPollFailed(error: unknown): number {
+    this.consecutiveFailures += 1;
+    const delayMs = this.backoff.failure();
+    const now = Date.now();
+    const isStateTransition = this.consecutiveFailures === 1;
+    const summaryDue = now - this.lastFailureLoggedAt >= FAILURE_SUMMARY_INTERVAL_MS;
+    if (isStateTransition || summaryDue) {
+      this.lastFailureLoggedAt = now;
+      this.deps.logger.warn(
+        redactSecrets({
+          op: 'remote_compute_poll',
+          ...describePollError(error),
+          consecutiveFailures: this.consecutiveFailures,
+          nextRetryMs: delayMs,
+        }),
+        'remote compute provider poll failed',
+      );
+    }
+    return delayMs;
   }
 
   private async handleProviderJob(job: RemoteComputeJob): Promise<void> {
@@ -225,3 +292,18 @@ export class RemoteComputeRuntime {
 }
 
 function requireUserAuthorization(value: string): void { if (!value.startsWith('Bearer ') || value.length < 20) throw localError(400, 'backend_authorization_required'); }
+
+/**
+ * Safe, structured shape for a poll failure. Deliberately narrow — a typed
+ * error code, an HTTP status when the failure came from the backend client,
+ * and a short message — never the raw error object, which for some SDKs can
+ * carry request headers or full URLs (query-string tokens included).
+ */
+function describePollError(error: unknown): { code?: string; status?: number; message: string } {
+  const err = error as { code?: string; status?: number; statusCode?: number; message?: string };
+  return {
+    code: err?.code,
+    status: err?.status ?? err?.statusCode,
+    message: String(err?.message || error || 'unknown error'),
+  };
+}

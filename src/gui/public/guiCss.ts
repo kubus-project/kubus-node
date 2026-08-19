@@ -562,6 +562,8 @@ details.disclosure > .stack, details.disclosure > .stack-sm { margin-top: var(--
 .log-level.warn { color: var(--k-attention); }
 .log-level.error { color: var(--k-critical); }
 .log-level.info { color: var(--k-text-tertiary); }
+.log-subsystem { font-weight: 600; color: var(--k-text-secondary); margin-right: var(--k-space-xs); }
+.log-detail { display: block; color: var(--k-text-tertiary); font-size: 11.5px; }
 
 /* --- Auth screen -------------------------------------------------------- */
 .auth {

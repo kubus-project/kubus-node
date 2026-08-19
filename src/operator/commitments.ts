@@ -3,7 +3,7 @@ import type { AvailabilityCommitment, PublicPinSetRecord, RewardableCid } from '
 import type { AppConfig } from '../config/schema.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import { reconcilePins } from '../ipfs/pinning.js';
-import { probeRetrieval } from '../ipfs/retrieval.js';
+import { probeRetrieval, RETRIEVAL_AVAILABLE_STATES } from '../ipfs/retrieval.js';
 import type { LocalStore } from '../state/localStore.js';
 import { addHoursIso } from '../utils/time.js';
 
@@ -127,7 +127,7 @@ export async function refreshCommitments(api: KubusApiClient, kubo: KuboClient, 
       continue;
     }
     const probe = await probeRetrieval(kubo, config.ipfsGatewayUrl, item.cid);
-    if (!['pinned', 'retrievable'].includes(probe.state) && !config.skipPinning) {
+    if (!RETRIEVAL_AVAILABLE_STATES.includes(probe.state) && !config.skipPinning) {
       skipReasons[item.cid] = `retrieval_${probe.state}`;
       continue;
     }
