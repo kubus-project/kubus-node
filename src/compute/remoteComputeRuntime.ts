@@ -180,7 +180,15 @@ export class RemoteComputeRuntime {
   /** Records the failure, decides whether this tick is loud or silent, and returns the next retry delay. */
   private onPollFailed(error: unknown): number {
     this.consecutiveFailures += 1;
-    const delayMs = this.backoff.failure();
+    const described = describePollError(error);
+    // A 401/403 is a standing configuration fact, not a transient outage: the
+    // operator token simply does not carry the scope this poll needs, and no
+    // amount of retrying changes that. A real node was observed retrying the
+    // same `compute:jobs:read` scope rejection 591 consecutive times. Back off
+    // to the ceiling immediately and say plainly what has to be fixed, instead
+    // of climbing a ladder that leads nowhere.
+    const isAuthorizationFailure = described.status === 401 || described.status === 403;
+    const delayMs = isAuthorizationFailure ? POLL_MAX_BACKOFF_MS : this.backoff.failure();
     const now = Date.now();
     const isStateTransition = this.consecutiveFailures === 1;
     const summaryDue = now - this.lastFailureLoggedAt >= FAILURE_SUMMARY_INTERVAL_MS;
@@ -189,11 +197,14 @@ export class RemoteComputeRuntime {
       this.deps.logger.warn(
         redactSecrets({
           op: 'remote_compute_poll',
-          ...describePollError(error),
+          ...described,
+          ...(isAuthorizationFailure ? { requiresOperatorAction: true } : {}),
           consecutiveFailures: this.consecutiveFailures,
           nextRetryMs: delayMs,
         }),
-        'remote compute provider poll failed',
+        isAuthorizationFailure
+          ? 'remote compute provider poll rejected — operator token lacks the required scope'
+          : 'remote compute provider poll failed',
       );
     }
     return delayMs;

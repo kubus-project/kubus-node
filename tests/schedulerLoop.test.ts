@@ -159,6 +159,37 @@ describe('runResilientLoop — scheduler loop failure state (Part 12 / Part 40)'
     await vi.advanceTimersByTimeAsync(15000);
   });
 
+  it('does not treat action-lock contention as a loop failure', async () => {
+    const { logger, calls } = fakeLogger();
+    let stopped = false;
+    const task = vi.fn(async () => {
+      throw Object.assign(new Error('Action already running: scheduler:pin-reconcile'), {
+        status: 409,
+      });
+    });
+
+    void runResilientLoop({
+      name: 'heartbeat',
+      intervalMs: 1000,
+      maxBackoffMs: 2000,
+      task,
+      logger,
+      isStopped: () => stopped,
+    });
+
+    await vi.advanceTimersByTimeAsync(10000);
+    stopped = true;
+    await vi.advanceTimersByTimeAsync(5000);
+
+    // The other loop is doing the work; this one just runs next tick.
+    expect(calls.filter((c) => c.level === 'warn')).toHaveLength(0);
+    // And it must not have been counted as a failure, so a later genuine
+    // recovery is not reported against a phantom failure streak.
+    expect(
+      calls.filter((c) => c.message === 'scheduler loop recovered'),
+    ).toHaveLength(0);
+  });
+
   it('never logs a raw Authorization header value from a failure', async () => {
     const { logger, calls } = fakeLogger();
     let stopped = false;

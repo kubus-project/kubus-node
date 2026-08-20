@@ -110,6 +110,31 @@ describe('RemoteComputeRuntime provider polling (Part 11 / Part 40)', () => {
     expect(recoveries).toHaveLength(1);
   });
 
+  it('treats a 403 scope rejection as a standing config fact, not a transient outage', async () => {
+    const pollTimestamps: number[] = [];
+    const { runtime, calls } = buildRuntime(async () => {
+      pollTimestamps.push(Date.now());
+      throw Object.assign(
+        new Error('Availability operator token missing scope: compute:jobs:read'),
+        { status: 403 },
+      );
+    });
+
+    runtime.start();
+    await vi.advanceTimersByTimeAsync(180000);
+    runtime.stop();
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const warning = calls.find((c) => c.level === 'warn');
+    expect(warning?.message).toContain('operator token lacks the required scope');
+    expect(warning?.payload).toMatchObject({ status: 403, requiresOperatorAction: true });
+
+    // Straight to the 60s ceiling rather than climbing 5s -> 10s -> 20s...
+    // A real node logged 591 consecutive failures of exactly this kind.
+    const gap = (pollTimestamps[1] ?? 0) - (pollTimestamps[0] ?? 0);
+    expect(gap).toBeGreaterThanOrEqual(60000);
+  });
+
   it('never logs a raw Authorization header value from a poll failure', async () => {
     const { runtime, calls } = buildRuntime(async () => {
       throw new Error('request failed: Authorization: Bearer super-secret-node-token');

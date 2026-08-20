@@ -171,6 +171,20 @@ export async function runResilientLoop(options: ResilientLoopOptions): Promise<v
       lastFailureLoggedAt = 0;
       backoff.success();
     } catch (error) {
+      const described = describeLoopError(error);
+      // Losing a race for the shared action lock is contention, not failure:
+      // the other loop is doing the work right now, and this one simply runs
+      // on its next tick. Treating it as a failure reset no state but did
+      // spend a warning and a backoff step, so a busy node logged
+      // "scheduler loop failed" for loops that were perfectly healthy.
+      if (isActionLockContention(described)) {
+        logger.debug?.(
+          { loop: name, ...described },
+          'scheduler loop skipped — another action holds the lock',
+        );
+        await sleep(delayMs);
+        continue;
+      }
       consecutiveFailures += 1;
       delayMs = backoff.failure();
       const now = Date.now();
@@ -181,7 +195,7 @@ export async function runResilientLoop(options: ResilientLoopOptions): Promise<v
         logger.warn(
           redactSecrets({
             loop: name,
-            ...describeLoopError(error),
+            ...described,
             consecutiveFailures,
             nextRetryMs: delayMs,
           }),
@@ -205,4 +219,12 @@ function describeLoopError(error: unknown): { code?: string; status?: number; me
     status: err?.status ?? err?.statusCode,
     message: String(err?.message || error || 'unknown error'),
   };
+}
+
+/// The shared [ActionLock] rejects a second concurrent runner with HTTP 409
+/// and an "Action already running" message.
+function isActionLockContention(
+  described: { status?: number; message: string },
+): boolean {
+  return described.status === 409 && described.message.includes('Action already running');
 }

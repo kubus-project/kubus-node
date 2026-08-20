@@ -1,5 +1,7 @@
 import 'dotenv/config';
+import { existsSync as fsExistsSync } from 'node:fs';
 import { isIP } from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import type { LocalStore } from '../state/localStore.js';
 import type { AppConfig } from './schema.js';
@@ -187,9 +189,54 @@ function parseLegacyApiUrl(
 }
 
 function deriveLanApiUrl(host: string, port: number, enabled: boolean): string | undefined {
-  if (!enabled || !isPrivateLanHost(host)) return undefined;
-  const urlHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+  if (!enabled) return undefined;
+  // Listening on a wildcard (0.0.0.0 / ::) is the normal bare-metal setup, and
+  // it is precisely the case that used to yield no endpoint at all: a wildcard
+  // is not itself a routable address, so the node advertised nothing and
+  // pairing failed with `pairing_endpoint_unavailable` — no QR, nothing to
+  // scan. The operator has already said LAN access is intended, so resolve the
+  // address a phone on the same network can actually reach.
+  //
+  // Deliberately NOT done inside a container: there `os.networkInterfaces()`
+  // reports the container's own bridge address (commonly 172.17-18.x, which
+  // is a private range and would pass every check here) while the phone must
+  // reach the *host's* LAN address instead. Guessing would produce a QR that
+  // scans perfectly and then never connects, which is strictly worse than an
+  // honest failure — so containers must state their reachable URL explicitly
+  // via LOCAL_API_LAN_URL.
+  const resolved = isWildcardHost(host)
+    ? isContainerRuntime()
+      ? undefined
+      : detectPrivateLanAddress()
+    : host;
+  if (!resolved || !isPrivateLanHost(resolved)) return undefined;
+  const urlHost = resolved.includes(':') && !resolved.startsWith('[') ? `[${resolved}]` : resolved;
   return `http://${urlHost}:${port}`;
+}
+
+/** True when this process is running inside a container. */
+export function isContainerRuntime(exists: (path: string) => boolean = fsExistsSync): boolean {
+  return exists('/.dockerenv') || exists('/run/.containerenv');
+}
+
+/**
+ * The node's own private LAN IPv4, or undefined when it has none.
+ *
+ * IPv4 only and non-internal only: a link-local/loopback/virtual address is
+ * not something a phone can pair against, and advertising one would trade an
+ * honest "unavailable" for a QR that silently never connects.
+ */
+export function detectPrivateLanAddress(
+  interfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces(),
+): string | undefined {
+  for (const entries of Object.values(interfaces)) {
+    for (const entry of entries ?? []) {
+      if (entry.internal) continue;
+      if (entry.family !== 'IPv4' && String(entry.family) !== '4') continue;
+      if (isPrivateLanHost(entry.address)) return entry.address;
+    }
+  }
+  return undefined;
 }
 
 function isPrivateLanHost(host: string): boolean {

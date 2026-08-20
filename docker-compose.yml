@@ -54,7 +54,12 @@ services:
       kubo:
         condition: service_healthy
     ports:
-      - "127.0.0.1:8787:8787"
+      # Loopback by default. Pairing a phone needs the LAN instead: the app
+      # scans a QR and then connects straight to this port, so a
+      # 127.0.0.1-only publish makes pairing impossible no matter what the QR
+      # says. Set NODE_BIND_ADDRESS=0.0.0.0 (with LOCAL_API_ALLOW_LAN=true and
+      # NODE_GUI_TOKEN set) to publish on the LAN for pairing.
+      - "${NODE_BIND_ADDRESS:-127.0.0.1}:8787:8787"
     volumes:
       - node-state:/var/lib/kubus-node
     healthcheck:
@@ -99,6 +104,10 @@ volumes:
 # - Do not expose Kubo RPC port 5001 to the host or public internet.
 # - Gateway port 8080 is loopback-bound for local verification only.
 # - The GUI binds to 0.0.0.0 inside the container so Docker can publish it.
-# - The host port is still loopback-bound at 127.0.0.1:8787, and NODE_GUI_TOKEN is required.
+# - The host port is loopback-bound by default at 127.0.0.1:8787, and NODE_GUI_TOKEN is required.
+# - Pairing a phone requires LAN reachability: NODE_BIND_ADDRESS=0.0.0.0 plus
+#   LOCAL_API_ALLOW_LAN=true. The node then advertises its detected private
+#   LAN IPv4 in the pairing QR. Keep NODE_GUI_TOKEN set when doing this — the
+#   port becomes reachable from every device on the network.
 # - my.node.kubus.site is only a hosts-file alias to 127.0.0.1.
 # - Swarm port 4001 can be exposed when operators intend to participate in public IPFS routing.
