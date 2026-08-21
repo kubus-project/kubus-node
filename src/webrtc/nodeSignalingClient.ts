@@ -45,6 +45,8 @@ export interface NodeSignalingClientOptions {
 
 export class NodeSignalingClient {
   private readonly sessions = new Map<string, PendingSession>();
+  /** Connected peers outlive their short-lived signaling rendezvous. */
+  private readonly activePeers = new Map<string, NodePeer>();
   private socket: Socket | undefined;
   private stopped = false;
 
@@ -81,7 +83,14 @@ export class NodeSignalingClient {
     });
     socket.on('signal:candidate', (payload: SignalPayload) => this.acceptCandidate(payload));
     socket.on('session:ice-restart', (payload: SignalPayload) => this.closeSession(this.sessionId(payload), 'ice_restart_requested'));
-    for (const event of ['session:closed', 'session:expired', 'session:rejected'] as const) {
+    socket.on('session:closed', (payload: SignalPayload) => {
+      // The client closes the rendezvous only after the identity challenge has
+      // passed. That is the successful terminal state for signaling, not for
+      // the encrypted data channel which must remain available for requests.
+      const reason = payload.reason === 'connected' ? 'session:negotiated' : 'session:closed';
+      this.closeSession(this.sessionId(payload), reason);
+    });
+    for (const event of ['session:expired', 'session:rejected'] as const) {
       socket.on(event, (payload: SignalPayload) => this.closeSession(this.sessionId(payload), event));
     }
   }
@@ -91,6 +100,8 @@ export class NodeSignalingClient {
     const socket = this.socket;
     this.socket = undefined;
     for (const sessionId of [...this.sessions.keys()]) this.closeSession(sessionId, 'node_stopped');
+    for (const peer of this.activePeers.values()) peer.close();
+    this.activePeers.clear();
     if (!socket) return;
     if (socket.connected) {
       await this.emitAck(socket, 'node:withdraw', {}).catch(() => undefined);
@@ -156,6 +167,8 @@ export class NodeSignalingClient {
         void this.emit('signal:candidate', { sessionId, messageId: messageId(), candidate: { candidate, sdpMid: mid } }).catch(() => this.closeSession(sessionId, 'candidate_relay_failed'));
       },
       onStateChange: (state) => {
+        if (state === 'connected') return;
+        this.activePeers.delete(sessionId);
         if (state === 'failed' || state === 'closed') this.closeSession(sessionId, `session:peer_${state}`);
       },
     });
@@ -197,7 +210,12 @@ export class NodeSignalingClient {
     if (!session) return;
     this.sessions.delete(sessionId);
     clearTimeout(session.timer);
+    if (reason === 'session:negotiated' && session.peer?.currentState === 'connected') {
+      this.activePeers.set(sessionId, session.peer);
+      return;
+    }
     session.peer?.close();
+    this.activePeers.delete(sessionId);
     // Closing a session is best-effort; it is short-lived at the control plane
     // even when this socket is already gone.
     if (this.socket?.connected && !reason.startsWith('session:')) {
