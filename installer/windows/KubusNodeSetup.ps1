@@ -35,12 +35,18 @@ function Stop-Node([bool]$removeData) {
   Test-Docker
   & docker compose -p kubus-node -f $composeFile down
   if ($LASTEXITCODE -ne 0) { throw 'Docker could not stop kubus Node.' }
+  $deleted = $false
   if ($removeData) {
     $answer = [System.Windows.Forms.MessageBox]::Show(
       'Delete the kubus Node Docker volumes? This permanently removes Node identity, pairing credentials, archive data, and private captures.',
       'Delete Node data', 'YesNo', 'Warning')
-    if ($answer -eq 'Yes') { & docker volume rm kubus-node_node-state kubus-node_kubo-data | Out-Null }
+    if ($answer -eq 'Yes') {
+      & docker volume rm kubus-node_node-state kubus-node_kubo-data | Out-Null
+      if ($LASTEXITCODE -ne 0) { throw 'Docker stopped the Node, but could not remove its data volumes.' }
+      $deleted = $true
+    }
   }
+  return $deleted
 }
 
 $form = New-Object System.Windows.Forms.Form
@@ -79,12 +85,23 @@ $remove.Text = 'Stop / uninstall'
 $remove.Location = New-Object System.Drawing.Point(188, 155)
 $remove.Size = New-Object System.Drawing.Size(150, 36)
 $remove.Add_Click({
-  try { Stop-Node $false; $status.Text = 'Node stopped. Its data and identity were preserved.' }
+  try {
+    $deleted = Stop-Node $deleteData.Checked
+    if ($deleted) { $status.Text = 'Node stopped and its Docker volumes were removed.' }
+    else { $status.Text = 'Node stopped. Its data and identity were preserved.' }
+  }
   catch { Show-Problem $_.Exception.Message }
 })
 $form.Controls.Add($remove)
 
-$form.Controls.Add((New-Object System.Windows.Forms.Label -Property @{ Text = 'GPU reconstruction is only enabled on supported Linux Docker + NVIDIA/CUDA hosts. Windows uses archive participation and remote processing.'; Location = New-Object System.Drawing.Point(24, 220); Size = New-Object System.Drawing.Size(480, 38); AutoSize = $false }))
+$deleteData = New-Object System.Windows.Forms.CheckBox
+$deleteData.Text = 'Also permanently delete Node data and identity'
+$deleteData.Location = New-Object System.Drawing.Point(24, 202)
+$deleteData.Size = New-Object System.Drawing.Size(360, 24)
+$deleteData.Checked = $false
+$form.Controls.Add($deleteData)
+
+$form.Controls.Add((New-Object System.Windows.Forms.Label -Property @{ Text = 'GPU reconstruction is only enabled on supported Linux Docker + NVIDIA/CUDA hosts. Windows uses archive participation and remote processing.'; Location = New-Object System.Drawing.Point(24, 236); Size = New-Object System.Drawing.Size(480, 38); AutoSize = $false }))
 
 try { Test-Docker; $status.Text = 'Docker Desktop is ready.' } catch { $status.Text = 'Docker Desktop needs attention.' }
 [void]$form.ShowDialog()
