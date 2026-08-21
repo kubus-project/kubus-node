@@ -1,0 +1,11 @@
+{
+  // Type-checking covers more than the runtime image ships. `tsconfig.json`
+  // emits `src/` alone, so tests and helper scripts would otherwise never be
+  // checked at all — they are checked here instead, with no emit, keeping
+  // `dist/` to exactly what the Docker image and the npm bin need.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts"]
+}
