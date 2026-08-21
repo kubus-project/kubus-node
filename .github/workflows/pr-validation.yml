@@ -85,6 +85,12 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.15.0
+          cache: npm
+      - name: Install and build the packaged CLI entrypoint
+        shell: pwsh
+        run: |
+          npm ci
+          npm run build
       - name: Parse installer and verify shipped-layout references
         shell: pwsh
         run: |
