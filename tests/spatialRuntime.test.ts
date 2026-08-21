@@ -8,6 +8,7 @@ import { CapabilityRegistry } from '../src/capabilities/registry.js';
 import { validateSpatialManifest } from '../src/spatial/models.js';
 import { LocalStore } from '../src/state/localStore.js';
 import { MIN_VIEWS_FOR_RECONSTRUCTION } from '../src/spatial/nerfstudioAdapter.js';
+import { AnalyticsStore } from '../src/analytics/analyticsStore.js';
 
 const dirs: string[] = [];
 
@@ -138,6 +139,58 @@ describe('private spatial runtime', () => {
     // Failed via the worker's own response, not the pre-flight eligibility gate.
     expect(jobs.get(job.id).state).toBe('failed');
     expect(jobs.get(job.id).error?.code).toBe('worker_unsupported');
+  });
+
+  it('records started/completed processing analytics for a real successful job', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-spatial-')); dirs.push(dir);
+    const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
+    const captures = new CaptureStore(dir, store);
+    const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: validCaptureFiles() });
+    const analytics = new AnalyticsStore(path.join(dir, 'analytics.json'));
+    await analytics.load();
+
+    let outputDirectory = '';
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.endsWith('/health')) {
+        return new Response(JSON.stringify({ status: 'ready', gpu: { available: true, name: 'RTX 3080 Ti' }, capabilities: ['spatial.reconstruct'] }), { status: 200 });
+      }
+      if (url.endsWith('/v1/process')) {
+        const body = JSON.parse(String(init?.body ?? '{}'));
+        outputDirectory = body.outputDirectory;
+        await fs.mkdir(outputDirectory, { recursive: true });
+        await fs.writeFile(path.join(outputDirectory, 'result.ply'), Buffer.alloc(1234, 1));
+        return new Response(JSON.stringify({
+          variants: [{ role: 'spatial_archive', path: 'result.ply', mimeType: 'application/octet-stream', format: 'ply', storageClass: 'cold' }],
+          processing: { protocol: 'kubus.spatial-job/1', workerVersion: 'kubus-spatial-worker/1', reconstruction: { engine: 'nerfstudio', method: 'splatfacto', iterations: 1000, outputFormat: 'ply' } },
+        }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    });
+    const capabilities = new CapabilityRegistry({ id: async () => ({ ID: 'peer' }) } as never, 'http://kubus-spatial-worker:8790');
+
+    const jobs = new JobRuntime({
+      store, captureStore: captures,
+      kubo: { addFileStreamed: async () => ({ Hash: 'bafyOutputCid' }), addBytes: async () => ({ Hash: 'bafyManifestCid' }) } as never,
+      logger: { warn: () => undefined } as never,
+      dataRoot: dir, concurrency: 1, workerUrl: 'http://kubus-spatial-worker:8790',
+      participationGate: { assertUsefulOperation: async () => undefined } as never,
+      workerAuth: { issue: async () => 'token' } as never,
+      capabilities,
+      analytics,
+    });
+    await jobs.start();
+    const job = await jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' });
+    await waitForTerminal(jobs, job.id);
+
+    expect(jobs.get(job.id).state).toBe('completed');
+    const buckets = analytics.query('24h');
+    expect(buckets).toHaveLength(1);
+    expect(buckets[0]!.processing.started).toBe(1);
+    expect(buckets[0]!.processing.completed).toBe(1);
+    expect(buckets[0]!.processing.totalInputBytes).toBe(capture.sizeBytes);
+    expect(buckets[0]!.processing.totalOutputBytes).toBe(1234);
+    expect(buckets[0]!.processing.totalDurationMs).toBeGreaterThanOrEqual(0);
   });
 
   it('validates the versioned renderer-neutral spatial manifest', () => {

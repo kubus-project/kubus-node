@@ -1,8 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { promises as fs } from 'node:fs';
 import type { IncomingMessage } from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import type { AppConfig } from '../src/config/schema.js';
 import type { SpatialWorkerHealth } from '../src/capabilities/registry.js';
 import { ActionLock } from '../src/runtime/actionLock.js';
+import { AnalyticsStore } from '../src/analytics/analyticsStore.js';
 import { assertGuiConfig, authorizeGuiRequest } from '../src/gui/guiAuth.js';
 import { startGuiServer } from '../src/gui/guiServer.js';
 import { guiJs } from '../src/gui/public/guiJs.js';
@@ -374,6 +378,68 @@ describe('local GUI safety helpers', () => {
       } finally {
         await server.close();
       }
+    });
+
+    describe('/gui/api/analytics', () => {
+      const analyticsDirs: string[] = [];
+      afterEach(async () => {
+        await Promise.all(analyticsDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
+      });
+
+      async function startNodeWithAnalytics() {
+        const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-gui-analytics-'));
+        analyticsDirs.push(dir);
+        const analytics = new AnalyticsStore(path.join(dir, 'analytics.json'));
+        await analytics.load();
+        await analytics.recordProcessingEvent('completed', { durationMs: 2000, inputBytes: 100, outputBytes: 200 });
+        const server = await startGuiServer({
+          api: {} as never,
+          kubo: {} as never,
+          store: { snapshot: () => ({}) } as never,
+          config: nodeConfig,
+          logger: { info: () => undefined } as never,
+          actionLock: new ActionLock(),
+          analytics,
+        });
+        return server;
+      }
+
+      it('returns real recorded buckets for a valid range', async () => {
+        const server = await startNodeWithAnalytics();
+        try {
+          const response = await fetch(server.url.replace('/gui', '/gui/api/analytics?range=24h'), { headers });
+          const body = await response.json();
+          expect(response.status).toBe(200);
+          expect(body.data.range).toBe('24h');
+          expect(body.data.buckets).toHaveLength(1);
+          expect(body.data.buckets[0].processing.completed).toBe(1);
+        } finally {
+          await server.close();
+        }
+      });
+
+      it('rejects an unsupported range rather than silently defaulting', async () => {
+        const server = await startNodeWithAnalytics();
+        try {
+          const response = await fetch(server.url.replace('/gui', '/gui/api/analytics?range=1y'), { headers });
+          expect(response.status).toBe(400);
+        } finally {
+          await server.close();
+        }
+      });
+
+      it('503s rather than crashing when analytics is not configured', async () => {
+        const server = await startGuiServer({
+          api: {} as never, kubo: {} as never, store: { snapshot: () => ({}) } as never,
+          config: nodeConfig, logger: { info: () => undefined } as never, actionLock: new ActionLock(),
+        });
+        try {
+          const response = await fetch(server.url.replace('/gui', '/gui/api/analytics'), { headers });
+          expect(response.status).toBe(503);
+        } finally {
+          await server.close();
+        }
+      });
     });
   });
 });

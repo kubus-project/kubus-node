@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import type { AnalyticsStore } from '../analytics/analyticsStore.js';
 import type { CaptureStore } from '../captures/captureStore.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import { localError } from '../localApi/pairingService.js';
@@ -56,6 +57,12 @@ interface WorkerOutput {
 
 const capabilityFor = (type: JobType) => type === 'spatial.reconstruct' ? 'spatial.reconstruction' : 'spatial.optimization';
 
+/** Wall-clock duration from real start/end timestamps, or undefined if the job never actually started running. */
+function durationOf(job: LocalJob): number | undefined {
+  if (!job.startedAt || !job.completedAt) return undefined;
+  return Date.parse(job.completedAt) - Date.parse(job.startedAt);
+}
+
 export class JobRuntime {
   private running = new Map<string, AbortController>();
   private dispatching = false;
@@ -72,6 +79,8 @@ export class JobRuntime {
       workerAuth: WorkerAuthService;
       /** Shared runtime capability state; when supplied, dispatch confirms freshness before talking to the worker. */
       capabilities?: CapabilityRegistry;
+      /** Optional: local processing analytics. Absent in tests that do not care about it. */
+      analytics?: AnalyticsStore;
     },
   ) {}
 
@@ -173,6 +182,7 @@ export class JobRuntime {
         current.startedAt = current.updatedAt = new Date().toISOString();
         current.logs.push({ at: current.updatedAt, level: 'info', message: 'Preparing dataset from capture' });
       });
+      this.recordAnalytics('started');
 
       // Only spatial.reconstruct trains from a raw capture; other job types
       // (optimize, generate_preview) operate on already-processed spatial
@@ -218,6 +228,10 @@ export class JobRuntime {
         current.completedAt = current.updatedAt = new Date().toISOString();
         current.logs.push({ at: current.updatedAt, level: 'info', message: 'Spatial outputs imported into local Kubo' });
       });
+      const finished = this.get(id);
+      const outputBytes = ((spatial as { manifest?: { variants?: Array<{ sizeBytes?: number }> } }).manifest?.variants || [])
+        .reduce((sum, variant) => sum + (variant.sizeBytes || 0), 0);
+      this.recordAnalytics('completed', { durationMs: durationOf(finished), inputBytes: capture.sizeBytes, outputBytes });
     } catch (error) {
       if (this.get(id).state === 'cancelled') return;
       const aborted = controller.signal.aborted;
@@ -228,8 +242,24 @@ export class JobRuntime {
         current.completedAt = current.updatedAt = new Date().toISOString();
         current.logs.push({ at: current.updatedAt, level: aborted ? 'warn' : 'error', message: current.error.message });
       });
+      this.recordAnalytics(aborted ? 'cancelled' : 'failed', { durationMs: durationOf(this.get(id)) });
       this.deps.logger.warn({ jobId: id, code: (error as { code?: string }).code }, 'spatial job stopped');
     }
+  }
+
+  /**
+   * Best-effort: analytics is a local, secondary concern. A write failure
+   * here (disk full, permissions) must never fail or retry the job itself -
+   * it is only logged.
+   */
+  private recordAnalytics(
+    kind: 'started' | 'completed' | 'failed' | 'cancelled',
+    extra: { durationMs?: number; inputBytes?: number; outputBytes?: number } = {},
+  ): void {
+    if (!this.deps.analytics) return;
+    this.deps.analytics.recordProcessingEvent(kind, extra).catch((error) => {
+      this.deps.logger.warn({ code: (error as Error).message }, 'failed to record processing analytics');
+    });
   }
 
   private async importOutputs(job: LocalJob, capture: ReturnType<CaptureStore['get']>, outputDirectory: string, output: WorkerOutput): Promise<Record<string, unknown>> {

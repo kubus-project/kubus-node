@@ -1,5 +1,6 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import type { AnalyticsRange, AnalyticsStore } from '../analytics/analyticsStore.js';
 import type { KubusApiClient } from '../backend/kubusApiClient.js';
 import type { AppConfig } from '../config/schema.js';
 import { formatFingerprint } from '../identity/nodeIdentity.js';
@@ -19,6 +20,7 @@ import { guiJs } from './public/guiJs.js';
 import { assertGuiConfig, authorizeGuiRequest, guiRemoteMode, sendUnauthorized } from './guiAuth.js';
 import { guiHtml } from './templates/index.js';
 import { handleLocalApi, type LocalApiDeps } from '../localApi/localApiRouter.js';
+import { localError } from '../localApi/pairingService.js';
 import { buildViewModel } from './viewModel.js';
 import { renderQrSvg } from './qr.js';
 import {
@@ -40,7 +42,11 @@ export interface GuiDeps {
   logger: Logger;
   actionLock: ActionLock;
   localApi?: LocalApiDeps;
+  /** Optional so narrow tests of unrelated routes don't need to construct one. */
+  analytics?: AnalyticsStore;
 }
+
+const ANALYTICS_RANGES: readonly AnalyticsRange[] = ['24h', '7d', '30d'];
 
 export interface GuiServerHandle {
   url: string;
@@ -217,6 +223,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
   if (req.method === 'GET' && spatialMatch) {
     const record = getSpatialRecord(deps.store, decodeURIComponent(spatialMatch[1]!));
     writeJson(res, 200, { success: true, data: record });
+    return;
+  }
+  if (req.method === 'GET' && parsed.pathname === '/gui/api/analytics') {
+    if (!deps.analytics) throw localError(503, 'analytics_unavailable');
+    const requested = parsed.searchParams.get('range') || '24h';
+    if (!ANALYTICS_RANGES.includes(requested as AnalyticsRange)) throw localError(400, 'analytics_range_invalid', { allowed: ANALYTICS_RANGES });
+    writeJson(res, 200, { success: true, data: { range: requested, buckets: deps.analytics.query(requested as AnalyticsRange) } });
     return;
   }
 
