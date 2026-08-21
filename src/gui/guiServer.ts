@@ -413,6 +413,20 @@ async function runAction(action: string, deps: GuiDeps): Promise<unknown> {
  * threw, which for a DNS/TLS/connection failure is literally the string
  * "fetch failed" and tells the operator nothing they can act on.
  */
+/**
+ * Failures that are settings problems rather than network problems. Telling an
+ * operator to check their connection when their gateway URL is simply
+ * unusable wastes the one piece of information the probe actually recovered.
+ */
+const GATEWAY_CONFIGURATION_ADVICE: Record<string, string> = {
+  gateway_url_port_not_permitted:
+    'Gateway URL uses a port this runtime refuses to connect to. Check IPFS_GATEWAY_URL — a gateway normally runs on 8080 or 443.',
+  gateway_url_scheme_unsupported:
+    'Gateway URL scheme is not supported. Check IPFS_GATEWAY_URL — it must begin with http:// or https://.',
+  gateway_url_invalid:
+    'Gateway URL could not be parsed. Check IPFS_GATEWAY_URL for a typo.',
+};
+
 function describeRetrievalProbe(probe: RetrievalProbe): string {
   switch (probe.state) {
     case 'pinned':
@@ -424,7 +438,10 @@ function describeRetrievalProbe(probe: RetrievalProbe): string {
     case 'gateway_timeout':
       return 'Gateway timed out — the configured gateway did not respond in time';
     case 'gateway_unreachable':
-      return `Gateway unreachable — could not connect (${probe.errorClass || 'unknown'}). Local content is unaffected.`;
+      // A configuration mistake and a network outage need different actions
+      // from the operator, so they must not read as the same message.
+      return GATEWAY_CONFIGURATION_ADVICE[probe.errorClass ?? '']
+        ?? `Gateway unreachable — could not connect (${probe.errorClass || 'unknown'}). Local content is unaffected.`;
     case 'gateway_http_error':
       return `Gateway returned HTTP ${probe.httpStatus} for this CID`;
     case 'gateway_not_found':
