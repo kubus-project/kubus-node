@@ -137,6 +137,34 @@ export class KuboClient {
     }
   }
 
+  /**
+   * Streams a CID's bytes without buffering them in Node memory, optionally
+   * restricted to a byte range. A Spatial archive can be a multi-hundred-
+   * megabyte Gaussian splat PLY; a GUI viewer serving that through `cat()`
+   * (which awaits the whole `arrayBuffer()`) would hold the entire file in
+   * memory just to re-emit it once. Kubo's `cat` RPC already accepts
+   * `offset`/`length`, so a caller answering an HTTP Range request can pass
+   * them straight through instead of slicing a buffered response.
+   *
+   * The caller owns cancellation: call `.cancel()` on the returned handle
+   * (e.g. when the client disconnects) to abort the upstream Kubo request
+   * rather than reading it to completion for nothing.
+   */
+  async catStream(
+    cid: string,
+    range?: { offset: number; length: number },
+  ): Promise<{ body: ReadableStream<Uint8Array>; cancel: () => void }> {
+    const controller = new AbortController();
+    const params: Record<string, string> = { arg: normalizeCid(cid) };
+    if (range) {
+      params.offset = String(range.offset);
+      params.length = String(range.length);
+    }
+    const response = await fetch(this.url('cat', params), { method: 'POST', signal: controller.signal });
+    if (!response.ok || !response.body) throw new Error(`Kubo cat failed with HTTP ${response.status}`);
+    return { body: response.body, cancel: () => controller.abort() };
+  }
+
   private async post<T>(command: string, params: Record<string, string> = {}): Promise<T> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);

@@ -21,6 +21,16 @@ import { guiHtml } from './templates/index.js';
 import { handleLocalApi, type LocalApiDeps } from '../localApi/localApiRouter.js';
 import { buildViewModel } from './viewModel.js';
 import { renderQrSvg } from './qr.js';
+import {
+  getCaptureSummary,
+  getJobSummary,
+  getSpatialRecord,
+  listCaptureSummaries,
+  listJobSummaries,
+  listSpatialSummaries,
+  serveCaptureFile,
+  serveSpatialVariant,
+} from './spatialGuiApi.js';
 
 export interface GuiDeps {
   api: KubusApiClient;
@@ -159,6 +169,57 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     writeJson(res, 200, { success: true, data: await runAction(action, deps) });
     return;
   }
+
+  // --- Spatial library, capture archive, and job queue (read-only) ---------
+  if (req.method === 'GET' && parsed.pathname === '/gui/api/jobs') {
+    const local = requireLocalApi(deps);
+    writeJson(res, 200, { success: true, data: listJobSummaries(local.jobs) });
+    return;
+  }
+  const jobMatch = parsed.pathname.match(/^\/gui\/api\/jobs\/([^/]+)$/);
+  if (req.method === 'GET' && jobMatch) {
+    const local = requireLocalApi(deps);
+    writeJson(res, 200, { success: true, data: getJobSummary(local.jobs, decodeURIComponent(jobMatch[1]!)) });
+    return;
+  }
+  if (req.method === 'GET' && parsed.pathname === '/gui/api/captures') {
+    const local = requireLocalApi(deps);
+    writeJson(res, 200, { success: true, data: listCaptureSummaries(local.captures) });
+    return;
+  }
+  const captureMatch = parsed.pathname.match(/^\/gui\/api\/captures\/([^/]+)$/);
+  if (req.method === 'GET' && captureMatch) {
+    const local = requireLocalApi(deps);
+    writeJson(res, 200, { success: true, data: getCaptureSummary(local.captures, decodeURIComponent(captureMatch[1]!)) });
+    return;
+  }
+  const captureContentMatch = parsed.pathname.match(/^\/gui\/api\/captures\/([^/]+)\/content\/(.+)$/);
+  if (req.method === 'GET' && captureContentMatch) {
+    const local = requireLocalApi(deps);
+    await serveCaptureFile(res, local, decodeURIComponent(captureContentMatch[1]!), decodeURIComponent(captureContentMatch[2]!));
+    return;
+  }
+  if (req.method === 'GET' && parsed.pathname === '/gui/api/spatial') {
+    writeJson(res, 200, { success: true, data: listSpatialSummaries(deps.store) });
+    return;
+  }
+  const spatialManifestMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/manifest$/);
+  if (req.method === 'GET' && spatialManifestMatch) {
+    writeJson(res, 200, { success: true, data: getSpatialRecord(deps.store, decodeURIComponent(spatialManifestMatch[1]!)).manifest });
+    return;
+  }
+  const spatialContentMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/content\/([^/]+)$/);
+  if (req.method === 'GET' && spatialContentMatch) {
+    await serveSpatialVariant(req, res, deps, decodeURIComponent(spatialContentMatch[1]!), decodeURIComponent(spatialContentMatch[2]!));
+    return;
+  }
+  const spatialMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)$/);
+  if (req.method === 'GET' && spatialMatch) {
+    const record = getSpatialRecord(deps.store, decodeURIComponent(spatialMatch[1]!));
+    writeJson(res, 200, { success: true, data: record });
+    return;
+  }
+
   writeJson(res, 404, { success: false, error: 'Not found' });
 }
 
