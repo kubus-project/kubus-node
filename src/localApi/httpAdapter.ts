@@ -61,16 +61,16 @@ function classifyPeer(config: AppConfig, address?: string): LocalPeer | null {
   if (normalized === '127.0.0.1' || normalized === '::1') {
     // Loopback is the operator's own machine. It is the only case where the
     // transport itself is evidence of who is calling.
-    return { kind: 'loopback', address: normalized, identityVerified: true };
+    return { kind: 'loopback', address: normalized, identityHandshakeComplete: true };
   }
   if (config.localApiAllowLan) {
-    return { kind: 'lan', address: normalized, identityVerified: true };
+    return { kind: 'lan', address: normalized, identityHandshakeComplete: true };
   }
   const trusted = config.localApiRemoteUrl
     && config.localApiTrustedProxyAddresses?.some(
       (candidate) => normalizePeerAddress(candidate) === normalized,
     );
-  if (trusted) return { kind: 'trusted-proxy', address: normalized, identityVerified: true };
+  if (trusted) return { kind: 'trusted-proxy', address: normalized, identityHandshakeComplete: true };
   return null;
 }
 

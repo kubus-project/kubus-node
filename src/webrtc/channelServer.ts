@@ -33,8 +33,9 @@ import {
  * What it *does* own is everything specific to being reachable by an
  * arbitrary internet peer:
  *
- * - Nothing privileged is served until the peer has answered the identity
- *   challenge. A data channel proves a channel exists, never who opened it.
+ * - Nothing privileged is served until the identity handshake has completed.
+ *   That is protocol ordering, not client authentication: see `LocalPeer` for
+ *   precisely what the challenge does and does not prove.
  * - Concurrency, body size, and in-flight request counts are bounded, because
  *   the far end is not trusted and a channel is cheap to open.
  * - A cancelled or abandoned request stops work rather than running to
@@ -57,7 +58,7 @@ export interface ChannelServerOptions {
   maxConcurrentRequests?: number;
   /** Largest request body this peer may send, before the route's own limit applies. */
   maxRequestBodyBytes?: number;
-  /** How long a peer may stay unverified before the channel is closed. */
+  /** How long a peer may go without completing the handshake before the channel closes. */
   identityProofTimeoutMs?: number;
 }
 
@@ -66,11 +67,13 @@ const DEFAULT_MAX_REQUEST_BODY_BYTES = 192 * 1024 * 1024;
 const DEFAULT_IDENTITY_PROOF_TIMEOUT_MS = 15_000;
 
 /**
- * The one operation served before the peer is verified.
+ * The one path answered before the handshake completes.
  *
- * It is answered on a reserved request id rather than through the dispatcher,
- * because it is not a Node API operation: it is the handshake that decides
- * whether this peer is ever allowed to issue one.
+ * Handled here rather than through the dispatcher because it is not a Node API
+ * operation and carries no authorization: it is the exchange that lets the
+ * client decide whether this really is the node it paired with. Answering it
+ * discloses nothing an unauthenticated peer could not already read off the
+ * pairing QR — the public key, and a signature over a nonce the peer chose.
  */
 const IDENTITY_CHALLENGE_PATH = '/local/v1/identity/challenge';
 
@@ -96,7 +99,7 @@ export class ChannelServer {
   private readonly maxConcurrentRequests: number;
   private readonly maxRequestBodyBytes: number;
   private readonly inFlight = new Map<number, InFlight>();
-  private identityVerified = false;
+  private identityHandshakeComplete = false;
   private proofTimer: NodeJS.Timeout | undefined;
   private closed = false;
 
@@ -111,7 +114,7 @@ export class ChannelServer {
     // A peer that opens a channel and then says nothing costs us a socket and
     // a timer. Give the handshake a deadline rather than waiting forever.
     this.proofTimer = setTimeout(() => {
-      if (!this.identityVerified) {
+      if (!this.identityHandshakeComplete) {
         this.logger?.warn({ sessionId: this.sessionId }, 'data channel closed: identity challenge not answered');
         this.close();
       }
@@ -178,9 +181,9 @@ export class ChannelServer {
     }
   }
 
-  /** Visible for tests: whether this peer has proved the node's identity. */
+  /** Visible for tests: whether the identity handshake has completed on this channel. */
   get isIdentityVerified(): boolean {
-    return this.identityVerified;
+    return this.identityHandshakeComplete;
   }
 
   get inFlightCount(): number {
@@ -302,7 +305,7 @@ export class ChannelServer {
       clientRole: 'client',
     });
 
-    this.identityVerified = true;
+    this.identityHandshakeComplete = true;
     if (this.proofTimer) clearTimeout(this.proofTimer);
     this.proofTimer = undefined;
 
@@ -361,7 +364,7 @@ export class ChannelServer {
   private peer(): LocalPeer {
     return {
       kind: 'webrtc',
-      identityVerified: this.identityVerified,
+      identityHandshakeComplete: this.identityHandshakeComplete,
       sessionId: this.sessionId,
     };
   }

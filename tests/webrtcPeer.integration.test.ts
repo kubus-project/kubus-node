@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Buffer } from 'node:buffer';
 import crypto from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -253,11 +253,16 @@ describe('node WebRTC peer, end to end', () => {
       nonce: crypto.randomBytes(32),
     });
 
-  beforeEach(async () => {
+  // One connection for the whole file. Standing up seven real ICE negotiations
+  // in a suite that also runs everything else made this flake under load, and a
+  // flaky integration test is worse than none: it trains you to re-run.
+  // The one case that needs a peer which has NOT yet completed the handshake
+  // runs first, before `verify()` is ever called.
+  beforeAll(async () => {
     harness = await build();
-  }, 40_000);
+  }, 60_000);
 
-  afterEach(() => {
+  afterAll(() => {
     harness?.peer.close();
     try {
       harness?.clientConnection.close();

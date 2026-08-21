@@ -47,14 +47,28 @@ export interface LocalPeer {
   /** Present only for socket transports; used for pairing rate-limit keys. */
   address?: string;
   /**
-   * True once this peer has proved possession of the paired Node's identity
-   * key, or is inherently trusted by virtue of the transport (loopback).
+   * Whether the identity handshake this transport requires has completed.
    *
-   * A WebRTC peer starts false and must not reach a privileged route until the
-   * challenge is verified: ICE and DTLS prove a channel exists, never who is
-   * on the other end of it.
+   * Be precise about what this does and does not buy, because the name invites
+   * an overclaim. The Ed25519 challenge protects the *client* from a fake
+   * node: the client picks a nonce, the node signs it, and the client checks
+   * the signature against the public key it recorded at pairing time. It is
+   * not, and cannot be, authentication of the client — a caller that simply
+   * sends a challenge gets a signature, because the signature discloses
+   * nothing beyond what the pairing QR already published.
+   *
+   * What gating privileged routes on it actually provides is protocol
+   * ordering: a client cannot present its credential over a data channel
+   * before it has been given the opportunity to verify who it is talking to.
+   * That closes a client-implementation mistake, not an attack by a peer that
+   * already holds a stolen credential — the credential's own scope, expiry
+   * and revocation are what bound that.
+   *
+   * Socket transports set this true because the transport itself is the
+   * evidence: loopback is the operator's own machine, and a LAN address is
+   * one the operator explicitly opted into.
    */
-  identityVerified: boolean;
+  identityHandshakeComplete: boolean;
   /**
    * The signaling session this peer arrived on, if any. Bound into the
    * identity proof so a captured proof cannot be replayed into a new session.

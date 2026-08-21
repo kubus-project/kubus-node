@@ -106,33 +106,93 @@ describe('runResilientLoop — scheduler loop failure state (Part 12 / Part 40)'
   });
 
   it('backs off instead of retrying on the plain interval while failing', async () => {
-    const { logger } = fakeLogger();
-    let stopped = false;
-    const tickTimestamps: number[] = [];
-    const task = vi.fn(async () => {
-      tickTimestamps.push(Date.now());
-      throw new Error('down');
-    });
+    // The delay carries +/-25% jitter, so comparing one sampled gap against
+    // another by a fixed ratio is not a property the code guarantees: a
+    // high-jittered first gap next to a low-jittered second one can legitimately
+    // land within any such ratio. Pin the jitter instead, and assert the exact
+    // delays the ladder is supposed to produce.
+    const jitter = vi.spyOn(Math, 'random').mockReturnValue(0.5); // no jitter: multiplier 1.0
+    try {
+      const { logger } = fakeLogger();
+      let stopped = false;
+      const tickTimestamps: number[] = [];
+      const task = vi.fn(async () => {
+        tickTimestamps.push(Date.now());
+        throw new Error('down');
+      });
 
-    void runResilientLoop({
-      name: 'commitments',
-      intervalMs: 5000,
-      maxBackoffMs: 60000,
-      task,
-      logger,
-      isStopped: () => stopped,
-    });
+      void runResilientLoop({
+        name: 'commitments',
+        intervalMs: 5000,
+        maxBackoffMs: 60000,
+        task,
+        logger,
+        isStopped: () => stopped,
+      });
 
-    await vi.advanceTimersByTimeAsync(5000 + 10000 + 20000);
-    stopped = true;
-    await vi.advanceTimersByTimeAsync(60000);
+      await vi.advanceTimersByTimeAsync(5000 + 10000 + 20000 + 40000);
+      stopped = true;
+      await vi.advanceTimersByTimeAsync(60000);
 
-    // Backoff grows each failure: gap 2 should be roughly double gap 1, not
-    // a fixed 5s repeat (allow for the +/-25% jitter on the first attempt).
-    expect(tickTimestamps.length).toBeGreaterThanOrEqual(3);
-    const gap1 = tickTimestamps[1]! - tickTimestamps[0]!;
-    const gap2 = tickTimestamps[2]! - tickTimestamps[1]!;
-    expect(gap2).toBeGreaterThan(gap1 * 1.4);
+      expect(tickTimestamps.length).toBeGreaterThanOrEqual(3);
+      const gaps = tickTimestamps
+        .slice(1)
+        .map((at, index) => at - tickTimestamps[index]!);
+
+      // Doubling, not a fixed 5s repeat. That is the whole point: a node whose
+      // backend is down must not keep hammering it every interval.
+      expect(gaps[0]).toBe(5000);
+      expect(gaps[1]).toBe(10000);
+      if (gaps.length > 2) expect(gaps[2]).toBe(20000);
+    } finally {
+      jitter.mockRestore();
+    }
+  });
+
+  it('keeps every jittered delay inside the band the ladder promises', async () => {
+    // The bound that must hold for ANY jitter draw, checked at both extremes
+    // rather than by sampling: the smallest possible second delay still
+    // exceeds the largest possible first one, which is what makes the growth
+    // real rather than statistical.
+    for (const [draw, multiplier] of [
+      [0, 0.75],
+      [0.999999, 1.25],
+    ] as const) {
+      const jitter = vi.spyOn(Math, 'random').mockReturnValue(draw);
+      try {
+        const { logger } = fakeLogger();
+        let stopped = false;
+        const tickTimestamps: number[] = [];
+        const task = vi.fn(async () => {
+          tickTimestamps.push(Date.now());
+          throw new Error('down');
+        });
+
+        void runResilientLoop({
+          name: 'commitments',
+          intervalMs: 5000,
+          maxBackoffMs: 60000,
+          task,
+          logger,
+          isStopped: () => stopped,
+        });
+
+        await vi.advanceTimersByTimeAsync(60000);
+        stopped = true;
+        await vi.advanceTimersByTimeAsync(60000);
+
+        expect(tickTimestamps.length).toBeGreaterThanOrEqual(3);
+        const gap1 = tickTimestamps[1]! - tickTimestamps[0]!;
+        const gap2 = tickTimestamps[2]! - tickTimestamps[1]!;
+        expect(gap1).toBe(Math.round(5000 * multiplier));
+        expect(gap2).toBe(Math.round(10000 * multiplier));
+      } finally {
+        jitter.mockRestore();
+      }
+    }
+
+    // And the invariant that makes the two bands non-overlapping at all.
+    expect(10000 * 0.75).toBeGreaterThan(5000 * 1.25);
   });
 
   it('respects a startup stagger before the first tick', async () => {

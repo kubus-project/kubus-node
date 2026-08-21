@@ -42,8 +42,8 @@ const jsonBody = (value: unknown): LocalRequestBody => {
   };
 };
 
-const verifiedPeer: LocalPeer = { kind: 'loopback', address: '127.0.0.1', identityVerified: true };
-const unverifiedWebRtcPeer: LocalPeer = { kind: 'webrtc', identityVerified: false, sessionId: 'session-1' };
+const verifiedPeer: LocalPeer = { kind: 'loopback', address: '127.0.0.1', identityHandshakeComplete: true };
+const unverifiedWebRtcPeer: LocalPeer = { kind: 'webrtc', identityHandshakeComplete: false, sessionId: 'session-1' };
 
 function request(overrides: Partial<LocalRequest> & Pick<LocalRequest, 'method' | 'path'>): LocalRequest {
   return {
@@ -172,7 +172,7 @@ describe('dispatchLocalRequest', () => {
         method: 'GET',
         path: '/local/v1/info',
         credential: token,
-        peer: { ...unverifiedWebRtcPeer, identityVerified: true },
+        peer: { ...unverifiedWebRtcPeer, identityHandshakeComplete: true },
       }),
       deps,
     );

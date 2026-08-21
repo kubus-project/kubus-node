@@ -106,7 +106,7 @@ export async function dispatchLocalRequest(
   // is on the far end of it. Holding a valid credential does not change that:
   // a stolen credential is exactly the case this guards. Nothing privileged is
   // served until the identity challenge has been answered.
-  if (!request.peer.identityVerified) {
+  if (!request.peer.identityHandshakeComplete) {
     throw localError(403, 'node_identity_proof_required');
   }
 
