@@ -1,11 +1,14 @@
 /**
  * kubus Node GUI stylesheet.
  *
- * Design intent: a local infrastructure appliance, not a daemon control panel
- * and not a crypto dashboard. It shares the art.kubus palette, spacing scale
- * and status vocabulary, but uses stable opaque surfaces instead of the app's
- * glass — this is an information-dense operator tool that has to stay legible
- * for long stretches on a desktop display.
+ * Design intent: the Node is a kubus product surface, not a generic admin
+ * panel — it uses the same canonical tokens and liquid-glass language as
+ * art.kubus (lib/utils/design_tokens.dart: KubusColors.glassLight/glassDark/
+ * glassBorderLight/glassBorderDark), applied at the same points the app
+ * applies it: the shell/nav and top-level panels, never nested rows. This is
+ * still an information-dense operator tool that has to stay legible for long
+ * stretches on a desktop display, so glass is bounded, not blanket - see
+ * "Liquid glass" below for exactly which surfaces get it.
  *
  * Constraints: no webfonts, no CDN, no framework. The node must render
  * correctly with no internet connection at all.
@@ -57,6 +60,15 @@ export const guiCss = `
   --k-shadow-sm: 0 1px 2px rgba(15, 23, 32, 0.06);
   --k-shadow-md: 0 2px 8px rgba(15, 23, 32, 0.08);
 
+  /* Liquid glass: mirrors KubusColors.glassLight/glassBorderLight exactly
+     (0x99FFFFFF = 60% white, 0x40FFFFFF border). Blur amounts are this
+     surface's own tuning - the Flutter tokens don't define blur radii. */
+  --k-glass: rgba(255, 255, 255, 0.6);
+  --k-glass-border: rgba(255, 255, 255, 0.4);
+  --k-glass-hover: rgba(255, 255, 255, 0.72);
+  --k-blur-md: 20px;
+  --k-blur-lg: 32px;
+
   --k-control-height: 36px;
   --k-motion-fast: 120ms;
   --k-motion: 180ms;
@@ -99,6 +111,12 @@ export const guiCss = `
 
     --k-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
     --k-shadow-md: 0 2px 10px rgba(0, 0, 0, 0.45);
+
+    /* Mirrors KubusColors.glassDark/glassBorderDark (0xCC1A1A1A = 80%
+       #1A1A1A, 0x40000000 border). */
+    --k-glass: rgba(26, 26, 26, 0.8);
+    --k-glass-border: rgba(0, 0, 0, 0.4);
+    --k-glass-hover: rgba(36, 36, 36, 0.85);
   }
 }
 
@@ -108,7 +126,17 @@ html, body { height: 100%; }
 
 body {
   margin: 0;
-  background: var(--k-bg);
+  /* The page backdrop itself: two fixed, cheap radial tints under the flat
+     background colour, so glass surfaces (.sidebar, .panel) have something
+     with actual variation to reveal - a blur over a perfectly flat colour
+     is indistinguishable from a plain tint and would make the blur pure
+     cost with no visual payoff. Fixed (not scroll-linked) and static (no
+     animation): this is texture, not decoration to keep re-computing. */
+  background:
+    radial-gradient(720px 480px at 8% -8%, var(--k-primary-soft), transparent 60%),
+    radial-gradient(640px 480px at 100% 0%, var(--k-primary-soft), transparent 55%),
+    var(--k-bg);
+  background-attachment: fixed;
   color: var(--k-text);
 }
 
@@ -146,6 +174,59 @@ button, input, select, textarea { font: inherit; color: inherit; }
   border-radius: var(--k-radius-xs);
 }
 
+/* --- Liquid glass --------------------------------------------------------
+   Bounded to genuinely elevated surfaces: the shell/nav and top-level
+   panels/menus/modals. Nested rows, list items and table cells stay flat -
+   a blurred surface inside a blurred surface reads as noise, not depth, and
+   costs real compositing time for no visual benefit.
+
+   .sidebar and .panel (below) carry the glass treatment directly in their
+   own rules, since they're the two surfaces that already exist everywhere
+   in this file (25+ call sites) - a second class name at every call site
+   would be one more thing to remember and one more way to regress. The
+   .kubus-glass-* classes exist as the reusable primitive for surfaces that
+   don't have their own base rule yet: modals, dropdown/context menus, and
+   standalone controls a future Part D screen (job detail, Spatial preview,
+   pairing) introduces.
+
+   Every primitive falls back to an opaque surface when backdrop-filter
+   isn't supported, so the Node never renders a see-through, illegible
+   panel. */
+.kubus-glass,
+.kubus-glass-panel,
+.kubus-glass-modal,
+.kubus-glass-menu {
+  background: var(--k-glass);
+  backdrop-filter: blur(var(--k-blur-md));
+  -webkit-backdrop-filter: blur(var(--k-blur-md));
+  border: 1px solid var(--k-glass-border);
+}
+.kubus-glass-nav {
+  background: var(--k-glass);
+  backdrop-filter: blur(var(--k-blur-lg));
+  -webkit-backdrop-filter: blur(var(--k-blur-lg));
+}
+.kubus-glass-control,
+.kubus-glass-input,
+.kubus-glass-chip {
+  background: var(--k-glass);
+  border: 1px solid var(--k-glass-border);
+  /* Controls typically live inside an already-glass panel; blurring them
+     too would stack blur-in-blur, so they take the glass tint without a
+     second backdrop-filter pass. */
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .kubus-glass,
+  .kubus-glass-panel,
+  .kubus-glass-modal,
+  .kubus-glass-menu,
+  .kubus-glass-nav,
+  .sidebar,
+  .panel {
+    background: var(--k-surface);
+  }
+}
+
 /* --- App shell ---------------------------------------------------------- */
 .shell {
   display: grid;
@@ -154,8 +235,10 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 
 .sidebar {
-  border-right: 1px solid var(--k-border);
-  background: var(--k-surface);
+  background: var(--k-glass);
+  backdrop-filter: blur(var(--k-blur-lg));
+  -webkit-backdrop-filter: blur(var(--k-blur-lg));
+  border-right: 1px solid var(--k-glass-border);
   padding: var(--k-space-lg) var(--k-space-md);
   display: flex;
   flex-direction: column;
@@ -262,8 +345,10 @@ button, input, select, textarea { font: inherit; color: inherit; }
 
 /* --- Surfaces ----------------------------------------------------------- */
 .panel {
-  background: var(--k-surface);
-  border: 1px solid var(--k-border);
+  background: var(--k-glass);
+  backdrop-filter: blur(var(--k-blur-md));
+  -webkit-backdrop-filter: blur(var(--k-blur-md));
+  border: 1px solid var(--k-glass-border);
   border-radius: var(--k-radius-md);
   padding: var(--k-space-md);
   display: grid;
