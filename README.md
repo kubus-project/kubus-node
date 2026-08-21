@@ -107,6 +107,7 @@ Both are pending control-plane records. Settlement is not active; KUB8 has no gu
 - [Distributed compute](docs/DISTRIBUTED_COMPUTE.md)
 - [Rewards](docs/REWARDS.md)
 - [Privacy](docs/PRIVACY.md)
+- [Remote paired-device transport](docs/REMOTE_TRANSPORT.md)
 - [Security](docs/security.md)
 - [Operator guide](docs/operator-guide.md)
 - [Release channels](docs/RELEASES.md)

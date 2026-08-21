@@ -24,6 +24,7 @@ import { WorkerAuthService } from '../spatial/workerAuth.js';
 import { ComputeIdentityService } from '../compute/computeIdentity.js';
 import { PrivatePayloadTransport } from '../compute/privatePayloadTransport.js';
 import { RemoteComputeRuntime } from '../compute/remoteComputeRuntime.js';
+import { NodeSignalingClient } from '../webrtc/nodeSignalingClient.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const command = argv[0] || 'start';
@@ -119,18 +120,28 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   await capabilities.refresh();
   const gui = (config.guiEnabled || config.localApiEnabled) ? await startGuiServer({ api, kubo, store, config, logger, actionLock, localApi }) : null;
   let scheduler: Scheduler | null = null;
+  let signaling: NodeSignalingClient | null = null;
   try {
     await actionLock.run('startup', () => bootstrapOnce(api, kubo, store, config, capabilities, participationGate, computeIdentity));
     scheduler = new Scheduler({ api, kubo, store, config, logger, gate: participationGate, identity: computeIdentity, capabilities, actionLock });
     scheduler.start();
     remoteCompute.start();
+    // The signaling namespace authorizes the durable node id against the
+    // operator token, so it can only start after registration. It remains
+    // explicitly non-fatal: a signaling outage must not take down LAN access,
+    // configured HTTPS, or archive participation.
+    const nodeId = store.snapshot().nodeId;
+    if (nodeId) {
+      signaling = new NodeSignalingClient({ config, nodeId, localApi, identity, logger });
+      signaling.start();
+    }
     logger.info({ nodeId: store.snapshot().nodeId }, 'kubus node started');
   } catch (error) {
     logger.error({ error: String((error as Error).message || error) }, 'kubus node startup failed');
     if (!gui) throw error;
     logger.warn({ guiUrl: gui.url }, 'GUI remains available for local diagnostics; scheduler was not started');
   }
-  await waitForShutdown(scheduler, gui, remoteCompute);
+  await waitForShutdown(scheduler, gui, remoteCompute, signaling);
 }
 
 async function bootstrapOnce(api: KubusApiClient, kubo: KuboClient, store: LocalStore, config: ReturnType<typeof parseEnv>, capabilities: CapabilityRegistry, gate?: NetworkParticipationGate, identity?: ComputeIdentityService) {
@@ -178,7 +189,12 @@ async function doctor(api: KubusApiClient, kubo: KuboClient, config: ReturnType<
   console.log(JSON.stringify(report, null, 2));
 }
 
-async function waitForShutdown(scheduler: Scheduler | null, gui?: GuiServerHandle | null, remoteCompute?: RemoteComputeRuntime): Promise<void> {
+async function waitForShutdown(
+  scheduler: Scheduler | null,
+  gui?: GuiServerHandle | null,
+  remoteCompute?: RemoteComputeRuntime,
+  signaling?: NodeSignalingClient | null,
+): Promise<void> {
   await new Promise<void>((resolve) => {
     const done = () => resolve();
     process.once('SIGINT', done);
@@ -186,5 +202,6 @@ async function waitForShutdown(scheduler: Scheduler | null, gui?: GuiServerHandl
   });
   await scheduler?.stop();
   remoteCompute?.stop();
+  await signaling?.stop();
   await gui?.close();
 }
