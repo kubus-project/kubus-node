@@ -42,6 +42,23 @@ describe('streaming capture upload', () => {
     expect(record.private).toBe(true);
   });
 
+  it('writes a multi-chunk request without requiring one whole-file buffer', async () => {
+    const store = await newStore();
+    const draft = await store.beginDraft(draftPayload);
+    const chunks = async function* () {
+      yield Buffer.from('first-');
+      yield Buffer.from('second-');
+      yield Buffer.from('third');
+    };
+
+    const progress = await store.writeDraftFileStream(draft.id, 'rgb/00000.jpg', chunks(), 'image/jpeg');
+    const record = await store.commitDraft(draft.id);
+    const written = await fs.readFile(path.join(record.directory, 'rgb/00000.jpg'), 'utf8');
+
+    expect(written).toBe('first-second-third');
+    expect(progress.sizeBytes).toBe(Buffer.byteLength(written));
+  });
+
   it('accumulates size and file count across appends', async () => {
     const store = await newStore();
     const draft = await store.beginDraft(draftPayload);

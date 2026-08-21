@@ -283,15 +283,15 @@ async function route(
     if (!(await pairing.authorize(credential, 'captures:create'))) throw localError(403, 'scope_required');
     const filePath = request.query.get('path');
     if (!filePath) throw localError(400, 'capture_file_path_invalid');
-    const bytes = await request.body.binary(BODY_LIMITS.captureDraftFile);
     const mimeType = request.contentType;
     return jsonResponse(
       200,
-      await captures.writeDraftFile(
+      await captures.writeDraftFileStream(
         draftFileMatch[1]!,
         filePath,
-        bytes,
+        request.body.stream(),
         typeof mimeType === 'string' && mimeType !== 'application/octet-stream' ? mimeType : undefined,
+        BODY_LIMITS.captureDraftFile,
       ),
     );
   }

@@ -79,6 +79,10 @@ function safeRelativePath(raw: string): string {
 const MAX_CAPTURE_BYTES = 5 * 1024 * 1024 * 1024;
 const MAX_CAPTURE_FILES = 5000;
 
+async function* oneChunk(bytes: Buffer): AsyncIterable<Buffer> {
+  yield bytes;
+}
+
 interface DraftEntry {
   draft: CaptureDraft;
   payload: CaptureDraftPayload;
@@ -199,13 +203,24 @@ export class CaptureStore {
     bytes: Buffer,
     mimeType?: string,
   ): Promise<CaptureDraft> {
+    return this.writeDraftFileStream(id, rawPath, oneChunk(bytes), mimeType);
+  }
+
+  /** Streams a file directly to a temporary file and promotes it atomically. */
+  async writeDraftFileStream(
+    id: string,
+    rawPath: string,
+    chunks: AsyncIterable<Buffer>,
+    mimeType?: string,
+    maxBytes = MAX_CAPTURE_BYTES,
+  ): Promise<CaptureDraft> {
     const entry = this.drafts.get(id);
     if (!entry) throw localError(404, 'capture_draft_not_found');
 
     // Queue behind any in-flight mutation of this draft. Chained on the entry
     // so uploads to different drafts still proceed in parallel.
     const result = entry.lock.then(
-      () => this.writeDraftFileExclusive(entry, rawPath, bytes, mimeType),
+      () => this.writeDraftFileStreamExclusive(entry, rawPath, chunks, mimeType, maxBytes),
     );
     // Keep the chain alive even if this write rejects, so one failed upload
     // does not poison every later one.
@@ -213,11 +228,12 @@ export class CaptureStore {
     return result;
   }
 
-  private async writeDraftFileExclusive(
+  private async writeDraftFileStreamExclusive(
     entry: DraftEntry,
     rawPath: string,
-    bytes: Buffer,
+    chunks: AsyncIterable<Buffer>,
     mimeType?: string,
+    maxBytes = MAX_CAPTURE_BYTES,
   ): Promise<CaptureDraft> {
     const relative = safeRelativePath(rawPath);
     const target = path.join(entry.draft.directory, relative);
@@ -226,16 +242,38 @@ export class CaptureStore {
     }
 
     const existing = entry.files.get(relative);
-    const nextSize = entry.draft.sizeBytes - (existing?.bytes ?? 0) + bytes.byteLength;
-    if (nextSize > MAX_CAPTURE_BYTES) throw localError(413, 'capture_size_exceeded');
     if (!existing && entry.files.size >= MAX_CAPTURE_FILES) {
       throw localError(413, 'capture_file_count_exceeded');
     }
 
     await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
-    await fs.writeFile(target, bytes, { mode: 0o600 });
-    entry.files.set(relative, { bytes: bytes.byteLength, mimeType });
-    entry.draft.sizeBytes = nextSize;
+    const temporary = `${target}.partial-${crypto.randomUUID()}`;
+    let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+    let written = 0;
+    try {
+      handle = await fs.open(temporary, 'w', 0o600);
+      for await (const chunk of chunks) {
+        const bytes = Buffer.from(chunk);
+        written += bytes.byteLength;
+        if (written > maxBytes) throw localError(413, 'request_too_large');
+        const nextSize = entry.draft.sizeBytes - (existing?.bytes ?? 0) + written;
+        if (nextSize > MAX_CAPTURE_BYTES) throw localError(413, 'capture_size_exceeded');
+        for (let offset = 0; offset < bytes.byteLength;) {
+          const result = await handle.write(bytes, offset, bytes.byteLength - offset);
+          offset += result.bytesWritten;
+        }
+      }
+      if (written === 0) throw localError(400, 'capture_file_empty');
+      await handle.close();
+      handle = undefined;
+      await fs.rename(temporary, target);
+    } catch (error) {
+      await handle?.close().catch(() => undefined);
+      await fs.rm(temporary, { force: true }).catch(() => undefined);
+      throw error;
+    }
+    entry.files.set(relative, { bytes: written, mimeType });
+    entry.draft.sizeBytes = entry.draft.sizeBytes - (existing?.bytes ?? 0) + written;
     entry.draft.fileCount = entry.files.size;
     return structuredClone(entry.draft);
   }
