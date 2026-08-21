@@ -84,7 +84,37 @@ function classifyGatewayFetchError(error: unknown): { state: RetrievalState; err
   if (err?.name === 'AbortError') return { state: 'gateway_timeout', errorClass: 'abort' };
   const causeCode = err?.cause?.code;
   if (causeCode) return { state: 'gateway_unreachable', errorClass: causeCode };
+  const configured = classifyConfigurationFailure(err?.cause?.message);
+  if (configured) return { state: 'gateway_unreachable', errorClass: configured };
   const message = String(err?.message || error || '');
   if (message.toLowerCase().includes('abort')) return { state: 'gateway_timeout', errorClass: 'abort' };
   return { state: 'gateway_unreachable', errorClass: 'unknown' };
+}
+
+/**
+ * Some failures never reach a socket at all, so they carry no OS error code
+ * and would otherwise be reported as `unknown` — the least actionable answer
+ * available, and for a *configuration* mistake the most misleading one. The
+ * operator does not have a network problem; they have a gateway URL the
+ * runtime will not dial. Naming that distinctly is the difference between
+ * "check your network" and "check this setting".
+ *
+ * Matched on the cause's message because that is the only signal present, but
+ * mapped onto a fixed vocabulary so the raw message — which can contain the
+ * configured URL, and therefore any credential embedded in it — never becomes
+ * the error class itself.
+ */
+function classifyConfigurationFailure(causeMessage?: string): string | undefined {
+  const message = (causeMessage || '').toLowerCase();
+  if (!message) return undefined;
+  // `fetch` refuses a set of ports outright (WHATWG "bad port" list) rather
+  // than attempting a connection.
+  if (message.includes('bad port')) return 'gateway_url_port_not_permitted';
+  if (message.includes('unsupported protocol') || message.includes('protocol')) {
+    return 'gateway_url_scheme_unsupported';
+  }
+  if (message.includes('invalid url') || message.includes('failed to parse')) {
+    return 'gateway_url_invalid';
+  }
+  return undefined;
 }
