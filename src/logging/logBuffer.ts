@@ -12,6 +12,10 @@ let sequence = 0;
 
 const TOKEN_PATTERNS = [
   /kubus_node_[A-Za-z0-9._~-]+/g,
+  // The credential a paired phone authenticates with. It is minted by the
+  // pairing exchange and is as sensitive as an operator token, but it was not
+  // matched here, so a failing local-API request could print one verbatim.
+  /kubus_local_[A-Za-z0-9._~-]+/g,
   /(Authorization\s*:\s*Bearer\s+)[A-Za-z0-9._~-]+/gi,
   /("authorization"\s*:\s*"Bearer\s+)[^"]+(")/gi,
   /("KUBUS_OPERATOR_TOKEN"\s*:\s*")[^"]+(")/gi,
@@ -23,7 +27,10 @@ export function redactSecrets<T>(value: T): T {
     let next: string = value;
     for (const pattern of TOKEN_PATTERNS) {
       next = next.replace(pattern, (match, prefix = '', suffix = '') => {
+        // Keep the recognisable prefix so a reader can still tell which kind
+        // of credential appeared, without disclosing any of it.
         if (match.startsWith('kubus_node_')) return 'kubus_node_[redacted]';
+        if (match.startsWith('kubus_local_')) return 'kubus_local_[redacted]';
         return `${prefix}[redacted]${suffix}`;
       });
     }
@@ -53,8 +60,16 @@ export function redactSecrets<T>(value: T): T {
   return value;
 }
 
+/**
+ * Appends an already-sanitized log record to the GUI's buffer.
+ *
+ * The caller redacts: the logger hook sanitizes once and hands the same
+ * arguments to both this buffer and pino's own transport, so the two surfaces
+ * can never disagree about what was safe to show. Redacting again here would
+ * be harmless but would hide that contract.
+ */
 export function appendLog(level: string, args: unknown[]): void {
-  const sanitizedArgs = redactSecrets(args);
+  const sanitizedArgs = args;
   const message = sanitizedArgs
     .filter((entry) => typeof entry === 'string')
     .join(' ')

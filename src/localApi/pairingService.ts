@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import type { AppConfig } from '../config/schema.js';
+import type { NodeIdentity } from '../identity/nodeIdentity.js';
 import type { LocalStore } from '../state/localStore.js';
 
 export const LOCAL_SCOPES = [
@@ -15,12 +16,12 @@ export const LOCAL_SCOPES = [
 export type LocalScope = typeof LOCAL_SCOPES[number];
 
 export interface PairingSessionResponse {
-  version: 2;
+  version: 3;
   sessionId: string;
   secret: string;
   expiresAt: string;
   payload: string;
-  node: { id: string | null; label: string; endpoint: string; endpoints: string[]; fingerprint: string };
+  node: { id: string | null; label: string; endpoint: string; endpoints: string[]; fingerprint: string; publicKey: string };
 }
 
 /** Bounded, in-memory protection for a remotely exposed pairing exchange. */
@@ -85,7 +86,18 @@ const safeEqual = (left: string, right: string) => {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 };
 
-/** One versioned serialization for the QR, copy action, and API response. */
+/**
+ * One versioned serialization for the QR, copy action, and API response.
+ *
+ * v3 adds `pk`, the node's raw Ed25519 public key: the value a WebRTC peer
+ * verifies the node against after connecting, so a paired app can hold the
+ * key across the session rather than trusting the fingerprint alone. `f`
+ * stays a separate parameter (rather than something the app derives locally)
+ * so a display/compare flow that only reads `f` keeps working unchanged; the
+ * two must agree — `nodeFingerprintFromPublicKey(pk) === f` always holds; see
+ * `PairingService.createSession`. There are no production pairing partners on
+ * v2 to keep compatible, so v3 is emitted exclusively rather than dual-issued.
+ */
 export function serializePairingPayload(input: {
   endpoint: string;
   alternateEndpoints: string[];
@@ -94,26 +106,31 @@ export function serializePairingPayload(input: {
   nodeId: string;
   label: string;
   fingerprint: string;
+  publicKey: string;
 }): string {
   const uri = new URL('kubus-node://pair');
-  uri.searchParams.set('v', '2');
+  uri.searchParams.set('v', '3');
   uri.searchParams.set('e', input.endpoint);
   uri.searchParams.set('s', input.sessionId);
   uri.searchParams.set('k', input.secret);
   uri.searchParams.set('n', input.nodeId);
   uri.searchParams.set('l', input.label.slice(0, 80));
   uri.searchParams.set('f', input.fingerprint);
+  uri.searchParams.set('pk', input.publicKey);
   for (const endpoint of input.alternateEndpoints) uri.searchParams.append('a', endpoint);
   return uri.toString();
 }
 
 export class PairingService {
-  constructor(private readonly store: LocalStore, private readonly config: AppConfig) {}
+  constructor(private readonly store: LocalStore, private readonly config: AppConfig, private readonly identity: NodeIdentity) {}
 
   async createSession(): Promise<PairingSessionResponse> {
-    // Pairing is available before public registration, so ensure the durable
-    // local identity exists even for the standalone `kubus-node gui` command.
-    const nodeKey = await this.store.getOrCreateNodeKey(this.config.nodeKey);
+    // Pairing is available before public registration, so ensure the legacy
+    // node key exists even for the standalone `kubus-node gui` command — it is
+    // still what `registerNode`/heartbeat send to the backend. It plays no
+    // part in the identity below: that comes from the Ed25519 keypair, which
+    // is minted independently of registration and of this call.
+    await this.store.getOrCreateNodeKey(this.config.nodeKey);
     const id = crypto.randomUUID();
     const secret = crypto.randomBytes(32).toString('base64url');
     const now = Date.now();
@@ -132,15 +149,26 @@ export class PairingService {
     ]
       .filter((endpoint): endpoint is string => Boolean(endpoint));
     if (endpoints.length === 0) throw localError(409, 'pairing_endpoint_unavailable');
-    const fingerprint = digest(`kubus-local-identity:${nodeKey}`);
+    const fingerprint = this.identity.fingerprint;
+    const publicKey = this.identity.publicKeyBase64Url;
     // A Node can pair before it has registered with the public availability
-    // service. Its local identity remains stable because it is derived from
-    // the persisted node key; registration later upgrades only the public ID.
+    // service. Its local identity remains stable because the Ed25519 keypair
+    // is generated once and persisted independently of registration.
+    //
+    // Deliberate choice: the fallback id is `local-${fingerprint}`, and
+    // `fingerprint` used to be derived from the shared node key; it is now
+    // derived from the public key instead. That is the identity a connecting
+    // client actually verifies (see identityProof.ts), so it is the more
+    // correct fallback id, not just an incidental consequence of this change.
+    // Nothing downstream depends on the old value: `registerNode`/heartbeat
+    // send the raw node key to the backend directly and never read this
+    // fallback id, and once registration succeeds `state.nodeId` (the
+    // backend-issued id) takes over here regardless.
     const nodeId = state.nodeId || `local-${fingerprint}`;
     const [endpoint, ...alternateEndpoints] = endpoints;
-    const payload = serializePairingPayload({ endpoint: endpoint!, alternateEndpoints, sessionId: id, secret, nodeId, label: this.config.nodeLabel, fingerprint });
+    const payload = serializePairingPayload({ endpoint: endpoint!, alternateEndpoints, sessionId: id, secret, nodeId, label: this.config.nodeLabel, fingerprint, publicKey });
     return {
-      version: 2,
+      version: 3,
       sessionId: id,
       secret,
       expiresAt,
@@ -151,6 +179,7 @@ export class PairingService {
         endpoint: endpoint!,
         endpoints,
         fingerprint,
+        publicKey,
       },
     };
   }

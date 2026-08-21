@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "version": "0.8.0-alpha.4",
+  "channel": "alpha",
+  "sourceSha": "0000000000000000000000000000000000000000",
+  "nodeImage": "ghcr.io/kubus-project/kubus-node@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "workerImage": "ghcr.io/kubus-project/kubus-spatial-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "composeSha256": "a3ad5a0d419780eee245a3139b6f385c2609d4d832c82539eb489055dab68319",
+  "minimumCliVersion": "0.8.0-alpha.4",
+  "protocolVersion": 3
+}

@@ -1,0 +1,105 @@
+name: Build kubus Node package
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        required: false
+        type: string
+      release_tag:
+        required: false
+        type: string
+      publish:
+        required: false
+        default: false
+        type: boolean
+      node_image:
+        required: false
+        default: ghcr.io/kubus-project/kubus-node@sha256:0000000000000000000000000000000000000000000000000000000000000000
+        type: string
+      worker_image:
+        required: false
+        default: ghcr.io/kubus-project/kubus-spatial-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000
+        type: string
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Commit to package (defaults to the selected ref)
+        required: false
+        type: string
+      release_tag:
+        description: Release tag, for example v0.8.0-alpha.4
+        required: false
+        type: string
+      publish:
+        description: This package is for a release publication
+        required: false
+        default: false
+        type: boolean
+      node_image:
+        description: Immutable node image reference
+        required: false
+        type: string
+      worker_image:
+        description: Immutable spatial worker image reference
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build and verify exact release and npm packages
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.15.0
+          cache: npm
+      - name: Validate release version and package source
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          test "$version" = "$(node -p "require('./version.json').version")"
+          if [ -n "${{ inputs.release_tag }}" ]; then test "${{ inputs.release_tag }}" = "v$version"; fi
+          npm ci
+          git diff --exit-code -- package-lock.json
+          npm run build
+      - name: Enforce npm package allow-list before creating release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pack --dry-run --json > npm-pack-dry-run.json
+          node -e "const [p]=require('./npm-pack-dry-run.json'); const f=new Set(p.files.map(x=>x.path)); for(const x of ['dist/src/index.js','runtime/release-manifest.json','runtime/docker-compose.release.yml','version.json']) if(!f.has(x)) throw new Error('npm pack missing '+x); for(const x of f) if(/^(src|tests?|coverage|\\.github|node_modules)\\//.test(x)||/(^|\\/)\\.env/.test(x)) throw new Error('npm package leak '+x);"
+      - name: Build the exact package candidate
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          NODE_IMAGE: ${{ inputs.node_image || 'ghcr.io/kubus-project/kubus-node@sha256:0000000000000000000000000000000000000000000000000000000000000000' }}
+          WORKER_IMAGE: ${{ inputs.worker_image || 'ghcr.io/kubus-project/kubus-spatial-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000' }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$RELEASE_TAG" ]]; then RELEASE_TAG="v$(node -p "require('./version.json').version")"; fi
+          node scripts/build_release_package.mjs --output release --tag "$RELEASE_TAG" --source-sha "${{ inputs.source_sha || github.sha }}" --node-image "$NODE_IMAGE" --worker-image "$WORKER_IMAGE"
+          node scripts/verify_release_package.mjs --directory "release/kubus-node-windows-$RELEASE_TAG" --version "$(node -p "require('./version.json').version")"
+          docker compose -f "release/kubus-node-windows-$RELEASE_TAG/docker-compose.release.yml" config >/dev/null
+          node scripts/build_npm_package.mjs --output release/npm --tag "$RELEASE_TAG" --source-sha "${{ inputs.source_sha || github.sha }}" --node-image "$NODE_IMAGE" --worker-image "$WORKER_IMAGE"
+          tarball="$(find release/npm -maxdepth 1 -name '*.tgz' -print -quit)"
+          test -n "$tarball"
+          node scripts/verify_npm_package.mjs --tarball "$tarball"
+          cp "release/kubus-node-windows-$RELEASE_TAG/release-manifest.json" "release/kubus-node-release-manifest-$RELEASE_TAG.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kubus-node-release-package-${{ inputs.release_tag || github.sha }}
+          path: |
+            release/*.zip
+            release/*.tar.gz
+            release/npm/*.tgz
+            release/kubus-node-release-manifest-*.json
+          if-no-files-found: error
+          retention-days: ${{ inputs.publish && 30 || 7 }}

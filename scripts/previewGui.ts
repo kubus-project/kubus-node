@@ -9,10 +9,14 @@
 import crypto from 'node:crypto';
 import { startGuiServer } from '../src/gui/guiServer.js';
 import { serializePairingPayload } from '../src/localApi/pairingService.js';
+import { nodeFingerprintFromPublicKey } from '../src/identity/nodeIdentity.js';
 
 const scenario = process.argv[2] || 'healthy';
 const previewSecret = Buffer.from(Array.from({ length: 32 }, (_, index) => index + 1)).toString('base64url');
-const previewFingerprint = crypto.createHash('sha256').update('kubus-node-preview-identity').digest('hex');
+const previewKeyPair = crypto.generateKeyPairSync('ed25519');
+const previewPublicKeyRaw = Buffer.from((previewKeyPair.publicKey.export({ format: 'jwk' }) as { x: string }).x, 'base64url');
+const previewPublicKey = previewPublicKeyRaw.toString('base64url');
+const previewFingerprint = nodeFingerprintFromPublicKey(previewPublicKeyRaw);
 const previewPairingPayload = serializePairingPayload({
   endpoint: 'http://192.168.1.24:8787',
   alternateEndpoints: ['https://node.example.test'],
@@ -21,6 +25,7 @@ const previewPairingPayload = serializePairingPayload({
   nodeId: 'node-1',
   label: 'ROK-DESKTOP',
   fingerprint: previewFingerprint,
+  publicKey: previewPublicKey,
 });
 
 const config = {
@@ -103,6 +108,7 @@ const server = await startGuiServer({
   logger: { info: () => undefined } as never,
   actionLock: { snapshot: () => ({}), run: async (_n: string, f: () => unknown) => f() } as never,
   localApi: {
+    identity: { fingerprint: previewFingerprint },
     participationGate: { refresh: async () => participationByScenario[scenario] },
     capabilities: { getWorkerHealth: () => workerByScenario[scenario], refreshIfStale: async () => [] },
     jobs: { health: () => ({ configured: true, running: scenario === 'healthy' ? 1 : 0, queued: 0, concurrency: 2 }) },
@@ -113,7 +119,7 @@ const server = await startGuiServer({
     captures: { list: () => Array.from({ length: scenario === 'healthy' ? 6 : 0 }, () => ({ sizeBytes: 800 * 1024 ** 2 })) },
     pairing: {
       createSession: async () => ({
-        version: 2,
+        version: 3,
         sessionId: 'session-1',
         secret: previewSecret,
         expiresAt: new Date(Date.now() + 292_000).toISOString(),
@@ -124,6 +130,7 @@ const server = await startGuiServer({
           endpoint: 'http://192.168.1.24:8787',
           endpoints: ['http://192.168.1.24:8787', 'https://node.example.test'],
           fingerprint: previewFingerprint,
+          publicKey: previewPublicKey,
         },
       }),
       revoke: async () => undefined,

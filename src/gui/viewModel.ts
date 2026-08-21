@@ -18,6 +18,7 @@
 import type { ParticipationSnapshot } from '../participation/networkParticipationGate.js';
 import type { SpatialWorkerHealth } from '../capabilities/registry.js';
 import type { ComputeProviderSettings } from '../compute/providerSettings.js';
+import { formatFingerprint } from '../identity/nodeIdentity.js';
 import type { LocalState } from '../state/localStore.js';
 import {
   RECIPROCITY_EXPLANATION,
@@ -37,6 +38,8 @@ import {
 
 export interface ViewModelInput {
   state: LocalState;
+  /** Only the fingerprint travels here — never the public key or anything key-shaped, and never the private key. */
+  identity: { fingerprint: string };
   participation: ParticipationSnapshot;
   worker: SpatialWorkerHealth;
   jobs: { configured: boolean; running: number; queued: number; concurrency: number };
@@ -101,6 +104,13 @@ export interface NodeViewModel {
     peerIdFull: string | null;
     version: string | null;
     lastHeartbeat: string | null;
+    /**
+     * Formatted (grouped, uppercase, 16-hex-char) Ed25519 identity fingerprint —
+     * the value an operator compares by eye against what the art.kubus app
+     * shows for this node. Never the public key itself, and never the
+     * private key.
+     */
+    fingerprint: string;
   };
   participation: StateDescription & {
     /** Shown once, on the overview — never repeated on each gated control. */
@@ -210,6 +220,7 @@ export function buildViewModel(input: ViewModelInput): NodeViewModel {
       peerIdFull: state.peerId ?? null,
       version: state.latestHeartbeat?.agentVersion ?? null,
       lastHeartbeat: formatRelativeTime(state.latestHeartbeatAt, now),
+      fingerprint: formatFingerprint(input.identity.fingerprint),
     },
     participation: {
       ...participationDescription,

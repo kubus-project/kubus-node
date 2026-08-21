@@ -1,0 +1,72 @@
+services:
+  kubo:
+    image: ipfs/kubo:v0.43.0
+    command: ["daemon", "--migrate=true", "--agent-version-suffix=kubus-node"]
+    environment:
+      IPFS_TELEMETRY: "off"
+    ports:
+      - "4001:4001/tcp"
+      - "4001:4001/udp"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - kubo-data:/data/ipfs
+    healthcheck:
+      test: ["CMD-SHELL", "ipfs id >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  kubus-node-agent:
+    image: __KUBUS_NODE_IMAGE__
+    restart: unless-stopped
+    environment:
+      IPFS_RPC_URL: http://kubo:5001
+      IPFS_GATEWAY_URL: http://kubo:8080
+      LOCAL_STATE_PATH: /var/lib/kubus-node/state.json
+      LOCAL_DATA_PATH: /var/lib/kubus-node/data
+      LOCAL_API_ENABLED: "true"
+      LOCAL_API_HOST: "0.0.0.0"
+      LOCAL_API_PORT: "8787"
+      LOCAL_API_LAN_URL: ${NODE_LAN_URL:-}
+      NODE_GUI_ENABLED: "true"
+      NODE_GUI_HOST: "0.0.0.0"
+      NODE_GUI_PORT: "8787"
+      SPATIAL_WORKER_URL: http://kubus-spatial-worker:8790
+      WORKER_AUTH_KEY_PATH: /var/lib/kubus-node/worker-auth.key
+    depends_on:
+      kubo:
+        condition: service_healthy
+    ports:
+      - "${NODE_BIND_ADDRESS:-127.0.0.1}:8787:8787"
+    volumes:
+      - node-state:/var/lib/kubus-node
+    healthcheck:
+      test: ["CMD", "node", "dist/src/index.js", "status"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 30s
+
+  kubus-spatial-worker:
+    image: __KUBUS_SPATIAL_WORKER_IMAGE__
+    profiles: ["spatial"]
+    environment:
+      KUBUS_SPATIAL_MAX_ITERATIONS: ${KUBUS_SPATIAL_MAX_ITERATIONS:-15000}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      WORKER_AUTH_KEY_PATH: /var/lib/kubus-node/worker-auth.key
+    volumes:
+      - node-state:/var/lib/kubus-node
+    expose:
+      - "8790"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8790/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  kubo-data:
+  node-state:

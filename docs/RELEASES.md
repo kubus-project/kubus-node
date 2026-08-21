@@ -10,6 +10,27 @@ kubus Node uses SemVer. Exact Git and container tags are immutable.
 
 An alpha or beta never updates `latest`. Every `v*` tag runs type checking, tests, the TypeScript build, dependency audit, node and worker image builds, release-bundle checksums, and SPDX SBOM generation before GitHub release assets are published. A failed workflow is a failed release, regardless of whether the Git tag exists.
 
+## Canonical runtime and npm channel
+
+One release creates the immutable Node image, immutable spatial-worker image,
+release Compose file, Windows ZIP, operator archive, release manifest, and the
+`@kubus/kubus-node` npm tarball. The release manifest records the source SHA,
+channel, exact image digests, Compose checksum, minimum CLI version, and
+protocol version. Both the Windows installer and the npm CLI use that release
+Compose definition; neither builds or executes a checkout.
+
+NPM publication happens only after the release assets have been generated from
+the exact tested tarball. It uses GitHub Actions OIDC provenance and maps
+`alpha` to `edge`, `beta` to `beta`, and stable to `latest`. If a publication
+step is retried after the GitHub Release exists, it reuses the same tarball and
+must retain the same version, manifest checksum, and image digests; a changed
+artifact is a release failure, not a retry.
+
+The npm CLI is a passive installer/control package. It has no package lifecycle
+hooks. `npm uninstall -g @kubus/kubus-node` removes only the CLI; Docker
+volumes and the durable Node identity remain until the operator explicitly runs
+the destructive `kubus-node uninstall --delete-data --yes-delete-data` path.
+
 The compose bundle contains no credentials. Operators must create `.env` from the included example and supply their own scoped token and local secrets.
 
 ## v0.8.0-alpha.4 — Spatial Network Integration

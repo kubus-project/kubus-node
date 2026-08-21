@@ -311,6 +311,10 @@ const ERROR_MESSAGES: Record<string, string> = {
   pairing_session_replayed: 'That pairing code has already been used.',
   invalid_pairing_secret: 'That pairing code is not valid.',
   pairing_activation_required: 'Start pairing from the node itself.',
+  pairing_endpoint_unavailable:
+    'This node has no address a phone could connect to. Set LOCAL_API_ALLOW_LAN=true. ' +
+    'In Docker also set LOCAL_API_LAN_URL to this machine\'s LAN address ' +
+    '(for example http://192.168.1.20:8787) and publish the port on the LAN.',
   worker_unavailable: 'The spatial worker is not running on this node.',
   worker_unsupported: 'This node cannot process that capture type.',
   worker_failed: 'The spatial worker stopped before finishing.',

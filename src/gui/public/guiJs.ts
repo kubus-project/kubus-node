@@ -530,6 +530,37 @@ function renderDiagnostics() {
     '</section>';
 }
 
+/**
+ * The subsystem a structured log line came from — the loop name for a
+ * Scheduler loop, or the compute poller — so five different scheduler
+ * loops failing at once no longer read as identical noise (Part 28).
+ */
+function logSubsystem(line) {
+  const data = line.data;
+  if (!data) return null;
+  if (data.loop) return 'Scheduler · ' + data.loop;
+  if (data.op === 'remote_compute_poll') return 'Compute provider';
+  return null;
+}
+
+/**
+ * A compact one-line error detail from a structured log payload — e.g.
+ * "Backend unavailable · HTTP 503 · retry in 10s" — instead of forcing the
+ * operator to read the raw message string for context already present as
+ * structured fields.
+ */
+function logDetail(line) {
+  const data = line.data;
+  if (!data) return null;
+  const parts = [];
+  if (data.message && data.message !== line.message) parts.push(data.message);
+  if (data.status) parts.push('HTTP ' + data.status);
+  else if (data.code) parts.push(data.code);
+  if (data.consecutiveFailures > 1) parts.push(data.consecutiveFailures + ' failures');
+  if (data.nextRetryMs) parts.push('retrying in ' + Math.round(data.nextRetryMs / 1000) + 's');
+  return parts.length ? parts.join(' · ') : null;
+}
+
 function renderLogLines() {
   const viewport = $('#logViewport');
   if (!viewport) return;
@@ -537,13 +568,19 @@ function renderLogLines() {
   const lines = logState.lines.filter((line) =>
     !query || String(line.message || '').toLowerCase().indexOf(query) >= 0);
   viewport.innerHTML = lines.length
-    ? lines.map((line) =>
-      '<div class="log-line">' +
-      '<span class="log-level ' + h(line.level) + '">' + h(line.level) + '</span>' +
-      '<span>' + h(line.at) + '</span>' +
-      '<span>' + h(line.message) + '</span>' +
-      '</div>'
-    ).join('')
+    ? lines.map((line) => {
+      const subsystem = logSubsystem(line);
+      const detail = logDetail(line);
+      return '<div class="log-line">' +
+        '<span class="log-level ' + h(line.level) + '">' + h(line.level) + '</span>' +
+        '<span>' + h(line.at) + '</span>' +
+        '<span>' +
+        (subsystem ? '<span class="log-subsystem">' + h(subsystem) + '</span> ' : '') +
+        h(line.message) +
+        (detail ? '<span class="log-detail">' + h(detail) + '</span>' : '') +
+        '</span>' +
+        '</div>';
+    }).join('')
     : '<div class="log-line"><span></span><span></span><span>No matching log lines.</span></div>';
   if (logState.follow) viewport.scrollTop = viewport.scrollHeight;
 }
@@ -556,6 +593,9 @@ function renderSettings() {
     detailRow('Name', model.node.label) +
     detailRow('Version', model.node.version) +
     detailRow('Last reported to the network', model.node.lastHeartbeat) +
+    // Same value, same format, shown on the pairing code — this is what an
+    // operator compares by eye against what the art.kubus app displays.
+    detailRow('Identity fingerprint', model.node.fingerprint) +
     '</section>' +
     '<section class="panel">' +
     '<h2 class="t-card">Access</h2>' +

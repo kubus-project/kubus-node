@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { AppConfig } from '../src/config/schema.js';
+import { loadOrCreateNodeIdentity, nodeFingerprintFromPublicKey } from '../src/identity/nodeIdentity.js';
 import { PairingAttemptLimiter, PairingService, pairingAttemptKey, serializePairingPayload } from '../src/localApi/pairingService.js';
 import { renderQrSvg } from '../src/gui/qr.js';
 import { LocalStore } from '../src/state/localStore.js';
@@ -13,12 +14,14 @@ afterEach(async () => Promise.all(dirs.splice(0).map((dir) => fs.rm(dir, { recur
 async function fixture(ttl = 300000) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-pairing-')); dirs.push(dir);
   const store = new LocalStore(path.join(dir, 'state.json')); await store.load(); await store.getOrCreateNodeKey();
+  const identity = await loadOrCreateNodeIdentity(dir);
   return {
+    identity,
     service: new PairingService(store, {
       nodeLabel: 'test', localApiPort: 8787, pairingSessionTtlMs: ttl,
       localApiAllowLan: true,
       localApiLanUrl: 'http://192.168.1.24:8787', localApiRemoteUrl: 'https://node.example.test',
-    } as AppConfig),
+    } as AppConfig, identity),
     statePath: path.join(dir, 'state.json'),
   };
 }
@@ -79,25 +82,28 @@ describe('PairingService', () => {
       nodeLabel: 'fresh', localApiPort: 8787, pairingSessionTtlMs: 300000,
       localApiAllowLan: true, localApiLanUrl: 'http://192.168.1.24:8787',
     } as AppConfig;
+    const identity = await loadOrCreateNodeIdentity(dir);
     const firstStore = new LocalStore(statePath); await firstStore.load();
-    const first = await new PairingService(firstStore, config).createSession();
+    const first = await new PairingService(firstStore, config, identity).createSession();
     expect(firstStore.snapshot().nodeKey).toBeTruthy();
 
     const restartedStore = new LocalStore(statePath); await restartedStore.load();
-    const second = await new PairingService(restartedStore, config).createSession();
+    const second = await new PairingService(restartedStore, config, identity).createSession();
     expect(second.node.id).toBe(first.node.id);
     expect(second.node.fingerprint).toBe(first.node.fingerprint);
+    expect(second.node.publicKey).toBe(first.node.publicKey);
   });
 
   it('does not advertise a configured LAN URL while LAN access is disabled', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-pairing-remote-')); dirs.push(dir);
     const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
+    const identity = await loadOrCreateNodeIdentity(dir);
     const service = new PairingService(store, {
       nodeLabel: 'remote-only', localApiPort: 8787, pairingSessionTtlMs: 300000,
       localApiAllowLan: false,
       localApiLanUrl: 'http://192.168.1.24:8787',
       localApiRemoteUrl: 'https://node.example.test',
-    } as AppConfig);
+    } as AppConfig, identity);
     const session = await service.createSession();
     expect(session.node.endpoints).toEqual(['https://node.example.test']);
     expect(new URL(session.payload).searchParams.get('e')).toBe('https://node.example.test');
@@ -132,13 +138,24 @@ describe('PairingService', () => {
       nodeId: session.node.id!,
       label: session.node.label,
       fingerprint: session.node.fingerprint,
+      publicKey: session.node.publicKey,
     }));
     const uri = new URL(session.payload);
-    expect(uri.searchParams.get('v')).toBe('2');
+    expect(uri.searchParams.get('v')).toBe('3');
     expect(uri.searchParams.get('e')).toBe('http://192.168.1.24:8787');
     expect(uri.searchParams.getAll('a')).toEqual(['https://node.example.test']);
     expect(uri.searchParams.get('n')).toBe(session.node.id);
     expect(uri.searchParams.get('f')).toHaveLength(64);
+    expect(uri.searchParams.get('pk')).toBe(session.node.publicKey);
+  });
+
+  it('derives the pairing fingerprint from the public key, not the shared node key', async () => {
+    const { service, identity } = await fixture();
+    const session = await service.createSession();
+    expect(session.node.fingerprint).toBe(nodeFingerprintFromPublicKey(identity.publicKeyRaw));
+    const uri = new URL(session.payload);
+    expect(uri.searchParams.get('f')).toBe(nodeFingerprintFromPublicKey(identity.publicKeyRaw));
+    expect(uri.searchParams.get('pk')).toBe(identity.publicKeyBase64Url);
   });
 
   it('keeps complete identity metadata in a dense maintained QR', async () => {
@@ -150,10 +167,23 @@ describe('PairingService', () => {
       nodeId: 'node-8f14e45f-ea4e-4e2f-9c1a-2b3c4d5e6f70',
       label: 'Ž'.repeat(80),
       fingerprint: 'f'.repeat(64),
+      publicKey: 'p'.repeat(43),
     });
     const uri = new URL(payload);
     expect(uri.searchParams.get('f')).toBe('f'.repeat(64));
     expect(uri.searchParams.get('l')!.length).toBe(80);
+    expect(uri.searchParams.get('pk')).toBe('p'.repeat(43));
     await expect(renderQrSvg(payload)).resolves.toContain('<svg');
+  });
+
+  it('never logs or persists the pairing secret alongside the node identity', async () => {
+    const { service, statePath } = await fixture();
+    const session = await service.createSession();
+    const persisted = await fs.readFile(statePath, 'utf8');
+    expect(persisted).not.toContain(session.secret);
+    // The identity file sits entirely outside state.json and holds only the
+    // Ed25519 material, never a pairing secret.
+    const identityRaw = await fs.readFile(path.join(path.dirname(statePath), 'identity.json'), 'utf8');
+    expect(identityRaw).not.toContain(session.secret);
   });
 });

@@ -61,7 +61,59 @@ kubus Node is a network participant, not a standalone Gaussian-splatting utility
 
 A short outage may enter `DEGRADED` only after successful participation was previously verified: running work is not killed, canonical public content remains readable, and diagnostics remain available. New work locks after the grace period. A fresh or never-verified node remains `JOINING`. See [participation](docs/PARTICIPATION.md).
 
-## Quick start
+## First install (Windows, no terminal)
+
+Download and extract `kubus-node-windows-vX.Y.Z.zip`, then open
+`Start-KubusNodeSetup.cmd`. It checks that Docker Desktop is running and has at
+least 10 GiB free, pulls the immutable images recorded in
+`docker-compose.release.yml`, starts the local stack, and opens
+`http://127.0.0.1:8787/setup`. The setup page collects the scoped Node token,
+creates a random GUI credential, writes a mode-0600 configuration beside the
+durable Node identity, then restarts into the normal GUI. The LAN toggle
+detects the PC's private address and recreates the runtime on `0.0.0.0`; when
+off it remains loopback-only. Normal pairing never asks a user to type an IP
+address. Stopping/uninstalling preserves Docker volumes by default; the
+explicit volume-delete confirmation is the only destructive path.
+
+Windows is archive-only in this release. Local NVIDIA reconstruction is only
+supported on validated Linux Docker + NVIDIA/CUDA hosts; use remote processing
+from Windows rather than claiming unsupported local GPU support.
+
+## Operator CLI (npm)
+
+`@kubus/kubus-node` is an optional cross-platform control and bootstrap CLI.
+It is not a second Node implementation: production services always run from
+the digest-pinned Kubernetes Node and spatial-worker container images in the
+release manifest. The Windows ZIP remains the preferred normal-user Windows
+installer.
+
+Linux x64 and Windows x64 operators can install the exact release CLI with:
+
+```sh
+npm install -g @kubus/kubus-node
+# or without a global install
+npx @kubus/kubus-node setup
+```
+
+Docker Engine plus Compose v2 is required. `kubus-node setup` validates Docker,
+pulls the immutable release images, starts only the loopback bootstrap service,
+and opens the same setup wizard as the Windows installer. No checkout, source
+build, manual `.env`, or `docker compose --build` is used. `setup --headless`
+starts that loopback wizard without opening a browser, for access through an
+SSH tunnel on a server. `kubus-node doctor --json` is safe for automation.
+
+Use `kubus-node update` only after deliberately selecting the desired released
+CLI version (for example `npx @kubus/kubus-node@beta update`); it applies that
+package's verified immutable runtime manifest and preserves Docker volumes.
+`npm uninstall -g @kubus/kubus-node` removes only the CLI. It never removes the
+Node runtime, identity, pairings, Kubo archive, or captures. Use
+`kubus-node uninstall` to stop the runtime while preserving data, or add both
+`--delete-data --yes-delete-data` for the explicitly destructive path.
+
+NPM channels track runtime channels: alpha uses `edge`, beta uses `beta`, and
+stable uses `latest`. macOS is intentionally unsupported for this alpha CLI.
+
+## Quick start (operators)
 
 ```sh
 cp .env.example .env
@@ -107,6 +159,7 @@ Both are pending control-plane records. Settlement is not active; KUB8 has no gu
 - [Distributed compute](docs/DISTRIBUTED_COMPUTE.md)
 - [Rewards](docs/REWARDS.md)
 - [Privacy](docs/PRIVACY.md)
+- [Remote paired-device transport](docs/REMOTE_TRANSPORT.md)
 - [Security](docs/security.md)
 - [Operator guide](docs/operator-guide.md)
 - [Release channels](docs/RELEASES.md)

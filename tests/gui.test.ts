@@ -202,6 +202,7 @@ describe('local GUI safety helpers', () => {
         logger: { info: () => undefined } as never,
         actionLock: new ActionLock(),
         localApi: {
+          identity: { fingerprint: 'abcdef0123456789fedcba9876543210fedcba9876543210fedcba98765432' },
           participationGate: { refresh: async () => ({ state: 'CONTRIBUTING', reason: 'ok', leaseEligible: true, requirements: { registered: true } }) },
           capabilities: {
             getWorkerHealth: () => workerHealth,
@@ -215,12 +216,19 @@ describe('local GUI safety helpers', () => {
           captures: { list: () => [{ sizeBytes: 512 * 1024 ** 2 }] },
           pairing: {
             createSession: async () => ({
-              version: 2,
+              version: 3,
               sessionId: 'session-1',
               secret: 'pairing-one-time-secret',
               expiresAt: new Date(Date.now() + 300000).toISOString(),
-              payload: 'kubus-node://pair?v=2&e=https%3A%2F%2Fnode.example.test&s=session-1&k=pairing-one-time-secret&l=kubus_node_studio&f=abcdef012345',
-              node: { id: 'node-1', label: 'ROK-DESKTOP', endpoint: 'https://node.example.test', endpoints: ['https://node.example.test'], fingerprint: 'abcdef0123456789' },
+              payload: 'kubus-node://pair?v=3&e=https%3A%2F%2Fnode.example.test&s=session-1&k=pairing-one-time-secret&l=kubus_node_studio&f=abcdef012345&pk=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY',
+              node: {
+                id: 'node-1',
+                label: 'ROK-DESKTOP',
+                endpoint: 'https://node.example.test',
+                endpoints: ['https://node.example.test'],
+                fingerprint: 'abcdef0123456789',
+                publicKey: 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY',
+              },
             }),
           },
         } as never,
@@ -243,6 +251,8 @@ describe('local GUI safety helpers', () => {
         expect(model.archive.stored).toBe('1.0 GB');
         // Peer ID is truncated for display but copyable in full.
         expect(model.node.peerId).toContain('…');
+        // Formatted identity fingerprint for on-screen comparison with the app.
+        expect(model.node.fingerprint).toBe('ABCD EF01 2345 6789');
 
         const serialized = JSON.stringify(body);
         expect(serialized).not.toContain('kubus_node_operator_secret');
@@ -264,11 +274,13 @@ describe('local GUI safety helpers', () => {
         expect(body.data.qrSvg.startsWith('<svg')).toBe(true);
         expect(body.data.qrSvg).not.toContain('<image');
         // Manual copy and rendered QR use the exact same canonical payload.
-        expect(body.data.code).toContain('kubus-node://pair?v=2');
+        expect(body.data.code).toContain('kubus-node://pair?v=3');
         expect(body.data.code).toContain('l=kubus_node_studio');
         expect(body.data.code).not.toContain('[redacted]');
         expect(body.data.qrSvg).toContain('viewBox=');
-        expect(body.data.node.fingerprint).toHaveLength(12);
+        // The GUI formats the fingerprint for display (formatFingerprint):
+        // grouped 4s, uppercase, from the first 16 hex characters.
+        expect(body.data.node.fingerprint).toBe('ABCD EF01 2345 6789');
         expect(JSON.stringify(body)).not.toContain('kubus_node_operator_secret');
       } finally {
         await server.close();

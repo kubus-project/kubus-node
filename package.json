@@ -7,19 +7,30 @@
   "bin": {
     "kubus-node": "./dist/src/index.js"
   },
+  "files": [
+    "dist/",
+    "runtime/",
+    "version.json",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts start",
     "start": "node dist/src/index.js start",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.check.json",
     "test": "vitest run",
-    "lint": "tsc -p tsconfig.json --noEmit",
+    "lint": "tsc -p tsconfig.check.json",
     "status": "tsx src/index.ts status",
     "doctor": "tsx src/index.ts doctor",
     "gui": "tsx src/index.ts gui",
     "smoke": "tsx scripts/smoke.ts",
     "sync:version": "node scripts/sync_version.mjs",
-    "sync:versions": "npm run sync:version"
+    "sync:versions": "npm run sync:version",
+    "build:release-package": "node scripts/build_release_package.mjs",
+    "verify:release-package": "node scripts/verify_release_package.mjs",
+    "build:npm-package": "node scripts/build_npm_package.mjs",
+    "verify:npm-package": "node scripts/verify_npm_package.mjs"
   },
   "engines": {
     "node": ">=20.19.0",
@@ -28,8 +39,10 @@
   "dependencies": {
     "dotenv": "^16.4.7",
     "json-stable-stringify": "1.3.0",
+    "node-datachannel": "^0.33.1",
     "pino": "^9.6.0",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "socket.io-client": "4.8.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",

@@ -1,5 +1,7 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
+import { existsSync as fsExistsSync, readFileSync } from 'node:fs';
 import { isIP } from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import type { LocalStore } from '../state/localStore.js';
 import type { AppConfig } from './schema.js';
@@ -48,6 +50,12 @@ function boolEnv(env: NodeJS.ProcessEnv, key: string, fallback: boolean): boolea
 }
 
 export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  // Docker injects only the safe, topology-specific defaults. The setup page
+  // writes the operator choices to a 0600 file on the durable node volume, so
+  // a first start never needs a hand-authored `.env` yet an explicit process
+  // environment value still wins for managed deployments.
+  const effectiveEnv = mergePersistedConfig(env);
+  env = effectiveEnv;
   const nodeEnv = requireString(env, 'NODE_ENV');
   const authMode = (env.KUBUS_AUTH_MODE || 'bearer').trim().toLowerCase();
   if (authMode !== 'bearer') throw new Error('Only KUBUS_AUTH_MODE=bearer is supported in v1');
@@ -152,6 +160,31 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
   };
 }
 
+/** Location intentionally follows LOCAL_STATE_PATH, so identity and setup move together on backup/restore. */
+export function persistedConfigPath(env: NodeJS.ProcessEnv = process.env): string {
+  const statePath = env.LOCAL_STATE_PATH?.trim() || path.join(process.cwd(), 'state.json');
+  return path.join(path.dirname(path.resolve(statePath)), 'config.env');
+}
+
+function mergePersistedConfig(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const filePath = env.KUBUS_NODE_CONFIG_PATH?.trim() || persistedConfigPath(env);
+  let persisted: NodeJS.ProcessEnv = {};
+  try {
+    if (fsExistsSync(filePath)) persisted = dotenv.parse(readFileSync(filePath));
+  } catch (error) {
+    // Treat a damaged configuration exactly like other invalid configuration:
+    // startup stops and the setup surface gives the operator a repair route.
+    throw new Error(`Unable to read kubus Node configuration: ${String((error as Error).message || error)}`);
+  }
+  // Compose materializes unset substitutions as empty strings. Treating those
+  // as an explicit override would erase a value the setup page just persisted
+  // on the node volume every time the container restarts.
+  const explicit = Object.fromEntries(
+    Object.entries(env).filter(([, value]) => value !== undefined && value !== ''),
+  ) as NodeJS.ProcessEnv;
+  return { ...persisted, ...explicit };
+}
+
 function parseLanApiUrl(value: string, key: string): string {
   const parsed = new URL(parseUrl(value, key));
   if (!['http:', 'https:'].includes(parsed.protocol) || !isPrivateLanHost(parsed.hostname)) {
@@ -187,9 +220,54 @@ function parseLegacyApiUrl(
 }
 
 function deriveLanApiUrl(host: string, port: number, enabled: boolean): string | undefined {
-  if (!enabled || !isPrivateLanHost(host)) return undefined;
-  const urlHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+  if (!enabled) return undefined;
+  // Listening on a wildcard (0.0.0.0 / ::) is the normal bare-metal setup, and
+  // it is precisely the case that used to yield no endpoint at all: a wildcard
+  // is not itself a routable address, so the node advertised nothing and
+  // pairing failed with `pairing_endpoint_unavailable` — no QR, nothing to
+  // scan. The operator has already said LAN access is intended, so resolve the
+  // address a phone on the same network can actually reach.
+  //
+  // Deliberately NOT done inside a container: there `os.networkInterfaces()`
+  // reports the container's own bridge address (commonly 172.17-18.x, which
+  // is a private range and would pass every check here) while the phone must
+  // reach the *host's* LAN address instead. Guessing would produce a QR that
+  // scans perfectly and then never connects, which is strictly worse than an
+  // honest failure — so containers must state their reachable URL explicitly
+  // via LOCAL_API_LAN_URL.
+  const resolved = isWildcardHost(host)
+    ? isContainerRuntime()
+      ? undefined
+      : detectPrivateLanAddress()
+    : host;
+  if (!resolved || !isPrivateLanHost(resolved)) return undefined;
+  const urlHost = resolved.includes(':') && !resolved.startsWith('[') ? `[${resolved}]` : resolved;
   return `http://${urlHost}:${port}`;
+}
+
+/** True when this process is running inside a container. */
+export function isContainerRuntime(exists: (path: string) => boolean = fsExistsSync): boolean {
+  return exists('/.dockerenv') || exists('/run/.containerenv');
+}
+
+/**
+ * The node's own private LAN IPv4, or undefined when it has none.
+ *
+ * IPv4 only and non-internal only: a link-local/loopback/virtual address is
+ * not something a phone can pair against, and advertising one would trade an
+ * honest "unavailable" for a QR that silently never connects.
+ */
+export function detectPrivateLanAddress(
+  interfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces(),
+): string | undefined {
+  for (const entries of Object.values(interfaces)) {
+    for (const entry of entries ?? []) {
+      if (entry.internal) continue;
+      if (entry.family !== 'IPv4' && String(entry.family) !== '4') continue;
+      if (isPrivateLanHost(entry.address)) return entry.address;
+    }
+  }
+  return undefined;
 }
 
 function isPrivateLanHost(host: string): boolean {

@@ -5,6 +5,7 @@ import path from 'node:path';
 import type { AppConfig } from '../src/config/schema.js';
 import { CapabilityRegistry } from '../src/capabilities/registry.js';
 import { startGuiServer } from '../src/gui/guiServer.js';
+import { loadOrCreateNodeIdentity } from '../src/identity/nodeIdentity.js';
 import { PairingService, localError } from '../src/localApi/pairingService.js';
 import { isAllowedLocalApiPeer } from '../src/localApi/localApiRouter.js';
 import { ActionLock } from '../src/runtime/actionLock.js';
@@ -51,7 +52,8 @@ describe('local/v1 authorization', () => {
       version: async () => ({ Version: '0.41.0' }),
       repoStat: async () => ({ RepoSize: 0, StorageMax: 0 }),
     };
-    const pairing = new PairingService(store, config);
+    const identity = await loadOrCreateNodeIdentity(dir);
+    const pairing = new PairingService(store, config, identity);
     const localApi = {
       api: {} as never,
       kubo: kubo as never,
@@ -63,6 +65,7 @@ describe('local/v1 authorization', () => {
       jobs: { health: () => ({ running: 0, queued: 0 }), list: () => [] } as never,
       participationGate: { refresh: async () => ({ state: 'CONTRIBUTING', leaseEligible: true }), assertUsefulOperation: async () => undefined } as never,
       remoteCompute: {} as never,
+      identity,
     };
     const server = await startGuiServer({
       api: {} as never,
@@ -95,7 +98,16 @@ describe('local/v1 authorization', () => {
         headers: { Authorization: `Bearer ${exchangeBody.data.token}` },
       });
       expect(authorized.status).toBe(200);
-      expect(await authorized.text()).toContain('test-node');
+      const infoText = await authorized.text();
+      expect(infoText).toContain('test-node');
+      const info = JSON.parse(infoText) as { data: { fingerprint: string; publicKey: string; identityAlgorithm: string } };
+      expect(info.data.identityAlgorithm).toBe('ed25519');
+      expect(info.data.publicKey).toBe(identity.publicKeyBase64Url);
+      expect(info.data.fingerprint).toBe(identity.fingerprint);
+      // The private key must never reach an API response. Read the raw
+      // persisted key material directly and confirm it never appears on the wire.
+      const storedIdentity = JSON.parse(await fs.readFile(path.join(dir, 'identity.json'), 'utf8')) as { privateKey: string };
+      expect(infoText).not.toContain(storedIdentity.privateKey);
 
       vi.spyOn(pairing, 'exchange').mockRejectedValueOnce(
         localError(500, 'state_write_failed'),
@@ -131,7 +143,8 @@ describe('local/v1 capability state', () => {
       nodeLabel: 'test-node', pairingSessionTtlMs: 60_000,
     } as AppConfig;
     const kubo = { id: async () => ({ ID: 'peer-1' }), version: async () => ({ Version: '0.41.0' }), repoStat: async () => ({ RepoSize: 0, StorageMax: 0 }) };
-    const pairing = new PairingService(store, config);
+    const identity = await loadOrCreateNodeIdentity(dir);
+    const pairing = new PairingService(store, config, identity);
     const capabilities = new CapabilityRegistry(kubo as never, workerUrl);
     const localApi = {
       api: {} as never, kubo: kubo as never, store, config, capabilities, pairing,
@@ -139,6 +152,7 @@ describe('local/v1 capability state', () => {
       jobs: { health: () => ({ running: 0, queued: 0 }), list: () => [] } as never,
       participationGate: { refresh: async () => ({ state: 'CONTRIBUTING', leaseEligible: true }), assertUsefulOperation: async () => undefined } as never,
       remoteCompute: {} as never,
+      identity,
     };
     const server = await startGuiServer({
       api: {} as never, kubo: kubo as never, store, config,

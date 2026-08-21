@@ -1,6 +1,9 @@
+import path from 'node:path';
+import { existsSync } from 'node:fs';
 import { KubusApiClient } from '../backend/kubusApiClient.js';
 import { BearerAuthProvider } from '../backend/operatorAuth.js';
-import { parseEnv, resolveNodeKey } from '../config/env.js';
+import { parseEnv, persistedConfigPath, resolveNodeKey } from '../config/env.js';
+import { loadOrCreateNodeIdentity } from '../identity/nodeIdentity.js';
 import { KuboClient } from '../ipfs/kuboClient.js';
 import { getKuboHealth, waitForKubo } from '../ipfs/health.js';
 import { createLogger } from '../logging/logger.js';
@@ -22,13 +25,30 @@ import { WorkerAuthService } from '../spatial/workerAuth.js';
 import { ComputeIdentityService } from '../compute/computeIdentity.js';
 import { PrivatePayloadTransport } from '../compute/privatePayloadTransport.js';
 import { RemoteComputeRuntime } from '../compute/remoteComputeRuntime.js';
+import { NodeSignalingClient } from '../webrtc/nodeSignalingClient.js';
+import { startSetupServer } from '../gui/setupServer.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const command = argv[0] || 'start';
-  const config = parseEnv();
+  let config: ReturnType<typeof parseEnv>;
+  try {
+    config = parseEnv();
+  } catch (error) {
+    // First start is the one moment the runtime cannot yet know the backend
+    // token or operator wallet. Serve setup only when there is no durable
+    // configuration file; a broken existing configuration must fail loudly
+    // rather than presenting an unauthenticated overwrite page.
+    if (command !== 'start' || existsSync(process.env.KUBUS_NODE_CONFIG_PATH?.trim() || persistedConfigPath())) throw error;
+    const setup = await startSetupServer();
+    console.log(JSON.stringify({ status: 'setup_required', url: setup.url }, null, 2));
+    await waitForShutdown(null, setup);
+    return;
+  }
   const logger = createLogger(config.logLevel);
   const store = new LocalStore(config.localStatePath);
   await store.load();
+  // Own file, own directory — never inside `state.json`. See identity/nodeIdentity.ts.
+  const identity = await loadOrCreateNodeIdentity(path.dirname(config.localStatePath), logger);
   const api = new KubusApiClient({ baseUrl: config.apiBaseUrl, auth: new BearerAuthProvider(config.operatorToken) });
   const kubo = new KuboClient(config.ipfsRpcUrl);
   const actionLock = new ActionLock();
@@ -38,7 +58,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   await workerAuth.initialize();
   const computeIdentity = new ComputeIdentityService(store);
   await computeIdentity.initialize();
-  const pairing = new PairingService(store, config);
+  const pairing = new PairingService(store, config, identity);
   const captures = new CaptureStore(config.localDataPath, store);
   // Streaming-upload drafts are in-memory, so a restart mid-transfer leaves a
   // capture directory with no owner. Reclaim those before serving, or every
@@ -50,7 +70,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const jobs = new JobRuntime({ store, captureStore: captures, kubo, logger, dataRoot: config.localDataPath, workerUrl: config.spatialWorkerUrl, concurrency: config.jobConcurrency, participationGate, workerAuth, capabilities });
   const privateTransport = new PrivatePayloadTransport({ captures, kubo, store, identity: computeIdentity, dataRoot: config.localDataPath, maxInputBytes: config.remoteComputeMaxInputBytes });
   const remoteCompute = new RemoteComputeRuntime({ api, kubo, store, config, captures, jobs, gate: participationGate, identity: computeIdentity, transport: privateTransport, logger });
-  const localApi = { api, kubo, store, config, capabilities, pairing, captures, jobs, participationGate, remoteCompute };
+  const localApi = { api, kubo, store, config, capabilities, pairing, captures, jobs, participationGate, remoteCompute, identity };
 
   if (command === 'status') {
     const live = await liveStatus(api, kubo);
@@ -115,18 +135,28 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   await capabilities.refresh();
   const gui = (config.guiEnabled || config.localApiEnabled) ? await startGuiServer({ api, kubo, store, config, logger, actionLock, localApi }) : null;
   let scheduler: Scheduler | null = null;
+  let signaling: NodeSignalingClient | null = null;
   try {
     await actionLock.run('startup', () => bootstrapOnce(api, kubo, store, config, capabilities, participationGate, computeIdentity));
     scheduler = new Scheduler({ api, kubo, store, config, logger, gate: participationGate, identity: computeIdentity, capabilities, actionLock });
     scheduler.start();
     remoteCompute.start();
+    // The signaling namespace authorizes the durable node id against the
+    // operator token, so it can only start after registration. It remains
+    // explicitly non-fatal: a signaling outage must not take down LAN access,
+    // configured HTTPS, or archive participation.
+    const nodeId = store.snapshot().nodeId;
+    if (nodeId) {
+      signaling = new NodeSignalingClient({ config, nodeId, localApi, identity, logger });
+      signaling.start();
+    }
     logger.info({ nodeId: store.snapshot().nodeId }, 'kubus node started');
   } catch (error) {
     logger.error({ error: String((error as Error).message || error) }, 'kubus node startup failed');
     if (!gui) throw error;
     logger.warn({ guiUrl: gui.url }, 'GUI remains available for local diagnostics; scheduler was not started');
   }
-  await waitForShutdown(scheduler, gui, remoteCompute);
+  await waitForShutdown(scheduler, gui, remoteCompute, signaling);
 }
 
 async function bootstrapOnce(api: KubusApiClient, kubo: KuboClient, store: LocalStore, config: ReturnType<typeof parseEnv>, capabilities: CapabilityRegistry, gate?: NetworkParticipationGate, identity?: ComputeIdentityService) {
@@ -174,7 +204,12 @@ async function doctor(api: KubusApiClient, kubo: KuboClient, config: ReturnType<
   console.log(JSON.stringify(report, null, 2));
 }
 
-async function waitForShutdown(scheduler: Scheduler | null, gui?: GuiServerHandle | null, remoteCompute?: RemoteComputeRuntime): Promise<void> {
+async function waitForShutdown(
+  scheduler: Scheduler | null,
+  gui?: GuiServerHandle | null,
+  remoteCompute?: RemoteComputeRuntime,
+  signaling?: NodeSignalingClient | null,
+): Promise<void> {
   await new Promise<void>((resolve) => {
     const done = () => resolve();
     process.once('SIGINT', done);
@@ -182,5 +217,6 @@ async function waitForShutdown(scheduler: Scheduler | null, gui?: GuiServerHandl
   });
   await scheduler?.stop();
   remoteCompute?.stop();
+  await signaling?.stop();
   await gui?.close();
 }

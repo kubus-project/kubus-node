@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { parseEnv } from '../src/config/env.js';
 
 const baseEnv = {
@@ -26,6 +28,28 @@ describe('parseEnv', () => {
     const config = parseEnv(baseEnv);
     expect(config.apiBaseUrl).toBe('http://localhost:3000');
     expect(config.cidClassFilters).toEqual(['hot', 'warm']);
+  });
+
+  it('loads durable first-run configuration while explicit environment still wins', async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-config-'));
+    const configPath = path.join(directory, 'config.env');
+    try {
+      await fs.writeFile(configPath, Object.entries({
+        ...baseEnv,
+        KUBUS_API_BASE_URL: 'https://persisted.example',
+        KUBUS_OPERATOR_TOKEN: 'persisted-token',
+      }).map(([key, value]) => `${key}=${JSON.stringify(value)}`).join('\n'));
+      const config = parseEnv({
+        ...baseEnv,
+        KUBUS_NODE_CONFIG_PATH: configPath,
+        KUBUS_API_BASE_URL: '',
+        KUBUS_OPERATOR_TOKEN: 'process-token',
+      });
+      expect(config.apiBaseUrl).toBe('https://persisted.example');
+      expect(config.operatorToken).toBe('process-token');
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true });
+    }
   });
 
   it('fails clearly when required values are missing', () => {

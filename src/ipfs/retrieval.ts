@@ -1,13 +1,40 @@
 import type { KuboClient } from './kuboClient.js';
 import { isValidCidLike, normalizeCid } from '../utils/cid.js';
 
-export type RetrievalState = 'pinned' | 'retrievable' | 'missing' | 'timeout' | 'invalid_cid';
+/**
+ * Typed retrieval outcome. A thrown gateway fetch (DNS failure, TLS failure,
+ * connection refused, socket reset, ...) is a transport fact, not evidence
+ * that the content is globally absent — `gateway_unreachable` and
+ * `gateway_timeout` are distinct from `gateway_not_found` (the gateway
+ * answered and said 404) and `gateway_http_error` (the gateway answered with
+ * some other failure status) precisely so a caller can never collapse "the
+ * network is broken" into "content missing".
+ */
+export type RetrievalState =
+  | 'pinned'
+  | 'local_retrievable'
+  | 'gateway_retrievable'
+  | 'gateway_timeout'
+  | 'gateway_unreachable'
+  | 'gateway_http_error'
+  | 'gateway_not_found'
+  | 'invalid_cid';
+
+/** States that mean "confirmed available from somewhere". */
+export const RETRIEVAL_AVAILABLE_STATES: readonly RetrievalState[] = ['pinned', 'local_retrievable', 'gateway_retrievable'];
 
 export interface RetrievalProbe {
   cid: string;
   state: RetrievalState;
   checkedAt: string;
-  error?: string;
+  /** HTTP status code, only present for `gateway_http_error` / `gateway_not_found`. */
+  httpStatus?: number;
+  /**
+   * A safe, non-secret classification of the failure — never the raw error
+   * message, which for `fetch` can embed the request URL (and therefore any
+   * query-string credentials a misconfigured gateway URL might carry).
+   */
+  errorClass?: string;
 }
 
 export async function probeRetrieval(kubo: KuboClient, gatewayUrl: string, rawCid: string): Promise<RetrievalProbe> {
@@ -21,7 +48,7 @@ export async function probeRetrieval(kubo: KuboClient, gatewayUrl: string, rawCi
   }
   try {
     await kubo.blockStat(cid);
-    return { cid, state: 'retrievable', checkedAt: new Date().toISOString() };
+    return { cid, state: 'local_retrievable', checkedAt: new Date().toISOString() };
   } catch {
     // Continue to gateway probe.
   }
@@ -34,12 +61,60 @@ export async function probeRetrieval(kubo: KuboClient, gatewayUrl: string, rawCi
       headers: { Range: 'bytes=0-0' },
       signal: controller.signal,
     });
-    if (response.ok || response.status === 206) return { cid, state: 'retrievable', checkedAt: new Date().toISOString() };
-    return { cid, state: 'missing', checkedAt: new Date().toISOString(), error: `gateway_http_${response.status}` };
+    if (response.ok || response.status === 206) return { cid, state: 'gateway_retrievable', checkedAt: new Date().toISOString() };
+    if (response.status === 404) return { cid, state: 'gateway_not_found', checkedAt: new Date().toISOString(), httpStatus: 404 };
+    return { cid, state: 'gateway_http_error', checkedAt: new Date().toISOString(), httpStatus: response.status };
   } catch (error) {
-    const message = String((error as Error).message || error);
-    return { cid, state: message.toLowerCase().includes('abort') ? 'timeout' : 'missing', checkedAt: new Date().toISOString(), error: message };
+    return { cid, ...classifyGatewayFetchError(error), checkedAt: new Date().toISOString() };
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/**
+ * Classifies a thrown gateway `fetch` into `gateway_timeout` (the probe's own
+ * abort) vs `gateway_unreachable` (DNS/TLS/connection-level failure) —
+ * everything Node's `fetch` throws for a genuine transport failure surfaces
+ * as `TypeError: fetch failed` with the real reason nested in `error.cause`,
+ * which is what actually distinguishes an abort from, say, DNS resolution
+ * failing.
+ */
+function classifyGatewayFetchError(error: unknown): { state: RetrievalState; errorClass?: string } {
+  const err = error as { name?: string; message?: string; cause?: { code?: string; message?: string } };
+  if (err?.name === 'AbortError') return { state: 'gateway_timeout', errorClass: 'abort' };
+  const causeCode = err?.cause?.code;
+  if (causeCode) return { state: 'gateway_unreachable', errorClass: causeCode };
+  const configured = classifyConfigurationFailure(err?.cause?.message);
+  if (configured) return { state: 'gateway_unreachable', errorClass: configured };
+  const message = String(err?.message || error || '');
+  if (message.toLowerCase().includes('abort')) return { state: 'gateway_timeout', errorClass: 'abort' };
+  return { state: 'gateway_unreachable', errorClass: 'unknown' };
+}
+
+/**
+ * Some failures never reach a socket at all, so they carry no OS error code
+ * and would otherwise be reported as `unknown` — the least actionable answer
+ * available, and for a *configuration* mistake the most misleading one. The
+ * operator does not have a network problem; they have a gateway URL the
+ * runtime will not dial. Naming that distinctly is the difference between
+ * "check your network" and "check this setting".
+ *
+ * Matched on the cause's message because that is the only signal present, but
+ * mapped onto a fixed vocabulary so the raw message — which can contain the
+ * configured URL, and therefore any credential embedded in it — never becomes
+ * the error class itself.
+ */
+function classifyConfigurationFailure(causeMessage?: string): string | undefined {
+  const message = (causeMessage || '').toLowerCase();
+  if (!message) return undefined;
+  // `fetch` refuses a set of ports outright (WHATWG "bad port" list) rather
+  // than attempting a connection.
+  if (message.includes('bad port')) return 'gateway_url_port_not_permitted';
+  if (message.includes('unsupported protocol') || message.includes('protocol')) {
+    return 'gateway_url_scheme_unsupported';
+  }
+  if (message.includes('invalid url') || message.includes('failed to parse')) {
+    return 'gateway_url_invalid';
+  }
+  return undefined;
 }
