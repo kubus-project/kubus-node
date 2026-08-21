@@ -19,6 +19,8 @@ import { guiCss } from './public/guiCss.js';
 import { guiJs } from './public/guiJs.js';
 import { assertGuiConfig, authorizeGuiRequest, guiRemoteMode, sendUnauthorized } from './guiAuth.js';
 import { guiHtml } from './templates/index.js';
+import { spatialViewerBootstrapJs, spatialViewerHtml } from './templates/spatialViewer.js';
+import { spatialViewerBundle } from './public/vendor/spatialViewerBundle.js';
 import { handleLocalApi, type LocalApiDeps } from '../localApi/localApiRouter.js';
 import { localError } from '../localApi/pairingService.js';
 import { buildViewModel } from './viewModel.js';
@@ -113,6 +115,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
   }
   if (req.method === 'GET' && parsed.pathname === '/gui/assets/gui.js') {
     writeText(res, 200, guiJs, 'application/javascript; charset=utf-8');
+    return;
+  }
+  if (req.method === 'GET' && parsed.pathname === '/gui/assets/spatial-viewer.html') {
+    writeText(res, 200, spatialViewerHtml(), 'text/html; charset=utf-8');
+    return;
+  }
+  if (req.method === 'GET' && parsed.pathname === '/gui/assets/spatial-viewer-bootstrap.js') {
+    writeText(res, 200, spatialViewerBootstrapJs, 'application/javascript; charset=utf-8');
+    return;
+  }
+  if (req.method === 'GET' && parsed.pathname === '/gui/assets/spatial-viewer.bundle.js') {
+    writeText(res, 200, spatialViewerBundle, 'application/javascript; charset=utf-8');
     return;
   }
   if (!parsed.pathname.startsWith('/gui/api/')) {

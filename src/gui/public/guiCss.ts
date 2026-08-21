@@ -678,6 +678,104 @@ details.disclosure > .stack, details.disclosure > .stack-sm { margin-top: var(--
   border: 0;
 }
 
+/* --- Tabs (Spatial library tabs, Analytics range) ------------------------ */
+.tabs {
+  display: flex;
+  gap: var(--k-space-xs);
+  border-bottom: 1px solid var(--k-border);
+  padding-bottom: 0;
+}
+.tab {
+  border: 0;
+  background: transparent;
+  padding: var(--k-space-sm) var(--k-space-md);
+  font-size: 14px;
+  color: var(--k-text-secondary);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  transition: color var(--k-motion-fast) var(--k-ease), border-color var(--k-motion-fast) var(--k-ease);
+}
+.tab:hover { color: var(--k-text); }
+.tab.is-active { color: var(--k-primary); border-bottom-color: var(--k-primary); font-weight: 600; }
+
+/* --- Spatial library: capture/archive cards ------------------------------ */
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: var(--k-space-md);
+}
+.card {
+  border: 1px solid var(--k-border);
+  border-radius: var(--k-radius-md);
+  background: var(--k-surface);
+  overflow: hidden;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color var(--k-motion-fast) var(--k-ease), transform var(--k-motion-fast) var(--k-ease);
+}
+.card:hover { border-color: var(--k-border-strong); }
+.card-thumb {
+  aspect-ratio: 4 / 3;
+  background: var(--k-surface-sunken);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.card-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.card-thumb-fallback { font-size: 28px; color: var(--k-text-tertiary); }
+.card-thumb-lg { aspect-ratio: 16 / 9; max-width: 420px; border-radius: var(--k-radius-sm); margin-bottom: var(--k-space-md); }
+.card-body { padding: var(--k-space-sm) var(--k-space-md) var(--k-space-md); display: grid; gap: var(--k-space-xxs); }
+.card-title { font-weight: 560; }
+
+/* --- Processing: job rows ------------------------------------------------- */
+.job-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--k-space-md);
+  padding: var(--k-space-sm) 0;
+  border-bottom: 1px solid var(--k-border);
+  cursor: pointer;
+}
+.job-row:last-child { border-bottom: 0; }
+.job-row-main { display: grid; gap: var(--k-space-xxs); min-width: 0; }
+
+/* --- Analytics: chart + table --------------------------------------------- */
+.chart-canvas {
+  width: 100%;
+  height: 180px;
+  display: block;
+  margin: var(--k-space-md) 0;
+}
+.chart-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.chart-table th, .chart-table td {
+  text-align: left;
+  padding: var(--k-space-xxs) var(--k-space-sm);
+  border-bottom: 1px solid var(--k-border);
+  color: var(--k-text-secondary);
+}
+.chart-table th { font-weight: 560; color: var(--k-text); }
+
+/* --- Interactive Spatial viewer ------------------------------------------- */
+.viewer-mount {
+  display: grid;
+  gap: var(--k-space-sm);
+}
+.viewer-frame {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border: 1px solid var(--k-border);
+  border-radius: var(--k-radius-md);
+  background: #101415;
+}
+.viewer-fullscreen { justify-self: start; }
+
 /* --- Responsive --------------------------------------------------------- */
 /* Tablet and small laptop: the sidebar becomes a horizontal section bar. */
 @media (max-width: 1024px) {
@@ -710,6 +808,8 @@ details.disclosure > .stack, details.disclosure > .stack-sm { margin-top: var(--
   :root { font-size: 14.5px; }
   .main { padding: var(--k-space-md) var(--k-space-md) var(--k-space-xl); gap: var(--k-space-md); }
   .t-page { font-size: 22px; }
+  .card-grid { grid-template-columns: 1fr; }
+  .tabs { overflow-x: auto; }
   .metrics { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
   .overview-grid { grid-template-columns: 1fr; }
   .row-between { flex-direction: column; align-items: flex-start; gap: var(--k-space-sm); }
