@@ -61,7 +61,21 @@ kubus Node is a network participant, not a standalone Gaussian-splatting utility
 
 A short outage may enter `DEGRADED` only after successful participation was previously verified: running work is not killed, canonical public content remains readable, and diagnostics remain available. New work locks after the grace period. A fresh or never-verified node remains `JOINING`. See [participation](docs/PARTICIPATION.md).
 
-## Quick start
+## First install (Windows, no terminal)
+
+Open `installer/windows/Start-KubusNodeSetup.cmd` from a verified release
+bundle. It checks that Docker Desktop is running and has at least 10 GiB free,
+starts the local stack, and opens `http://127.0.0.1:8787/setup`. The setup page
+collects the scoped Node token, creates a random GUI credential, writes a
+mode-0600 configuration beside the durable Node identity, then restarts into
+the normal GUI. Stopping/uninstalling preserves Docker volumes by default;
+the explicit volume-delete confirmation is the only destructive path.
+
+Windows is archive-only in this release. Local NVIDIA reconstruction is only
+supported on validated Linux Docker + NVIDIA/CUDA hosts; use remote processing
+from Windows rather than claiming unsupported local GPU support.
+
+## Quick start (operators)
 
 ```sh
 cp .env.example .env

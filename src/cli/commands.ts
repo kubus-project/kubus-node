@@ -1,7 +1,8 @@
 import path from 'node:path';
+import { existsSync } from 'node:fs';
 import { KubusApiClient } from '../backend/kubusApiClient.js';
 import { BearerAuthProvider } from '../backend/operatorAuth.js';
-import { parseEnv, resolveNodeKey } from '../config/env.js';
+import { parseEnv, persistedConfigPath, resolveNodeKey } from '../config/env.js';
 import { loadOrCreateNodeIdentity } from '../identity/nodeIdentity.js';
 import { KuboClient } from '../ipfs/kuboClient.js';
 import { getKuboHealth, waitForKubo } from '../ipfs/health.js';
@@ -25,10 +26,24 @@ import { ComputeIdentityService } from '../compute/computeIdentity.js';
 import { PrivatePayloadTransport } from '../compute/privatePayloadTransport.js';
 import { RemoteComputeRuntime } from '../compute/remoteComputeRuntime.js';
 import { NodeSignalingClient } from '../webrtc/nodeSignalingClient.js';
+import { startSetupServer } from '../gui/setupServer.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const command = argv[0] || 'start';
-  const config = parseEnv();
+  let config: ReturnType<typeof parseEnv>;
+  try {
+    config = parseEnv();
+  } catch (error) {
+    // First start is the one moment the runtime cannot yet know the backend
+    // token or operator wallet. Serve setup only when there is no durable
+    // configuration file; a broken existing configuration must fail loudly
+    // rather than presenting an unauthenticated overwrite page.
+    if (command !== 'start' || existsSync(process.env.KUBUS_NODE_CONFIG_PATH?.trim() || persistedConfigPath())) throw error;
+    const setup = await startSetupServer();
+    console.log(JSON.stringify({ status: 'setup_required', url: setup.url }, null, 2));
+    await waitForShutdown(null, setup);
+    return;
+  }
   const logger = createLogger(config.logLevel);
   const store = new LocalStore(config.localStatePath);
   await store.load();

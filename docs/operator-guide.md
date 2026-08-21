@@ -1,6 +1,8 @@
 # Operator Guide
 
-Install Node.js 20+ and Docker. In art.kubus, sign in with the operator wallet and open Settings > Wallet > Availability Node. Create a scoped operator token, copy it once, and paste it into `.env` as `KUBUS_OPERATOR_TOKEN`.
+For a normal Windows installation, open `installer/windows/Start-KubusNodeSetup.cmd` from a verified release bundle. It starts Docker and opens the local setup page; no `.env` editing is required. The setup page writes `config.env` beside `LOCAL_STATE_PATH` with restrictive permissions, creates a random GUI token, and restarts the container into the ordinary GUI. Docker volumes and this configuration are retained by default when stopping the Node.
+
+For managed/headless deployments, install Node.js 20+ and Docker. In art.kubus, sign in with the operator wallet and open Settings > Wallet > Availability Node. Create a scoped operator token, copy it once, and paste it into `.env` as `KUBUS_OPERATOR_TOKEN`.
 
 Configure every required value in `.env.example`, then run:
 

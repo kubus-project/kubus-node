@@ -19,6 +19,7 @@ services:
 
   kubus-node-agent:
     build: .
+    restart: unless-stopped
     env_file:
       - path: .env
         required: false

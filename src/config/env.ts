@@ -1,5 +1,5 @@
-import 'dotenv/config';
-import { existsSync as fsExistsSync } from 'node:fs';
+import dotenv from 'dotenv';
+import { existsSync as fsExistsSync, readFileSync } from 'node:fs';
 import { isIP } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -50,6 +50,12 @@ function boolEnv(env: NodeJS.ProcessEnv, key: string, fallback: boolean): boolea
 }
 
 export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  // Docker injects only the safe, topology-specific defaults. The setup page
+  // writes the operator choices to a 0600 file on the durable node volume, so
+  // a first start never needs a hand-authored `.env` yet an explicit process
+  // environment value still wins for managed deployments.
+  const effectiveEnv = mergePersistedConfig(env);
+  env = effectiveEnv;
   const nodeEnv = requireString(env, 'NODE_ENV');
   const authMode = (env.KUBUS_AUTH_MODE || 'bearer').trim().toLowerCase();
   if (authMode !== 'bearer') throw new Error('Only KUBUS_AUTH_MODE=bearer is supported in v1');
@@ -152,6 +158,31 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
     participationGraceMs: parseOptionalIntEnv(env, 'PARTICIPATION_GRACE_MS', 15 * 60 * 1000, 60000),
     workerAuthKeyPath: path.resolve(env.WORKER_AUTH_KEY_PATH?.trim() || path.join(path.dirname(requireString(env, 'LOCAL_STATE_PATH')), 'worker-auth.key')),
   };
+}
+
+/** Location intentionally follows LOCAL_STATE_PATH, so identity and setup move together on backup/restore. */
+export function persistedConfigPath(env: NodeJS.ProcessEnv = process.env): string {
+  const statePath = env.LOCAL_STATE_PATH?.trim() || path.join(process.cwd(), 'state.json');
+  return path.join(path.dirname(path.resolve(statePath)), 'config.env');
+}
+
+function mergePersistedConfig(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const filePath = env.KUBUS_NODE_CONFIG_PATH?.trim() || persistedConfigPath(env);
+  let persisted: NodeJS.ProcessEnv = {};
+  try {
+    if (fsExistsSync(filePath)) persisted = dotenv.parse(readFileSync(filePath));
+  } catch (error) {
+    // Treat a damaged configuration exactly like other invalid configuration:
+    // startup stops and the setup surface gives the operator a repair route.
+    throw new Error(`Unable to read kubus Node configuration: ${String((error as Error).message || error)}`);
+  }
+  // Compose materializes unset substitutions as empty strings. Treating those
+  // as an explicit override would erase a value the setup page just persisted
+  // on the node volume every time the container restarts.
+  const explicit = Object.fromEntries(
+    Object.entries(env).filter(([, value]) => value !== undefined && value !== ''),
+  ) as NodeJS.ProcessEnv;
+  return { ...persisted, ...explicit };
 }
 
 function parseLanApiUrl(value: string, key: string): string {
