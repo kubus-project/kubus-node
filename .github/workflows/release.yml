@@ -172,6 +172,6 @@ jobs:
         run: |
           set -euo pipefail
           case "$CHANNEL" in alpha) tag=edge;; beta) tag=beta;; stable) tag=latest;; *) exit 1;; esac
-          tarball="$(find release/npm -maxdepth 1 -name '@kubus-kubus-node-*.tgz' -print -quit)"
+          tarball="$(find release/npm -maxdepth 1 -name 'kubus-kubus-node-*.tgz' -print -quit)"
           test -n "$tarball"
           npm publish "$tarball" --access public --provenance --tag "$tag"

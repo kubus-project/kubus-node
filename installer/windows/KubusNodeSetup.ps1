@@ -4,7 +4,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $ErrorActionPreference = 'Stop'
-$releaseRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$releaseRoot = $PSScriptRoot
 $composeFile = Join-Path $releaseRoot 'docker-compose.release.yml'
 $dataRoot = Join-Path $env:LOCALAPPDATA 'kubus-node'
 $runtimeEnv = Join-Path $dataRoot 'runtime.env'

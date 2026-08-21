@@ -156,13 +156,13 @@ export class RuntimeManager {
     // The setup server writes this durable file only after validated setup
     // completes. Until then the host port is loopback-only, so an unfinished
     // bootstrap UI can never be exposed to the LAN.
-    const allowLan = await until(async () => {
+    const completed = await until(async () => {
       const config = await this.readSetupConfig();
-      if (/^LOCAL_API_ALLOW_LAN=(?:"?true"?)$/m.test(config)) return true;
-      if (/^LOCAL_API_ALLOW_LAN=(?:"?false"?)$/m.test(config)) return false;
+      if (/^LOCAL_API_ALLOW_LAN=(?:"?true"?)$/m.test(config)) return { allowLan: true };
+      if (/^LOCAL_API_ALLOW_LAN=(?:"?false"?)$/m.test(config)) return { allowLan: false };
       return undefined;
     }, 600, 3000, 'Setup did not complete in time. The bootstrap remains loopback-only; rerun kubus-node setup to continue.');
-    await this.writeTopology(allowLan);
+    await this.writeTopology(completed.allowLan);
     await this.compose(['up', '-d', '--force-recreate']);
     await this.waitForHealthy();
   }
