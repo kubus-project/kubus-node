@@ -63,13 +63,17 @@ A short outage may enter `DEGRADED` only after successful participation was prev
 
 ## First install (Windows, no terminal)
 
-Open `installer/windows/Start-KubusNodeSetup.cmd` from a verified release
-bundle. It checks that Docker Desktop is running and has at least 10 GiB free,
-starts the local stack, and opens `http://127.0.0.1:8787/setup`. The setup page
-collects the scoped Node token, creates a random GUI credential, writes a
-mode-0600 configuration beside the durable Node identity, then restarts into
-the normal GUI. Stopping/uninstalling preserves Docker volumes by default;
-the explicit volume-delete confirmation is the only destructive path.
+Download and extract `kubus-node-windows-vX.Y.Z.zip`, then open
+`Start-KubusNodeSetup.cmd`. It checks that Docker Desktop is running and has at
+least 10 GiB free, pulls the immutable images recorded in
+`docker-compose.release.yml`, starts the local stack, and opens
+`http://127.0.0.1:8787/setup`. The setup page collects the scoped Node token,
+creates a random GUI credential, writes a mode-0600 configuration beside the
+durable Node identity, then restarts into the normal GUI. The LAN toggle
+detects the PC's private address and recreates the runtime on `0.0.0.0`; when
+off it remains loopback-only. Normal pairing never asks a user to type an IP
+address. Stopping/uninstalling preserves Docker volumes by default; the
+explicit volume-delete confirmation is the only destructive path.
 
 Windows is archive-only in this release. Local NVIDIA reconstruction is only
 supported on validated Linux Docker + NVIDIA/CUDA hosts; use remote processing

@@ -19,7 +19,9 @@
     "gui": "tsx src/index.ts gui",
     "smoke": "tsx scripts/smoke.ts",
     "sync:version": "node scripts/sync_version.mjs",
-    "sync:versions": "npm run sync:version"
+    "sync:versions": "npm run sync:version",
+    "build:release-package": "node scripts/build_release_package.mjs",
+    "verify:release-package": "node scripts/verify_release_package.mjs"
   },
   "engines": {
     "node": ">=20.19.0",

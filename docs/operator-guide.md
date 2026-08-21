@@ -1,6 +1,15 @@
 # Operator Guide
 
-For a normal Windows installation, open `installer/windows/Start-KubusNodeSetup.cmd` from a verified release bundle. It starts Docker and opens the local setup page; no `.env` editing is required. The setup page writes `config.env` beside `LOCAL_STATE_PATH` with restrictive permissions, creates a random GUI token, and restarts the container into the ordinary GUI. Docker volumes and this configuration are retained by default when stopping the Node.
+For a normal Windows installation, extract `kubus-node-windows-vX.Y.Z.zip` and
+open `Start-KubusNodeSetup.cmd`. It pulls the immutable images recorded in the
+shipped `docker-compose.release.yml`, opens the loopback-only setup page, and
+never builds from source or needs a checkout. No `.env` editing is required.
+The setup page writes `config.env` beside `LOCAL_STATE_PATH` with restrictive
+permissions, creates a random GUI token, and restarts the container into the
+ordinary GUI. When LAN pairing is enabled, the installer detects the host LAN
+address and recreates the port binding; users do not enter a manual LAN URL.
+Docker volumes and this configuration are retained by default when stopping the
+Node.
 
 For managed/headless deployments, install Node.js 20+ and Docker. In art.kubus, sign in with the operator wallet and open Settings > Wallet > Availability Node. Create a scoped operator token, copy it once, and paste it into `.env` as `KUBUS_OPERATOR_TOKEN`.
 

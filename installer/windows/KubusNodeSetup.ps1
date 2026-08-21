@@ -1,9 +1,13 @@
+param([switch]$FinalizeSetup)
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $ErrorActionPreference = 'Stop'
 $releaseRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$composeFile = Join-Path $releaseRoot 'docker-compose.yml'
+$composeFile = Join-Path $releaseRoot 'docker-compose.release.yml'
+$dataRoot = Join-Path $env:LOCALAPPDATA 'kubus-node'
+$runtimeEnv = Join-Path $dataRoot 'runtime.env'
 
 function Show-Problem([string]$message) {
   [System.Windows.Forms.MessageBox]::Show($message, 'kubus Node Setup', 'OK', 'Error') | Out-Null
@@ -19,22 +23,77 @@ function Test-Docker {
   }
 }
 
+function Write-RuntimeTopology([bool]$allowLan) {
+  New-Item -ItemType Directory -Force -Path $dataRoot | Out-Null
+  $bindAddress = '127.0.0.1'
+  $lanUrl = ''
+  if ($allowLan) {
+    $address = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+      Where-Object { $_.IPAddress -match '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)' -and $_.PrefixOrigin -ne 'WellKnown' } |
+      Select-Object -First 1 -ExpandProperty IPAddress
+    if (-not $address) { throw 'LAN access was selected, but no private IPv4 address was found. Connect this PC to the intended network and start setup again.' }
+    $bindAddress = '0.0.0.0'
+    $lanUrl = "http://${address}:8787"
+  }
+  @("NODE_BIND_ADDRESS=$bindAddress", "NODE_LAN_URL=$lanUrl") | Set-Content -LiteralPath $runtimeEnv -Encoding ascii
+}
+
+function Invoke-NodeCompose([string[]]$arguments) {
+  & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile @arguments
+  if ($LASTEXITCODE -ne 0) { throw 'Docker could not complete the kubus Node operation. Open Docker Desktop, check its resources, then retry.' }
+}
+
+function Read-SetupConfig {
+  $config = & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile exec -T kubus-node-agent sh -lc 'test -s /var/lib/kubus-node/config.env && cat /var/lib/kubus-node/config.env' 2>$null
+  if ($LASTEXITCODE -ne 0) { return $null }
+  return ($config -join "`n")
+}
+
+function Wait-NodeReady {
+  for ($attempt = 0; $attempt -lt 40; $attempt++) {
+    $status = & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile ps --format json 2>$null
+    if ($LASTEXITCODE -eq 0 -and $status -match 'healthy') { return }
+    Start-Sleep -Seconds 3
+  }
+  throw 'kubus Node did not become ready in time. Docker Desktop can show the runtime logs; your identity and configuration remain preserved.'
+}
+
+function Complete-SetupTransition {
+  Test-Docker
+  for ($attempt = 0; $attempt -lt 600; $attempt++) {
+    $config = Read-SetupConfig
+    if ($config -match '(?m)^LOCAL_API_ALLOW_LAN=(?:"true"|true)$') {
+      Write-RuntimeTopology $true
+      Invoke-NodeCompose @('up', '-d', '--force-recreate')
+      Wait-NodeReady
+      return
+    }
+    if ($config -match '(?m)^LOCAL_API_ALLOW_LAN=(?:"false"|false)$') {
+      Write-RuntimeTopology $false
+      Invoke-NodeCompose @('up', '-d', '--force-recreate')
+      Wait-NodeReady
+      return
+    }
+    Start-Sleep -Seconds 3
+  }
+}
+
 function Start-Node {
   Test-Docker
-  if (-not (Test-Path -LiteralPath $composeFile)) { throw 'This release bundle is incomplete: docker-compose.yml is missing.' }
-  $dataRoot = Join-Path $env:LOCALAPPDATA 'kubus-node'
-  New-Item -ItemType Directory -Force -Path $dataRoot | Out-Null
+  if (-not (Test-Path -LiteralPath $composeFile)) { throw 'This release bundle is incomplete: docker-compose.release.yml is missing.' }
+  Write-RuntimeTopology $false
   $freeBytes = (Get-PSDrive -Name ([IO.Path]::GetPathRoot($dataRoot).TrimEnd(':','\'))).Free
   if ($freeBytes -lt 10GB) { throw 'At least 10 GB of free disk space is required before starting kubus Node.' }
-  & docker compose -p kubus-node -f $composeFile up -d --build
-  if ($LASTEXITCODE -ne 0) { throw 'Docker could not start kubus Node. Open Docker Desktop, check its resources, then retry.' }
+  Invoke-NodeCompose @('pull')
+  Invoke-NodeCompose @('up', '-d')
+  Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-File', $PSCommandPath, '-FinalizeSetup')
   Start-Process 'http://127.0.0.1:8787/setup'
 }
 
 function Stop-Node([bool]$removeData) {
   Test-Docker
-  & docker compose -p kubus-node -f $composeFile down
-  if ($LASTEXITCODE -ne 0) { throw 'Docker could not stop kubus Node.' }
+  if (-not (Test-Path -LiteralPath $runtimeEnv)) { Write-RuntimeTopology $false }
+  Invoke-NodeCompose @('down')
   $deleted = $false
   if ($removeData) {
     $answer = [System.Windows.Forms.MessageBox]::Show(
@@ -103,5 +162,6 @@ $form.Controls.Add($deleteData)
 
 $form.Controls.Add((New-Object System.Windows.Forms.Label -Property @{ Text = 'GPU reconstruction is only enabled on supported Linux Docker + NVIDIA/CUDA hosts. Windows uses archive participation and remote processing.'; Location = New-Object System.Drawing.Point(24, 236); Size = New-Object System.Drawing.Size(480, 38); AutoSize = $false }))
 
+if ($FinalizeSetup) { Complete-SetupTransition; exit }
 try { Test-Docker; $status.Text = 'Docker Desktop is ready.' } catch { $status.Text = 'Docker Desktop needs attention.' }
 [void]$form.ShowDialog()

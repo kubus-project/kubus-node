@@ -77,8 +77,6 @@ function setupConfig(input: Record<string, unknown>, env: NodeJS.ProcessEnv): Re
   const operatorWallet = requiredText(input, 'operatorWallet', 128);
   const nodeLabel = requiredText(input, 'nodeLabel', 80);
   const allowLan = input.allowLan === true;
-  const lanUrl = optionalUrl(input, 'lanUrl');
-  if (allowLan && !lanUrl) throw new Error('lan_url_required');
   const statePath = env.LOCAL_STATE_PATH?.trim() || '/var/lib/kubus-node/state.json';
   const guiToken = crypto.randomBytes(32).toString('base64url');
   return {
@@ -109,7 +107,6 @@ function setupConfig(input: Record<string, unknown>, env: NodeJS.ProcessEnv): Re
     LOCAL_API_HOST: env.LOCAL_API_HOST?.trim() || '0.0.0.0',
     LOCAL_API_PORT: env.LOCAL_API_PORT?.trim() || '8787',
     LOCAL_API_ALLOW_LAN: String(allowLan),
-    ...(lanUrl ? { LOCAL_API_LAN_URL: lanUrl } : {}),
     LOCAL_DATA_PATH: env.LOCAL_DATA_PATH?.trim() || path.join(path.dirname(statePath), 'data'),
     OFFER_REMOTE_COMPUTE: String(input.offerRemoteCompute === true),
     REMOTE_COMPUTE_PAUSED: 'false',
@@ -176,6 +173,6 @@ function setupHtml(): string {
   return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Set up kubus Node</title>
 <style>body{max-width:42rem;margin:3rem auto;padding:0 1rem;font:16px system-ui}label{display:block;margin:1rem 0}input{box-sizing:border-box;width:100%;padding:.6rem}button{padding:.7rem 1rem}small{color:#555}</style>
 <h1>Set up kubus Node</h1><p>Your captures stay on your Node. The network receives archive participation and short-lived connection coordination, never capture bytes.</p>
-<form id="f"><label>Node name<input name="nodeLabel" required maxlength="80"></label><label>art.kubus API URL<input name="apiBaseUrl" type="url" required placeholder="https://api.kubus.site"></label><label>Operator wallet<input name="operatorWallet" required></label><label>Scoped Node token<input name="operatorToken" type="password" required autocomplete="off"></label><label>Archive capacity (bytes)<input name="archiveBytes" type="number" min="1" value="53687091200"></label><label>Archive record limit<input name="archiveRecords" type="number" min="1" value="100"></label><label><input name="allowLan" type="checkbox"> Allow paired devices on this Wi-Fi/LAN</label><label>LAN URL <small>(required only when LAN is enabled)</small><input name="lanUrl" type="url" placeholder="http://192.168.1.20:8787"></label><label><input name="offerRemoteCompute" type="checkbox"> Offer compatible NVIDIA GPU capacity to the network</label><button>Save and start Node</button></form><p id="m" role="status"></p>
+<form id="f"><label>Node name<input name="nodeLabel" required maxlength="80"></label><label>art.kubus API URL<input name="apiBaseUrl" type="url" required placeholder="https://api.kubus.site"></label><label>Operator wallet<input name="operatorWallet" required></label><label>Scoped Node token<input name="operatorToken" type="password" required autocomplete="off"></label><label>Archive capacity (bytes)<input name="archiveBytes" type="number" min="1" value="53687091200"></label><label>Archive record limit<input name="archiveRecords" type="number" min="1" value="100"></label><label><input name="allowLan" type="checkbox"> Allow connections from devices on this network</label><small>When enabled, setup detects this PC's private LAN address and uses it in pairing. You never need to type an IP address.</small><label><input name="offerRemoteCompute" type="checkbox"> Offer compatible NVIDIA GPU capacity to the network</label><button>Save and start Node</button></form><p id="m" role="status"></p>
 <script>f.onsubmit=async e=>{e.preventDefault();m.textContent='Saving…';let d=Object.fromEntries(new FormData(f));d.allowLan=f.allowLan.checked;d.offerRemoteCompute=f.offerRemoteCompute.checked;let r=await fetch('/setup/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(d)});m.textContent=r.ok?'Saved. Node is restarting…':'Could not save setup. Check every field and try again.'}</script>`;
 }
