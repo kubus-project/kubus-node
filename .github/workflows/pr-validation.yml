@@ -102,6 +102,14 @@ jobs:
           $digest = 'sha256:' + ('0' * 64)
           node scripts/build_release_package.mjs --output release-contract --node-image "ghcr.io/kubus-project/kubus-node@$digest" --worker-image "ghcr.io/kubus-project/kubus-spatial-worker@$digest"
           node scripts/verify_release_package.mjs --directory release-contract/kubus-node-windows-v0.8.0-alpha.4 --version 0.8.0-alpha.4
+      - name: Install the exact npm tarball and exercise the installed CLI
+        shell: pwsh
+        run: |
+          $digest = 'sha256:' + ('0' * 64)
+          node scripts/build_npm_package.mjs --output npm-contract --node-image "ghcr.io/kubus-project/kubus-node@$digest" --worker-image "ghcr.io/kubus-project/kubus-spatial-worker@$digest"
+          $tarball = Get-ChildItem npm-contract -Filter *.tgz | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $tarball) { throw 'npm package tarball missing.' }
+          node scripts/verify_npm_package.mjs --tarball $tarball
 
   pr-validation-required:
     name: PR validation required

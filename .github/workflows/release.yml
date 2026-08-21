@@ -11,6 +11,7 @@ concurrency:
 permissions:
   contents: write
   packages: write
+  id-token: write
 
 jobs:
   source-gate:
@@ -18,6 +19,8 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       prerelease: ${{ steps.version.outputs.prerelease }}
+      channel: ${{ steps.version.outputs.channel }}
+      source_sha: ${{ steps.version.outputs.source_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,6 +42,8 @@ jobs:
           elif [[ "$version" == *-beta.* ]]; then test "$channel" = beta; prerelease=true;
           else test "$channel" = stable; prerelease=false; fi
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
 
   verify:
     name: Full release validation
@@ -111,7 +116,7 @@ jobs:
     needs: [source-gate, images]
     uses: ./.github/workflows/node-package.yml
     with:
-      source_sha: ${{ github.sha }}
+      source_sha: ${{ needs.source-gate.outputs.source_sha }}
       release_tag: ${{ github.ref_name }}
       publish: true
       node_image: ghcr.io/kubus-project/kubus-node@${{ needs.images.outputs.node_digest }}
@@ -126,6 +131,10 @@ jobs:
         with:
           name: kubus-node-release-package-${{ github.ref_name }}
           path: release
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.15.0
+          registry-url: https://registry.npmjs.org
       - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ghcr.io/kubus-project/kubus-node@${{ needs.images.outputs.node_digest }}
@@ -144,7 +153,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          (cd release && sha256sum *.zip *.tar.gz *.spdx.json > SHA256SUMS)
+          (cd release && sha256sum *.zip *.tar.gz *.spdx.json kubus-node-release-manifest-*.json npm/*.tgz > SHA256SUMS)
       - uses: softprops/action-gh-release@fe965f7af51af5f2602596916f38a38df2e33de0 # v3.0.2
         with:
           prerelease: ${{ needs.source-gate.outputs.prerelease == 'true' }}
@@ -152,5 +161,17 @@ jobs:
           files: |
             release/*.zip
             release/*.tar.gz
+            release/npm/*.tgz
             release/SHA256SUMS
             release/*.spdx.json
+            release/kubus-node-release-manifest-*.json
+      - name: Publish the exact tested npm package with its channel dist-tag
+        shell: bash
+        env:
+          CHANNEL: ${{ needs.source-gate.outputs.channel }}
+        run: |
+          set -euo pipefail
+          case "$CHANNEL" in alpha) tag=edge;; beta) tag=beta;; stable) tag=latest;; *) exit 1;; esac
+          tarball="$(find release/npm -maxdepth 1 -name '@kubus-kubus-node-*.tgz' -print -quit)"
+          test -n "$tarball"
+          npm publish "$tarball" --access public --provenance --tag "$tag"

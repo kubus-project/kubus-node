@@ -5,7 +5,7 @@ import { join, relative, resolve } from 'node:path';
 const directory = resolve(argument('--directory') ?? process.argv[2] ?? '');
 if (!directory) throw new Error('Pass --directory <release-package-directory>.');
 const expectedVersion = argument('--version');
-const required = new Set(['Start-KubusNodeSetup.cmd', 'KubusNodeSetup.ps1', 'docker-compose.release.yml', 'version.json', 'release-metadata.json', 'README-FIRST.txt', 'SHA256SUMS']);
+const required = new Set(['Start-KubusNodeSetup.cmd', 'KubusNodeSetup.ps1', 'docker-compose.release.yml', 'version.json', 'release-metadata.json', 'release-manifest.json', 'README-FIRST.txt', 'SHA256SUMS']);
 const entries = await files(directory);
 const relativeEntries = new Set(entries.map((file) => relative(directory, file).replaceAll('\\', '/')));
 for (const file of required) if (!relativeEntries.has(file)) throw new Error(`Missing required release file: ${file}`);
@@ -29,6 +29,10 @@ const metadata = JSON.parse(await readFile(join(directory, 'release-metadata.jso
 if (metadata.version !== version.version || metadata.tag !== `v${version.version}`) throw new Error('Release metadata, version.json, and tag disagree.');
 if (metadata.nodeImage !== digests.find((value) => value.includes('/kubus-node@')) || metadata.workerImage !== digests.find((value) => value.includes('/kubus-spatial-worker@'))) {
   throw new Error('Release metadata does not match the immutable images in Compose.');
+}
+const manifest = JSON.parse(await readFile(join(directory, 'release-manifest.json'), 'utf8'));
+if (manifest.version !== version.version || manifest.nodeImage !== metadata.nodeImage || manifest.workerImage !== metadata.workerImage || manifest.composeSha256 !== createHash('sha256').update(compose).digest('hex')) {
+  throw new Error('Release manifest does not match the packaged version, images, or Compose file.');
 }
 const checksums = await readFile(join(directory, 'SHA256SUMS'), 'utf8');
 const declared = new Map(checksums.trim().split(/\r?\n/).filter(Boolean).map((line) => {

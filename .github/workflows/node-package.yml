@@ -50,7 +50,7 @@ permissions:
 
 jobs:
   package:
-    name: Build and verify exact release package
+    name: Build and verify exact release and npm packages
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -69,6 +69,13 @@ jobs:
           if [ -n "${{ inputs.release_tag }}" ]; then test "${{ inputs.release_tag }}" = "v$version"; fi
           npm ci
           git diff --exit-code -- package-lock.json
+          npm run build
+      - name: Enforce npm package allow-list before creating release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pack --dry-run --json > npm-pack-dry-run.json
+          node -e "const [p]=require('./npm-pack-dry-run.json'); const f=new Set(p.files.map(x=>x.path)); for(const x of ['dist/src/index.js','runtime/release-manifest.json','runtime/docker-compose.release.yml','version.json']) if(!f.has(x)) throw new Error('npm pack missing '+x); for(const x of f) if(/^(src|tests?|coverage|\\.github|node_modules)\\//.test(x)||/(^|\\/)\\.env/.test(x)) throw new Error('npm package leak '+x);"
       - name: Build the exact package candidate
         shell: bash
         env:
@@ -78,14 +85,21 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "$RELEASE_TAG" ]]; then RELEASE_TAG="v$(node -p "require('./version.json').version")"; fi
-          node scripts/build_release_package.mjs --output release --tag "$RELEASE_TAG" --node-image "$NODE_IMAGE" --worker-image "$WORKER_IMAGE"
+          node scripts/build_release_package.mjs --output release --tag "$RELEASE_TAG" --source-sha "${{ inputs.source_sha || github.sha }}" --node-image "$NODE_IMAGE" --worker-image "$WORKER_IMAGE"
           node scripts/verify_release_package.mjs --directory "release/kubus-node-windows-$RELEASE_TAG" --version "$(node -p "require('./version.json').version")"
           docker compose -f "release/kubus-node-windows-$RELEASE_TAG/docker-compose.release.yml" config >/dev/null
+          node scripts/build_npm_package.mjs --output release/npm --tag "$RELEASE_TAG" --source-sha "${{ inputs.source_sha || github.sha }}" --node-image "$NODE_IMAGE" --worker-image "$WORKER_IMAGE"
+          tarball="$(find release/npm -maxdepth 1 -name '*.tgz' -print -quit)"
+          test -n "$tarball"
+          node scripts/verify_npm_package.mjs --tarball "$tarball"
+          cp "release/kubus-node-windows-$RELEASE_TAG/release-manifest.json" "release/kubus-node-release-manifest-$RELEASE_TAG.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kubus-node-release-package-${{ inputs.release_tag || github.sha }}
           path: |
             release/*.zip
             release/*.tar.gz
+            release/npm/*.tgz
+            release/kubus-node-release-manifest-*.json
           if-no-files-found: error
           retention-days: ${{ inputs.publish && 30 || 7 }}

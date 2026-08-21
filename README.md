@@ -79,6 +79,40 @@ Windows is archive-only in this release. Local NVIDIA reconstruction is only
 supported on validated Linux Docker + NVIDIA/CUDA hosts; use remote processing
 from Windows rather than claiming unsupported local GPU support.
 
+## Operator CLI (npm)
+
+`@kubus/kubus-node` is an optional cross-platform control and bootstrap CLI.
+It is not a second Node implementation: production services always run from
+the digest-pinned Kubernetes Node and spatial-worker container images in the
+release manifest. The Windows ZIP remains the preferred normal-user Windows
+installer.
+
+Linux x64 and Windows x64 operators can install the exact release CLI with:
+
+```sh
+npm install -g @kubus/kubus-node
+# or without a global install
+npx @kubus/kubus-node setup
+```
+
+Docker Engine plus Compose v2 is required. `kubus-node setup` validates Docker,
+pulls the immutable release images, starts only the loopback bootstrap service,
+and opens the same setup wizard as the Windows installer. No checkout, source
+build, manual `.env`, or `docker compose --build` is used. `setup --headless`
+starts that loopback wizard without opening a browser, for access through an
+SSH tunnel on a server. `kubus-node doctor --json` is safe for automation.
+
+Use `kubus-node update` only after deliberately selecting the desired released
+CLI version (for example `npx @kubus/kubus-node@beta update`); it applies that
+package's verified immutable runtime manifest and preserves Docker volumes.
+`npm uninstall -g @kubus/kubus-node` removes only the CLI. It never removes the
+Node runtime, identity, pairings, Kubo archive, or captures. Use
+`kubus-node uninstall` to stop the runtime while preserving data, or add both
+`--delete-data --yes-delete-data` for the explicitly destructive path.
+
+NPM channels track runtime channels: alpha uses `edge`, beta uses `beta`, and
+stable uses `latest`. macOS is intentionally unsupported for this alpha CLI.
+
 ## Quick start (operators)
 
 ```sh

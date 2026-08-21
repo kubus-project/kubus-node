@@ -7,6 +7,13 @@
   "bin": {
     "kubus-node": "./dist/src/index.js"
   },
+  "files": [
+    "dist/",
+    "runtime/",
+    "version.json",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts start",
@@ -21,7 +28,9 @@
     "sync:version": "node scripts/sync_version.mjs",
     "sync:versions": "npm run sync:version",
     "build:release-package": "node scripts/build_release_package.mjs",
-    "verify:release-package": "node scripts/verify_release_package.mjs"
+    "verify:release-package": "node scripts/verify_release_package.mjs",
+    "build:npm-package": "node scripts/build_npm_package.mjs",
+    "verify:npm-package": "node scripts/verify_npm_package.mjs"
   },
   "engines": {
     "node": ">=20.19.0",

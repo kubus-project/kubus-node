@@ -54,10 +54,12 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 describe('RemoteComputeRuntime provider polling (Part 11 / Part 40)', () => {
   it('backs off after repeated poll failures instead of retrying every 5s forever', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
     const pollTimestamps: number[] = [];
     const { runtime } = buildRuntime(async () => {
       pollTimestamps.push(Date.now());
@@ -65,7 +67,12 @@ describe('RemoteComputeRuntime provider polling (Part 11 / Part 40)', () => {
     });
 
     runtime.start();
-    await vi.advanceTimersByTimeAsync(5000 + 10000 + 20000);
+    // Advance each scheduled retry separately. A single large fake-clock jump
+    // can coalesce promise continuations and make the observed timestamps
+    // describe the test runner rather than the runtime's retry schedule.
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(10000);
     runtime.stop();
     await vi.advanceTimersByTimeAsync(1000);
 
@@ -73,7 +80,8 @@ describe('RemoteComputeRuntime provider polling (Part 11 / Part 40)', () => {
     const gap1 = pollTimestamps[1]! - pollTimestamps[0]!;
     const gap2 = pollTimestamps[2]! - pollTimestamps[1]!;
     // Growing backoff, not a fixed 5s repeat.
-    expect(gap2).toBeGreaterThan(gap1 * 1.4);
+    expect(gap1).toBeGreaterThanOrEqual(5000);
+    expect(gap2).toBeGreaterThanOrEqual(10000);
   });
 
   it('logs a warning only on the healthy -> failing transition, not every 5s tick', async () => {

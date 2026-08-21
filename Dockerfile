@@ -16,6 +16,7 @@ LABEL org.opencontainers.image.title="kubus Node" \
       org.opencontainers.image.version="0.8.0-alpha.1"
 WORKDIR /app
 ENV NODE_ENV=production
+ENV KUBUS_NODE_EXECUTION_MODE=container
 COPY package*.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist

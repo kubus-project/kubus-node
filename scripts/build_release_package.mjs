@@ -14,6 +14,8 @@ if (packageMetadata.version !== versionMetadata.version || version !== packageMe
 }
 const tag = options.tag ?? `v${version}`;
 if (tag !== `v${version}`) throw new Error(`Release tag ${tag} does not match v${version}.`);
+const sourceSha = options['source-sha'] ?? '0000000000000000000000000000000000000000';
+if (!/^[a-f0-9]{40}$/i.test(sourceSha)) throw new Error('--source-sha must be a 40 character commit SHA.');
 const nodeImage = requiredDigestImage(options['node-image'], 'node-image');
 const workerImage = requiredDigestImage(options['worker-image'], 'worker-image');
 const output = resolve(options.output ?? join(root, 'release'));
@@ -25,16 +27,23 @@ await mkdir(packageDir, { recursive: true });
 await cp(join(root, 'installer', 'windows', 'Start-KubusNodeSetup.cmd'), join(packageDir, 'Start-KubusNodeSetup.cmd'));
 await cp(join(root, 'installer', 'windows', 'KubusNodeSetup.ps1'), join(packageDir, 'KubusNodeSetup.ps1'));
 await cp(join(root, 'version.json'), join(packageDir, 'version.json'));
-await writeFile(join(packageDir, 'release-metadata.json'), `${JSON.stringify({
-  version,
-  tag,
-  nodeImage,
-  workerImage,
-}, null, 2)}\n`, 'utf8');
 const compose = (await readFile(join(root, 'docker-compose.release.template.yml'), 'utf8'))
   .replaceAll('__KUBUS_NODE_IMAGE__', nodeImage)
   .replaceAll('__KUBUS_SPATIAL_WORKER_IMAGE__', workerImage);
 await writeFile(join(packageDir, 'docker-compose.release.yml'), compose, 'utf8');
+const releaseManifest = {
+  schemaVersion: 1,
+  version,
+  channel: versionMetadata.channel,
+  sourceSha,
+  nodeImage,
+  workerImage,
+  composeSha256: createHash('sha256').update(compose).digest('hex'),
+  minimumCliVersion: version,
+  protocolVersion: 3,
+};
+await writeFile(join(packageDir, 'release-manifest.json'), `${JSON.stringify(releaseManifest, null, 2)}\n`, 'utf8');
+await writeFile(join(packageDir, 'release-metadata.json'), `${JSON.stringify({ version, tag, nodeImage, workerImage, releaseManifest }, null, 2)}\n`, 'utf8');
 await writeFile(join(packageDir, 'README-FIRST.txt'), firstReadme(tag), 'utf8');
 await writeChecksums(packageDir);
 await archive(packageDir, join(output, `${packageName}.zip`), 'zip');
