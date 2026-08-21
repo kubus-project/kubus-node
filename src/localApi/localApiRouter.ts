@@ -1,9 +1,9 @@
-import crypto from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { KubusApiClient } from '../backend/kubusApiClient.js';
 import type { CapabilityRegistry } from '../capabilities/registry.js';
 import type { CaptureDraftPayload, CapturePackagePayload, CaptureStore } from '../captures/captureStore.js';
 import type { AppConfig } from '../config/schema.js';
+import type { NodeIdentity } from '../identity/nodeIdentity.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import type { JobRuntime, JobType } from '../jobs/jobRuntime.js';
 import { isValidCidLike, normalizeCid } from '../utils/cid.js';
@@ -23,6 +23,8 @@ export interface LocalApiDeps {
   jobs: JobRuntime;
   participationGate: NetworkParticipationGate;
   remoteCompute: RemoteComputeRuntime;
+  /** Loaded once at startup; every route reads the same in-memory identity rather than re-reading `identity.json`. */
+  identity: NodeIdentity;
 }
 
 const SCOPE_BY_ROUTE: Array<[RegExp, LocalScope]> = [
@@ -85,12 +87,13 @@ export async function handleLocalApi(req: IncomingMessage, res: ServerResponse, 
   if (!await deps.pairing.authorize(token, routeScope)) throw localError(401, 'local_credential_required');
 
   if (req.method === 'GET' && parsed.pathname === '/local/v1/info') {
-    const nodeKey = await deps.store.getOrCreateNodeKey(deps.config.nodeKey);
     const state = deps.store.snapshot();
-    const fingerprint = crypto.createHash('sha256').update(`kubus-local-identity:${nodeKey}`).digest('hex');
+    const fingerprint = deps.identity.fingerprint;
     json(res, 200, {
       apiVersion: 'local/v1', nodeId: state.nodeId || `local-${fingerprint}`, label: deps.config.nodeLabel, peerId: state.peerId || null,
       fingerprint,
+      publicKey: deps.identity.publicKeyBase64Url,
+      identityAlgorithm: 'ed25519',
       endpoints: [
         deps.config.localApiRemoteUrl,
         deps.config.localApiAllowLan ? deps.config.localApiLanUrl : undefined,

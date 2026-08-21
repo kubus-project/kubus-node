@@ -27,6 +27,10 @@ function state(overrides: Partial<LocalState> = {}): LocalState {
 function input(overrides: Partial<ViewModelInput> = {}): ViewModelInput {
   return {
     state: state(),
+    // A deterministic public-key fingerprint stands in for the node's real
+    // Ed25519 identity: the view model only formats it, and pinning the value
+    // keeps the grouped display assertion meaningful.
+    identity: { fingerprint: 'a1b2c3d4e5f60718293a4b5c6d7e8f901234567890abcdef1234567890abcdef' },
     participation: { state: 'CONTRIBUTING', reason: 'ok', leaseEligible: true, requirements: {} },
     worker: { status: 'ready', gpu: { available: true, model: 'RTX 3080 Ti', totalVramBytes: 12 * 1024 ** 3 }, capabilities: ['spatial.reconstruct'] },
     jobs: { configured: true, running: 0, queued: 0, concurrency: 1 },

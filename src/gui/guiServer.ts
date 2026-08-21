@@ -2,6 +2,7 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { KubusApiClient } from '../backend/kubusApiClient.js';
 import type { AppConfig } from '../config/schema.js';
+import { formatFingerprint } from '../identity/nodeIdentity.js';
 import { getKuboHealth } from '../ipfs/health.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import { probeRetrieval, RETRIEVAL_AVAILABLE_STATES, type RetrievalProbe } from '../ipfs/retrieval.js';
@@ -228,6 +229,7 @@ async function buildGuiView(deps: GuiDeps) {
 
   return buildViewModel({
     state,
+    identity: { fingerprint: local.identity.fingerprint },
     participation,
     worker: local.capabilities.getWorkerHealth(),
     jobs: local.jobs.health(),
@@ -272,9 +274,11 @@ async function createGuiPairing(deps: GuiDeps) {
   const session = await local.pairing.createSession();
   // The app shows the node's name and fingerprint for confirmation before it
   // exchanges the credential, so both travel in the code itself — otherwise the
-  // person is asked to trust a bare host and port. The fingerprint is the short
-  // form; it is for recognition, not verification.
-  const fingerprint = session.node.fingerprint.slice(0, 12);
+  // person is asked to trust a bare host and port. `formatFingerprint` is the
+  // same grouped, uppercase form used in Settings, and the same form the app
+  // computes from the public key it just received (`pk` in the payload) — the
+  // operator compares this string, not the full 64-character digest.
+  const fingerprint = formatFingerprint(session.node.fingerprint);
   return {
     code: session.payload,
     sessionId: session.sessionId,
@@ -282,8 +286,6 @@ async function createGuiPairing(deps: GuiDeps) {
     qrSvg: await renderQrSvg(session.payload, { title: 'kubus Node pairing code' }),
     node: {
       label: session.node.label,
-      // A short fingerprint is enough for the operator to recognise the node in
-      // the app; the full digest is not useful on screen.
       fingerprint,
       endpoint: session.node.endpoint,
     },

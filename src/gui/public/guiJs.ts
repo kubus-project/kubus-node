@@ -593,6 +593,9 @@ function renderSettings() {
     detailRow('Name', model.node.label) +
     detailRow('Version', model.node.version) +
     detailRow('Last reported to the network', model.node.lastHeartbeat) +
+    // Same value, same format, shown on the pairing code — this is what an
+    // operator compares by eye against what the art.kubus app displays.
+    detailRow('Identity fingerprint', model.node.fingerprint) +
     '</section>' +
     '<section class="panel">' +
     '<h2 class="t-card">Access</h2>' +
