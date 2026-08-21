@@ -176,16 +176,37 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     return;
   }
 
-  // --- Spatial library, capture archive, and job queue (read-only) ---------
+  // --- Spatial library, capture archive, and job queue ---------------------
   if (req.method === 'GET' && parsed.pathname === '/gui/api/jobs') {
     const local = requireLocalApi(deps);
     writeJson(res, 200, { success: true, data: listJobSummaries(local.jobs) });
+    return;
+  }
+  if (req.method === 'POST' && parsed.pathname === '/gui/api/jobs') {
+    // "Process on this Node" from the GUI uses the exact same JobRuntime a
+    // phone-triggered job does - there is no second, GUI-only processing
+    // path to keep honest with reality.
+    const local = requireLocalApi(deps);
+    const body = await readGuiJson(req);
+    const captureId = typeof body.captureId === 'string' ? body.captureId : '';
+    if (!captureId) throw localError(400, 'job_capture_required');
+    const capture = local.captures.get(captureId);
+    const type = typeof body.type === 'string' ? body.type : 'spatial.reconstruct';
+    const job = await local.jobs.create(type as never, { captureId, artworkId: capture.artworkId, markerId: capture.markerId });
+    writeJson(res, 201, { success: true, data: job });
     return;
   }
   const jobMatch = parsed.pathname.match(/^\/gui\/api\/jobs\/([^/]+)$/);
   if (req.method === 'GET' && jobMatch) {
     const local = requireLocalApi(deps);
     writeJson(res, 200, { success: true, data: getJobSummary(local.jobs, decodeURIComponent(jobMatch[1]!)) });
+    return;
+  }
+  const jobCancelMatch = parsed.pathname.match(/^\/gui\/api\/jobs\/([^/]+)\/cancel$/);
+  if (req.method === 'POST' && jobCancelMatch) {
+    const local = requireLocalApi(deps);
+    const job = await local.jobs.cancel(decodeURIComponent(jobCancelMatch[1]!));
+    writeJson(res, 200, { success: true, data: job });
     return;
   }
   if (req.method === 'GET' && parsed.pathname === '/gui/api/captures') {

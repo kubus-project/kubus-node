@@ -7,6 +7,9 @@ import type { AppConfig } from '../src/config/schema.js';
 import type { SpatialWorkerHealth } from '../src/capabilities/registry.js';
 import { ActionLock } from '../src/runtime/actionLock.js';
 import { AnalyticsStore } from '../src/analytics/analyticsStore.js';
+import { CaptureStore } from '../src/captures/captureStore.js';
+import { JobRuntime } from '../src/jobs/jobRuntime.js';
+import { LocalStore } from '../src/state/localStore.js';
 import { assertGuiConfig, authorizeGuiRequest } from '../src/gui/guiAuth.js';
 import { startGuiServer } from '../src/gui/guiServer.js';
 import { guiJs } from '../src/gui/public/guiJs.js';
@@ -436,6 +439,114 @@ describe('local GUI safety helpers', () => {
         try {
           const response = await fetch(server.url.replace('/gui', '/gui/api/analytics'), { headers });
           expect(response.status).toBe(503);
+        } finally {
+          await server.close();
+        }
+      });
+    });
+
+    describe('POST /gui/api/jobs (Process on this Node)', () => {
+      const jobDirs: string[] = [];
+      afterEach(async () => {
+        await Promise.all(jobDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
+      });
+
+      /** Waits for the job's background dispatch to reach a terminal state before the test (and its directory cleanup) proceeds. */
+      async function waitForTerminal(server: Awaited<ReturnType<typeof startGuiServer>>, jobId: string, timeoutMs = 2000): Promise<void> {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+          const response = await fetch(server.url.replace('/gui', `/gui/api/jobs/${jobId}`), { headers });
+          const state = (await response.json()).data?.state;
+          if (['completed', 'failed', 'cancelled'].includes(state)) return;
+          if (Date.now() > deadline) throw new Error(`job ${jobId} did not reach a terminal state`);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
+
+      async function startNodeWithRealJobs() {
+        const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-gui-jobs-'));
+        jobDirs.push(dir);
+        const store = new LocalStore(path.join(dir, 'state.json'));
+        await store.load();
+        const captures = new CaptureStore(dir, store);
+        const capture = await captures.create({
+          schema: 'kubus.capture/1', artworkId: 'artwork-1', capturedAt: new Date().toISOString(), metadata: {},
+          files: [{ path: 'rgb/00000.jpg', contentBase64: Buffer.from([0xff]).toString('base64') }],
+        });
+        const jobs = new JobRuntime({
+          store, captureStore: captures, kubo: {} as never, logger: { warn: () => undefined } as never,
+          dataRoot: dir, concurrency: 1,
+          // No workerUrl configured: the job will predictably fail fast with
+          // worker_unavailable rather than actually trying to process -
+          // this test is about the GUI's create/cancel routes, not JobRuntime
+          // itself (already covered in spatialRuntime.test.ts).
+          participationGate: { assertUsefulOperation: async () => undefined } as never,
+          workerAuth: { issue: async () => 'token' } as never,
+        });
+        await jobs.start();
+        const server = await startGuiServer({
+          api: {} as never, kubo: {} as never, store, config: nodeConfig,
+          logger: { info: () => undefined } as never, actionLock: new ActionLock(),
+          localApi: {
+            captures, jobs,
+            api: {} as never, kubo: {} as never, store, config: nodeConfig,
+            capabilities: { refreshIfStale: async () => undefined } as never,
+            pairing: {} as never, participationGate: { assertUsefulOperation: async () => undefined } as never,
+            remoteCompute: {} as never, identity: { fingerprint: 'abc' } as never,
+          } as never,
+        });
+        return { server, capture };
+      }
+
+      it('creates a real job for a real capture, visible immediately via GET', async () => {
+        const { server, capture } = await startNodeWithRealJobs();
+        try {
+          const created = await fetch(server.url.replace('/gui', '/gui/api/jobs'), {
+            method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ captureId: capture.id }),
+          });
+          expect(created.status).toBe(201);
+          const job = (await created.json()).data;
+          expect(job.input.captureId).toBe(capture.id);
+          expect(job.input.artworkId).toBe('artwork-1');
+
+          const fetched = await fetch(server.url.replace('/gui', `/gui/api/jobs/${job.id}`), { headers });
+          expect((await fetched.json()).data.id).toBe(job.id);
+          await waitForTerminal(server, job.id);
+        } finally {
+          await server.close();
+        }
+      });
+
+      it('rejects creating a job for a capture that does not exist', async () => {
+        const { server } = await startNodeWithRealJobs();
+        try {
+          const response = await fetch(server.url.replace('/gui', '/gui/api/jobs'), {
+            method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ captureId: 'does-not-exist' }),
+          });
+          expect(response.status).toBe(404);
+        } finally {
+          await server.close();
+        }
+      });
+
+      it('cancels a real job through the GUI route', async () => {
+        const { server, capture } = await startNodeWithRealJobs();
+        try {
+          const created = await fetch(server.url.replace('/gui', '/gui/api/jobs'), {
+            method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ captureId: capture.id }),
+          });
+          const job = (await created.json()).data;
+
+          const cancelled = await fetch(server.url.replace('/gui', `/gui/api/jobs/${job.id}/cancel`), {
+            method: 'POST', headers,
+          });
+          expect(cancelled.status).toBe(200);
+          const state = (await cancelled.json()).data.state;
+          expect(['cancelled', 'failed']).toContain(state);
+          await waitForTerminal(server, job.id);
         } finally {
           await server.close();
         }
