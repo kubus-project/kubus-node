@@ -5,6 +5,7 @@ import type { CaptureStore } from '../captures/captureStore.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import { localError } from '../localApi/pairingService.js';
 import type { Logger } from '../logging/logger.js';
+import { buildNerfstudioDataset } from '../spatial/nerfstudioAdapter.js';
 import { validateSpatialManifest, type SpatialManifest, type SpatialVariant } from '../spatial/models.js';
 import type { LocalStore } from '../state/localStore.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
@@ -13,12 +14,29 @@ import type { CapabilityRegistry } from '../capabilities/registry.js';
 
 export type JobType = 'spatial.reconstruct' | 'spatial.optimize' | 'spatial.generate_preview';
 export type JobState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+/**
+ * Truthful processing stages. `progress` stays a fixed, honest checkpoint for
+ * bounded steps; it is `null` during `training`, the one stage whose real
+ * duration and completion fraction this worker version does not report -
+ * showing a fabricated percentage there would be worse than an indeterminate
+ * spinner labelled with the real stage name.
+ */
+export type JobStage =
+  | 'queued'
+  | 'preparing_dataset'
+  | 'starting_worker'
+  | 'training'
+  | 'importing'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
 export interface LocalJob {
   id: string;
   type: JobType;
   capability: string;
   state: JobState;
-  progress: number;
+  stage: JobStage;
+  progress: number | null;
   input: Record<string, unknown>;
   output?: Record<string, unknown>;
   error?: { code: string; message: string };
@@ -90,7 +108,7 @@ export class JobRuntime {
     this.deps.captureStore.get(captureId);
     const now = new Date().toISOString();
     const job: LocalJob = {
-      id: crypto.randomUUID(), type, capability: capabilityFor(type), state: 'queued', progress: 0,
+      id: crypto.randomUUID(), type, capability: capabilityFor(type), state: 'queued', stage: 'queued', progress: 0,
       input: structuredClone(input), createdAt: now, updatedAt: now,
       logs: [{ at: now, level: 'info', message: 'Job queued' }],
     };
@@ -151,18 +169,53 @@ export class JobRuntime {
       const outputDirectory = path.join(this.deps.dataRoot, 'private', 'jobs', id);
       await fs.mkdir(outputDirectory, { recursive: true, mode: 0o700 });
       await this.patchJob(id, (current) => {
-        current.state = 'running'; current.progress = 0.05; current.startedAt = current.updatedAt = new Date().toISOString();
-        current.logs.push({ at: current.updatedAt, level: 'info', message: 'Spatial worker started' });
+        current.state = 'running'; current.stage = 'preparing_dataset'; current.progress = 0.05;
+        current.startedAt = current.updatedAt = new Date().toISOString();
+        current.logs.push({ at: current.updatedAt, level: 'info', message: 'Preparing dataset from capture' });
+      });
+
+      // Only spatial.reconstruct trains from a raw capture; other job types
+      // (optimize, generate_preview) operate on already-processed spatial
+      // data and skip the kubus.capture/1 -> Nerfstudio translation.
+      let workerCaptureDirectory = capture.directory;
+      if (job.type === 'spatial.reconstruct') {
+        const datasetDirectory = path.join(outputDirectory, 'dataset');
+        const dataset = await buildNerfstudioDataset(capture.directory, datasetDirectory);
+        workerCaptureDirectory = dataset.datasetDirectory;
+        await this.patchJob(id, (current) => {
+          current.logs.push({
+            at: new Date().toISOString(),
+            level: 'info',
+            message: `Dataset ready: ${dataset.frameCount} view(s)${dataset.droppedFrameCount ? `, ${dataset.droppedFrameCount} frame(s) dropped as unusable` : ''}`,
+          });
+        });
+      }
+
+      await this.patchJob(id, (current) => {
+        current.stage = 'starting_worker'; current.progress = 0.15; current.updatedAt = new Date().toISOString();
+        current.logs.push({ at: current.updatedAt, level: 'info', message: 'Starting spatial worker' });
+      });
+      await this.patchJob(id, (current) => {
+        // Training runs as a single blocking call in this worker version, so
+        // there is no real interim percentage to report - an indeterminate
+        // stage is honest, a fabricated one is not.
+        current.stage = 'training'; current.progress = null; current.updatedAt = new Date().toISOString();
+        current.logs.push({ at: current.updatedAt, level: 'info', message: 'Training (this can take a while; progress is not reported mid-run by this worker version)' });
       });
       const response = await fetch(`${this.deps.workerUrl}/v1/process`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Kubus-Worker-Authorization': await this.deps.workerAuth.issue(id, job.type) }, signal: controller.signal,
-        body: JSON.stringify({ jobId: id, type: job.type, captureDirectory: capture.directory, outputDirectory, input: job.input }),
+        body: JSON.stringify({ jobId: id, type: job.type, captureDirectory: workerCaptureDirectory, outputDirectory, input: job.input }),
       });
       const body = await response.json().catch(() => ({})) as WorkerOutput & { error?: string };
       if (!response.ok) throw Object.assign(new Error(body.error || `worker_http_${response.status}`), { code: response.status === 503 ? 'worker_unsupported' : 'worker_failed' });
+      await this.patchJob(id, (current) => {
+        current.stage = 'importing'; current.progress = 0.9; current.updatedAt = new Date().toISOString();
+        current.logs.push({ at: current.updatedAt, level: 'info', message: 'Importing spatial output into local Kubo' });
+      });
       const spatial = await this.importOutputs(job, capture, outputDirectory, body);
       await this.patchJob(id, (current) => {
-        current.state = 'completed'; current.progress = 1; current.output = spatial; current.completedAt = current.updatedAt = new Date().toISOString();
+        current.state = 'completed'; current.stage = 'completed'; current.progress = 1; current.output = spatial;
+        current.completedAt = current.updatedAt = new Date().toISOString();
         current.logs.push({ at: current.updatedAt, level: 'info', message: 'Spatial outputs imported into local Kubo' });
       });
     } catch (error) {
@@ -170,6 +223,7 @@ export class JobRuntime {
       const aborted = controller.signal.aborted;
       await this.patchJob(id, (current) => {
         current.state = aborted ? 'cancelled' : 'failed';
+        current.stage = aborted ? 'cancelled' : 'failed';
         current.error = { code: String((error as { code?: string }).code || (aborted ? 'cancelled' : 'job_failed')), message: String((error as Error).message || error) };
         current.completedAt = current.updatedAt = new Date().toISOString();
         current.logs.push({ at: current.updatedAt, level: aborted ? 'warn' : 'error', message: current.error.message });
@@ -184,10 +238,13 @@ export class JobRuntime {
     for (const item of output.variants) {
       const target = path.resolve(outputDirectory, item.path);
       if (!target.startsWith(`${path.resolve(outputDirectory)}${path.sep}`)) throw new Error('worker_output_path_invalid');
-      const bytes = await fs.readFile(target);
-      const added = await this.deps.kubo.addBytes(bytes, path.basename(target));
+      // Streamed from disk: a Gaussian splat PLY can be hundreds of megabytes
+      // and must never be held whole in Node's memory just to re-emit it as
+      // multipart form data.
+      const { size: sizeBytes } = await fs.stat(target);
+      const added = await this.deps.kubo.addFileStreamed(target, path.basename(target));
       if (!added.Hash) throw new Error('kubo_add_missing_cid');
-      variants.push({ role: item.role, cid: added.Hash, sizeBytes: bytes.byteLength, mimeType: item.mimeType, format: item.format, storageClass: item.storageClass });
+      variants.push({ role: item.role, cid: added.Hash, sizeBytes, mimeType: item.mimeType, format: item.format, storageClass: item.storageClass });
     }
     const id = crypto.randomUUID();
     const manifest: SpatialManifest = {

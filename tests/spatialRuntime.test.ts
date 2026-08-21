@@ -7,8 +7,30 @@ import { JobRuntime } from '../src/jobs/jobRuntime.js';
 import { CapabilityRegistry } from '../src/capabilities/registry.js';
 import { validateSpatialManifest } from '../src/spatial/models.js';
 import { LocalStore } from '../src/state/localStore.js';
+import { MIN_VIEWS_FOR_RECONSTRUCTION } from '../src/spatial/nerfstudioAdapter.js';
 
 const dirs: string[] = [];
+
+/** A minimal but adapter-valid kubus.capture/1 file set: enough posed, intrinsics-complete frames to clear the reconstruction floor. */
+function validCaptureFiles(): Array<{ path: string; contentBase64: string }> {
+  const frames = Array.from({ length: MIN_VIEWS_FOR_RECONSTRUCTION }, (_, index) => ({
+    index,
+    rgbPath: `rgb/${String(index).padStart(5, '0')}.jpg`,
+    poseTranslation: [index * 0.1, 0, 0],
+    poseRotation: [0, 0, 0, 1],
+    intrinsics: { width: 1920, height: 1080, fx: 1400.5, fy: 1400.5, cx: 960, cy: 540 },
+    timestampNanos: 1000 + index,
+    depthAvailable: false,
+  }));
+  const jpgBytes = Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString('base64');
+  return [
+    ...frames.map((f) => ({ path: f.rgbPath, contentBase64: jpgBytes })),
+    {
+      path: 'frames.json',
+      contentBase64: Buffer.from(JSON.stringify({ schema: 'kubus.capture.frames/1', frames })).toString('base64'),
+    },
+  ];
+}
 afterEach(async () => {
   vi.restoreAllMocks();
   await Promise.all(dirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
@@ -84,7 +106,7 @@ describe('private spatial runtime', () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-spatial-')); dirs.push(dir);
     const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
     const captures = new CaptureStore(dir, store);
-    const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: [{ path: 'frames/0001.jpg', contentBase64: Buffer.from('frame').toString('base64') }] });
+    const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: validCaptureFiles() });
 
     vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
