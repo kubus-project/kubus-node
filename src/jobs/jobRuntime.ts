@@ -132,9 +132,15 @@ export class JobRuntime {
     this.running.get(id)?.abort();
     await this.patchJob(id, (current) => {
       current.state = 'cancelled';
+      current.stage = 'cancelled';
       current.completedAt = current.updatedAt = new Date().toISOString();
       current.logs.push({ at: current.updatedAt, level: 'warn', message: 'Job cancelled' });
     });
+    // Finalized here, not in run()'s catch: by the time the abort causes
+    // that fetch to reject, state is already 'cancelled' and its early
+    // return (correctly) does nothing further, so this is the one place a
+    // user-initiated cancellation - queued or running - gets counted.
+    this.recordAnalytics('cancelled', { durationMs: durationOf(this.get(id)) });
     return this.get(id);
   }
 
@@ -233,6 +239,8 @@ export class JobRuntime {
         .reduce((sum, variant) => sum + (variant.sizeBytes || 0), 0);
       this.recordAnalytics('completed', { durationMs: durationOf(finished), inputBytes: capture.sizeBytes, outputBytes });
     } catch (error) {
+      // cancel() already finalized state, stage, and analytics before
+      // aborting; this rejection is just that abort reaching here.
       if (this.get(id).state === 'cancelled') return;
       const aborted = controller.signal.aborted;
       await this.patchJob(id, (current) => {

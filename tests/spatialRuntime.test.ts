@@ -193,6 +193,60 @@ describe('private spatial runtime', () => {
     expect(buckets[0]!.processing.totalDurationMs).toBeGreaterThanOrEqual(0);
   });
 
+  it('records cancelled processing analytics and stage for a user-cancelled job', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-spatial-')); dirs.push(dir);
+    const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
+    const captures = new CaptureStore(dir, store);
+    const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: validCaptureFiles() });
+    const analytics = new AnalyticsStore(path.join(dir, 'analytics.json'));
+    await analytics.load();
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.endsWith('/health')) {
+        return new Response(JSON.stringify({ status: 'ready', gpu: { available: true, name: 'RTX 3080 Ti' }, capabilities: ['spatial.reconstruct'] }), { status: 200 });
+      }
+      if (url.endsWith('/v1/process')) {
+        // Never resolves on its own - only the cancellation's abort ends it,
+        // simulating a real in-flight training run getting cancelled.
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+        });
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    });
+    const capabilities = new CapabilityRegistry({ id: async () => ({ ID: 'peer' }) } as never, 'http://kubus-spatial-worker:8790');
+
+    const jobs = new JobRuntime({
+      store, captureStore: captures,
+      kubo: { addFileStreamed: async () => ({ Hash: 'bafyOutputCid' }), addBytes: async () => ({ Hash: 'bafyManifestCid' }) } as never,
+      logger: { warn: () => undefined } as never,
+      dataRoot: dir, concurrency: 1, workerUrl: 'http://kubus-spatial-worker:8790',
+      participationGate: { assertUsefulOperation: async () => undefined } as never,
+      workerAuth: { issue: async () => 'token' } as never,
+      capabilities,
+      analytics,
+    });
+    await jobs.start();
+    const job = await jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' });
+
+    const deadline = Date.now() + 2000;
+    while (jobs.get(job.id).stage !== 'training' && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(jobs.get(job.id).stage).toBe('training');
+
+    const cancelled = await jobs.cancel(job.id);
+    expect(cancelled.state).toBe('cancelled');
+    expect(cancelled.stage).toBe('cancelled');
+
+    const buckets = analytics.query('24h');
+    expect(buckets).toHaveLength(1);
+    expect(buckets[0]!.processing.started).toBe(1);
+    expect(buckets[0]!.processing.cancelled).toBe(1);
+    expect(buckets[0]!.processing.completed).toBe(0);
+  });
+
   it('validates the versioned renderer-neutral spatial manifest', () => {
     expect(validateSpatialManifest({ schema: 'kubus.spatial/1', type: 'gaussianSplat', id: 's1', artworkId: 'a1', captureId: 'c1', captureProvenance: { source: 'localCapture', captureId: 'c1' }, capturedAt: '2026-08-10T00:00:00Z', createdAt: '2026-08-10T00:00:00Z', variants: [{ role: 'spatial_mobile', cid: 'cid', sizeBytes: 1, mimeType: 'application/octet-stream', format: 'spz', storageClass: 'warm' }], processing: { protocol: 'kubus.spatial-job/1', workerVersion: 'kubus-spatial-worker/1', reconstruction: { engine: 'nerfstudio', method: 'splatfacto', iterations: 15000, outputFormat: 'spz' } } }).schema).toBe('kubus.spatial/1');
   });

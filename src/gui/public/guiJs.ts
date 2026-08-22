@@ -365,7 +365,11 @@ function fmtWhen(iso) {
 
 function jobStageLabel(job) {
   const stages = { queued: 'Queued', preparing_dataset: 'Preparing dataset', starting_worker: 'Starting worker', training: 'Training', importing: 'Importing', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled' };
-  return stages[job.stage] || job.stage;
+  if (job.stage) return stages[job.stage] || job.stage;
+  // Jobs persisted before the stage field existed have state/progress only.
+  // Fall back to state so they render a real label instead of "undefined".
+  const states = { queued: 'Queued', running: 'Running', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled' };
+  return states[job.state] || job.state;
 }
 
 function jobSeverity(job) {
@@ -382,9 +386,18 @@ async function loadLibrary() {
   library.error = null;
   renderSection();
   try {
-    const [captures, spatial] = await Promise.all([request('/gui/api/captures'), request('/gui/api/spatial')]);
+    // Jobs load alongside captures/spatial (not just when the Processing
+    // section itself is visited) so a capture's "Process on this Node"
+    // button can see an already-queued/running job for it before offering
+    // to start a second one.
+    const [captures, spatial, jobs] = await Promise.all([
+      request('/gui/api/captures'),
+      request('/gui/api/spatial'),
+      request('/gui/api/jobs'),
+    ]);
     library.captures = captures;
     library.spatial = spatial;
+    processing.jobs = jobs;
   } catch (error) {
     library.error = error.message;
   } finally {
@@ -790,7 +803,10 @@ function renderAnalytics() {
   const totals = analyticsTotals(buckets);
   const terminal = totals.completed + totals.failed + totals.cancelled;
   const successRate = terminal > 0 ? Math.round((totals.completed / terminal) * 100) : null;
-  const avgDuration = totals.completed > 0 ? Math.round(totals.durationMs / totals.completed / 1000) : null;
+  // durationMs is recorded for every terminal outcome (completed, failed,
+  // cancelled - see jobRuntime.ts), so the average divides by all of them,
+  // not just completed, or one long run of failures inflates this figure.
+  const avgDuration = terminal > 0 ? Math.round(totals.durationMs / terminal / 1000) : null;
 
   return pageHeader('Analytics', 'Local processing activity on this Node. Nothing here ever leaves this computer.') +
     rangeButtons +
@@ -1418,6 +1434,14 @@ async function refresh() {
       // Keep the shell; only the section content and nav flags change.
       renderShell();
       renderSection();
+      // renderSection()'s own loaders are gated on "cache is still null" so
+      // a section visit only fetches once. Without an explicit refresh here,
+      // a running job's stage, a newly completed archive, or advancing
+      // analytics would sit stale on screen until the user manually left
+      // the section and came back.
+      if (activeSection === 'spatial' && !library.loading) void loadLibrary();
+      if (activeSection === 'processing' && !processing.loading) void loadProcessing();
+      if (activeSection === 'analytics' && !analytics.loading) void loadAnalytics();
     }
   } catch (error) {
     if (String(error.message) === 'authorization') return;
