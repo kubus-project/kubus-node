@@ -1,5 +1,6 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import type { AnalyticsRange, AnalyticsStore } from '../analytics/analyticsStore.js';
 import type { KubusApiClient } from '../backend/kubusApiClient.js';
 import type { AppConfig } from '../config/schema.js';
 import { formatFingerprint } from '../identity/nodeIdentity.js';
@@ -18,9 +19,22 @@ import { guiCss } from './public/guiCss.js';
 import { guiJs } from './public/guiJs.js';
 import { assertGuiConfig, authorizeGuiRequest, guiRemoteMode, sendUnauthorized } from './guiAuth.js';
 import { guiHtml } from './templates/index.js';
+import { spatialViewerBootstrapJs, spatialViewerHtml } from './templates/spatialViewer.js';
+import { spatialViewerBundle } from './public/vendor/spatialViewerBundle.js';
 import { handleLocalApi, type LocalApiDeps } from '../localApi/localApiRouter.js';
+import { localError } from '../localApi/pairingService.js';
 import { buildViewModel } from './viewModel.js';
 import { renderQrSvg } from './qr.js';
+import {
+  getCaptureSummary,
+  getJobSummary,
+  getSpatialRecord,
+  listCaptureSummaries,
+  listJobSummaries,
+  listSpatialSummaries,
+  serveCaptureFile,
+  serveSpatialVariant,
+} from './spatialGuiApi.js';
 
 export interface GuiDeps {
   api: KubusApiClient;
@@ -30,7 +44,11 @@ export interface GuiDeps {
   logger: Logger;
   actionLock: ActionLock;
   localApi?: LocalApiDeps;
+  /** Optional so narrow tests of unrelated routes don't need to construct one. */
+  analytics?: AnalyticsStore;
 }
+
+const ANALYTICS_RANGES: readonly AnalyticsRange[] = ['24h', '7d', '30d'];
 
 export interface GuiServerHandle {
   url: string;
@@ -99,6 +117,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     writeText(res, 200, guiJs, 'application/javascript; charset=utf-8');
     return;
   }
+  if (req.method === 'GET' && parsed.pathname === '/gui/assets/spatial-viewer.html') {
+    writeText(res, 200, spatialViewerHtml(), 'text/html; charset=utf-8');
+    return;
+  }
+  if (req.method === 'GET' && parsed.pathname === '/gui/assets/spatial-viewer-bootstrap.js') {
+    writeText(res, 200, spatialViewerBootstrapJs, 'application/javascript; charset=utf-8');
+    return;
+  }
+  if (req.method === 'GET' && parsed.pathname === '/gui/assets/spatial-viewer.bundle.js') {
+    writeText(res, 200, spatialViewerBundle, 'application/javascript; charset=utf-8');
+    return;
+  }
   if (!parsed.pathname.startsWith('/gui/api/')) {
     writeJson(res, 404, { success: false, error: 'Not found' });
     return;
@@ -159,6 +189,85 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     writeJson(res, 200, { success: true, data: await runAction(action, deps) });
     return;
   }
+
+  // --- Spatial library, capture archive, and job queue ---------------------
+  if (req.method === 'GET' && parsed.pathname === '/gui/api/jobs') {
+    const local = requireLocalApi(deps);
+    writeJson(res, 200, { success: true, data: listJobSummaries(local.jobs) });
+    return;
+  }
+  if (req.method === 'POST' && parsed.pathname === '/gui/api/jobs') {
+    // "Process on this Node" from the GUI uses the exact same JobRuntime a
+    // phone-triggered job does - there is no second, GUI-only processing
+    // path to keep honest with reality.
+    const local = requireLocalApi(deps);
+    const body = await readGuiJson(req);
+    const captureId = typeof body.captureId === 'string' ? body.captureId : '';
+    if (!captureId) throw localError(400, 'job_capture_required');
+    const capture = local.captures.get(captureId);
+    const type = typeof body.type === 'string' ? body.type : 'spatial.reconstruct';
+    const job = await local.jobs.create(type as never, { captureId, artworkId: capture.artworkId, markerId: capture.markerId });
+    writeJson(res, 201, { success: true, data: job });
+    return;
+  }
+  const jobMatch = parsed.pathname.match(/^\/gui\/api\/jobs\/([^/]+)$/);
+  if (req.method === 'GET' && jobMatch) {
+    const local = requireLocalApi(deps);
+    writeJson(res, 200, { success: true, data: getJobSummary(local.jobs, decodeURIComponent(jobMatch[1]!)) });
+    return;
+  }
+  const jobCancelMatch = parsed.pathname.match(/^\/gui\/api\/jobs\/([^/]+)\/cancel$/);
+  if (req.method === 'POST' && jobCancelMatch) {
+    const local = requireLocalApi(deps);
+    const job = await local.jobs.cancel(decodeURIComponent(jobCancelMatch[1]!));
+    writeJson(res, 200, { success: true, data: job });
+    return;
+  }
+  if (req.method === 'GET' && parsed.pathname === '/gui/api/captures') {
+    const local = requireLocalApi(deps);
+    writeJson(res, 200, { success: true, data: listCaptureSummaries(local.captures) });
+    return;
+  }
+  const captureMatch = parsed.pathname.match(/^\/gui\/api\/captures\/([^/]+)$/);
+  if (req.method === 'GET' && captureMatch) {
+    const local = requireLocalApi(deps);
+    writeJson(res, 200, { success: true, data: getCaptureSummary(local.captures, decodeURIComponent(captureMatch[1]!)) });
+    return;
+  }
+  const captureContentMatch = parsed.pathname.match(/^\/gui\/api\/captures\/([^/]+)\/content\/(.+)$/);
+  if (req.method === 'GET' && captureContentMatch) {
+    const local = requireLocalApi(deps);
+    await serveCaptureFile(res, local, decodeURIComponent(captureContentMatch[1]!), decodeURIComponent(captureContentMatch[2]!));
+    return;
+  }
+  if (req.method === 'GET' && parsed.pathname === '/gui/api/spatial') {
+    writeJson(res, 200, { success: true, data: listSpatialSummaries(deps.store) });
+    return;
+  }
+  const spatialManifestMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/manifest$/);
+  if (req.method === 'GET' && spatialManifestMatch) {
+    writeJson(res, 200, { success: true, data: getSpatialRecord(deps.store, decodeURIComponent(spatialManifestMatch[1]!)).manifest });
+    return;
+  }
+  const spatialContentMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/content\/([^/]+)$/);
+  if (req.method === 'GET' && spatialContentMatch) {
+    await serveSpatialVariant(req, res, deps, decodeURIComponent(spatialContentMatch[1]!), decodeURIComponent(spatialContentMatch[2]!));
+    return;
+  }
+  const spatialMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)$/);
+  if (req.method === 'GET' && spatialMatch) {
+    const record = getSpatialRecord(deps.store, decodeURIComponent(spatialMatch[1]!));
+    writeJson(res, 200, { success: true, data: record });
+    return;
+  }
+  if (req.method === 'GET' && parsed.pathname === '/gui/api/analytics') {
+    if (!deps.analytics) throw localError(503, 'analytics_unavailable');
+    const requested = parsed.searchParams.get('range') || '24h';
+    if (!ANALYTICS_RANGES.includes(requested as AnalyticsRange)) throw localError(400, 'analytics_range_invalid', { allowed: ANALYTICS_RANGES });
+    writeJson(res, 200, { success: true, data: { range: requested, buckets: deps.analytics.query(requested as AnalyticsRange) } });
+    return;
+  }
+
   writeJson(res, 404, { success: false, error: 'Not found' });
 }
 

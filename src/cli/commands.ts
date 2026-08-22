@@ -27,6 +27,7 @@ import { PrivatePayloadTransport } from '../compute/privatePayloadTransport.js';
 import { RemoteComputeRuntime } from '../compute/remoteComputeRuntime.js';
 import { NodeSignalingClient } from '../webrtc/nodeSignalingClient.js';
 import { startSetupServer } from '../gui/setupServer.js';
+import { AnalyticsStore } from '../analytics/analyticsStore.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const command = argv[0] || 'start';
@@ -67,7 +68,11 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   if (reclaimedCaptures > 0) {
     logger.info(`captures: reclaimed ${reclaimedCaptures} orphaned capture ${reclaimedCaptures === 1 ? 'directory' : 'directories'}`);
   }
-  const jobs = new JobRuntime({ store, captureStore: captures, kubo, logger, dataRoot: config.localDataPath, workerUrl: config.spatialWorkerUrl, concurrency: config.jobConcurrency, participationGate, workerAuth, capabilities });
+  // Own file, own directory — same rationale as identity above: bounded
+  // derived counters, never appended into state.json's single growing file.
+  const analytics = new AnalyticsStore(path.join(path.dirname(config.localStatePath), 'analytics.json'));
+  await analytics.load();
+  const jobs = new JobRuntime({ store, captureStore: captures, kubo, logger, dataRoot: config.localDataPath, workerUrl: config.spatialWorkerUrl, concurrency: config.jobConcurrency, participationGate, workerAuth, capabilities, analytics });
   const privateTransport = new PrivatePayloadTransport({ captures, kubo, store, identity: computeIdentity, dataRoot: config.localDataPath, maxInputBytes: config.remoteComputeMaxInputBytes });
   const remoteCompute = new RemoteComputeRuntime({ api, kubo, store, config, captures, jobs, gate: participationGate, identity: computeIdentity, transport: privateTransport, logger });
   const localApi = { api, kubo, store, config, capabilities, pairing, captures, jobs, participationGate, remoteCompute, identity };
@@ -88,7 +93,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     await jobs.start();
     await capabilities.refresh();
     const guiConfig = { ...config, guiEnabled: true };
-    const gui = await startGuiServer({ api, kubo, store, config: guiConfig, logger, actionLock, localApi: { ...localApi, config: guiConfig } });
+    const gui = await startGuiServer({ api, kubo, store, config: guiConfig, logger, actionLock, analytics, localApi: { ...localApi, config: guiConfig } });
     console.log(JSON.stringify({
       status: 'gui_started',
       url: gui.url,
@@ -133,7 +138,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   if (command !== 'start') throw new Error(`Unknown command: ${command}`);
   await jobs.start();
   await capabilities.refresh();
-  const gui = (config.guiEnabled || config.localApiEnabled) ? await startGuiServer({ api, kubo, store, config, logger, actionLock, localApi }) : null;
+  const gui = (config.guiEnabled || config.localApiEnabled) ? await startGuiServer({ api, kubo, store, config, logger, actionLock, analytics, localApi }) : null;
   let scheduler: Scheduler | null = null;
   let signaling: NodeSignalingClient | null = null;
   try {

@@ -7,8 +7,31 @@ import { JobRuntime } from '../src/jobs/jobRuntime.js';
 import { CapabilityRegistry } from '../src/capabilities/registry.js';
 import { validateSpatialManifest } from '../src/spatial/models.js';
 import { LocalStore } from '../src/state/localStore.js';
+import { MIN_VIEWS_FOR_RECONSTRUCTION } from '../src/spatial/nerfstudioAdapter.js';
+import { AnalyticsStore } from '../src/analytics/analyticsStore.js';
 
 const dirs: string[] = [];
+
+/** A minimal but adapter-valid kubus.capture/1 file set: enough posed, intrinsics-complete frames to clear the reconstruction floor. */
+function validCaptureFiles(): Array<{ path: string; contentBase64: string }> {
+  const frames = Array.from({ length: MIN_VIEWS_FOR_RECONSTRUCTION }, (_, index) => ({
+    index,
+    rgbPath: `rgb/${String(index).padStart(5, '0')}.jpg`,
+    poseTranslation: [index * 0.1, 0, 0],
+    poseRotation: [0, 0, 0, 1],
+    intrinsics: { width: 1920, height: 1080, fx: 1400.5, fy: 1400.5, cx: 960, cy: 540 },
+    timestampNanos: 1000 + index,
+    depthAvailable: false,
+  }));
+  const jpgBytes = Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString('base64');
+  return [
+    ...frames.map((f) => ({ path: f.rgbPath, contentBase64: jpgBytes })),
+    {
+      path: 'frames.json',
+      contentBase64: Buffer.from(JSON.stringify({ schema: 'kubus.capture.frames/1', frames })).toString('base64'),
+    },
+  ];
+}
 afterEach(async () => {
   vi.restoreAllMocks();
   await Promise.all(dirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
@@ -84,7 +107,7 @@ describe('private spatial runtime', () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-spatial-')); dirs.push(dir);
     const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
     const captures = new CaptureStore(dir, store);
-    const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: [{ path: 'frames/0001.jpg', contentBase64: Buffer.from('frame').toString('base64') }] });
+    const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: validCaptureFiles() });
 
     vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
@@ -116,6 +139,112 @@ describe('private spatial runtime', () => {
     // Failed via the worker's own response, not the pre-flight eligibility gate.
     expect(jobs.get(job.id).state).toBe('failed');
     expect(jobs.get(job.id).error?.code).toBe('worker_unsupported');
+  });
+
+  it('records started/completed processing analytics for a real successful job', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-spatial-')); dirs.push(dir);
+    const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
+    const captures = new CaptureStore(dir, store);
+    const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: validCaptureFiles() });
+    const analytics = new AnalyticsStore(path.join(dir, 'analytics.json'));
+    await analytics.load();
+
+    let outputDirectory = '';
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.endsWith('/health')) {
+        return new Response(JSON.stringify({ status: 'ready', gpu: { available: true, name: 'RTX 3080 Ti' }, capabilities: ['spatial.reconstruct'] }), { status: 200 });
+      }
+      if (url.endsWith('/v1/process')) {
+        const body = JSON.parse(String(init?.body ?? '{}'));
+        outputDirectory = body.outputDirectory;
+        await fs.mkdir(outputDirectory, { recursive: true });
+        await fs.writeFile(path.join(outputDirectory, 'result.ply'), Buffer.alloc(1234, 1));
+        return new Response(JSON.stringify({
+          variants: [{ role: 'spatial_archive', path: 'result.ply', mimeType: 'application/octet-stream', format: 'ply', storageClass: 'cold' }],
+          processing: { protocol: 'kubus.spatial-job/1', workerVersion: 'kubus-spatial-worker/1', reconstruction: { engine: 'nerfstudio', method: 'splatfacto', iterations: 1000, outputFormat: 'ply' } },
+        }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    });
+    const capabilities = new CapabilityRegistry({ id: async () => ({ ID: 'peer' }) } as never, 'http://kubus-spatial-worker:8790');
+
+    const jobs = new JobRuntime({
+      store, captureStore: captures,
+      kubo: { addFileStreamed: async () => ({ Hash: 'bafyOutputCid' }), addBytes: async () => ({ Hash: 'bafyManifestCid' }) } as never,
+      logger: { warn: () => undefined } as never,
+      dataRoot: dir, concurrency: 1, workerUrl: 'http://kubus-spatial-worker:8790',
+      participationGate: { assertUsefulOperation: async () => undefined } as never,
+      workerAuth: { issue: async () => 'token' } as never,
+      capabilities,
+      analytics,
+    });
+    await jobs.start();
+    const job = await jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' });
+    await waitForTerminal(jobs, job.id);
+
+    expect(jobs.get(job.id).state).toBe('completed');
+    const buckets = analytics.query('24h');
+    expect(buckets).toHaveLength(1);
+    expect(buckets[0]!.processing.started).toBe(1);
+    expect(buckets[0]!.processing.completed).toBe(1);
+    expect(buckets[0]!.processing.totalInputBytes).toBe(capture.sizeBytes);
+    expect(buckets[0]!.processing.totalOutputBytes).toBe(1234);
+    expect(buckets[0]!.processing.totalDurationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('records cancelled processing analytics and stage for a user-cancelled job', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-spatial-')); dirs.push(dir);
+    const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
+    const captures = new CaptureStore(dir, store);
+    const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: validCaptureFiles() });
+    const analytics = new AnalyticsStore(path.join(dir, 'analytics.json'));
+    await analytics.load();
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.endsWith('/health')) {
+        return new Response(JSON.stringify({ status: 'ready', gpu: { available: true, name: 'RTX 3080 Ti' }, capabilities: ['spatial.reconstruct'] }), { status: 200 });
+      }
+      if (url.endsWith('/v1/process')) {
+        // Never resolves on its own - only the cancellation's abort ends it,
+        // simulating a real in-flight training run getting cancelled.
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+        });
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    });
+    const capabilities = new CapabilityRegistry({ id: async () => ({ ID: 'peer' }) } as never, 'http://kubus-spatial-worker:8790');
+
+    const jobs = new JobRuntime({
+      store, captureStore: captures,
+      kubo: { addFileStreamed: async () => ({ Hash: 'bafyOutputCid' }), addBytes: async () => ({ Hash: 'bafyManifestCid' }) } as never,
+      logger: { warn: () => undefined } as never,
+      dataRoot: dir, concurrency: 1, workerUrl: 'http://kubus-spatial-worker:8790',
+      participationGate: { assertUsefulOperation: async () => undefined } as never,
+      workerAuth: { issue: async () => 'token' } as never,
+      capabilities,
+      analytics,
+    });
+    await jobs.start();
+    const job = await jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' });
+
+    const deadline = Date.now() + 2000;
+    while (jobs.get(job.id).stage !== 'training' && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(jobs.get(job.id).stage).toBe('training');
+
+    const cancelled = await jobs.cancel(job.id);
+    expect(cancelled.state).toBe('cancelled');
+    expect(cancelled.stage).toBe('cancelled');
+
+    const buckets = analytics.query('24h');
+    expect(buckets).toHaveLength(1);
+    expect(buckets[0]!.processing.started).toBe(1);
+    expect(buckets[0]!.processing.cancelled).toBe(1);
+    expect(buckets[0]!.processing.completed).toBe(0);
   });
 
   it('validates the versioned renderer-neutral spatial manifest', () => {

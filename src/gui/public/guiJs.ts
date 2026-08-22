@@ -22,7 +22,9 @@ const SECTIONS = [
   { id: 'overview', label: 'Overview' },
   { id: 'archive', label: 'Archive' },
   { id: 'spatial', label: 'Spatial' },
+  { id: 'processing', label: 'Processing' },
   { id: 'compute', label: 'Compute' },
+  { id: 'analytics', label: 'Analytics' },
   { id: 'contribution', label: 'Contribution' },
   { id: 'devices', label: 'Devices' },
   { id: 'diagnostics', label: 'Diagnostics' },
@@ -38,6 +40,9 @@ let onboardingStep = 0;
 let onboardingDismissed = false;
 let logState = { level: '', query: '', follow: true, lines: [] };
 let diagnostics = null;
+let library = { tab: 'captures', captures: null, spatial: null, loading: false, error: null, detail: null };
+let processing = { jobs: null, loading: false, error: null, detailId: null };
+let analytics = { range: '24h', data: null, loading: false, error: null };
 
 if (!SECTIONS.some((section) => section.id === activeSection)) activeSection = 'overview';
 
@@ -337,28 +342,186 @@ function renderArchive() {
     '</section>';
 }
 
-function renderSpatial() {
-  const spatial = model.spatial;
-  const items = [];
-  if (spatial.gpu) items.push({ label: 'Graphics processor', value: spatial.gpu });
-  items.push({ label: 'Active jobs', value: String(spatial.activeJobs), detail: spatial.queuedJobs ? spatial.queuedJobs + ' waiting' : undefined });
-  items.push({ label: 'Captures held', value: String(spatial.captures) });
+/** Bytes, formatted client-side - the raw library/processing/analytics APIs return plain numbers, unlike the view model's pre-formatted strings. */
+function fmtBytes(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let n = value, i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? String(n) : n.toFixed(1)) + ' ' + units[i];
+}
 
-  return pageHeader('Spatial processing', 'Reconstructing spatial captures on this computer.',
-    statusLine(spatial.severity, spatial.title)) +
+function fmtWhen(iso) {
+  if (!iso) return '—';
+  const diffMs = Date.now() - new Date(iso).getTime();
+  const mins = Math.round(diffMs / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return mins + (mins === 1 ? ' min ago' : ' mins ago');
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return hours + (hours === 1 ? ' hr ago' : ' hrs ago');
+  const days = Math.round(hours / 24);
+  return days + (days === 1 ? ' day ago' : ' days ago');
+}
+
+function jobStageLabel(job) {
+  const stages = { queued: 'Queued', preparing_dataset: 'Preparing dataset', starting_worker: 'Starting worker', training: 'Training', importing: 'Importing', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled' };
+  if (job.stage) return stages[job.stage] || job.stage;
+  // Jobs persisted before the stage field existed have state/progress only.
+  // Fall back to state so they render a real label instead of "undefined".
+  const states = { queued: 'Queued', running: 'Running', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled' };
+  return states[job.state] || job.state;
+}
+
+function jobSeverity(job) {
+  if (job.state === 'completed') return 'good';
+  if (job.state === 'failed') return 'critical';
+  if (job.state === 'cancelled') return 'neutral';
+  return 'attention';
+}
+
+/* --- Spatial library: captures + processed archives ---------------------- */
+
+async function loadLibrary() {
+  library.loading = true;
+  library.error = null;
+  renderSection();
+  try {
+    // Jobs load alongside captures/spatial (not just when the Processing
+    // section itself is visited) so a capture's "Process on this Node"
+    // button can see an already-queued/running job for it before offering
+    // to start a second one.
+    const [captures, spatial, jobs] = await Promise.all([
+      request('/gui/api/captures'),
+      request('/gui/api/spatial'),
+      request('/gui/api/jobs'),
+    ]);
+    library.captures = captures;
+    library.spatial = spatial;
+    processing.jobs = jobs;
+  } catch (error) {
+    library.error = error.message;
+  } finally {
+    library.loading = false;
+    renderSection();
+  }
+}
+
+function spatialRecordsFor(captureId) {
+  return (library.spatial || []).filter((record) => record.captureId === captureId);
+}
+
+function jobsFor(captureId) {
+  return (processing.jobs || []).filter((job) => job.input && job.input.captureId === captureId);
+}
+
+function renderLibrary() {
+  if (library.detail && library.detail.kind === 'capture') return renderCaptureDetail(library.detail.id);
+  if (library.detail && library.detail.kind === 'spatial') return renderSpatialDetail(library.detail.id);
+
+  const tabs = '<div class="tabs" role="tablist">' +
+    '<button class="tab' + (library.tab === 'captures' ? ' is-active' : '') + '" data-lib-tab="captures" role="tab" aria-selected="' + (library.tab === 'captures') + '">Captures</button>' +
+    '<button class="tab' + (library.tab === 'spatial' ? ' is-active' : '') + '" data-lib-tab="spatial" role="tab" aria-selected="' + (library.tab === 'spatial') + '">Spatial archives</button>' +
+    '</div>';
+
+  let body;
+  if (library.loading && !library.captures) body = '<section class="panel"><p class="t-body">Loading…</p></section>';
+  else if (library.error) body = '<section class="panel">' + empty('Could not load the Spatial library', library.error) + '</section>';
+  else if (library.tab === 'captures') body = renderCaptureGrid();
+  else body = renderSpatialGrid();
+
+  return pageHeader('Spatial', 'Captures and processed 3D archives held on this Node.') +
+    tabs + body;
+}
+
+function renderCaptureGrid() {
+  const items = library.captures || [];
+  if (items.length === 0) {
+    return '<section class="panel">' + empty('No spatial captures yet', 'Document an artwork spatially in the art.kubus app to create its first capture.') + '</section>';
+  }
+  return '<div class="card-grid">' + items.map((capture) => {
+    const related = spatialRecordsFor(capture.id);
+    const jobs = jobsFor(capture.id);
+    const activeJob = jobs.find((job) => job.state === 'queued' || job.state === 'running');
+    let stateChip;
+    if (activeJob) stateChip = '<span class="chip attention">' + h(jobStageLabel(activeJob)) + '</span>';
+    else if (related.length) stateChip = '<span class="chip good">Processed</span>';
+    else stateChip = '<span class="chip">Not processed</span>';
+    return '<article class="card" data-open-capture="' + h(capture.id) + '">' +
+      '<div class="card-thumb" data-thumb-capture="' + h(capture.id) + '"><span class="card-thumb-fallback" aria-hidden="true">◧</span></div>' +
+      '<div class="card-body">' +
+      '<div class="row-between"><span class="t-body card-title">' + h(capture.artworkId || 'Untitled capture') + '</span>' + stateChip + '</div>' +
+      '<div class="t-meta">' + h(fmtWhen(capture.capturedAt)) + ' · ' + h(capture.fileCount) + ' files · ' + h(fmtBytes(capture.sizeBytes)) + '</div>' +
+      '</div></article>';
+  }).join('') + '</div>';
+}
+
+function renderSpatialGrid() {
+  const items = library.spatial || [];
+  if (items.length === 0) {
+    return '<section class="panel">' + empty('No processed Spatial archives yet', 'Process a capture on this Node or the Kubus network to create one.') + '</section>';
+  }
+  return '<div class="card-grid">' + items.map((record) => {
+    const archive = record.variants.find((v) => v.role === 'spatial_archive');
+    return '<article class="card" data-open-spatial="' + h(record.id) + '">' +
+      '<div class="card-thumb"><span class="card-thumb-fallback" aria-hidden="true">◈</span></div>' +
+      '<div class="card-body">' +
+      '<div class="row-between"><span class="t-body card-title">' + h(record.artworkId || 'Untitled') + '</span><span class="chip good">' + h(record.state) + '</span></div>' +
+      '<div class="t-meta">' + h(fmtWhen(record.createdAt)) + (archive ? ' · ' + h(fmtBytes(archive.sizeBytes)) + ' ' + h(archive.format) : '') + '</div>' +
+      '</div></article>';
+  }).join('') + '</div>';
+}
+
+function renderCaptureDetail(id) {
+  const capture = (library.captures || []).find((c) => c.id === id);
+  if (!capture) return '<section class="panel">' + empty('Capture not found', 'It may have been deleted.') + '</section>';
+  const related = spatialRecordsFor(id);
+  const jobs = jobsFor(id);
+  const activeJob = jobs.find((job) => job.state === 'queued' || job.state === 'running');
+  const canProcess = !activeJob;
+
+  return pageHeader(capture.artworkId || 'Untitled capture', 'Private capture, not yet published.',
+    '<button class="button small subtle" data-lib-back="1">Back to Spatial</button>') +
     '<section class="panel">' +
-    '<p class="t-body">' + h(spatial.body) + '</p>' +
-    metrics(items) +
-    (spatial.action ? '<div class="row"><button class="button" data-section="' + h(spatial.action.section) + '">' + h(spatial.action.label) + '</button></div>' : '') +
+    '<div class="card-thumb card-thumb-lg" data-thumb-capture="' + h(capture.id) + '"><span class="card-thumb-fallback" aria-hidden="true">◧</span></div>' +
+    metrics([
+      { label: 'Captured', value: fmtWhen(capture.capturedAt) },
+      { label: 'Files', value: String(capture.fileCount) },
+      { label: 'Size', value: fmtBytes(capture.sizeBytes) },
+    ]) +
+    '<div class="row">' +
+    (canProcess
+      ? '<button class="button primary" data-process-capture="' + h(capture.id) + '">Process on this Node</button>'
+      : '<button class="button" disabled>' + h(jobStageLabel(activeJob)) + '…</button>') +
+    '</div>' +
     '</section>' +
-    (spatial.captures === 0
-      ? '<section class="panel">' + empty('No spatial captures yet', 'Document an artwork spatially in the art.kubus app to create its first 3D archive.') + '</section>'
-      : '') +
+    (jobs.length ? '<section class="panel"><h2 class="t-card">Processing history</h2>' + jobs.map(renderJobRow).join('') + '</section>' : '') +
+    (related.length ? '<section class="panel"><h2 class="t-card">Spatial archives from this capture</h2>' +
+      related.map((record) => '<div class="row-between"><span class="t-body">' + h(fmtWhen(record.createdAt)) + '</span>' +
+        '<button class="button small subtle" data-open-spatial="' + h(record.id) + '">Open</button></div>').join('') +
+      '</section>' : '');
+}
+
+function renderSpatialDetail(id) {
+  const record = (library.spatial || []).find((r) => r.id === id);
+  if (!record) return '<section class="panel">' + empty('Spatial archive not found', 'It may have been deleted.') + '</section>';
+  const archive = record.variants.find((v) => v.role === 'spatial_archive');
+
+  return pageHeader(record.artworkId || 'Untitled', 'Processed Spatial archive.',
+    '<button class="button small subtle" data-lib-back="1">Back to Spatial</button>') +
     '<section class="panel">' +
-    '<details class="disclosure"><summary>Worker details</summary><div class="stack-sm">' +
-    detailRow('Reported state', spatial.title) +
-    (spatial.workerDetail ? '<div class="t-mono">' + h(spatial.workerDetail) + '</div>' : '') +
-    (spatial.capabilities.length ? detailRow('Supported operations', spatial.capabilities.join(', ')) : '') +
+    '<div id="spatialPreviewMount" class="viewer-mount"></div>' +
+    '<div class="row"><button class="button primary" data-open-preview="' + h(record.id) + '">Open interactive preview</button>' +
+    (archive ? '<span class="t-meta">' + h(fmtBytes(archive.sizeBytes)) + ' ' + h(archive.format) + ' - loads on demand</span>' : '') +
+    '</div>' +
+    '</section>' +
+    '<section class="panel">' +
+    metrics([
+      { label: 'Created', value: fmtWhen(record.createdAt) },
+      { label: 'State', value: record.state },
+      { label: 'Manifest CID', value: record.manifestCid ? record.manifestCid.slice(0, 12) + '…' : '—' },
+    ]) +
+    '<details class="disclosure"><summary>Variants</summary><div class="stack-sm">' +
+    record.variants.map((v) => detailRow(v.role, fmtBytes(v.sizeBytes) + ' · ' + v.format)).join('') +
     '</div></details>' +
     '</section>';
 }
@@ -404,6 +567,97 @@ function renderCompute() {
         '<div class="stack-sm">' + compute.settingsDisplay.map((item) => detailRow(item.label, item.value)).join('') + '</div>' +
         '</details></section>'
       : '');
+}
+
+/* --- Processing: my jobs + history ---------------------------------------- */
+
+async function loadProcessing() {
+  processing.loading = true;
+  processing.error = null;
+  renderSection();
+  try {
+    processing.jobs = await request('/gui/api/jobs');
+  } catch (error) {
+    processing.error = error.message;
+  } finally {
+    processing.loading = false;
+    renderSection();
+  }
+}
+
+function renderJobRow(job) {
+  const captureLabel = (job.input && job.input.artworkId) || 'Untitled capture';
+  const cancellable = job.state === 'queued' || job.state === 'running';
+  const progressText = job.progress === null || job.progress === undefined
+    ? jobStageLabel(job) + '…'
+    : Math.round(job.progress * 100) + '% · ' + jobStageLabel(job);
+  return '<div class="job-row" data-open-job="' + h(job.id) + '">' +
+    '<div class="job-row-main">' +
+    '<span class="t-body">' + h(captureLabel) + '</span>' +
+    statusLine(jobSeverity(job), job.state === 'running' ? progressText : jobStageLabel(job)) +
+    '</div>' +
+    '<div class="t-meta">' + h(fmtWhen(job.createdAt)) +
+    (job.error ? ' · ' + h(job.error.message) : '') + '</div>' +
+    (cancellable ? '<button class="button small subtle" data-cancel-job="' + h(job.id) + '">Cancel</button>' : '') +
+    '</div>';
+}
+
+function renderProcessing() {
+  if (processing.detailId) return renderJobDetail(processing.detailId);
+  if (processing.loading && !processing.jobs) {
+    return pageHeader('Processing', 'Spatial reconstruction jobs on this Node.') +
+      '<section class="panel"><p class="t-body">Loading…</p></section>';
+  }
+  if (processing.error) {
+    return pageHeader('Processing', 'Spatial reconstruction jobs on this Node.') +
+      '<section class="panel">' + empty('Could not load jobs', processing.error) + '</section>';
+  }
+  const jobs = processing.jobs || [];
+  const active = jobs.filter((j) => j.state === 'queued' || j.state === 'running');
+  const completed = jobs.filter((j) => j.state === 'completed');
+  const failed = jobs.filter((j) => j.state === 'failed' || j.state === 'cancelled');
+
+  const spatial = model.spatial;
+  const workerItems = [];
+  if (spatial.gpu) workerItems.push({ label: 'Graphics processor', value: spatial.gpu, emphasis: 'text' });
+
+  return pageHeader('Processing', 'Spatial reconstruction jobs on this Node.',
+    statusLine(spatial.severity, spatial.title)) +
+    '<section class="panel">' +
+    (workerItems.length ? metrics(workerItems) : '') +
+    '<p class="t-body">' + h(spatial.body) + '</p>' +
+    '</section>' +
+    '<section class="panel"><h2 class="t-card">Active and queued (' + active.length + ')</h2>' +
+    (active.length ? active.map(renderJobRow).join('') : '<p class="t-body">Nothing processing right now.</p>') +
+    '</section>' +
+    '<section class="panel"><h2 class="t-card">Completed (' + completed.length + ')</h2>' +
+    (completed.length ? completed.slice(0, 20).map(renderJobRow).join('') : '<p class="t-body">No completed jobs yet.</p>') +
+    '</section>' +
+    (failed.length ? '<section class="panel"><h2 class="t-card">Failed / cancelled (' + failed.length + ')</h2>' +
+      failed.slice(0, 20).map(renderJobRow).join('') + '</section>' : '');
+}
+
+function renderJobDetail(id) {
+  const job = (processing.jobs || []).find((j) => j.id === id);
+  if (!job) return '<section class="panel">' + empty('Job not found', 'It may have been removed.') + '</section>';
+  const cancellable = job.state === 'queued' || job.state === 'running';
+  return pageHeader((job.input && job.input.artworkId) || 'Processing job', 'Job ' + job.id.slice(0, 8),
+    '<button class="button small subtle" data-processing-back="1">Back to Processing</button>') +
+    '<section class="panel">' +
+    statusLine(jobSeverity(job), jobStageLabel(job)) +
+    metrics([
+      { label: 'Created', value: fmtWhen(job.createdAt) },
+      { label: 'Started', value: job.startedAt ? fmtWhen(job.startedAt) : '—' },
+      { label: 'Completed', value: job.completedAt ? fmtWhen(job.completedAt) : '—' },
+    ]) +
+    (job.error ? '<p class="t-body">' + h(job.error.message) + '</p>' : '') +
+    (cancellable ? '<div class="row"><button class="button" data-cancel-job="' + h(job.id) + '">Cancel job</button></div>' : '') +
+    '</section>' +
+    '<section class="panel"><h2 class="t-card">Stage history</h2>' +
+    '<div class="stack-sm">' + job.logs.map((entry) =>
+      '<div class="row-between"><span class="t-body">' + h(entry.message) + '</span><span class="t-meta">' + h(fmtWhen(entry.at)) + '</span></div>'
+    ).join('') + '</div>' +
+    '</section>';
 }
 
 function renderContribution() {
@@ -495,6 +749,149 @@ function renderPairingArea() {
   });
   $('#cancelPairing').addEventListener('click', stopPairing);
   tickPairing();
+}
+
+/* --- Analytics -------------------------------------------------------------
+ * Local-only: every number here comes from AnalyticsStore, which never
+ * leaves this Node. No range beyond 24h/7d/30d is offered - the API only
+ * accepts those three, so there is nothing here to widen into an arbitrary
+ * query. */
+
+async function loadAnalytics() {
+  analytics.loading = true;
+  analytics.error = null;
+  renderSection();
+  try {
+    analytics.data = await request('/gui/api/analytics?range=' + encodeURIComponent(analytics.range));
+  } catch (error) {
+    analytics.error = error.message;
+  } finally {
+    analytics.loading = false;
+    renderSection();
+  }
+}
+
+function analyticsTotals(buckets) {
+  return buckets.reduce((totals, bucket) => {
+    const p = bucket.processing;
+    totals.started += p.started; totals.completed += p.completed; totals.failed += p.failed; totals.cancelled += p.cancelled;
+    totals.durationMs += p.totalDurationMs; totals.inputBytes += p.totalInputBytes; totals.outputBytes += p.totalOutputBytes;
+    return totals;
+  }, { started: 0, completed: 0, failed: 0, cancelled: 0, durationMs: 0, inputBytes: 0, outputBytes: 0 });
+}
+
+function renderAnalytics() {
+  const ranges = [['24h', '24 hours'], ['7d', '7 days'], ['30d', '30 days']];
+  const rangeButtons = '<div class="tabs" role="group" aria-label="Time range">' +
+    ranges.map(([value, label]) =>
+      '<button class="tab' + (analytics.range === value ? ' is-active' : '') + '" data-analytics-range="' + value + '" aria-pressed="' + (analytics.range === value) + '">' + label + '</button>'
+    ).join('') + '</div>';
+
+  if (analytics.loading && !analytics.data) {
+    return pageHeader('Analytics', 'Local processing activity on this Node. Nothing here ever leaves this computer.') +
+      rangeButtons + '<section class="panel"><p class="t-body">Loading…</p></section>';
+  }
+  if (analytics.error) {
+    return pageHeader('Analytics', 'Local processing activity on this Node. Nothing here ever leaves this computer.') +
+      rangeButtons + '<section class="panel">' + empty('Could not load analytics', analytics.error) + '</section>';
+  }
+  const buckets = (analytics.data && analytics.data.buckets) || [];
+  if (buckets.length === 0) {
+    return pageHeader('Analytics', 'Local processing activity on this Node. Nothing here ever leaves this computer.') +
+      rangeButtons + '<section class="panel">' + empty('No earlier data', 'Analytics starts recording from now - nothing has been processed in this range yet.') + '</section>';
+  }
+  const totals = analyticsTotals(buckets);
+  const terminal = totals.completed + totals.failed + totals.cancelled;
+  const successRate = terminal > 0 ? Math.round((totals.completed / terminal) * 100) : null;
+  // durationMs is recorded for every terminal outcome (completed, failed,
+  // cancelled - see jobRuntime.ts), so the average divides by all of them,
+  // not just completed, or one long run of failures inflates this figure.
+  const avgDuration = terminal > 0 ? Math.round(totals.durationMs / terminal / 1000) : null;
+
+  return pageHeader('Analytics', 'Local processing activity on this Node. Nothing here ever leaves this computer.') +
+    rangeButtons +
+    '<section class="panel">' +
+    '<h2 class="t-card">Processing</h2>' +
+    metrics([
+      { label: 'Started', value: String(totals.started) },
+      { label: 'Completed', value: String(totals.completed) },
+      { label: 'Failed', value: String(totals.failed) },
+      { label: 'Cancelled', value: String(totals.cancelled) },
+      { label: 'Success rate', value: successRate === null ? '—' : successRate + '%' },
+      { label: 'Avg. duration', value: avgDuration === null ? '—' : avgDuration + 's' },
+      { label: 'Input processed', value: fmtBytes(totals.inputBytes) },
+      { label: 'Output produced', value: fmtBytes(totals.outputBytes) },
+    ]) +
+    '<canvas id="analyticsChart" class="chart-canvas" width="640" height="180" role="img" aria-label="Completed and failed processing jobs per hour, over the selected range"></canvas>' +
+    '<table class="chart-table"><caption class="visually-hidden">Processing outcomes by hour</caption>' +
+    '<thead><tr><th scope="col">Hour</th><th scope="col">Completed</th><th scope="col">Failed</th></tr></thead><tbody>' +
+    buckets.slice(-12).map((bucket) =>
+      '<tr><td>' + h(new Date(bucket.bucketStart).toLocaleString()) + '</td><td>' + h(bucket.processing.completed) + '</td><td>' + h(bucket.processing.failed) + '</td></tr>'
+    ).join('') + '</tbody></table>' +
+    '</section>';
+}
+
+function drawAnalyticsChart() {
+  const canvas = $('#analyticsChart');
+  if (!canvas || !analytics.data) return;
+  const buckets = analytics.data.buckets;
+  const ctx = canvas.getContext('2d');
+  const width = canvas.width, height = canvas.height;
+  ctx.clearRect(0, 0, width, height);
+  if (buckets.length === 0) return;
+
+  const styles = getComputedStyle(document.documentElement);
+  const goodColor = styles.getPropertyValue('--k-good').trim() || '#2e7d32';
+  const criticalColor = styles.getPropertyValue('--k-critical').trim() || '#c62828';
+  const gridColor = styles.getPropertyValue('--k-border').trim() || '#e0e0e0';
+
+  const max = Math.max(1, ...buckets.map((b) => b.processing.completed + b.processing.failed));
+  const barWidth = width / buckets.length;
+  const plotHeight = height - 20;
+
+  ctx.strokeStyle = gridColor;
+  ctx.beginPath();
+  ctx.moveTo(0, height - 20 + 0.5);
+  ctx.lineTo(width, height - 20 + 0.5);
+  ctx.stroke();
+
+  buckets.forEach((bucket, index) => {
+    const completedH = (bucket.processing.completed / max) * plotHeight;
+    const failedH = (bucket.processing.failed / max) * plotHeight;
+    const x = index * barWidth + barWidth * 0.15;
+    const barW = barWidth * 0.7;
+    ctx.fillStyle = goodColor;
+    ctx.fillRect(x, plotHeight - completedH, barW, completedH);
+    ctx.fillStyle = criticalColor;
+    ctx.fillRect(x, plotHeight - completedH - failedH, barW, failedH);
+  });
+}
+
+/**
+ * Lazy, authenticated capture thumbnails. An <img src="..."> can't carry the
+ * Authorization header the content endpoint requires, so each thumbnail is
+ * fetched once as a blob and handed to the element as an object URL - never
+ * the raw capture collection, never more than the one frame this card shows.
+ */
+function loadThumbnails() {
+  $$('[data-thumb-capture]').forEach((el) => {
+    if (el.dataset.thumbLoaded) return;
+    el.dataset.thumbLoaded = '1';
+    const captureId = el.dataset.thumbCapture;
+    const token = localStorage.getItem(TOKEN_KEY) || '';
+    const headers = { Accept: 'image/*' };
+    if (token) headers.Authorization = 'Bearer ' + token;
+    fetch('/gui/api/captures/' + encodeURIComponent(captureId) + '/content/rgb%2F00000.jpg', { headers: headers })
+      .then((response) => { if (!response.ok) throw new Error('no thumbnail'); return response.blob(); })
+      .then((blob) => {
+        const img = document.createElement('img');
+        img.src = URL.createObjectURL(blob);
+        img.alt = '';
+        el.innerHTML = '';
+        el.appendChild(img);
+      })
+      .catch(() => { /* Fallback glyph already in the markup stays. */ });
+  });
 }
 
 function renderDiagnostics() {
@@ -836,6 +1233,97 @@ function bindSectionEvents() {
       toggleFollow.textContent = logState.follow ? 'Pause' : 'Follow';
     });
   }
+
+  /* --- Spatial library --- */
+  $$('[data-lib-tab]').forEach((button) => {
+    button.addEventListener('click', () => {
+      library.tab = button.dataset.libTab;
+      library.detail = null;
+      renderSection();
+    });
+  });
+  $$('[data-open-capture]').forEach((card) => {
+    card.addEventListener('click', () => { library.detail = { kind: 'capture', id: card.dataset.openCapture }; renderSection(); });
+  });
+  $$('[data-open-spatial]').forEach((card) => {
+    card.addEventListener('click', (event) => {
+      event.stopPropagation();
+      library.detail = { kind: 'spatial', id: card.dataset.openSpatial };
+      renderSection();
+    });
+  });
+  $$('[data-lib-back]').forEach((button) => {
+    button.addEventListener('click', () => { library.detail = null; renderSection(); });
+  });
+  $$('[data-process-capture]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      button.textContent = 'Starting…';
+      try {
+        await request('/gui/api/jobs', { method: 'POST', body: JSON.stringify({ captureId: button.dataset.processCapture }) });
+        await loadProcessing();
+        renderSection();
+      } catch (error) {
+        announce(error.message);
+        button.disabled = false;
+        button.textContent = 'Process on this Node';
+      }
+    });
+  });
+  $$('[data-open-preview]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const mount = $('#spatialPreviewMount');
+      if (!mount) return;
+      button.disabled = true;
+      button.textContent = 'Loading preview…';
+      const iframe = document.createElement('iframe');
+      iframe.className = 'viewer-frame';
+      iframe.title = 'Interactive Spatial preview';
+      iframe.allow = 'fullscreen';
+      iframe.src = '/gui/assets/spatial-viewer.html?id=' + encodeURIComponent(button.dataset.openPreview) + '&role=spatial_archive';
+      mount.innerHTML = '';
+      mount.appendChild(iframe);
+      const fullscreenButton = document.createElement('button');
+      fullscreenButton.className = 'button small subtle viewer-fullscreen';
+      fullscreenButton.textContent = 'Fullscreen';
+      fullscreenButton.addEventListener('click', () => {
+        if (iframe.requestFullscreen) void iframe.requestFullscreen();
+      });
+      mount.appendChild(fullscreenButton);
+      button.remove();
+    });
+  });
+
+  /* --- Processing --- */
+  $$('[data-open-job]').forEach((row) => {
+    row.addEventListener('click', () => { processing.detailId = row.dataset.openJob; renderSection(); });
+  });
+  $$('[data-processing-back]').forEach((button) => {
+    button.addEventListener('click', () => { processing.detailId = null; renderSection(); });
+  });
+  $$('[data-cancel-job]').forEach((button) => {
+    button.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      if (!confirm('Cancel this processing job?')) return;
+      try {
+        await request('/gui/api/jobs/' + encodeURIComponent(button.dataset.cancelJob) + '/cancel', { method: 'POST' });
+        await loadProcessing();
+        renderSection();
+      } catch (error) {
+        announce(error.message);
+      }
+    });
+  });
+
+  /* --- Analytics --- */
+  $$('[data-analytics-range]').forEach((button) => {
+    button.addEventListener('click', () => {
+      if (analytics.range === button.dataset.analyticsRange) return;
+      analytics.range = button.dataset.analyticsRange;
+      analytics.data = null;
+      void loadAnalytics();
+    });
+  });
 }
 
 async function updateCompute(patch) {
@@ -902,8 +1390,10 @@ function renderSection() {
   if (!main) return;
   if (activeSection === 'overview') main.innerHTML = renderOverview();
   else if (activeSection === 'archive') main.innerHTML = banner() + renderArchive();
-  else if (activeSection === 'spatial') main.innerHTML = banner() + renderSpatial();
+  else if (activeSection === 'spatial') main.innerHTML = banner() + renderLibrary();
+  else if (activeSection === 'processing') main.innerHTML = banner() + renderProcessing();
   else if (activeSection === 'compute') main.innerHTML = banner() + renderCompute();
+  else if (activeSection === 'analytics') main.innerHTML = renderAnalytics();
   else if (activeSection === 'contribution') main.innerHTML = renderContribution();
   else if (activeSection === 'devices') main.innerHTML = renderDevices();
   else if (activeSection === 'diagnostics') main.innerHTML = renderDiagnostics();
@@ -911,6 +1401,11 @@ function renderSection() {
   bindSectionEvents();
   if (activeSection === 'devices') renderPairingArea();
   if (activeSection === 'diagnostics') { renderLogLines(); void loadLogs(); }
+  if (activeSection === 'spatial' && library.captures === null && !library.loading) void loadLibrary();
+  if (activeSection === 'processing' && processing.jobs === null && !processing.loading) void loadProcessing();
+  if (activeSection === 'analytics' && analytics.data === null && !analytics.loading) void loadAnalytics();
+  if (activeSection === 'spatial') loadThumbnails();
+  if (activeSection === 'analytics' && analytics.data) drawAnalyticsChart();
 }
 
 function render() {
@@ -928,10 +1423,25 @@ async function refresh() {
     const firstLoad = model === null;
     model = next;
     if (firstLoad) render();
-    else {
+    else if ($('#spatialPreviewMount iframe')) {
+      // An interactive Spatial preview is live: rebuilding the shell/section
+      // would destroy its iframe (and the WebGL context inside it) out from
+      // under the viewer every 10s, snapping the user back to "Open
+      // interactive preview" mid-session. The model is still refreshed above
+      // so the rest of the GUI stays current; only the DOM rebuild for this
+      // tick is skipped, and resumes once the preview closes.
+    } else {
       // Keep the shell; only the section content and nav flags change.
       renderShell();
       renderSection();
+      // renderSection()'s own loaders are gated on "cache is still null" so
+      // a section visit only fetches once. Without an explicit refresh here,
+      // a running job's stage, a newly completed archive, or advancing
+      // analytics would sit stale on screen until the user manually left
+      // the section and came back.
+      if (activeSection === 'spatial' && !library.loading) void loadLibrary();
+      if (activeSection === 'processing' && !processing.loading) void loadProcessing();
+      if (activeSection === 'analytics' && !analytics.loading) void loadAnalytics();
     }
   } catch (error) {
     if (String(error.message) === 'authorization') return;
