@@ -73,6 +73,56 @@ const pairingAttempts = new PairingAttemptLimiter();
 export const HTTP_IDENTITY_SESSION_ID = 'local-http/v1';
 
 /**
+ * Counts admissions, not authentication failures.
+ *
+ * `PairingAttemptLimiter` is a failure budget: `assertAllowed` advances only the
+ * process-wide counter, and a client's own bucket moves only when `failed()` is
+ * called. A route with no failure concept — every well-formed challenge is
+ * answered — therefore never fills a per-client bucket, so its per-client
+ * ceiling would never bind and one caller could consume the entire process-wide
+ * allowance and hand every other device a 429.
+ *
+ * The per-client ceiling is checked *before* the global counter is charged, so
+ * a caller that is already over its own limit cannot keep spending the shared
+ * allowance it is being refused by.
+ */
+export class AdmissionLimiter {
+  private readonly clients = new Map<string, { windowStartedAt: number; count: number }>();
+  private globalWindowStartedAt: number | undefined;
+  private globalCount = 0;
+
+  constructor(
+    private readonly maxPerClient: number,
+    private readonly windowMs: number,
+    private readonly maxTrackedKeys: number,
+    private readonly maxGlobal: number,
+  ) {}
+
+  assertAllowed(client: string, now = Date.now()): void {
+    if (this.globalWindowStartedAt === undefined || now - this.globalWindowStartedAt >= this.windowMs) {
+      this.globalWindowStartedAt = now;
+      this.globalCount = 0;
+    }
+
+    const existing = this.clients.get(client);
+    const bucket = existing && now - existing.windowStartedAt < this.windowMs
+      ? existing
+      : { windowStartedAt: now, count: 0 };
+
+    if (bucket.count >= this.maxPerClient) throw localError(429, 'identity_proof_rate_limited');
+    if (this.globalCount >= this.maxGlobal) throw localError(429, 'identity_proof_rate_limited');
+
+    if (!this.clients.has(client) && this.clients.size >= this.maxTrackedKeys) {
+      const oldest = this.clients.keys().next().value as string | undefined;
+      if (oldest) this.clients.delete(oldest);
+    }
+    bucket.count += 1;
+    this.clients.set(client, bucket);
+    this.globalCount += 1;
+  }
+}
+
+/**
  * Rate limit for the unauthenticated proof route, which is a signing oracle.
  *
  * The ceiling is deliberately high: the app proves identity again before every
@@ -80,7 +130,7 @@ export const HTTP_IDENTITY_SESSION_ID = 'local-http/v1';
  * many proofs in a row. This is here to bound CPU against an unauthenticated
  * flood, not to police normal use.
  */
-const identityProofAttempts = new PairingAttemptLimiter(600, 60_000, 4096, 3000);
+export const identityProofAttempts = new AdmissionLimiter(600, 60_000, 4096, 3000);
 const sharedIdempotency = new IdempotencyStore();
 
 /** Verbs whose effects a retry could duplicate. */
@@ -127,6 +177,17 @@ export async function dispatchLocalRequest(
   // which machine it reached must not have to present the credential to find
   // out. See proveIdentity's doc comment for what it does and does not expose.
   if (method === 'POST' && path === '/local/v1/identity/proof') {
+    // Socket transports only. A data channel proves identity with a proof bound
+    // to its own signalling session, and ChannelServer forwards canonical paths
+    // straight to this dispatcher — so without this a peer could relay an HTTP
+    // verifier's nonce over a channel and hand back a proof bound to
+    // `local-http/v1`, which is precisely the transport separation the session
+    // id exists to keep. It is also reachable before the channel's own identity
+    // handshake, so the peer need not have proved anything at all.
+    //
+    // Reported as "not found" rather than "forbidden": on this transport the
+    // route genuinely does not exist, and saying so tells a prober nothing.
+    if (request.peer.kind === 'webrtc') throw localError(404, 'local_route_not_found');
     return proveIdentity(request, deps);
   }
 

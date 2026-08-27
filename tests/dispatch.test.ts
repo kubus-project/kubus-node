@@ -9,6 +9,7 @@ import { IdempotencyStore } from '../src/localApi/idempotencyStore.js';
 import {
   dispatchLocalRequest,
   routeScope,
+  AdmissionLimiter,
   HTTP_IDENTITY_SESSION_ID,
   type LocalApiDeps,
 } from '../src/localApi/dispatch.js';
@@ -377,6 +378,16 @@ describe('dispatchLocalRequest', () => {
  * echoing them proves nothing; only a signature over the caller's own nonce
  * does.
  */
+/** The exact shape the proof route returns, so the strict check config does not see every field as possibly absent. */
+interface ProofResponse {
+  protocolVersion: string;
+  sessionId: string;
+  nodeId: string;
+  fingerprint: string;
+  publicKey: string;
+  signature: string;
+}
+
 describe('POST /local/v1/identity/proof', () => {
   let dir: string;
   let deps: LocalApiDeps;
@@ -435,7 +446,7 @@ describe('POST /local/v1/identity/proof', () => {
       proofRequest({ protocolVersion: IDENTITY_PROOF_PROTOCOL_VERSION, nonce: nonce.toString('base64') }),
       deps,
     );
-    const value = (response as { value: Record<string, string> }).value;
+    const value = (response as { value: ProofResponse }).value;
 
     // Verified the way the app verifies it: against the key recorded at
     // pairing, over the canonical message, never against the key the response
@@ -458,7 +469,7 @@ describe('POST /local/v1/identity/proof', () => {
       proofRequest({ protocolVersion: IDENTITY_PROOF_PROTOCOL_VERSION, nonce: nonce.toString('base64') }),
       deps,
     );
-    const value = (response as { value: Record<string, string> }).value;
+    const value = (response as { value: ProofResponse }).value;
     const otherNonce = Buffer.alloc(32, 9);
     expect(
       verifyIdentityProof({
@@ -478,7 +489,7 @@ describe('POST /local/v1/identity/proof', () => {
       proofRequest({ protocolVersion: IDENTITY_PROOF_PROTOCOL_VERSION, nonce: nonce.toString('base64') }),
       deps,
     );
-    const value = (response as { value: Record<string, string> }).value;
+    const value = (response as { value: ProofResponse }).value;
     expect(value.sessionId).toBe(HTTP_IDENTITY_SESSION_ID);
     // The same signature must not verify under a signalling session id.
     expect(
@@ -510,6 +521,26 @@ describe('POST /local/v1/identity/proof', () => {
     expect(JSON.stringify(value)).not.toContain('SECRET-LABEL');
   });
 
+  it('is not served over a data channel, so an HTTP proof cannot be relayed', async () => {
+    // ChannelServer forwards canonical paths straight to this dispatcher, and
+    // this route sits ahead of the channel's own identity handshake. Without
+    // the transport check a peer could relay an HTTP verifier's nonce over a
+    // data channel and hand back a proof bound to `local-http/v1` — exactly the
+    // separation the session id exists to keep.
+    const webRtcPeer: LocalPeer = { kind: 'webrtc', identityHandshakeComplete: false, sessionId: 'session-1' };
+    await expect(
+      dispatchLocalRequest(
+        request({
+          method: 'POST',
+          path: '/local/v1/identity/proof',
+          peer: webRtcPeer,
+          body: jsonBody({ protocolVersion: IDENTITY_PROOF_PROTOCOL_VERSION, nonce: freshNonce().toString('base64') }),
+        }),
+        deps,
+      ),
+    ).rejects.toMatchObject({ statusCode: 404, code: 'local_route_not_found' });
+  });
+
   it('refuses a nonce that is not 32 bytes, before signing anything', async () => {
     await expect(
       dispatchLocalRequest(
@@ -523,5 +554,63 @@ describe('POST /local/v1/identity/proof', () => {
     await expect(
       dispatchLocalRequest(proofRequest({ protocolVersion: 'kubus-node/99', nonce: freshNonce().toString('base64') }), deps),
     ).rejects.toMatchObject({ statusCode: 400, code: 'identity_protocol_version_unsupported' });
+  });
+});
+
+/**
+ * The proof route answers every well-formed challenge, so it has no
+ * authentication-failure signal to meter on. PairingAttemptLimiter charges only
+ * its global counter from assertAllowed and moves a client's own bucket solely
+ * in failed(), which means a per-client ceiling attached to this route would
+ * never bind. These cover the limiter that replaced it.
+ */
+describe('AdmissionLimiter', () => {
+  it('binds the per-client ceiling', () => {
+    const limiter = new AdmissionLimiter(3, 60_000, 16, 100);
+    for (let i = 0; i < 3; i++) limiter.assertAllowed('a', 1_000);
+    expect(() => limiter.assertAllowed('a', 1_000)).toThrow(
+      expect.objectContaining({ statusCode: 429 }),
+    );
+  });
+
+  it('does not let a refused client keep spending the shared allowance', () => {
+    // The property that matters. If the global counter were charged before the
+    // per-client ceiling was checked, one flooding caller would still drain the
+    // process-wide budget and 429 everybody else while being refused itself.
+    const limiter = new AdmissionLimiter(2, 60_000, 16, 4);
+    for (let i = 0; i < 2; i++) limiter.assertAllowed('flooder', 1_000);
+    for (let i = 0; i < 20; i++) {
+      expect(() => limiter.assertAllowed('flooder', 1_000)).toThrow();
+    }
+    // Two of the four global admissions are still unspent. Had the refusals
+    // charged the global counter, these twenty would have exhausted it and this
+    // unrelated device would be refused something it never used.
+    expect(() => limiter.assertAllowed('someone-else', 1_000)).not.toThrow();
+    expect(() => limiter.assertAllowed('someone-else', 1_000)).not.toThrow();
+  });
+
+  it('binds the process-wide ceiling across distinct clients', () => {
+    const limiter = new AdmissionLimiter(10, 60_000, 16, 3);
+    limiter.assertAllowed('a', 1_000);
+    limiter.assertAllowed('b', 1_000);
+    limiter.assertAllowed('c', 1_000);
+    expect(() => limiter.assertAllowed('d', 1_000)).toThrow(
+      expect.objectContaining({ statusCode: 429 }),
+    );
+  });
+
+  it('lets both ceilings recover once the window rolls over', () => {
+    const limiter = new AdmissionLimiter(1, 60_000, 16, 1);
+    limiter.assertAllowed('a', 1_000);
+    expect(() => limiter.assertAllowed('a', 1_000)).toThrow();
+    expect(() => limiter.assertAllowed('a', 1_000 + 60_000)).not.toThrow();
+  });
+
+  it('bounds how many clients it tracks', () => {
+    const limiter = new AdmissionLimiter(1, 60_000, 2, 1000);
+    for (let i = 0; i < 50; i++) limiter.assertAllowed(`client-${i}`, 1_000);
+    // Evicting the oldest is what keeps this from being a memory-growth vector
+    // for an unauthenticated route; the earliest key is no longer remembered.
+    expect(() => limiter.assertAllowed('client-0', 1_000)).not.toThrow();
   });
 });
