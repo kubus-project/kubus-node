@@ -3,6 +3,7 @@ import type { KubusApiClient } from '../backend/kubusApiClient.js';
 import type { CapabilityRegistry } from '../capabilities/registry.js';
 import type { CaptureDraftPayload, CapturePackagePayload, CaptureStore } from '../captures/captureStore.js';
 import type { AppConfig } from '../config/schema.js';
+import { createIdentityProof, IDENTITY_PROOF_PROTOCOL_VERSION } from '../identity/identityProof.js';
 import type { NodeIdentity } from '../identity/nodeIdentity.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import type { JobRuntime, JobType } from '../jobs/jobRuntime.js';
@@ -55,6 +56,81 @@ const SCOPE_BY_ROUTE: Array<[RegExp, LocalScope]> = [
 ];
 
 const pairingAttempts = new PairingAttemptLimiter();
+
+/**
+ * The session id bound into every HTTP identity proof.
+ *
+ * WebRTC binds a real signalling session here. HTTP has none, so this constant
+ * takes its place and does the one job that still matters over HTTP: it keeps
+ * the two transports' proofs disjoint, so a proof minted for a data channel
+ * can never be presented as an HTTP proof or the reverse. Freshness is not its
+ * job -- the client's 32-byte nonce carries that.
+ *
+ * Like the WebRTC session id, it is the node's own value and is never read
+ * from the request. A client that could choose what gets signed here could ask
+ * for a proof bound to someone else's session.
+ */
+export const HTTP_IDENTITY_SESSION_ID = 'local-http/v1';
+
+/**
+ * Counts admissions, not authentication failures.
+ *
+ * `PairingAttemptLimiter` is a failure budget: `assertAllowed` advances only the
+ * process-wide counter, and a client's own bucket moves only when `failed()` is
+ * called. A route with no failure concept — every well-formed challenge is
+ * answered — therefore never fills a per-client bucket, so its per-client
+ * ceiling would never bind and one caller could consume the entire process-wide
+ * allowance and hand every other device a 429.
+ *
+ * The per-client ceiling is checked *before* the global counter is charged, so
+ * a caller that is already over its own limit cannot keep spending the shared
+ * allowance it is being refused by.
+ */
+export class AdmissionLimiter {
+  private readonly clients = new Map<string, { windowStartedAt: number; count: number }>();
+  private globalWindowStartedAt: number | undefined;
+  private globalCount = 0;
+
+  constructor(
+    private readonly maxPerClient: number,
+    private readonly windowMs: number,
+    private readonly maxTrackedKeys: number,
+    private readonly maxGlobal: number,
+  ) {}
+
+  assertAllowed(client: string, now = Date.now()): void {
+    if (this.globalWindowStartedAt === undefined || now - this.globalWindowStartedAt >= this.windowMs) {
+      this.globalWindowStartedAt = now;
+      this.globalCount = 0;
+    }
+
+    const existing = this.clients.get(client);
+    const bucket = existing && now - existing.windowStartedAt < this.windowMs
+      ? existing
+      : { windowStartedAt: now, count: 0 };
+
+    if (bucket.count >= this.maxPerClient) throw localError(429, 'identity_proof_rate_limited');
+    if (this.globalCount >= this.maxGlobal) throw localError(429, 'identity_proof_rate_limited');
+
+    if (!this.clients.has(client) && this.clients.size >= this.maxTrackedKeys) {
+      const oldest = this.clients.keys().next().value as string | undefined;
+      if (oldest) this.clients.delete(oldest);
+    }
+    bucket.count += 1;
+    this.clients.set(client, bucket);
+    this.globalCount += 1;
+  }
+}
+
+/**
+ * Rate limit for the unauthenticated proof route, which is a signing oracle.
+ *
+ * The ceiling is deliberately high: the app proves identity again before every
+ * private transfer, so uploading a capture of many files legitimately asks for
+ * many proofs in a row. This is here to bound CPU against an unauthenticated
+ * flood, not to police normal use.
+ */
+export const identityProofAttempts = new AdmissionLimiter(600, 60_000, 4096, 3000);
 const sharedIdempotency = new IdempotencyStore();
 
 /** Verbs whose effects a retry could duplicate. */
@@ -97,6 +173,24 @@ export async function dispatchLocalRequest(
     return exchangePairing(request, deps);
   }
 
+  // Before the credential gate on purpose: a caller that has not yet proved
+  // which machine it reached must not have to present the credential to find
+  // out. See proveIdentity's doc comment for what it does and does not expose.
+  if (method === 'POST' && path === '/local/v1/identity/proof') {
+    // Socket transports only. A data channel proves identity with a proof bound
+    // to its own signalling session, and ChannelServer forwards canonical paths
+    // straight to this dispatcher — so without this a peer could relay an HTTP
+    // verifier's nonce over a channel and hand back a proof bound to
+    // `local-http/v1`, which is precisely the transport separation the session
+    // id exists to keep. It is also reachable before the channel's own identity
+    // handshake, so the peer need not have proved anything at all.
+    //
+    // Reported as "not found" rather than "forbidden": on this transport the
+    // route genuinely does not exist, and saying so tells a prober nothing.
+    if (request.peer.kind === 'webrtc') throw localError(404, 'local_route_not_found');
+    return proveIdentity(request, deps);
+  }
+
   const scope = routeScope(path);
   if (!(await deps.pairing.authorize(request.credential, scope))) {
     throw localError(401, 'local_credential_required');
@@ -133,6 +227,72 @@ export async function dispatchLocalRequest(
   } finally {
     if (response) claim?.settle(response, false);
   }
+}
+
+/**
+ * Proves possession of the node's private key over a caller-supplied nonce.
+ *
+ * ## Why this route is unauthenticated
+ *
+ * It is the bootstrap of "prove who you are before I trust you with a
+ * credential". A client that has not yet confirmed which machine answered must
+ * not send the node credential to find out -- that is precisely the disclosure
+ * the check exists to prevent -- so the one request it is willing to make to an
+ * unproved address has to work without one.
+ *
+ * ## Why it discloses nothing new
+ *
+ * It returns the node id, fingerprint and public key, and nothing else. All
+ * three are printed in the pairing QR code an operator holds up to a camera,
+ * so they are public by construction. It deliberately does NOT return the
+ * label, peer id, endpoint list or version that `/local/v1/info` carries: those
+ * describe the deployment rather than the identity, and stay behind the
+ * credential.
+ *
+ * ## Why a signature rather than an echo
+ *
+ * Returning the identity fields alone would prove nothing. Anyone who has seen
+ * the pairing QR -- or any earlier response from this route -- knows all three
+ * values and could repeat them. Only the private key distinguishes the real
+ * node, so the caller picks a random challenge and requires a signature over
+ * it. The message is built by the shared canonical builder, so the bytes signed
+ * here are the same ones the data-channel handshake signs.
+ *
+ * A live relay that forwards a challenge to the real node and returns its
+ * answer is not defeated by this, and cannot be without binding the proof to
+ * the channel. Over HTTPS the transport already authenticates the host; over
+ * cleartext LAN the attacker must already be on the network.
+ */
+async function proveIdentity(request: LocalRequest, deps: LocalApiDeps): Promise<LocalResponse> {
+  identityProofAttempts.assertAllowed(
+    pairingAttemptKey(request.peer.address || request.peer.kind, 'identity-proof'),
+  );
+  const body = await request.body.json(BODY_LIMITS.json);
+  if (String(body.protocolVersion || '') !== IDENTITY_PROOF_PROTOCOL_VERSION) {
+    throw localError(400, 'identity_protocol_version_unsupported');
+  }
+  // base64 or base64url, since the two sides of this protocol historically
+  // disagree about which; the length check is what actually matters.
+  const nonce = Buffer.from(String(body.nonce || ''), 'base64');
+  if (nonce.length !== 32) throw localError(400, 'identity_nonce_invalid');
+
+  const proof = createIdentityProof(deps.identity, {
+    protocolVersion: IDENTITY_PROOF_PROTOCOL_VERSION,
+    sessionId: HTTP_IDENTITY_SESSION_ID,
+    nonce,
+    // The same role the data-channel handshake signs, because the verifier is
+    // literally the same code path on the app side.
+    clientRole: 'client',
+  });
+  const state = deps.store.snapshot();
+  return jsonResponse(200, {
+    protocolVersion: IDENTITY_PROOF_PROTOCOL_VERSION,
+    sessionId: HTTP_IDENTITY_SESSION_ID,
+    nodeId: state.nodeId || `local-${deps.identity.fingerprint}`,
+    fingerprint: proof.fingerprint,
+    publicKey: proof.publicKeyRaw.toString('base64url'),
+    signature: proof.signature.toString('base64'),
+  });
 }
 
 async function exchangePairing(request: LocalRequest, deps: LocalApiDeps): Promise<LocalResponse> {

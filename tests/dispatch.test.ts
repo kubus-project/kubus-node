@@ -6,7 +6,14 @@ import path from 'node:path';
 import type { AppConfig } from '../src/config/schema.js';
 import { loadOrCreateNodeIdentity } from '../src/identity/nodeIdentity.js';
 import { IdempotencyStore } from '../src/localApi/idempotencyStore.js';
-import { dispatchLocalRequest, routeScope, type LocalApiDeps } from '../src/localApi/dispatch.js';
+import {
+  dispatchLocalRequest,
+  routeScope,
+  AdmissionLimiter,
+  HTTP_IDENTITY_SESSION_ID,
+  type LocalApiDeps,
+} from '../src/localApi/dispatch.js';
+import { IDENTITY_PROOF_PROTOCOL_VERSION, verifyIdentityProof } from '../src/identity/identityProof.js';
 import type { LocalPeer, LocalRequest, LocalRequestBody } from '../src/localApi/localRequest.js';
 import { LOCAL_SCOPES, PairingService } from '../src/localApi/pairingService.js';
 import { LocalStore } from '../src/state/localStore.js';
@@ -360,3 +367,250 @@ describe('dispatchLocalRequest', () => {
   });
 });
 
+/**
+ * The HTTP identity proof.
+ *
+ * The app must decide whether the machine that answered is the Node it paired
+ * with *before* it sends the Node credential or a private capture. It cannot
+ * present the credential to find out, so this route has to answer without one
+ * -- and it has to answer with something an impostor could not produce. The
+ * node id, fingerprint and public key are all printed in the pairing QR, so
+ * echoing them proves nothing; only a signature over the caller's own nonce
+ * does.
+ */
+/** The exact shape the proof route returns, so the strict check config does not see every field as possibly absent. */
+interface ProofResponse {
+  protocolVersion: string;
+  sessionId: string;
+  nodeId: string;
+  fingerprint: string;
+  publicKey: string;
+  signature: string;
+}
+
+describe('POST /local/v1/identity/proof', () => {
+  let dir: string;
+  let deps: LocalApiDeps;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(os.tmpdir(), 'kubus-identity-'));
+    const store = new LocalStore(path.join(dir, 'state.json'));
+    await store.load();
+    const identity = await loadOrCreateNodeIdentity(dir);
+    const config = {
+      localApiEnabled: true,
+      localApiAllowLan: true,
+      localApiLanUrl: 'http://192.168.1.10:8787',
+      localApiTrustedProxyAddresses: [],
+      guiToken: 'gui-administrator-token',
+      nodeLabel: 'SECRET-LABEL',
+      pairingSessionTtlMs: 300_000,
+    } as unknown as AppConfig;
+    deps = {
+      api: {} as never,
+      kubo: {} as never,
+      store,
+      config,
+      capabilities: {} as never,
+      pairing: new PairingService(store, config, identity),
+      captures: {} as never,
+      jobs: {} as never,
+      participationGate: {} as never,
+      remoteCompute: {} as never,
+      identity,
+      idempotency: new IdempotencyStore(),
+    };
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  });
+
+  const proofRequest = (body: unknown) =>
+    request({ method: 'POST', path: '/local/v1/identity/proof', body: jsonBody(body) });
+
+  const freshNonce = () => Buffer.from(Array.from({ length: 32 }, (_, i) => (i * 7 + 3) % 256));
+
+  it('answers an unauthenticated caller, because proving identity is what comes before trust', async () => {
+    const response = await dispatchLocalRequest(
+      proofRequest({ protocolVersion: IDENTITY_PROOF_PROTOCOL_VERSION, nonce: freshNonce().toString('base64') }),
+      deps,
+    );
+    expect(response.kind).toBe('json');
+    expect((response as { status: number }).status).toBe(200);
+  });
+
+  it('signs the nonce the caller chose, using the key recorded at pairing', async () => {
+    const nonce = freshNonce();
+    const response = await dispatchLocalRequest(
+      proofRequest({ protocolVersion: IDENTITY_PROOF_PROTOCOL_VERSION, nonce: nonce.toString('base64') }),
+      deps,
+    );
+    const value = (response as { value: ProofResponse }).value;
+
+    // Verified the way the app verifies it: against the key recorded at
+    // pairing, over the canonical message, never against the key the response
+    // supplied for itself.
+    expect(
+      verifyIdentityProof({
+        publicKeyRaw: deps.identity.publicKeyRaw,
+        signature: Buffer.from(value.signature, 'base64'),
+        protocolVersion: IDENTITY_PROOF_PROTOCOL_VERSION,
+        sessionId: HTTP_IDENTITY_SESSION_ID,
+        nonce,
+        clientRole: 'client',
+      }),
+    ).toBe(true);
+  });
+
+  it('does not verify against a different nonce, so a captured proof cannot be replayed', async () => {
+    const nonce = freshNonce();
+    const response = await dispatchLocalRequest(
+      proofRequest({ protocolVersion: IDENTITY_PROOF_PROTOCOL_VERSION, nonce: nonce.toString('base64') }),
+      deps,
+    );
+    const value = (response as { value: ProofResponse }).value;
+    const otherNonce = Buffer.alloc(32, 9);
+    expect(
+      verifyIdentityProof({
+        publicKeyRaw: deps.identity.publicKeyRaw,
+        signature: Buffer.from(value.signature, 'base64'),
+        protocolVersion: IDENTITY_PROOF_PROTOCOL_VERSION,
+        sessionId: HTTP_IDENTITY_SESSION_ID,
+        nonce: otherNonce,
+        clientRole: 'client',
+      }),
+    ).toBe(false);
+  });
+
+  it('binds a transport-specific session id, keeping HTTP and data-channel proofs disjoint', async () => {
+    const nonce = freshNonce();
+    const response = await dispatchLocalRequest(
+      proofRequest({ protocolVersion: IDENTITY_PROOF_PROTOCOL_VERSION, nonce: nonce.toString('base64') }),
+      deps,
+    );
+    const value = (response as { value: ProofResponse }).value;
+    expect(value.sessionId).toBe(HTTP_IDENTITY_SESSION_ID);
+    // The same signature must not verify under a signalling session id.
+    expect(
+      verifyIdentityProof({
+        publicKeyRaw: deps.identity.publicKeyRaw,
+        signature: Buffer.from(value.signature, 'base64'),
+        protocolVersion: IDENTITY_PROOF_PROTOCOL_VERSION,
+        sessionId: 'session-1',
+        nonce,
+        clientRole: 'client',
+      }),
+    ).toBe(false);
+  });
+
+  it('discloses only identity, never the deployment description', async () => {
+    const response = await dispatchLocalRequest(
+      proofRequest({ protocolVersion: IDENTITY_PROOF_PROTOCOL_VERSION, nonce: freshNonce().toString('base64') }),
+      deps,
+    );
+    const value = (response as { value: Record<string, unknown> }).value;
+    expect(Object.keys(value).sort()).toEqual(
+      ['fingerprint', 'nodeId', 'protocolVersion', 'publicKey', 'sessionId', 'signature'].sort(),
+    );
+    // /local/v1/info carries these; this route must not.
+    expect(value.label).toBeUndefined();
+    expect(value.endpoints).toBeUndefined();
+    expect(value.version).toBeUndefined();
+    expect(value.peerId).toBeUndefined();
+    expect(JSON.stringify(value)).not.toContain('SECRET-LABEL');
+  });
+
+  it('is not served over a data channel, so an HTTP proof cannot be relayed', async () => {
+    // ChannelServer forwards canonical paths straight to this dispatcher, and
+    // this route sits ahead of the channel's own identity handshake. Without
+    // the transport check a peer could relay an HTTP verifier's nonce over a
+    // data channel and hand back a proof bound to `local-http/v1` — exactly the
+    // separation the session id exists to keep.
+    const webRtcPeer: LocalPeer = { kind: 'webrtc', identityHandshakeComplete: false, sessionId: 'session-1' };
+    await expect(
+      dispatchLocalRequest(
+        request({
+          method: 'POST',
+          path: '/local/v1/identity/proof',
+          peer: webRtcPeer,
+          body: jsonBody({ protocolVersion: IDENTITY_PROOF_PROTOCOL_VERSION, nonce: freshNonce().toString('base64') }),
+        }),
+        deps,
+      ),
+    ).rejects.toMatchObject({ statusCode: 404, code: 'local_route_not_found' });
+  });
+
+  it('refuses a nonce that is not 32 bytes, before signing anything', async () => {
+    await expect(
+      dispatchLocalRequest(
+        proofRequest({ protocolVersion: IDENTITY_PROOF_PROTOCOL_VERSION, nonce: Buffer.alloc(8).toString('base64') }),
+        deps,
+      ),
+    ).rejects.toMatchObject({ statusCode: 400, code: 'identity_nonce_invalid' });
+  });
+
+  it('refuses a protocol version it does not implement', async () => {
+    await expect(
+      dispatchLocalRequest(proofRequest({ protocolVersion: 'kubus-node/99', nonce: freshNonce().toString('base64') }), deps),
+    ).rejects.toMatchObject({ statusCode: 400, code: 'identity_protocol_version_unsupported' });
+  });
+});
+
+/**
+ * The proof route answers every well-formed challenge, so it has no
+ * authentication-failure signal to meter on. PairingAttemptLimiter charges only
+ * its global counter from assertAllowed and moves a client's own bucket solely
+ * in failed(), which means a per-client ceiling attached to this route would
+ * never bind. These cover the limiter that replaced it.
+ */
+describe('AdmissionLimiter', () => {
+  it('binds the per-client ceiling', () => {
+    const limiter = new AdmissionLimiter(3, 60_000, 16, 100);
+    for (let i = 0; i < 3; i++) limiter.assertAllowed('a', 1_000);
+    expect(() => limiter.assertAllowed('a', 1_000)).toThrow(
+      expect.objectContaining({ statusCode: 429 }),
+    );
+  });
+
+  it('does not let a refused client keep spending the shared allowance', () => {
+    // The property that matters. If the global counter were charged before the
+    // per-client ceiling was checked, one flooding caller would still drain the
+    // process-wide budget and 429 everybody else while being refused itself.
+    const limiter = new AdmissionLimiter(2, 60_000, 16, 4);
+    for (let i = 0; i < 2; i++) limiter.assertAllowed('flooder', 1_000);
+    for (let i = 0; i < 20; i++) {
+      expect(() => limiter.assertAllowed('flooder', 1_000)).toThrow();
+    }
+    // Two of the four global admissions are still unspent. Had the refusals
+    // charged the global counter, these twenty would have exhausted it and this
+    // unrelated device would be refused something it never used.
+    expect(() => limiter.assertAllowed('someone-else', 1_000)).not.toThrow();
+    expect(() => limiter.assertAllowed('someone-else', 1_000)).not.toThrow();
+  });
+
+  it('binds the process-wide ceiling across distinct clients', () => {
+    const limiter = new AdmissionLimiter(10, 60_000, 16, 3);
+    limiter.assertAllowed('a', 1_000);
+    limiter.assertAllowed('b', 1_000);
+    limiter.assertAllowed('c', 1_000);
+    expect(() => limiter.assertAllowed('d', 1_000)).toThrow(
+      expect.objectContaining({ statusCode: 429 }),
+    );
+  });
+
+  it('lets both ceilings recover once the window rolls over', () => {
+    const limiter = new AdmissionLimiter(1, 60_000, 16, 1);
+    limiter.assertAllowed('a', 1_000);
+    expect(() => limiter.assertAllowed('a', 1_000)).toThrow();
+    expect(() => limiter.assertAllowed('a', 1_000 + 60_000)).not.toThrow();
+  });
+
+  it('bounds how many clients it tracks', () => {
+    const limiter = new AdmissionLimiter(1, 60_000, 2, 1000);
+    for (let i = 0; i < 50; i++) limiter.assertAllowed(`client-${i}`, 1_000);
+    // Evicting the oldest is what keeps this from being a memory-growth vector
+    // for an unauthenticated route; the earliest key is no longer remembered.
+    expect(() => limiter.assertAllowed('client-0', 1_000)).not.toThrow();
+  });
+});
