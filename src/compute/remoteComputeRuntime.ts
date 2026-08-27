@@ -13,6 +13,7 @@ import { validateSpatialManifest, type SpatialManifest } from '../spatial/models
 import { redactSecrets } from '../logging/logBuffer.js';
 import { Backoff } from '../scheduler/backoff.js';
 import type { LocalStore } from '../state/localStore.js';
+import { credentialFingerprint } from './credentialFingerprint.js';
 import type { ComputeIdentityService } from './computeIdentity.js';
 import { PrivatePayloadTransport, type ComputeKeyEnvelope } from './privatePayloadTransport.js';
 import { effectiveComputeProviderSettings, validateComputeProviderSettings, type ComputeProviderSettings } from './providerSettings.js';
@@ -46,6 +47,24 @@ export class RemoteComputeRuntime {
 
   start(): void {
     if (!this.stopped) return;
+    // A blocked verdict recorded against the credential still in use survives a
+    // restart. Starting the loop anyway would re-learn the same 403 the hard
+    // way and put the request back on the backend, which is exactly the
+    // once-a-minute-forever behaviour this exists to end. A verdict recorded
+    // against a *different* credential says nothing about this one, so
+    // `isAuthorizationBlocked` clears itself when the fingerprint moves.
+    if (this.isAuthorizationBlocked()) {
+      this.deps.logger.warn(
+        {
+          op: 'remote_compute_poll',
+          state: 'AUTHORIZATION_REQUIRED',
+          requiresOperatorAction: true,
+          ...this.authorizationDiagnostics(),
+        },
+        'remote compute provider polling not started — node authorization required',
+      );
+      return;
+    }
     this.stopped = false;
     this.scheduleNextPoll(0);
   }
@@ -67,6 +86,102 @@ export class RemoteComputeRuntime {
     const nextDelay = await this.pollProvider();
     if (this.stopped) return;
     this.scheduleNextPoll(nextDelay);
+  }
+
+  /** The fingerprint of the operator token this process is currently sending. */
+  private currentCredentialFingerprint(): string | undefined {
+    return credentialFingerprint(this.deps.config.operatorToken);
+  }
+
+  /**
+   * Whether remote compute is blocked for the credential in use right now.
+   *
+   * A recorded verdict only applies to the credential it was recorded against.
+   * If the operator token has changed since, the verdict is stale and this
+   * returns false so the new credential gets its own chance — that is what
+   * makes rotation resume polling without a restart or an explicit retry.
+   */
+  isAuthorizationBlocked(): boolean {
+    const recorded = this.deps.store.snapshot().computeAuthorization;
+    if (!recorded || recorded.state !== 'AUTHORIZATION_REQUIRED') return false;
+    if (!recorded.credentialFingerprint) return true;
+    return recorded.credentialFingerprint === this.currentCredentialFingerprint();
+  }
+
+  /** Safe to log and to show an operator. Never contains the token. */
+  authorizationDiagnostics(): Record<string, unknown> {
+    const recorded = this.deps.store.snapshot().computeAuthorization;
+    if (!recorded) return {};
+    return {
+      status: recorded.status,
+      missingScope: recorded.missingScope,
+      surface: recorded.surface,
+      observedAt: recorded.observedAt,
+      credentialFingerprint: recorded.credentialFingerprint,
+      lastAuthorizedAt: recorded.lastAuthorizedAt,
+    };
+  }
+
+  /**
+   * Records that the backend refused this node's compute credential, and stops.
+   *
+   * Deliberately terminal for this credential. 401 means the token is invalid,
+   * expired or revoked; 403 means it is valid but carries no
+   * `compute:jobs:read`. Neither is fixed by asking again, so the loop is not
+   * rescheduled at all — not even at the one-minute ceiling.
+   */
+  private async blockOnAuthorizationFailure(
+    status: number,
+    surface: 'provider_jobs' | 'provider_rewards',
+    missingScope?: string,
+  ): Promise<void> {
+    const fingerprint = this.currentCredentialFingerprint();
+    await this.deps.store.update((state) => {
+      state.computeAuthorization = {
+        ...(state.computeAuthorization ?? {}),
+        state: 'AUTHORIZATION_REQUIRED',
+        status,
+        missingScope,
+        surface,
+        observedAt: new Date().toISOString(),
+        credentialFingerprint: fingerprint,
+      };
+    });
+    this.stop();
+  }
+
+  /** Records that the credential worked, clearing any previous blocked verdict. */
+  private async recordAuthorized(): Promise<void> {
+    const recorded = this.deps.store.snapshot().computeAuthorization;
+    if (recorded?.state === 'OK' && recorded.credentialFingerprint === this.currentCredentialFingerprint()) return;
+    const fingerprint = this.currentCredentialFingerprint();
+    await this.deps.store.update((state) => {
+      state.computeAuthorization = {
+        state: 'OK',
+        credentialFingerprint: fingerprint,
+        lastAuthorizedAt: new Date().toISOString(),
+      };
+    });
+  }
+
+  /**
+   * Re-checks authorization and resumes polling if it now works.
+   *
+   * The explicit "Re-authorize Node" action, and the path a rotated credential
+   * takes. Clearing the recorded verdict first is what allows a retry against
+   * the same credential — an operator who has just had the scope granted
+   * server-side should not have to restart the node to find out.
+   */
+  async retryAuthorization(): Promise<{ resumed: boolean }> {
+    await this.deps.store.update((state) => {
+      if (state.computeAuthorization) state.computeAuthorization.state = 'OK';
+    });
+    const settings = this.settings();
+    if (!settings.enabled || settings.paused) return { resumed: false };
+    this.consecutiveFailures = 0;
+    this.backoff.success();
+    this.start();
+    return { resumed: !this.stopped };
   }
 
   settings(): ComputeProviderSettings { return effectiveComputeProviderSettings(this.deps.config, this.deps.store.snapshot()); }
@@ -157,9 +272,10 @@ export class RemoteComputeRuntime {
       const { jobs } = await this.deps.api.getProviderComputeJobs(nodeId, ['MATCHED', 'ACCEPTED', 'INPUT_READY', 'RUNNING', 'OUTPUT_READY']);
       for (const job of jobs) await this.handleProviderJob(job).catch((error) => this.failProviderJob(job, error));
       this.onPollSucceeded();
+      await this.recordAuthorized();
       return POLL_INTERVAL_MS;
     } catch (error) {
-      return this.onPollFailed(error);
+      return await this.onPollFailed(error);
     } finally {
       this.polling = false;
     }
@@ -178,17 +294,39 @@ export class RemoteComputeRuntime {
   }
 
   /** Records the failure, decides whether this tick is loud or silent, and returns the next retry delay. */
-  private onPollFailed(error: unknown): number {
+  private async onPollFailed(error: unknown): Promise<number> {
     this.consecutiveFailures += 1;
     const described = describePollError(error);
-    // A 401/403 is a standing configuration fact, not a transient outage: the
-    // operator token simply does not carry the scope this poll needs, and no
-    // amount of retrying changes that. A real node was observed retrying the
-    // same `compute:jobs:read` scope rejection 591 consecutive times. Back off
-    // to the ceiling immediately and say plainly what has to be fixed, instead
-    // of climbing a ladder that leads nowhere.
+    // A 401/403 is a standing fact about this credential, not a transient
+    // outage: the token is invalid, expired or revoked, or it is valid and
+    // carries no `compute:jobs:read`. Asking again cannot change any of those.
+    //
+    // Backing off to a ceiling was not enough — it still meant one rejected
+    // request per minute forever, which is how a single node produced 28,701
+    // 403s on /api/compute/provider/jobs. The verdict is now recorded durably
+    // and the loop stops outright. It resumes when something actually changes:
+    // the credential is rotated, or an operator asks it to retry.
     const isAuthorizationFailure = described.status === 401 || described.status === 403;
-    const delayMs = isAuthorizationFailure ? POLL_MAX_BACKOFF_MS : this.backoff.failure();
+    if (isAuthorizationFailure) {
+      await this.blockOnAuthorizationFailure(
+        described.status as number,
+        'provider_jobs',
+        missingScopeFrom(error) ?? 'compute:jobs:read',
+      );
+      this.deps.logger.warn(
+        redactSecrets({
+          op: 'remote_compute_poll',
+          ...described,
+          state: 'AUTHORIZATION_REQUIRED',
+          requiresOperatorAction: true,
+          pollingStopped: true,
+          consecutiveFailures: this.consecutiveFailures,
+        }),
+        'remote compute provider polling stopped — node authorization required',
+      );
+      return POLL_MAX_BACKOFF_MS;
+    }
+    const delayMs = this.backoff.failure();
     const now = Date.now();
     const isStateTransition = this.consecutiveFailures === 1;
     const summaryDue = now - this.lastFailureLoggedAt >= FAILURE_SUMMARY_INTERVAL_MS;
@@ -198,13 +336,10 @@ export class RemoteComputeRuntime {
         redactSecrets({
           op: 'remote_compute_poll',
           ...described,
-          ...(isAuthorizationFailure ? { requiresOperatorAction: true } : {}),
           consecutiveFailures: this.consecutiveFailures,
           nextRetryMs: delayMs,
         }),
-        isAuthorizationFailure
-          ? 'remote compute provider poll rejected — operator token lacks the required scope'
-          : 'remote compute provider poll failed',
+        'remote compute provider poll failed',
       );
     }
     return delayMs;
@@ -310,6 +445,13 @@ function requireUserAuthorization(value: string): void { if (!value.startsWith('
  * and a short message — never the raw error object, which for some SDKs can
  * carry request headers or full URLs (query-string tokens included).
  */
+/** The scope the backend named, when its error body carried one. */
+function missingScopeFrom(error: unknown): string | undefined {
+  const err = error as { details?: { missingScope?: unknown; scope?: unknown }; body?: { missingScope?: unknown; scope?: unknown } };
+  const candidate = err?.details?.missingScope ?? err?.details?.scope ?? err?.body?.missingScope ?? err?.body?.scope;
+  return typeof candidate === 'string' && candidate.trim() ? candidate.trim() : undefined;
+}
+
 function describePollError(error: unknown): { code?: string; status?: number; message: string } {
   const err = error as { code?: string; status?: number; statusCode?: number; message?: string };
   return {

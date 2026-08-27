@@ -85,6 +85,40 @@ export interface LocalState {
     minimumFreeVramBytes: number;
   };
   privateComputeCids?: Record<string, { jobId?: string; role: 'encrypted_input' | 'private_output'; createdAt: string; expiresAt?: string; releasedAt?: string }>;
+
+  /**
+   * Why the optional remote-compute capabilities are or are not currently usable.
+   *
+   * A 401 or 403 from the compute provider routes is a standing fact about this
+   * node's credential, not a transient outage: the operator token is invalid,
+   * revoked, expired, or simply does not carry `compute:jobs:read`. Retrying
+   * cannot change any of those. Recording the verdict here is what lets the
+   * runtime stop asking, survive a restart without re-learning it the hard way,
+   * and tell the operator what to actually do.
+   *
+   * `credentialFingerprint` is a salted hash of the operator token, never the
+   * token. It exists so a rotated credential is recognisable as a *different*
+   * one: a blocked state recorded against a credential that is no longer in use
+   * says nothing about the new one, so polling resumes on its own.
+   *
+   * Scoped to remote compute only. Archive participation, local processing and
+   * the GUI have their own scopes and are unaffected by this.
+   */
+  computeAuthorization?: {
+    state: 'OK' | 'AUTHORIZATION_REQUIRED';
+    /** 401 or 403 — an invalid credential and a valid one lacking scope are different problems. */
+    status?: number;
+    /** The scope the backend said was missing, when it said so. */
+    missingScope?: string;
+    /** Which capability observed it, so one failure does not mute the other. */
+    surface?: 'provider_jobs' | 'provider_rewards';
+    observedAt?: string;
+    /** Salted hash of the operator token in use when this was observed. Never the token. */
+    credentialFingerprint?: string;
+    /** Last time this node was successfully authorized for remote compute. */
+    lastAuthorizedAt?: string;
+  };
+
   updatedAt?: string;
 }
 
