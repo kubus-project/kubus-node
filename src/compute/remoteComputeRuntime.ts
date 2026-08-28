@@ -308,11 +308,30 @@ export class RemoteComputeRuntime {
     // the credential is rotated, or an operator asks it to retry.
     const isAuthorizationFailure = described.status === 401 || described.status === 403;
     if (isAuthorizationFailure) {
-      await this.blockOnAuthorizationFailure(
-        described.status as number,
-        'provider_jobs',
-        missingScopeFrom(error) ?? 'compute:jobs:read',
-      );
+      try {
+        await this.blockOnAuthorizationFailure(
+          described.status as number,
+          'provider_jobs',
+          missingScopeFrom(error) ?? 'compute:jobs:read',
+        );
+      } catch (storageError) {
+        // A full or read-only state volume must not turn a rejected provider
+        // request into an unhandled timer rejection. Without a durable verdict
+        // we cannot safely stop forever, so keep the loop alive with normal
+        // exponential backoff and report the persistence fault to the operator.
+        const delayMs = this.backoff.failure();
+        this.deps.logger.warn(
+          redactSecrets({
+            op: 'remote_compute_poll',
+            ...described,
+            authorizationVerdictPersistence: describePollError(storageError),
+            consecutiveFailures: this.consecutiveFailures,
+            nextRetryMs: delayMs,
+          }),
+          'remote compute authorization verdict could not be persisted — polling will retry',
+        );
+        return delayMs;
+      }
       this.deps.logger.warn(
         redactSecrets({
           op: 'remote_compute_poll',

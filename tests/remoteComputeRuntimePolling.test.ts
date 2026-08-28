@@ -27,7 +27,7 @@ const baseConfig = {
 
 function buildRuntime(
   getProviderComputeJobs: () => Promise<{ jobs: unknown[] }>,
-  options: { config?: Record<string, unknown>; initialState?: Record<string, unknown> } = {},
+  options: { config?: Record<string, unknown>; initialState?: Record<string, unknown>; failStoreUpdates?: boolean } = {},
 ) {
   const { logger, calls } = fakeLogger();
   // Stateful on purpose: a durable authorization verdict has to survive a
@@ -41,6 +41,7 @@ function buildRuntime(
   const store = {
     snapshot: () => JSON.parse(JSON.stringify(persisted)) as Record<string, unknown>,
     update: async (mutator: (state: Record<string, unknown>) => void) => {
+      if (options.failStoreUpdates) throw new Error('state volume is read-only');
       mutator(persisted);
       return JSON.parse(JSON.stringify(persisted));
     },
@@ -176,6 +177,29 @@ describe('RemoteComputeRuntime provider polling (Part 11 / Part 40)', () => {
 
     expect(polls).toBe(1);
     expect(persisted.computeAuthorization).toMatchObject({ state: 'AUTHORIZATION_REQUIRED', status: 401 });
+  });
+
+  it('keeps polling with backoff when an authorization verdict cannot be persisted', async () => {
+    let polls = 0;
+    const { runtime, calls, persisted } = buildRuntime(
+      async () => {
+        polls += 1;
+        throw Object.assign(new Error('operator token missing scope'), { status: 403 });
+      },
+      { failStoreUpdates: true },
+    );
+
+    runtime.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(polls).toBeGreaterThanOrEqual(2);
+    expect(persisted.computeAuthorization).toBeUndefined();
+    const warning = calls.find((call) => call.message.includes('could not be persisted'));
+    expect(warning?.payload).toMatchObject({ status: 403 });
+    expect((warning?.payload as { nextRetryMs?: number }).nextRetryMs).toBeGreaterThanOrEqual(4000);
+    expect((warning?.payload as { nextRetryMs?: number }).nextRetryMs).toBeLessThanOrEqual(6000);
+    runtime.stop();
   });
 
   it('does not start polling at all when a blocked verdict names the credential in use', async () => {
