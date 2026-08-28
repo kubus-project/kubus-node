@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RemoteComputeRuntime } from '../src/compute/remoteComputeRuntime.js';
+import { credentialFingerprint } from '../src/compute/credentialFingerprint.js';
 import type { Logger } from '../src/logging/logger.js';
 
 function fakeLogger() {
@@ -21,23 +22,37 @@ const baseConfig = {
   remoteComputeMaxInputBytes: 1024 * 1024 * 1024,
   remoteComputeMinimumFreeVramBytes: 0,
   localDataPath: '/tmp/kubus-test',
+  operatorToken: 'kubus_node_test-token-A',
 } as unknown as import('../src/config/schema.js').AppConfig;
 
-function buildRuntime(getProviderComputeJobs: () => Promise<{ jobs: unknown[] }>) {
+function buildRuntime(
+  getProviderComputeJobs: () => Promise<{ jobs: unknown[] }>,
+  options: { config?: Record<string, unknown>; initialState?: Record<string, unknown>; failStoreUpdates?: boolean } = {},
+) {
   const { logger, calls } = fakeLogger();
+  // Stateful on purpose: a durable authorization verdict has to survive a
+  // stop/start, which a store that discards every mutation cannot express.
+  const persisted: Record<string, unknown> = {
+    nodeId: 'node-1',
+    computeProviderSettings: undefined,
+    remoteJobs: {},
+    ...(options.initialState ?? {}),
+  };
   const store = {
-    snapshot: () => ({ nodeId: 'node-1', computeProviderSettings: undefined, remoteJobs: {} }),
+    snapshot: () => JSON.parse(JSON.stringify(persisted)) as Record<string, unknown>,
     update: async (mutator: (state: Record<string, unknown>) => void) => {
-      const state: Record<string, unknown> = { remoteJobs: {} };
-      mutator(state);
+      if (options.failStoreUpdates) throw new Error('state volume is read-only');
+      mutator(persisted);
+      return JSON.parse(JSON.stringify(persisted));
     },
   };
+  const config = { ...baseConfig, ...(options.config ?? {}) } as unknown as import('../src/config/schema.js').AppConfig;
   const api = { getProviderComputeJobs } as unknown as import('../src/backend/kubusApiClient.js').KubusApiClient;
   const runtime = new RemoteComputeRuntime({
     api,
     kubo: {} as unknown as import('../src/ipfs/kuboClient.js').KuboClient,
     store: store as unknown as import('../src/state/localStore.js').LocalStore,
-    config: baseConfig,
+    config,
     captures: {} as unknown as import('../src/captures/captureStore.js').CaptureStore,
     jobs: {} as unknown as import('../src/jobs/jobRuntime.js').JobRuntime,
     gate: {} as unknown as import('../src/participation/networkParticipationGate.js').NetworkParticipationGate,
@@ -45,7 +60,7 @@ function buildRuntime(getProviderComputeJobs: () => Promise<{ jobs: unknown[] }>
     transport: {} as unknown as import('../src/compute/privatePayloadTransport.js').PrivatePayloadTransport,
     logger,
   });
-  return { runtime, calls };
+  return { runtime, calls, persisted };
 }
 
 beforeEach(() => {
@@ -118,9 +133,12 @@ describe('RemoteComputeRuntime provider polling (Part 11 / Part 40)', () => {
     expect(recoveries).toHaveLength(1);
   });
 
-  it('treats a 403 scope rejection as a standing config fact, not a transient outage', async () => {
+  it('stops polling entirely after a single deterministic 403, and records why', async () => {
+    // The behaviour this replaced backed off to a 60s ceiling and kept going.
+    // That is still one rejected request per minute forever - the shape that
+    // produced 28,701 403s on /api/compute/provider/jobs from one node.
     const pollTimestamps: number[] = [];
-    const { runtime, calls } = buildRuntime(async () => {
+    const { runtime, calls, persisted } = buildRuntime(async () => {
       pollTimestamps.push(Date.now());
       throw Object.assign(
         new Error('Availability operator token missing scope: compute:jobs:read'),
@@ -129,18 +147,156 @@ describe('RemoteComputeRuntime provider polling (Part 11 / Part 40)', () => {
     });
 
     runtime.start();
-    await vi.advanceTimersByTimeAsync(180000);
-    runtime.stop();
-    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(0);
+    // A full hour of wall clock. Under the old ceiling behaviour this alone
+    // would have been sixty more requests.
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
 
+    expect(pollTimestamps).toHaveLength(1);
+    expect(persisted.computeAuthorization).toMatchObject({
+      state: 'AUTHORIZATION_REQUIRED',
+      status: 403,
+      missingScope: 'compute:jobs:read',
+      surface: 'provider_jobs',
+    });
     const warning = calls.find((c) => c.level === 'warn');
-    expect(warning?.message).toContain('operator token lacks the required scope');
-    expect(warning?.payload).toMatchObject({ status: 403, requiresOperatorAction: true });
+    expect(warning?.message).toContain('authorization required');
+    expect(warning?.payload).toMatchObject({ status: 403, requiresOperatorAction: true, pollingStopped: true });
+  });
 
-    // Straight to the 60s ceiling rather than climbing 5s -> 10s -> 20s...
-    // A real node logged 591 consecutive failures of exactly this kind.
-    const gap = (pollTimestamps[1] ?? 0) - (pollTimestamps[0] ?? 0);
-    expect(gap).toBeGreaterThanOrEqual(60000);
+  it('stops on a 401 as well - an invalid credential is equally deterministic', async () => {
+    let polls = 0;
+    const { runtime, persisted } = buildRuntime(async () => {
+      polls += 1;
+      throw Object.assign(new Error('invalid operator token'), { status: 401 });
+    });
+
+    runtime.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+
+    expect(polls).toBe(1);
+    expect(persisted.computeAuthorization).toMatchObject({ state: 'AUTHORIZATION_REQUIRED', status: 401 });
+  });
+
+  it('keeps polling with backoff when an authorization verdict cannot be persisted', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.5); // deterministic 5s first backoff
+    let polls = 0;
+    const { runtime, calls, persisted } = buildRuntime(
+      async () => {
+        polls += 1;
+        throw Object.assign(new Error('operator token missing scope'), { status: 403 });
+      },
+      { failStoreUpdates: true },
+    );
+
+    runtime.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(polls).toBeGreaterThanOrEqual(2);
+    expect(persisted.computeAuthorization).toBeUndefined();
+    const warning = calls.find((call) => call.message.includes('could not be persisted'));
+    expect(warning?.payload).toMatchObject({ status: 403, nextRetryMs: 5000 });
+    runtime.stop();
+  });
+
+  it('does not start polling at all when a blocked verdict names the credential in use', async () => {
+    // Restart behaviour. Re-learning the same 403 would put the request back on
+    // the backend, which is the noise this exists to end.
+    let polls = 0;
+    const { runtime } = buildRuntime(
+      async () => { polls += 1; return { jobs: [] }; },
+      {
+        initialState: {
+          computeAuthorization: {
+            state: 'AUTHORIZATION_REQUIRED',
+            status: 403,
+            credentialFingerprint: credentialFingerprint('kubus_node_test-token-A'),
+          },
+        },
+      },
+    );
+
+    runtime.start();
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    expect(polls).toBe(0);
+  });
+
+  it('resumes on its own when the credential is rotated', async () => {
+    // The verdict was recorded against a different token, so it says nothing
+    // about this one. No restart, no explicit retry.
+    let polls = 0;
+    const { runtime } = buildRuntime(
+      async () => { polls += 1; return { jobs: [] }; },
+      {
+        config: { operatorToken: 'kubus_node_rotated-token-B' },
+        initialState: {
+          computeAuthorization: {
+            state: 'AUTHORIZATION_REQUIRED',
+            status: 403,
+            credentialFingerprint: credentialFingerprint('kubus_node_test-token-A'),
+          },
+        },
+      },
+    );
+
+    runtime.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(polls).toBeGreaterThan(0);
+    runtime.stop();
+  });
+
+  it('retryAuthorization resumes polling for an operator who fixed the scope server-side', async () => {
+    let polls = 0;
+    const { runtime } = buildRuntime(
+      async () => { polls += 1; return { jobs: [] }; },
+      {
+        initialState: {
+          computeAuthorization: {
+            state: 'AUTHORIZATION_REQUIRED',
+            status: 403,
+            credentialFingerprint: credentialFingerprint('kubus_node_test-token-A'),
+          },
+        },
+      },
+    );
+
+    runtime.start();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(polls).toBe(0);
+
+    await runtime.retryAuthorization();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(polls).toBeGreaterThan(0);
+    runtime.stop();
+  });
+
+  it('a transient 500 still retries with backoff rather than blocking', async () => {
+    // Only 401/403 are deterministic. A backend outage must not disable the
+    // capability until an operator intervenes.
+    let polls = 0;
+    const { runtime, persisted } = buildRuntime(async () => {
+      polls += 1;
+      throw Object.assign(new Error('internal error'), { status: 500 });
+    });
+
+    runtime.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(10000);
+
+    expect(polls).toBeGreaterThan(1);
+    expect(persisted.computeAuthorization).toBeUndefined();
+    runtime.stop();
+  });
+
+  it('clears a stale blocked verdict once the credential authorizes again', async () => {
+    const { runtime, persisted } = buildRuntime(async () => ({ jobs: [] }));
+    runtime.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(persisted.computeAuthorization).toMatchObject({ state: 'OK' });
+    runtime.stop();
   });
 
   it('never logs a raw Authorization header value from a poll failure', async () => {
