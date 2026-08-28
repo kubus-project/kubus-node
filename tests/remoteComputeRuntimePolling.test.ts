@@ -180,6 +180,7 @@ describe('RemoteComputeRuntime provider polling (Part 11 / Part 40)', () => {
   });
 
   it('keeps polling with backoff when an authorization verdict cannot be persisted', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.5); // deterministic 5s first backoff
     let polls = 0;
     const { runtime, calls, persisted } = buildRuntime(
       async () => {
@@ -191,16 +192,12 @@ describe('RemoteComputeRuntime provider polling (Part 11 / Part 40)', () => {
 
     runtime.start();
     await vi.advanceTimersByTimeAsync(0);
-    // The backoff applies jitter, so advance through its complete first-retry
-    // window rather than assuming that every retry lands at exactly 5 seconds.
-    await vi.advanceTimersByTimeAsync(6000);
+    await vi.advanceTimersByTimeAsync(5000);
 
     expect(polls).toBeGreaterThanOrEqual(2);
     expect(persisted.computeAuthorization).toBeUndefined();
     const warning = calls.find((call) => call.message.includes('could not be persisted'));
-    expect(warning?.payload).toMatchObject({ status: 403 });
-    expect((warning?.payload as { nextRetryMs?: number }).nextRetryMs).toBeGreaterThanOrEqual(4000);
-    expect((warning?.payload as { nextRetryMs?: number }).nextRetryMs).toBeLessThanOrEqual(6000);
+    expect(warning?.payload).toMatchObject({ status: 403, nextRetryMs: 5000 });
     runtime.stop();
   });
 
