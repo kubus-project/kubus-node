@@ -191,7 +191,9 @@ describe('RemoteComputeRuntime provider polling (Part 11 / Part 40)', () => {
 
     runtime.start();
     await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(5000);
+    // The backoff applies jitter, so advance through its complete first-retry
+    // window rather than assuming that every retry lands at exactly 5 seconds.
+    await vi.advanceTimersByTimeAsync(6000);
 
     expect(polls).toBeGreaterThanOrEqual(2);
     expect(persisted.computeAuthorization).toBeUndefined();
