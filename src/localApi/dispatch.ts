@@ -5,10 +5,12 @@ import type { CaptureDraftPayload, CapturePackagePayload, CaptureStore } from '.
 import type { AppConfig } from '../config/schema.js';
 import { createIdentityProof, IDENTITY_PROOF_PROTOCOL_VERSION } from '../identity/identityProof.js';
 import type { NodeIdentity } from '../identity/nodeIdentity.js';
+import { signRemoteAttach, type NodeAuthorization } from '../identity/remoteAttach.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import type { JobRuntime, JobType } from '../jobs/jobRuntime.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
 import type { RemoteComputeRuntime } from '../compute/remoteComputeRuntime.js';
+import { computeAuthorizationRequired } from '../compute/credentialFingerprint.js';
 import type { LocalStore } from '../state/localStore.js';
 import { isValidCidLike, normalizeCid } from '../utils/cid.js';
 import { IdempotencyStore } from './idempotencyStore.js';
@@ -171,6 +173,25 @@ export async function dispatchLocalRequest(
 
   if (method === 'POST' && path === '/local/v1/pairing/exchange') {
     return exchangePairing(request, deps);
+  }
+
+  if (method === 'POST' && path === '/local/v1/pairing/remote-attach') {
+    if (request.peer.kind !== 'webrtc' || !request.peer.identityHandshakeComplete || !request.peer.sessionId) {
+      throw localError(403, 'remote_attach_verified_channel_required');
+    }
+    const body = await request.body.json(16 * 1024);
+    const grant = body.authorization as NodeAuthorization;
+    const verifier = body.verifier as string;
+    const nodeId = deps.store.snapshot().nodeId;
+    if (!nodeId) throw localError(409, 'node_registration_required');
+    const signature = signRemoteAttach(grant, verifier, request.peer.sessionId, nodeId, deps.identity);
+    const result = await deps.api.consumeNodeAuthorization(nodeId, grant.id, {
+      challenge: grant.challenge, signature, verifier,
+      sessionId: request.peer.sessionId, deviceId: grant.payload.deviceId,
+    });
+    if (result.authorized !== true || result.kind !== 'REMOTE_ATTACH' || result.nodeId !== nodeId
+      || result.deviceId !== grant.payload.deviceId) throw localError(403, 'remote_attach_not_authorized');
+    return jsonResponse(201, await deps.pairing.issueRemoteCredential(grant.id));
   }
 
   // Before the credential gate on purpose: a caller that has not yet proved
@@ -367,6 +388,10 @@ async function route(
       participation: await participationGate.refresh(),
       jobs: jobs.health(),
       captures: captures.list().length,
+      computeAuthorization: {
+        state: computeAuthorizationRequired(state.computeAuthorization, config.operatorToken)
+          ? 'COMPUTE_AUTHORIZATION_REQUIRED' : 'OK',
+      },
       worker: capabilities.getWorkerHealth(),
     });
   }

@@ -192,13 +192,26 @@ export class PairingService {
     if (Date.parse(session.expiresAt) <= Date.now()) throw localError(410, 'pairing_session_expired');
     if (!secret || !safeEqual(session.secretHash, digest(secret))) throw localError(401, 'invalid_pairing_secret');
 
-    const credentialId = crypto.randomUUID();
-    const token = `kubus_local_${crypto.randomBytes(32).toString('base64url')}`;
-    const scopes = [...LOCAL_SCOPES];
-    await this.store.update((next) => {
+    return this.issueCredential(label, (next) => {
       const current = next.pairingSessions?.[sessionId];
       if (!current || current.usedAt) throw localError(409, 'pairing_session_replayed');
       current.usedAt = new Date().toISOString();
+    });
+  }
+
+  // Called only after the backend consumes the session/device-bound grant.
+  // Local durable replay protection also covers an accidental caller retry.
+  async issueRemoteCredential(authorizationId: string): Promise<{ token: string; credentialId: string; scopes: LocalScope[] }> {
+    return this.issueCredential('art.kubus remote device', (next) => {
+      if (next.localCredentials?.[authorizationId]) throw localError(409, 'remote_attach_replayed');
+    }, authorizationId);
+  }
+
+  private async issueCredential(label: string | undefined, authorize: (state: ReturnType<LocalStore['snapshot']>) => void, credentialId: string = crypto.randomUUID()): Promise<{ token: string; credentialId: string; scopes: LocalScope[] }> {
+    const token = `kubus_local_${crypto.randomBytes(32).toString('base64url')}`;
+    const scopes = [...LOCAL_SCOPES];
+    await this.store.update((next) => {
+      authorize(next);
       (next.localCredentials ??= {})[credentialId] = {
         tokenHash: digest(token),
         label: label?.slice(0, 80),

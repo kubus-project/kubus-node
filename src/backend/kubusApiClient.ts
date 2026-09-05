@@ -16,6 +16,7 @@ import type {
 import type { AuthProvider } from './operatorAuth.js';
 import { Backoff } from '../scheduler/backoff.js';
 import { sleep } from '../utils/time.js';
+import type { NodeAuthorization } from '../identity/remoteAttach.js';
 
 export class KubusApiError extends Error {
   constructor(
@@ -78,6 +79,18 @@ export class KubusApiClient {
 
   registerNode(payload: RegisterNodePayload): Promise<AvailabilityNode> {
     return this.request('/api/availability/nodes/register', { method: 'POST', body: payload });
+  }
+
+  createIdentityChallenge(nodeId: string, publicKey: string): Promise<NodeAuthorization> {
+    return this.request(`/api/availability/nodes/${encodeURIComponent(nodeId)}/identity-challenges`, {
+      method: 'POST', body: { publicKey },
+    });
+  }
+
+  consumeNodeAuthorization(nodeId: string, id: string, body: Record<string, unknown>): Promise<{ authorized: boolean; kind: string; nodeId: string; deviceId?: string }> {
+    return this.request(`/api/availability/nodes/${encodeURIComponent(nodeId)}/authorizations/${encodeURIComponent(id)}/consume`, {
+      method: 'POST', body,
+    });
   }
 
   getCurrentNode(): Promise<NodeStatusSummary> {

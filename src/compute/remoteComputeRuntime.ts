@@ -13,7 +13,7 @@ import { validateSpatialManifest, type SpatialManifest } from '../spatial/models
 import { redactSecrets } from '../logging/logBuffer.js';
 import { Backoff } from '../scheduler/backoff.js';
 import type { LocalStore } from '../state/localStore.js';
-import { credentialFingerprint } from './credentialFingerprint.js';
+import { credentialFingerprint, computeAuthorizationRequired } from './credentialFingerprint.js';
 import type { ComputeIdentityService } from './computeIdentity.js';
 import { PrivatePayloadTransport, type ComputeKeyEnvelope } from './privatePayloadTransport.js';
 import { effectiveComputeProviderSettings, validateComputeProviderSettings, type ComputeProviderSettings } from './providerSettings.js';
@@ -102,10 +102,7 @@ export class RemoteComputeRuntime {
    * makes rotation resume polling without a restart or an explicit retry.
    */
   isAuthorizationBlocked(): boolean {
-    const recorded = this.deps.store.snapshot().computeAuthorization;
-    if (!recorded || recorded.state !== 'AUTHORIZATION_REQUIRED') return false;
-    if (!recorded.credentialFingerprint) return true;
-    return recorded.credentialFingerprint === this.currentCredentialFingerprint();
+    return computeAuthorizationRequired(this.deps.store.snapshot().computeAuthorization, this.deps.config.operatorToken);
   }
 
   /** Safe to log and to show an operator. Never contains the token. */

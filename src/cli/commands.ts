@@ -4,6 +4,7 @@ import { KubusApiClient } from '../backend/kubusApiClient.js';
 import { BearerAuthProvider } from '../backend/operatorAuth.js';
 import { parseEnv, persistedConfigPath, resolveNodeKey } from '../config/env.js';
 import { loadOrCreateNodeIdentity } from '../identity/nodeIdentity.js';
+import { enrollNodeIdentity } from '../identity/remoteAttach.js';
 import { KuboClient } from '../ipfs/kuboClient.js';
 import { getKuboHealth, waitForKubo } from '../ipfs/health.js';
 import { createLogger } from '../logging/logger.js';
@@ -152,6 +153,11 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     // configured HTTPS, or archive participation.
     const nodeId = store.snapshot().nodeId;
     if (nodeId) {
+      // Enrollment failure affects remote first attachment only. Local access,
+      // archive and existing pairings remain available during backend outages.
+      void enrollNodeIdentity(api, nodeId, identity).catch(() => {
+        logger.warn({ nodeId }, 'remote identity enrollment unavailable; existing pairings are preserved');
+      });
       signaling = new NodeSignalingClient({ config, nodeId, localApi, identity, logger });
       signaling.start();
     }

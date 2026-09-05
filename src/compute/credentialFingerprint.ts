@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import type { LocalState } from '../state/localStore.js';
 
 /**
  * A stable, non-reversible label for the operator token currently in use.
@@ -18,4 +19,9 @@ export function credentialFingerprint(token: string | undefined | null): string 
   const value = (token ?? '').trim();
   if (!value) return undefined;
   return crypto.createHash('sha256').update(DOMAIN).update('\0').update(value).digest('hex').slice(0, 16);
+}
+
+export function computeAuthorizationRequired(recorded: LocalState['computeAuthorization'], token: string | undefined): boolean {
+  if (!recorded || recorded.state !== 'AUTHORIZATION_REQUIRED') return false;
+  return !recorded.credentialFingerprint || recorded.credentialFingerprint === credentialFingerprint(token);
 }
