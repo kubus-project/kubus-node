@@ -24,8 +24,11 @@ export async function startSetupServer(env: NodeJS.ProcessEnv = process.env): Pr
   const configPath = env.KUBUS_NODE_CONFIG_PATH?.trim() || persistedConfigPath(env);
   const host = env.KUBUS_SETUP_HOST?.trim() || '0.0.0.0';
   const port = parsePort(env.KUBUS_SETUP_PORT || env.NODE_GUI_PORT || '8787');
+  const security = { nonce: crypto.randomBytes(32).toString('base64url'), port, saving: false, completed: false };
   const server = http.createServer((req, res) => {
-    void handle(req, res, configPath, env).catch(() => sendJson(res, 500, { success: false, error: 'Setup could not save the configuration.' }));
+    void handle(req, res, configPath, env, security).catch((error: unknown) => {
+      sendJson(res, error instanceof SetupRequestError ? error.status : 500, { success: false, error: 'Setup could not save the configuration.' });
+    });
   });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -37,20 +40,49 @@ export async function startSetupServer(env: NodeJS.ProcessEnv = process.env): Pr
   };
 }
 
-async function handle(req: http.IncomingMessage, res: http.ServerResponse, configPath: string, env: NodeJS.ProcessEnv): Promise<void> {
+class SetupRequestError extends Error {
+  constructor(readonly status: number) { super('Invalid setup request'); }
+}
+
+interface SetupSecurity {
+  nonce: string;
+  port: number;
+  saving: boolean;
+  completed: boolean;
+}
+
+async function handle(req: http.IncomingMessage, res: http.ServerResponse, configPath: string, env: NodeJS.ProcessEnv, security: SetupSecurity): Promise<void> {
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Content-Security-Policy', "frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+  const allowedHosts = [`127.0.0.1:${security.port}`, `localhost:${security.port}`, `[::1]:${security.port}`];
+  if (!req.headers.host || !allowedHosts.includes(req.headers.host)) throw new SetupRequestError(403);
+  if (req.headers['sec-fetch-site'] === 'cross-site') throw new SetupRequestError(403);
   const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
+  if (requestUrl.search) throw new SetupRequestError(400);
   if (req.method === 'GET' && requestUrl.pathname === '/setup') {
-    sendHtml(res, setupHtml());
+    sendHtml(res, setupHtml(security.nonce));
     return;
   }
   if (req.method === 'POST' && requestUrl.pathname === '/setup/config') {
-    const input = await readJson(req);
-    const config = setupConfig(input, env);
-    await writeConfig(configPath, config);
-    sendJson(res, 201, { success: true, restartRequired: true });
-    // Compose uses `restart: unless-stopped`; closing this bootstrap process
-    // is therefore the convergence point from unconfigured -> normal runtime.
-    setTimeout(() => process.exit(75), 150).unref();
+    if (req.headers.origin !== `http://${req.headers.host}`) throw new SetupRequestError(403);
+    if (req.headers['content-type']?.split(';')[0]?.trim().toLowerCase() !== 'application/json') throw new SetupRequestError(415);
+    const nonce = req.headers['x-kubus-setup-nonce'];
+    if (typeof nonce !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(nonce)
+        || !crypto.timingSafeEqual(Buffer.from(nonce), Buffer.from(security.nonce))) throw new SetupRequestError(403);
+    if (security.saving || security.completed) throw new SetupRequestError(409);
+    security.saving = true;
+    try {
+      const input = await readJson(req);
+      let config: Record<string, string>;
+      try { config = setupConfig(input, env); } catch { throw new SetupRequestError(400); }
+      await writeConfig(configPath, config);
+      security.completed = true;
+      sendJson(res, 201, { success: true, restartRequired: true });
+      // Compose uses `restart: unless-stopped`; closing this bootstrap process
+      // is therefore the convergence point from unconfigured -> normal runtime.
+      setTimeout(() => process.exit(75), 150).unref();
+    } finally { security.saving = false; }
     return;
   }
   sendJson(res, 404, { success: false, error: 'Not found' });
@@ -62,11 +94,12 @@ async function readJson(req: http.IncomingMessage): Promise<Record<string, unkno
   for await (const chunk of req) {
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += bytes.length;
-    if (size > MAX_BODY_BYTES) throw new Error('body_too_large');
+    if (size > MAX_BODY_BYTES) throw new SetupRequestError(413);
     chunks.push(bytes);
   }
-  const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid_body');
+  let parsed: unknown;
+  try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new SetupRequestError(400); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new SetupRequestError(400);
   return parsed as Record<string, unknown>;
 }
 
@@ -169,10 +202,10 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
   res.end(JSON.stringify(body));
 }
 
-function setupHtml(): string {
+function setupHtml(nonce: string): string {
   return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Set up kubus Node</title>
 <style>body{max-width:42rem;margin:3rem auto;padding:0 1rem;font:16px system-ui}label{display:block;margin:1rem 0}input{box-sizing:border-box;width:100%;padding:.6rem}button{padding:.7rem 1rem}small{color:#555}</style>
 <h1>Set up kubus Node</h1><p>Your captures stay on your Node. The network receives archive participation and short-lived connection coordination, never capture bytes.</p>
 <form id="f"><label>Node name<input name="nodeLabel" required maxlength="80"></label><label>art.kubus API URL<input name="apiBaseUrl" type="url" required placeholder="https://api.kubus.site"></label><label>Operator wallet<input name="operatorWallet" required></label><label>Scoped Node token<input name="operatorToken" type="password" required autocomplete="off"></label><label>Archive capacity (bytes)<input name="archiveBytes" type="number" min="1" value="53687091200"></label><label>Archive record limit<input name="archiveRecords" type="number" min="1" value="100"></label><label><input name="allowLan" type="checkbox"> Allow connections from devices on this network</label><small>When enabled, setup detects this PC's private LAN address and uses it in pairing. You never need to type an IP address.</small><label><input name="offerRemoteCompute" type="checkbox"> Offer compatible NVIDIA GPU capacity to the network</label><button>Save and start Node</button></form><p id="m" role="status"></p>
-<script>f.onsubmit=async e=>{e.preventDefault();m.textContent='Saving…';let d=Object.fromEntries(new FormData(f));d.allowLan=f.allowLan.checked;d.offerRemoteCompute=f.offerRemoteCompute.checked;let r=await fetch('/setup/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(d)});m.textContent=r.ok?'Saved. Node is restarting…':'Could not save setup. Check every field and try again.'}</script>`;
+<script>f.onsubmit=async e=>{e.preventDefault();m.textContent='Saving…';let d=Object.fromEntries(new FormData(f));d.allowLan=f.allowLan.checked;d.offerRemoteCompute=f.offerRemoteCompute.checked;let r=await fetch('/setup/config',{method:'POST',headers:{'content-type':'application/json','x-kubus-setup-nonce':'${nonce}'},body:JSON.stringify(d)});m.textContent=r.ok?'Saved. Node is restarting…':'Could not save setup. Check every field and try again.'}</script>`;
 }
