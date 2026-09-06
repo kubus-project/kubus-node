@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { promises as fs } from 'node:fs';
+import { createReadStream } from 'node:fs';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { CaptureStore, type CaptureDraftPayload } from '../src/captures/captureStore.js';
@@ -26,6 +28,35 @@ const draftPayload: CaptureDraftPayload = {
 };
 
 describe('streaming capture upload', () => {
+  it.each([10, 50, 95])('converges a 110 MiB streamed file after interruption at %i percent', async (percentage) => {
+    const store = await newStore();
+    const payload = { ...draftPayload, metadata: { ...draftPayload.metadata, localCaptureId: `large-${percentage}` } };
+    const draft = await store.beginDraft(payload);
+    const chunk = Buffer.alloc(256 * 1024, 0x6b);
+    const chunkCount = 440;
+    const interrupted = async function* () {
+      for (let index = 0; index < Math.floor(chunkCount * percentage / 100); index++) yield chunk;
+      throw new Error('simulated transport interruption');
+    };
+    await expect(store.writeDraftFileStream(draft.id, 'payload.bin', interrupted())).rejects.toThrow('simulated transport interruption');
+    expect(store.getDraft(draft.id).files).toEqual([]);
+    expect(store.getDraft(draft.id).sizeBytes).toBe(0);
+    const expected = createHash('sha256');
+    const complete = async function* () {
+      for (let index = 0; index < chunkCount; index++) { expected.update(chunk); yield chunk; }
+    };
+    await store.writeDraftFileStream(draft.id, 'payload.bin', complete());
+    const record = await store.commitDraft(draft.id);
+    expect(record.sizeBytes).toBe(110 * 1024 * 1024);
+    const actual = createHash('sha256');
+    for await (const bytes of createReadStream(path.join(record.directory, 'payload.bin'))) actual.update(bytes);
+    expect(actual.digest('hex')).toBe(expected.digest('hex'));
+    const retry = await store.beginDraft(payload);
+    await store.writeDraftFile(retry.id, 'payload.bin', chunk);
+    expect((await store.commitDraft(retry.id)).id).toBe(record.id);
+    expect(store.list()).toHaveLength(1);
+  }, 30000);
+
   it('stores files as raw bytes without base64 on the wire', async () => {
     const store = await newStore();
     const draft = await store.beginDraft(draftPayload);
