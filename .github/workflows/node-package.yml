@@ -2,6 +2,9 @@ name: Build kubus Node package
 
 on:
   workflow_call:
+    secrets:
+      KUBUS_AUTHENTICODE_SIGN_COMMAND:
+        required: false
     inputs:
       source_sha:
         required: false
@@ -82,8 +85,14 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
           NODE_IMAGE: ${{ inputs.node_image || 'ghcr.io/kubus-project/kubus-node@sha256:0000000000000000000000000000000000000000000000000000000000000000' }}
           WORKER_IMAGE: ${{ inputs.worker_image || 'ghcr.io/kubus-project/kubus-spatial-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000' }}
+          PUBLISH: ${{ inputs.publish }}
         run: |
           set -euo pipefail
+          if [[ "$PUBLISH" == "true" ]]; then
+            for image in "$NODE_IMAGE" "$WORKER_IMAGE"; do
+              if [[ "$image" =~ @sha256:0{64}$ ]]; then echo 'Fixture image digests cannot be released'; exit 1; fi
+            done
+          fi
           if [[ -z "$RELEASE_TAG" ]]; then RELEASE_TAG="v$(node -p "require('./version.json').version")"; fi
           node scripts/build_release_package.mjs --output release --tag "$RELEASE_TAG" --source-sha "${{ inputs.source_sha || github.sha }}" --node-image "$NODE_IMAGE" --worker-image "$WORKER_IMAGE"
           node scripts/verify_release_package.mjs --directory "release/kubus-node-windows-$RELEASE_TAG" --version "$(node -p "require('./version.json').version")"
@@ -101,5 +110,46 @@ jobs:
             release/*.tar.gz
             release/npm/*.tgz
             release/kubus-node-release-manifest-*.json
+          if-no-files-found: error
+          retention-days: ${{ inputs.publish && 30 || 7 }}
+
+  windows-installer:
+    name: Build and install the exact Windows EXE
+    needs: package
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.15.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: kubus-node-release-package-${{ inputs.release_tag || github.sha }}
+          path: release
+      - name: Install pinned compiler
+        shell: pwsh
+        run: |
+          winget install --id JRSoftware.InnoSetup --exact --version 6.7.3 --source winget --silent --disable-interactivity --accept-source-agreements --accept-package-agreements
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Inno Setup installation failed' }
+      - name: Compile, sign when configured, and test exact EXE bytes
+        shell: pwsh
+        env:
+          KUBUS_AUTHENTICODE_SIGN_COMMAND: ${{ secrets.KUBUS_AUTHENTICODE_SIGN_COMMAND }}
+        run: |
+          $version = (Get-Content version.json -Raw | ConvertFrom-Json).version
+          Expand-Archive -LiteralPath "release/kubus-node-windows-v$version.zip" -DestinationPath expanded
+          New-Item -ItemType Directory npm-expanded | Out-Null
+          $tarball = (Get-ChildItem release/npm/*.tgz).FullName
+          tar -xf $tarball -C npm-expanded
+          if ($LASTEXITCODE -ne 0) { throw 'npm extraction failed' }
+          $bundle = "expanded/kubus-node-windows-v$version"
+          ./scripts/build_windows_installer.ps1 -BundleDir $bundle -OutputDir release
+          ./scripts/verify_windows_installer.ps1 -Installer "release/KubusNodeSetup-$version-x64.exe" -BundleDir $bundle -NpmRuntimeDir npm-expanded/package/runtime
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kubus-node-windows-exe-${{ inputs.release_tag || github.sha }}
+          path: release/*.exe
           if-no-files-found: error
           retention-days: ${{ inputs.publish && 30 || 7 }}

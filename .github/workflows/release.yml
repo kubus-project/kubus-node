@@ -115,6 +115,7 @@ jobs:
     name: Package exact published images
     needs: [source-gate, images]
     uses: ./.github/workflows/node-package.yml
+    secrets: inherit
     with:
       source_sha: ${{ needs.source-gate.outputs.source_sha }}
       release_tag: ${{ github.ref_name }}
@@ -130,6 +131,10 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: kubus-node-release-package-${{ github.ref_name }}
+          path: release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: kubus-node-windows-exe-${{ github.ref_name }}
           path: release
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -153,12 +158,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          (cd release && sha256sum *.zip *.tar.gz *.spdx.json kubus-node-release-manifest-*.json npm/*.tgz > SHA256SUMS)
+          (cd release && sha256sum *.exe *.zip *.tar.gz *.spdx.json kubus-node-release-manifest-*.json npm/*.tgz > SHA256SUMS)
       - uses: softprops/action-gh-release@fe965f7af51af5f2602596916f38a38df2e33de0 # v3.0.2
         with:
           prerelease: ${{ needs.source-gate.outputs.prerelease == 'true' }}
           generate_release_notes: true
           files: |
+            release/*.exe
             release/*.zip
             release/*.tar.gz
             release/npm/*.tgz

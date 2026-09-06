@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { dirname, join, relative, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { createReleaseManifest } from './release_manifest.mjs';
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const options = parseArgs(process.argv.slice(2));
@@ -31,17 +32,14 @@ const compose = (await readFile(join(root, 'docker-compose.release.template.yml'
   .replaceAll('__KUBUS_NODE_IMAGE__', nodeImage)
   .replaceAll('__KUBUS_SPATIAL_WORKER_IMAGE__', workerImage);
 await writeFile(join(packageDir, 'docker-compose.release.yml'), compose, 'utf8');
-const releaseManifest = {
-  schemaVersion: 1,
+const releaseManifest = createReleaseManifest({
   version,
   channel: versionMetadata.channel,
   sourceSha,
   nodeImage,
   workerImage,
-  composeSha256: createHash('sha256').update(compose).digest('hex'),
-  minimumCliVersion: version,
-  protocolVersion: 3,
-};
+  compose,
+});
 await writeFile(join(packageDir, 'release-manifest.json'), `${JSON.stringify(releaseManifest, null, 2)}\n`, 'utf8');
 await writeFile(join(packageDir, 'release-metadata.json'), `${JSON.stringify({ version, tag, nodeImage, workerImage, releaseManifest }, null, 2)}\n`, 'utf8');
 await writeFile(join(packageDir, 'README-FIRST.txt'), firstReadme(tag), 'utf8');
