@@ -144,6 +144,18 @@ describe('dispatchLocalRequest', () => {
     ).rejects.toMatchObject({ statusCode: 401, code: 'local_credential_required' });
   });
 
+  it('retains credential-protected private result access when network participation expires', async () => {
+    deps.participationGate = { assertUsefulOperation: async () => { throw new Error('backend offline'); } } as never;
+    deps.jobs = { get: () => ({ id: 'j1', state: 'completed', output: { spatialId: 's1' } }) } as never;
+    await deps.store.update((state) => { state.spatial = { s1: { id: 's1', state: 'private_local' } }; });
+    for (const route of ['/local/v1/jobs/j1', '/local/v1/spatial/s1']) {
+      const response = await dispatchLocalRequest(request({ method: 'GET', path: route, credential: token }), deps);
+      expect(response.kind).toBe('json');
+      await expect(dispatchLocalRequest(request({ method: 'GET', path: route }), deps))
+        .rejects.toMatchObject({ statusCode: 401, code: 'local_credential_required' });
+    }
+  });
+
   it('serves the node identity to an authenticated, verified caller', async () => {
     const response = await dispatchLocalRequest(
       request({ method: 'GET', path: '/local/v1/info', credential: token }),

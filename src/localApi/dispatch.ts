@@ -528,7 +528,6 @@ async function route(
   const jobMatch = path.match(/^\/local\/v1\/jobs\/([^/]+)$/);
   if (method === 'GET' && jobMatch) {
     const job = jobs.get(jobMatch[1]!);
-    if (job.output) await participationGate.assertUsefulOperation('private_job_result_read');
     return jsonResponse(200, job);
   }
 
@@ -634,7 +633,6 @@ async function route(
 
   const spatialMatch = path.match(/^\/local\/v1\/spatial\/([^/]+)$/);
   if (method === 'GET' && spatialMatch) {
-    await participationGate.assertUsefulOperation('private_spatial_result_read');
     const value = store.snapshot().spatial?.[spatialMatch[1]!];
     if (!value) throw localError(404, 'spatial_not_found');
     return jsonResponse(200, value);

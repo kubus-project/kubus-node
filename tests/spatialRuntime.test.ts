@@ -53,7 +53,7 @@ async function waitForTerminal(jobs: { get: (id: string) => { state: string } },
 }
 
 describe('private spatial runtime', () => {
-  it('stores raw captures as private local records and fails jobs cleanly without a worker', async () => {
+  it('allows local processing during a backend outage and reports the actual worker failure', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-spatial-')); dirs.push(dir);
     const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
     const captures = new CaptureStore(dir, store);
@@ -61,7 +61,7 @@ describe('private spatial runtime', () => {
     expect(capture.private).toBe(true);
     expect(store.snapshot().desiredCids).toEqual([]);
     const jobs = new JobRuntime({ store, captureStore: captures, kubo: {} as never, logger: { warn: () => undefined } as never, dataRoot: dir, concurrency: 1,
-      participationGate: { assertUsefulOperation: async () => undefined } as never,
+      participationGate: { assertUsefulOperation: async () => { throw Object.assign(new Error('backend offline'), { code: 'NETWORK_PARTICIPATION_REQUIRED' }); } } as never,
       workerAuth: { issue: async () => 'token' } as never,
     });
     await jobs.start();
@@ -69,6 +69,9 @@ describe('private spatial runtime', () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(jobs.get(job.id).state).toBe('failed');
     expect(jobs.get(job.id).error?.code).toBe('worker_unavailable');
+    await expect(jobs.create('spatial.reconstruct', { captureId: capture.id, remoteComputeJobId: 'network-assignment' }))
+      .rejects.toMatchObject({ code: 'NETWORK_PARTICIPATION_REQUIRED' });
+    expect(jobs.list()).toHaveLength(1);
   });
 
   it('rejects dispatch against a configured worker the shared registry knows is unreachable, without a raw fetch attempt', async () => {
@@ -141,7 +144,7 @@ describe('private spatial runtime', () => {
     expect(jobs.get(job.id).error?.code).toBe('worker_unsupported');
   });
 
-  it('records started/completed processing analytics for a real successful job', async () => {
+  it('completes a local job and records analytics while backend participation is unavailable', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-spatial-')); dirs.push(dir);
     const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
     const captures = new CaptureStore(dir, store);
@@ -174,7 +177,7 @@ describe('private spatial runtime', () => {
       kubo: { addFileStreamed: async () => ({ Hash: 'bafyOutputCid' }), addBytes: async () => ({ Hash: 'bafyManifestCid' }) } as never,
       logger: { warn: () => undefined } as never,
       dataRoot: dir, concurrency: 1, workerUrl: 'http://kubus-spatial-worker:8790',
-      participationGate: { assertUsefulOperation: async () => undefined } as never,
+      participationGate: { assertUsefulOperation: async () => { throw new Error('backend offline and participation lease expired'); } } as never,
       workerAuth: { issue: async () => 'token' } as never,
       capabilities,
       analytics,

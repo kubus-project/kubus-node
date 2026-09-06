@@ -110,7 +110,9 @@ export class JobRuntime {
   }
 
   async create(type: JobType, input: Record<string, unknown>): Promise<LocalJob> {
-    await this.deps.participationGate.assertUsefulOperation(type);
+    // Network assignments retain participation authorization. A backend outage
+    // must not revoke an owner's ability to process their own local capture.
+    if (input.remoteComputeJobId) await this.deps.participationGate.assertUsefulOperation('remote_compute_execution');
     if (!['spatial.reconstruct', 'spatial.optimize', 'spatial.generate_preview'].includes(type)) throw localError(400, 'job_type_unsupported');
     const captureId = typeof input.captureId === 'string' ? input.captureId : '';
     if (!captureId) throw localError(400, 'job_capture_required');
@@ -170,7 +172,7 @@ export class JobRuntime {
 
   private async run(id: string, controller: AbortController): Promise<void> {
     try {
-      await this.deps.participationGate.assertUsefulOperation(this.get(id).type);
+      if (this.get(id).input.remoteComputeJobId) await this.deps.participationGate.assertUsefulOperation('remote_compute_execution');
       if (!this.deps.workerUrl) throw Object.assign(new Error('Spatial worker is not configured'), { code: 'worker_unavailable' });
       if (this.deps.capabilities) {
         await this.deps.capabilities.refreshIfStale();
