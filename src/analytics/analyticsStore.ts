@@ -148,6 +148,11 @@ export class AnalyticsStore {
     return file.buckets.filter((bucket) => Date.parse(bucket.bucketStart) >= cutoff);
   }
 
+  /** Wait for already queued writes before closing or removing this store. */
+  async flush(): Promise<void> {
+    await this.writeChain;
+  }
+
   private async persist(file: AnalyticsFile): Promise<void> {
     const next: AnalyticsFile = { schemaVersion: file.schemaVersion, buckets: file.buckets };
     this.writeChain = this.writeChain.then(() => this.atomicWrite(next));

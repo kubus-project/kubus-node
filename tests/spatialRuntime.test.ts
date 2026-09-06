@@ -191,6 +191,7 @@ describe('private spatial runtime', () => {
     expect(buckets[0]!.processing.totalInputBytes).toBe(capture.sizeBytes);
     expect(buckets[0]!.processing.totalOutputBytes).toBe(1234);
     expect(buckets[0]!.processing.totalDurationMs).toBeGreaterThanOrEqual(0);
+    await analytics.flush();
   });
 
   it('records cancelled processing analytics and stage for a user-cancelled job', async () => {
@@ -245,6 +246,7 @@ describe('private spatial runtime', () => {
     expect(buckets[0]!.processing.started).toBe(1);
     expect(buckets[0]!.processing.cancelled).toBe(1);
     expect(buckets[0]!.processing.completed).toBe(0);
+    await analytics.flush();
   });
 
   it('validates the versioned renderer-neutral spatial manifest', () => {
