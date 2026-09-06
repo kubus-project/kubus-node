@@ -29,6 +29,7 @@ import { RemoteComputeRuntime } from '../compute/remoteComputeRuntime.js';
 import { NodeSignalingClient } from '../webrtc/nodeSignalingClient.js';
 import { startSetupServer } from '../gui/setupServer.js';
 import { AnalyticsStore } from '../analytics/analyticsStore.js';
+import { recoverNetworkStartup } from '../runtime/networkStartup.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const command = argv[0] || 'start';
@@ -142,32 +143,40 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const gui = (config.guiEnabled || config.localApiEnabled) ? await startGuiServer({ api, kubo, store, config, logger, actionLock, analytics, localApi }) : null;
   let scheduler: Scheduler | null = null;
   let signaling: NodeSignalingClient | null = null;
-  try {
-    await actionLock.run('startup', () => bootstrapOnce(api, kubo, store, config, capabilities, participationGate, computeIdentity));
-    scheduler = new Scheduler({ api, kubo, store, config, logger, gate: participationGate, identity: computeIdentity, capabilities, actionLock });
-    scheduler.start();
-    remoteCompute.start();
-    // The signaling namespace authorizes the durable node id against the
-    // operator token, so it can only start after registration. It remains
-    // explicitly non-fatal: a signaling outage must not take down LAN access,
-    // configured HTTPS, or archive participation.
-    const nodeId = store.snapshot().nodeId;
-    if (nodeId) {
-      // Enrollment failure affects remote first attachment only. Local access,
-      // archive and existing pairings remain available during backend outages.
-      void enrollNodeIdentity(api, nodeId, identity).catch(() => {
-        logger.warn({ nodeId }, 'remote identity enrollment unavailable; existing pairings are preserved');
-      });
-      signaling = new NodeSignalingClient({ config, nodeId, localApi, identity, logger });
-      signaling.start();
-    }
-    logger.info({ nodeId: store.snapshot().nodeId }, 'kubus node started');
-  } catch (error) {
-    logger.error({ error: String((error as Error).message || error) }, 'kubus node startup failed');
-    if (!gui) throw error;
-    logger.warn({ guiUrl: gui.url }, 'GUI remains available for local diagnostics; scheduler was not started');
-  }
-  await waitForShutdown(scheduler, gui, remoteCompute, signaling);
+  const startupAbort = new AbortController();
+  const startup = recoverNetworkStartup({
+    signal: startupAbort.signal,
+    logger,
+    bootstrap: () => actionLock.run('startup', () => bootstrapOnce(api, kubo, store, config, capabilities, participationGate, computeIdentity)),
+    activate: () => {
+      scheduler = new Scheduler({ api, kubo, store, config, logger, gate: participationGate, identity: computeIdentity, capabilities, actionLock });
+      scheduler.start();
+      remoteCompute.start();
+      // The signaling namespace authorizes the durable node id against the
+      // operator token, so it can only start after registration. It remains
+      // explicitly non-fatal: a signaling outage must not take down LAN access,
+      // configured HTTPS, or archive participation.
+      const nodeId = store.snapshot().nodeId;
+      if (nodeId) {
+        // Enrollment failure affects remote first attachment only. Local access,
+        // archive and existing pairings remain available during backend outages.
+        void enrollNodeIdentity(api, nodeId, identity).catch(() => {
+          logger.warn({ nodeId }, 'remote identity enrollment unavailable; existing pairings are preserved');
+        });
+        signaling = new NodeSignalingClient({ config, nodeId, localApi, identity, logger });
+        signaling.start();
+      }
+      logger.info({ nodeId: store.snapshot().nodeId }, 'kubus node started');
+    },
+  });
+  await waitForShutdown({ stop: async () => {
+    startupAbort.abort();
+    // Backend requests have their own timeouts. A request completing after
+    // shutdown cannot activate services because recovery checks the signal.
+    await Promise.race([startup, new Promise<void>((resolve) => { setTimeout(resolve, 10000).unref(); })]);
+    await scheduler?.stop();
+    await signaling?.stop();
+  } }, gui, remoteCompute);
 }
 
 async function bootstrapOnce(api: KubusApiClient, kubo: KuboClient, store: LocalStore, config: ReturnType<typeof parseEnv>, capabilities: CapabilityRegistry, gate?: NetworkParticipationGate, identity?: ComputeIdentityService) {
@@ -216,7 +225,7 @@ async function doctor(api: KubusApiClient, kubo: KuboClient, config: ReturnType<
 }
 
 async function waitForShutdown(
-  scheduler: Scheduler | null,
+  scheduler: { stop(): Promise<void> } | null,
   gui?: GuiServerHandle | null,
   remoteCompute?: RemoteComputeRuntime,
   signaling?: NodeSignalingClient | null,
