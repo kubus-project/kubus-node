@@ -130,9 +130,9 @@ export class RuntimeManager {
   }
 
   private async dockerStatus(): Promise<DoctorReport['docker']> {
-    const engine = await run('docker', ['info']);
+    const engine = await run('docker', ['info'], true, 15000);
     if (engine.code !== 0) return { available: false, compose: false, detail: 'Docker Engine is unavailable. Install and start Docker Desktop (Windows) or Docker Engine (Linux).' };
-    const compose = await run('docker', ['compose', 'version']);
+    const compose = await run('docker', ['compose', 'version'], true, 15000);
     if (compose.code !== 0) return { available: true, compose: false, detail: 'Docker Compose v2 is required. Install the Docker Compose plugin and retry.' };
     return { available: true, compose: true };
   }
@@ -204,9 +204,9 @@ export function findPackageRoot(from = path.dirname(fileURLToPath(import.meta.ur
   }
 }
 
-function run(command: string, args: string[], capture = true): Promise<{ code: number; stdout: string; stderr: string }> {
+function run(command: string, args: string[], capture = true, timeout = 0): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const child = spawn(command, args, { stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'inherit', windowsHide: true, shell: false });
+    const child = spawn(command, args, { stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'inherit', windowsHide: true, shell: false, timeout, killSignal: 'SIGKILL' });
     let stdout = '';
     let stderr = '';
     child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
