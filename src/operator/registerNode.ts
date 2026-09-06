@@ -45,10 +45,16 @@ export async function registerNode(api: KubusApiClient, store: LocalStore, confi
 }
 
 export async function ensureRegistered(api: KubusApiClient, store: LocalStore, config: AppConfig, peerId: string, kuboHealth: KuboHealth) {
-  const current = await api.getCurrentNode().catch(() => null);
-  if (current?.node) {
+  const saved = store.snapshot();
+  if (saved.nodeId) {
+    // An account can own several Nodes. Its most recently seen Node is not
+    // necessarily this installation; never adopt that account-level shortcut.
+    const current = await api.getNodeStatus(saved.nodeId);
+    if (!current.node || current.node.id !== saved.nodeId
+        || (saved.nodeKey && current.node.nodeKey !== saved.nodeKey)) {
+      throw Object.assign(new Error('Registered Node identity does not match this installation'), { code: 'NODE_REGISTRATION_IDENTITY_MISMATCH' });
+    }
     await store.update((state) => {
-      state.nodeId = current.node?.id;
       state.node = current.node;
       state.latestStatus = current;
       state.peerId = peerId;
