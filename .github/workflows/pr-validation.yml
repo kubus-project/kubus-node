@@ -106,8 +106,12 @@ jobs:
         shell: pwsh
         run: |
           $digest = 'sha256:' + ('0' * 64)
+          # Derived, not hardcoded: a pinned literal silently stops matching the
+          # moment version.json is bumped, and this job then fails for reasons
+          # that have nothing to do with the change under review.
+          $version = (Get-Content -Raw version.json | ConvertFrom-Json).version
           node scripts/build_release_package.mjs --output release-contract --node-image "ghcr.io/kubus-project/kubus-node@$digest" --worker-image "ghcr.io/kubus-project/kubus-spatial-worker@$digest"
-          node scripts/verify_release_package.mjs --directory release-contract/kubus-node-windows-v0.8.0-alpha.4 --version 0.8.0-alpha.4
+          node scripts/verify_release_package.mjs --directory "release-contract/kubus-node-windows-v$version" --version $version
       - name: Install the exact npm tarball and exercise the installed CLI
         shell: pwsh
         run: |
