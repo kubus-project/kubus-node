@@ -1,6 +1,9 @@
 node_modules/
 dist/
 release-candidate/
+# Build output of the installer contract job; regenerated, never committed.
+release-contract/
+npm-contract/
 .env
 .env.*
 !.env.example
