@@ -560,10 +560,11 @@ async function route(
   // pairing cannot start one.
   if (path === '/local/v1/compute/permission-update' && (method === 'POST' || method === 'GET')) {
     if (!permissionUpdate) throw localError(503, 'permission_update_unavailable');
-    if (method === 'POST') {
-      if (!(await pairing.authorize(credential, 'compute:manage'))) throw localError(403, 'scope_required');
-      return jsonResponse(202, await permissionUpdate.begin());
-    }
+    // Both verbs require compute:manage: the read advances the exchange and
+    // writes the replacement credential, so it is not a read in the sense a
+    // narrower scope would imply.
+    if (!(await pairing.authorize(credential, 'compute:manage'))) throw localError(403, 'scope_required');
+    if (method === 'POST') return jsonResponse(202, await permissionUpdate.begin());
     return jsonResponse(200, await permissionUpdate.refresh());
   }
 
