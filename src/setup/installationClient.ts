@@ -100,6 +100,8 @@ export async function startInstallation(options: {
   label?: string | null;
   kind: InstallationKind;
   nodeId?: string | null;
+  /** Non-secret prefix of the credential this rotation replaces, if any. */
+  previousTokenPrefix?: string | null;
 }): Promise<StartedInstallation> {
   const claimVerifier = crypto.randomBytes(32).toString('base64url');
   const claimVerifierHash = crypto.createHash('sha256').update(claimVerifier).digest('hex');
@@ -123,6 +125,7 @@ export async function startInstallation(options: {
       signature,
       label: options.label ?? null,
       nodeId,
+      previousTokenPrefix: options.previousTokenPrefix ?? null,
     },
   );
   return {

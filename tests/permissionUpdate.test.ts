@@ -25,6 +25,7 @@ async function tempDir() {
 }
 
 const NODE_ID = '11111111-2222-4333-8444-555555555555';
+const CURRENT_TOKEN = `kubus_node_${'0'.repeat(16)}_${'1'.repeat(64)}`;
 const EXISTING_CONFIG = [
   'NODE_ENV="production"',
   'KUBUS_API_BASE_URL="https://api.kubus.site"',
@@ -37,7 +38,7 @@ const EXISTING_CONFIG = [
 interface Fake {
   origin: string;
   state: { value: string };
-  seen: { claimed: number; confirmed: number; kind?: string; nodeId?: string | null };
+  seen: { claimed: number; confirmed: number; kind?: string; nodeId?: string | null; previousTokenPrefix?: string | null };
   token: string;
   failClaim?: boolean;
 }
@@ -75,6 +76,7 @@ async function startFakeBackend(): Promise<Fake> {
       if (url === '/api/availability/node-installations') {
         fake.seen.kind = body.kind;
         fake.seen.nodeId = body.nodeId;
+        fake.seen.previousTokenPrefix = body.previousTokenPrefix;
         if (!verify('create', body.publicKey, body.signature, {
           id: null, userCode: null, publicKey: body.publicKey,
           claimVerifierHash: body.claimVerifierHash, kind: body.kind, nodeId: body.nodeId ?? null,
@@ -114,7 +116,7 @@ async function startFakeBackend(): Promise<Fake> {
   return fake;
 }
 
-async function newService(fake: Fake, overrides: { nodeId?: () => string | undefined } = {}) {
+async function newService(fake: Fake, overrides: { nodeId?: () => string | undefined; currentToken?: () => string | undefined } = {}) {
   const dir = await tempDir();
   const configPath = path.join(dir, 'config.env');
   await fs.writeFile(configPath, EXISTING_CONFIG);
@@ -124,6 +126,7 @@ async function newService(fake: Fake, overrides: { nodeId?: () => string | undef
     configPath,
     identity,
     nodeId: overrides.nodeId ?? (() => NODE_ID),
+    currentToken: overrides.currentToken ?? (() => CURRENT_TOKEN),
   });
   return { service, configPath, identity };
 }
@@ -139,6 +142,9 @@ describe('explicit compute permission update', () => {
     // Rotation targets the existing Node, never a re-enrolment.
     expect(fake.seen.kind).toBe('PERMISSION_UPDATE');
     expect(fake.seen.nodeId).toBe(NODE_ID);
+    // Names the credential being replaced, without its secret half.
+    expect(fake.seen.previousTokenPrefix).toBe(`kubus_node_${'0'.repeat(16)}`);
+    expect(JSON.stringify(fake.seen)).not.toContain('1'.repeat(64));
 
     expect((await service.refresh()).phase).toBe('WAITING_FOR_AUTHORIZATION');
     fake.state.value = 'AUTHORIZED';
@@ -215,6 +221,13 @@ describe('explicit compute permission update', () => {
     const fake = await startFakeBackend();
     const { service } = await newService(fake, { nodeId: () => undefined });
     await expect(service.begin()).rejects.toMatchObject({ code: 'NODE_NOT_REGISTERED' });
+  });
+
+  it('sends no prefix when the current credential is not a usable token', async () => {
+    const fake = await startFakeBackend();
+    const { service } = await newService(fake, { currentToken: () => undefined });
+    await service.begin();
+    expect(fake.seen.previousTokenPrefix).toBeNull();
   });
 
   it('replaceOperatorCredential refuses values that would corrupt the config file', async () => {

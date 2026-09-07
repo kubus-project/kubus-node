@@ -66,6 +66,12 @@ export async function replaceOperatorCredential(
   if (process.platform !== 'win32') await fs.chmod(configPath, 0o600);
 }
 
+/** `kubus_node_<16 hex>` from a full `kubus_node_<16 hex>_<64 hex>` token. */
+export function tokenPrefix(token: string | null | undefined): string | null {
+  const match = /^(kubus_node_[0-9a-f]{16})_[0-9a-f]{64}$/.exec((token || '').trim());
+  return match?.[1] ?? null;
+}
+
 export class PermissionUpdateService {
   private started: StartedInstallation | undefined;
   private phase: PermissionUpdatePhase = 'IDLE';
@@ -77,6 +83,8 @@ export class PermissionUpdateService {
     configPath: string;
     identity: NodeIdentity;
     nodeId: () => string | undefined;
+    /** The operator token this Node is running on, so the old one can be retired. */
+    currentToken?: () => string | undefined;
     logger?: Logger;
     /** Called once the replacement credential is durably stored. */
     onCredentialReplaced?: () => void;
@@ -109,6 +117,8 @@ export class PermissionUpdateService {
       kind: 'PERMISSION_UPDATE',
       nodeId,
       label: null,
+      // Only the prefix. The secret half of the current credential stays here.
+      previousTokenPrefix: tokenPrefix(this.deps.currentToken?.()),
     });
     this.phase = 'WAITING_FOR_AUTHORIZATION';
     return this.status();

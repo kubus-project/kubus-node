@@ -86,6 +86,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     configPath: process.env.KUBUS_NODE_CONFIG_PATH?.trim() || persistedConfigPath(),
     identity,
     nodeId: () => store.snapshot().nodeId,
+    currentToken: () => config.operatorToken,
     logger,
     onCredentialReplaced: () => { setTimeout(() => process.exit(75), 150).unref(); },
   });
