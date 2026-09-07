@@ -70,7 +70,9 @@ describe('setup HTTP security boundary', () => {
   it('saves once and rejects replay without replacing the configuration', async () => {
     const { origin, headers, configPath } = await setup();
     vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
-    const body = JSON.stringify({ nodeLabel: 'Home', apiBaseUrl: 'https://api.kubus.site', operatorWallet: 'wallet', operatorToken: 'kubus_node_test' });
+    // Advanced setup: manual token entry survives for operator recovery, but
+    // only when the person explicitly asked for it.
+    const body = JSON.stringify({ advanced: true, nodeLabel: 'Home', apiBaseUrl: 'https://api.kubus.site', operatorWallet: 'wallet', operatorToken: 'kubus_node_test' });
     const send = () => fetch(`${origin}/setup/config`, { method: 'POST', headers, body });
     expect((await send()).status).toBe(201);
     const saved = await fs.readFile(configPath, 'utf8');

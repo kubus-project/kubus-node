@@ -28,6 +28,7 @@ import { PrivatePayloadTransport } from '../compute/privatePayloadTransport.js';
 import { RemoteComputeRuntime } from '../compute/remoteComputeRuntime.js';
 import { NodeSignalingClient } from '../webrtc/nodeSignalingClient.js';
 import { startSetupServer } from '../gui/setupServer.js';
+import { PermissionUpdateService } from '../setup/permissionUpdate.js';
 import { AnalyticsStore } from '../analytics/analyticsStore.js';
 import { recoverNetworkStartup } from '../runtime/networkStartup.js';
 
@@ -77,7 +78,18 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const jobs = new JobRuntime({ store, captureStore: captures, kubo, logger, dataRoot: config.localDataPath, workerUrl: config.spatialWorkerUrl, concurrency: config.jobConcurrency, participationGate, workerAuth, capabilities, analytics });
   const privateTransport = new PrivatePayloadTransport({ captures, kubo, store, identity: computeIdentity, dataRoot: config.localDataPath, maxInputBytes: config.remoteComputeMaxInputBytes });
   const remoteCompute = new RemoteComputeRuntime({ api, kubo, store, config, captures, jobs, gate: participationGate, identity: computeIdentity, transport: privateTransport, logger });
-  const localApi = { api, kubo, store, config, capabilities, pairing, captures, jobs, participationGate, remoteCompute, identity };
+  // Explicit, account-authorized credential rotation for a Node paired before
+  // the current scope contract. Restarting is how the replacement takes
+  // effect, matching how setup converges from unconfigured to running.
+  const permissionUpdate = new PermissionUpdateService({
+    apiBaseUrl: config.apiBaseUrl,
+    configPath: process.env.KUBUS_NODE_CONFIG_PATH?.trim() || persistedConfigPath(),
+    identity,
+    nodeId: () => store.snapshot().nodeId,
+    logger,
+    onCredentialReplaced: () => { setTimeout(() => process.exit(75), 150).unref(); },
+  });
+  const localApi = { api, kubo, store, config, capabilities, pairing, captures, jobs, participationGate, remoteCompute, identity, permissionUpdate };
 
   if (command === 'status') {
     const live = await liveStatus(api, kubo);
