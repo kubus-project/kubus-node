@@ -4,6 +4,7 @@ import type { CapabilityRegistry } from '../capabilities/registry.js';
 import type { CaptureDraftPayload, CapturePackagePayload, CaptureStore } from '../captures/captureStore.js';
 import type { AppConfig } from '../config/schema.js';
 import { createIdentityProof, IDENTITY_PROOF_PROTOCOL_VERSION } from '../identity/identityProof.js';
+import type { PermissionUpdateService } from '../setup/permissionUpdate.js';
 import type { NodeIdentity } from '../identity/nodeIdentity.js';
 import { signRemoteAttach, type NodeAuthorization } from '../identity/remoteAttach.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
@@ -47,6 +48,8 @@ export interface LocalApiDeps {
    * transport keeps its own memory of what it has already done.
    */
   idempotency?: IdempotencyStore;
+  /** Absent where no persisted config exists to rewrite (tests, ad hoc runs). */
+  permissionUpdate?: PermissionUpdateService;
 }
 
 const SCOPE_BY_ROUTE: Array<[RegExp, LocalScope]> = [
@@ -357,7 +360,7 @@ async function route(
   request: LocalRequest,
   deps: LocalApiDeps,
 ): Promise<LocalResponse> {
-  const { pairing, store, config, capabilities, captures, jobs, participationGate, remoteCompute, kubo, api, identity } = deps;
+  const { pairing, store, config, capabilities, captures, jobs, participationGate, remoteCompute, kubo, api, identity, permissionUpdate } = deps;
   const credential = request.credential;
 
   if (method === 'GET' && path === '/local/v1/info') {
@@ -550,6 +553,19 @@ async function route(
   if (method === 'PUT' && path === '/local/v1/compute/settings') {
     if (!(await pairing.authorize(credential, 'compute:manage'))) throw localError(403, 'scope_required');
     return jsonResponse(200, await remoteCompute.updateSettings(await request.body.json(BODY_LIMITS.json)));
+  }
+
+  // Explicit permission rotation. Requires the same compute:manage scope as any
+  // other change to how this Node participates in compute, so a read-only
+  // pairing cannot start one.
+  if (path === '/local/v1/compute/permission-update' && (method === 'POST' || method === 'GET')) {
+    if (!permissionUpdate) throw localError(503, 'permission_update_unavailable');
+    // Both verbs require compute:manage: the read advances the exchange and
+    // writes the replacement credential, so it is not a read in the sense a
+    // narrower scope would imply.
+    if (!(await pairing.authorize(credential, 'compute:manage'))) throw localError(403, 'scope_required');
+    if (method === 'POST') return jsonResponse(202, await permissionUpdate.begin());
+    return jsonResponse(200, await permissionUpdate.refresh());
   }
 
   if (method === 'POST' && path === '/local/v1/compute/jobs') {

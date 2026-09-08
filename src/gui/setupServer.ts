@@ -3,6 +3,11 @@ import { promises as fs } from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { persistedConfigPath } from '../config/env.js';
+import { loadOrCreateNodeIdentity } from '../identity/nodeIdentity.js';
+import {
+  InstallationError, claimInstallation, confirmInstallation, pollInstallation, startInstallation,
+  type StartedInstallation,
+} from '../setup/installationClient.js';
 
 /**
  * A deliberately small first-start server, separate from the normal GUI.
@@ -24,7 +29,9 @@ export async function startSetupServer(env: NodeJS.ProcessEnv = process.env): Pr
   const configPath = env.KUBUS_NODE_CONFIG_PATH?.trim() || persistedConfigPath(env);
   const host = env.KUBUS_SETUP_HOST?.trim() || '0.0.0.0';
   const port = parsePort(env.KUBUS_SETUP_PORT || env.NODE_GUI_PORT || '8787');
-  const security = { nonce: crypto.randomBytes(32).toString('base64url'), port, saving: false, completed: false };
+  const security: SetupSecurity = {
+    nonce: crypto.randomBytes(32).toString('base64url'), port, saving: false, completed: false, starting: false,
+  };
   const server = http.createServer((req, res) => {
     void handle(req, res, configPath, env, security).catch((error: unknown) => {
       sendJson(res, error instanceof SetupRequestError ? error.status : 500, { success: false, error: 'Setup could not save the configuration.' });
@@ -49,6 +56,20 @@ interface SetupSecurity {
   port: number;
   saving: boolean;
   completed: boolean;
+  /** Guards concurrent installation starts, so one page cannot open many grants. */
+  starting: boolean;
+  apiBaseUrl?: string;
+  installation?: StartedInstallation;
+  /**
+   * The account-authorized credential, held in memory between the claim and the
+   * config write. It is never echoed back to the page.
+   */
+  credential?: { token: string; wallet: string };
+}
+
+/** The directory the durable Ed25519 identity lives in, before any config exists. */
+function stateDir(env: NodeJS.ProcessEnv): string {
+  return path.dirname(env.LOCAL_STATE_PATH?.trim() || '/var/lib/kubus-node/state.json');
 }
 
 async function handle(req: http.IncomingMessage, res: http.ServerResponse, configPath: string, env: NodeJS.ProcessEnv, security: SetupSecurity): Promise<void> {
@@ -64,19 +85,94 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, confi
     sendHtml(res, setupHtml(security.nonce));
     return;
   }
-  if (req.method === 'POST' && requestUrl.pathname === '/setup/config') {
+  // Every mutating setup route carries the identical guard. Account
+  // authorization is an additional route, never a way around these checks.
+  const assertMutation = (): void => {
     if (req.headers.origin !== `http://${req.headers.host}`) throw new SetupRequestError(403);
     if (req.headers['content-type']?.split(';')[0]?.trim().toLowerCase() !== 'application/json') throw new SetupRequestError(415);
     const nonce = req.headers['x-kubus-setup-nonce'];
     if (typeof nonce !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(nonce)
         || !crypto.timingSafeEqual(Buffer.from(nonce), Buffer.from(security.nonce))) throw new SetupRequestError(403);
-    if (security.saving || security.completed) throw new SetupRequestError(409);
+    if (security.completed) throw new SetupRequestError(409);
+  };
+
+  // Starts the account-authorized installation. The response carries only a
+  // short code the person reads; the claim verifier stays in this process.
+  if (req.method === 'POST' && requestUrl.pathname === '/setup/account/start') {
+    assertMutation();
+    if (security.starting) throw new SetupRequestError(409);
+    security.starting = true;
+    try {
+      const input = await readJson(req);
+      const apiBaseUrl = requiredUrl(input, 'apiBaseUrl');
+      const label = typeof input.nodeLabel === 'string' ? input.nodeLabel.trim().slice(0, 80) : null;
+      const identity = await loadOrCreateNodeIdentity(stateDir(env));
+      const started = await startInstallation({ apiBaseUrl, identity, label, kind: 'NODE_SETUP' });
+      security.apiBaseUrl = apiBaseUrl;
+      security.installation = started;
+      sendJson(res, 201, {
+        success: true,
+        userCode: started.userCode,
+        expiresAt: started.expiresAt,
+        fingerprint: identity.fingerprint,
+      });
+    } catch (error) {
+      security.installation = undefined;
+      throw error instanceof SetupRequestError ? error : new SetupRequestError(502);
+    } finally { security.starting = false; }
+    return;
+  }
+
+  // Polled by the setup page while the person authorizes in art.kubus. The
+  // credential lands in memory here and is written to disk by /setup/config.
+  if (req.method === 'POST' && requestUrl.pathname === '/setup/account/poll') {
+    assertMutation();
+    // Read (and therefore bound) the body before any state check, so every
+    // mutating route enforces the same 16 KiB limit in the same order.
+    await readJson(req);
+    const started = security.installation;
+    const apiBaseUrl = security.apiBaseUrl;
+    if (!started || !apiBaseUrl) throw new SetupRequestError(409);
+    if (security.credential) { sendJson(res, 200, { success: true, state: 'AUTHORIZED', ready: true }); return; }
+    let state: string;
+    try {
+      state = await pollInstallation({ apiBaseUrl, started });
+      if (state === 'AUTHORIZED') {
+        const identity = await loadOrCreateNodeIdentity(stateDir(env));
+        const claimed = await claimInstallation({ apiBaseUrl, identity, started });
+        security.credential = { token: claimed.token, wallet: claimed.wallet };
+      }
+    } catch (error) {
+      const code = error instanceof InstallationError ? error.code : 'NODE_INSTALLATION_FAILED';
+      sendJson(res, 200, { success: true, state: 'ERROR', ready: false, errorCode: code });
+      return;
+    }
+    sendJson(res, 200, { success: true, state, ready: Boolean(security.credential) });
+    return;
+  }
+
+  if (req.method === 'POST' && requestUrl.pathname === '/setup/config') {
+    assertMutation();
+    if (security.saving) throw new SetupRequestError(409);
     security.saving = true;
     try {
       const input = await readJson(req);
       let config: Record<string, string>;
-      try { config = setupConfig(input, env); } catch { throw new SetupRequestError(400); }
+      try { config = setupConfig(input, env, security.credential); } catch { throw new SetupRequestError(400); }
       await writeConfig(configPath, config);
+      // Only once the credential is durably on disk is the installation
+      // confirmed. A failure before this point leaves the grant unconsumed
+      // rather than burning it on a Node that never stored anything.
+      if (security.credential && security.installation && security.apiBaseUrl) {
+        try {
+          await confirmInstallation({
+            apiBaseUrl: security.apiBaseUrl,
+            identity: await loadOrCreateNodeIdentity(stateDir(env)),
+            started: security.installation,
+          });
+        } catch { /* The credential is already usable; confirmation retries on next start. */ }
+      }
+      security.credential = undefined;
       security.completed = true;
       sendJson(res, 201, { success: true, restartRequired: true });
       // Compose uses `restart: unless-stopped`; closing this bootstrap process
@@ -103,11 +199,35 @@ async function readJson(req: http.IncomingMessage): Promise<Record<string, unkno
   return parsed as Record<string, unknown>;
 }
 
-function setupConfig(input: Record<string, unknown>, env: NodeJS.ProcessEnv): Record<string, string> {
+/**
+ * Builds the runtime config.
+ *
+ * The ordinary path takes its credential from [accountCredential], produced by
+ * the account-authorized installation, so nobody is asked to paste a scoped
+ * operator token. Manual token entry survives only as an explicit Advanced
+ * choice for development and operator recovery; it is never the fallback when
+ * account authorization simply has not happened yet, because silently
+ * accepting a pasted token there would put the raw-token path back in front of
+ * ordinary users.
+ */
+function setupConfig(
+  input: Record<string, unknown>,
+  env: NodeJS.ProcessEnv,
+  accountCredential?: { token: string; wallet: string },
+): Record<string, string> {
   const apiUrl = requiredUrl(input, 'apiBaseUrl');
-  const operatorToken = requiredText(input, 'operatorToken', 1024);
+  const advanced = input.advanced === true;
+  let operatorToken: string;
+  let operatorWallet: string;
+  if (advanced) {
+    operatorToken = requiredText(input, 'operatorToken', 1024);
+    operatorWallet = requiredText(input, 'operatorWallet', 128);
+  } else {
+    if (!accountCredential) throw new Error('account_authorization_required');
+    operatorToken = accountCredential.token;
+    operatorWallet = accountCredential.wallet;
+  }
   if (!operatorToken.startsWith('kubus_node_')) throw new Error('operator_token_invalid');
-  const operatorWallet = requiredText(input, 'operatorWallet', 128);
   const nodeLabel = requiredText(input, 'nodeLabel', 80);
   const allowLan = input.allowLan === true;
   const statePath = env.LOCAL_STATE_PATH?.trim() || '/var/lib/kubus-node/state.json';
@@ -204,8 +324,42 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
 
 function setupHtml(nonce: string): string {
   return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Set up kubus Node</title>
-<style>body{max-width:42rem;margin:3rem auto;padding:0 1rem;font:16px system-ui}label{display:block;margin:1rem 0}input{box-sizing:border-box;width:100%;padding:.6rem}button{padding:.7rem 1rem}small{color:#555}</style>
+<style>body{max-width:42rem;margin:3rem auto;padding:0 1rem;font:16px system-ui;line-height:1.5}label{display:block;margin:1rem 0}input{box-sizing:border-box;width:100%;padding:.6rem}button{padding:.7rem 1rem}small{color:#555}code{font:600 1.6rem/1.2 ui-monospace,monospace;letter-spacing:.16em}details{margin:1.5rem 0;border-top:1px solid #ddd;padding-top:1rem}#step2{display:none}</style>
 <h1>Set up kubus Node</h1><p>Your captures stay on your Node. The network receives archive participation and short-lived connection coordination, never capture bytes.</p>
-<form id="f"><label>Node name<input name="nodeLabel" required maxlength="80"></label><label>art.kubus API URL<input name="apiBaseUrl" type="url" required placeholder="https://api.kubus.site"></label><label>Operator wallet<input name="operatorWallet" required></label><label>Scoped Node token<input name="operatorToken" type="password" required autocomplete="off"></label><label>Archive capacity (bytes)<input name="archiveBytes" type="number" min="1" value="53687091200"></label><label>Archive record limit<input name="archiveRecords" type="number" min="1" value="100"></label><label><input name="allowLan" type="checkbox"> Allow connections from devices on this network</label><small>When enabled, setup detects this PC's private LAN address and uses it in pairing. You never need to type an IP address.</small><label><input name="offerRemoteCompute" type="checkbox"> Offer compatible NVIDIA GPU capacity to the network</label><button>Save and start Node</button></form><p id="m" role="status"></p>
-<script>f.onsubmit=async e=>{e.preventDefault();m.textContent='Saving…';let d=Object.fromEntries(new FormData(f));d.allowLan=f.allowLan.checked;d.offerRemoteCompute=f.offerRemoteCompute.checked;let r=await fetch('/setup/config',{method:'POST',headers:{'content-type':'application/json','x-kubus-setup-nonce':'${nonce}'},body:JSON.stringify(d)});m.textContent=r.ok?'Saved. Node is restarting…':'Could not save setup. Check every field and try again.'}</script>`;
+<form id="f">
+<label>Node name<input name="nodeLabel" required maxlength="80"></label>
+<label>art.kubus API URL<input name="apiBaseUrl" type="url" required value="https://api.kubus.site"></label>
+<label>Archive capacity (bytes)<input name="archiveBytes" type="number" min="1" value="53687091200"></label>
+<label>Archive record limit<input name="archiveRecords" type="number" min="1" value="100"></label>
+<label><input name="allowLan" type="checkbox"> Allow connections from devices on this network</label>
+<small>When enabled, setup detects this PC's private LAN address and uses it in pairing. You never need to type an IP address.</small>
+<label><input name="offerRemoteCompute" type="checkbox"> Offer compatible NVIDIA GPU capacity to the network</label>
+<details><summary>Advanced setup</summary><p><small>For development and operator recovery only. An ordinary setup never needs these: signing in to art.kubus authorizes this Node for you.</small></p>
+<label><input id="adv" name="advanced" type="checkbox"> Configure a scoped Node token manually</label>
+<label>Operator wallet<input name="operatorWallet" autocomplete="off"></label>
+<label>Scoped Node token<input name="operatorToken" type="password" autocomplete="off"></label></details>
+<button id="go">Continue</button></form>
+<section id="step2"><h2>Authorize this Node</h2>
+<p>Open art.kubus, sign in, and choose <strong>Add a Node</strong>. Enter this code:</p>
+<p><code id="code"></code></p>
+<p><small>Node fingerprint: <span id="fp"></span></small></p></section>
+<p id="m" role="status"></p>
+<script>
+const body=()=>{let d=Object.fromEntries(new FormData(f));d.allowLan=f.allowLan.checked;d.offerRemoteCompute=f.offerRemoteCompute.checked;d.advanced=adv.checked;return d};
+const send=(p,d)=>fetch(p,{method:'POST',headers:{'content-type':'application/json','x-kubus-setup-nonce':'${nonce}'},body:JSON.stringify(d)});
+const save=async()=>{let r=await send('/setup/config',body());m.textContent=r.ok?'Saved. Node is restarting…':'Could not save setup. Check every field and try again.'};
+f.onsubmit=async e=>{e.preventDefault();
+  if(adv.checked){m.textContent='Saving…';return save()}
+  m.textContent='Starting authorization…';
+  let r=await send('/setup/account/start',body());
+  if(!r.ok){m.textContent='Could not reach art.kubus. Check the API URL and try again.';return}
+  let s=await r.json();code.textContent=s.userCode;fp.textContent=s.fingerprint.slice(0,16);
+  step2.style.display='block';go.disabled=true;m.textContent='Waiting for you to authorize this Node in art.kubus…';
+  const tick=async()=>{let p=await send('/setup/account/poll',{});let v=await p.json();
+    if(v.ready){m.textContent='Authorized. Saving…';return save()}
+    if(v.state==='DECLINED'){m.textContent='Authorization was declined in art.kubus.';go.disabled=false;return}
+    if(v.state==='EXPIRED'){m.textContent='That code expired. Choose Continue to get a new one.';go.disabled=false;step2.style.display='none';return}
+    setTimeout(tick,3000)};
+  setTimeout(tick,3000)};
+</script>`;
 }
