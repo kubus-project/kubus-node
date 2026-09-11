@@ -15,6 +15,7 @@ import { refreshRewards } from '../operator/rewards.js';
 import { buildStatusSummary, refreshStatus } from '../operator/status.js';
 import type { ActionLock } from '../runtime/actionLock.js';
 import type { LocalStore } from '../state/localStore.js';
+import type { RemoteConnectionDiagnostic } from '../webrtc/peerRoute.js';
 import { guiCss } from './public/guiCss.js';
 import { guiJs } from './public/guiJs.js';
 import { assertGuiConfig, authorizeGuiRequest, guiRemoteMode, sendUnauthorized } from './guiAuth.js';
@@ -46,6 +47,8 @@ export interface GuiDeps {
   localApi?: LocalApiDeps;
   /** Optional so narrow tests of unrelated routes don't need to construct one. */
   analytics?: AnalyticsStore;
+  /** Late-bound: signaling starts after registration, long after the GUI does. */
+  remoteConnections?: () => RemoteConnectionDiagnostic[];
 }
 
 const ANALYTICS_RANGES: readonly AnalyticsRange[] = ['24h', '7d', '30d'];
@@ -367,6 +370,7 @@ async function buildGuiView(deps: GuiDeps) {
       operatorTokenConfigured: Boolean(deps.config.operatorToken),
     },
     captureCount: captures.length,
+    remoteConnections: deps.remoteConnections?.() ?? [],
   });
 }
 

@@ -20,6 +20,7 @@ import type { SpatialWorkerHealth } from '../capabilities/registry.js';
 import type { ComputeProviderSettings } from '../compute/providerSettings.js';
 import { formatFingerprint } from '../identity/nodeIdentity.js';
 import type { LocalState } from '../state/localStore.js';
+import type { RemoteConnectionDiagnostic } from '../webrtc/peerRoute.js';
 import {
   RECIPROCITY_EXPLANATION,
   describeGpu,
@@ -64,6 +65,8 @@ export interface ViewModelInput {
     operatorTokenConfigured: boolean;
   };
   captureCount: number;
+  /** Connected art.kubus devices and how each is carried. Absent where signaling never started. */
+  remoteConnections?: RemoteConnectionDiagnostic[];
   now?: number;
 }
 
@@ -182,6 +185,11 @@ export interface NodeViewModel {
     guiExposure: string;
     operatorTokenConfigured: boolean;
     guiTokenConfigured: boolean;
+    /**
+     * How each connected device is carried. Candidate kinds only, and the one
+     * place relay vocabulary may appear: it is diagnostic, never a headline.
+     */
+    remoteConnections: Array<{ session: string; verified: boolean; route: string; detail: string }>;
   };
 }
 
@@ -247,7 +255,26 @@ export function buildViewModel(input: ViewModelInput): NodeViewModel {
       guiExposure: input.config.guiRemoteMode ? 'Reachable beyond this computer' : 'This computer only',
       operatorTokenConfigured: input.config.operatorTokenConfigured,
       guiTokenConfigured: input.config.guiTokenConfigured,
+      remoteConnections: (input.remoteConnections ?? []).map(describeRemoteConnection),
     },
+  };
+}
+
+const ROUTE_LABELS: Record<RemoteConnectionDiagnostic['route'], string> = {
+  relay: 'Relayed through TURN',
+  direct: 'Direct peer connection',
+  unknown: 'Route not yet reported',
+};
+
+function describeRemoteConnection(connection: RemoteConnectionDiagnostic) {
+  const { local, remote } = connection;
+  return {
+    session: connection.session,
+    verified: connection.verified,
+    route: ROUTE_LABELS[connection.route],
+    detail: local && remote
+      ? `local ${local.type}/${local.transport} · remote ${remote.type}/${remote.transport}`
+      : 'Candidate types not yet reported',
   };
 }
 

@@ -119,8 +119,10 @@ export const KUBUS_CHANNEL = '${manifest.channel || 'beta'}'
   const dockerfilePath = path.join(rootDir, 'Dockerfile');
   if (fs.existsSync(dockerfilePath)) {
     const dockerfile = fs.readFileSync(dockerfilePath, 'utf8').replace(
-      /LABEL org\.opencontainers\.image\.version="[^"]+"/,
-      `LABEL org.opencontainers.image.version="${manifest.version}"`,
+      // The Dockerfile declares its labels as one multi-line LABEL, so the key
+      // is on a continuation line; requiring "LABEL" beside it never matched.
+      /org\.opencontainers\.image\.version="[^"]+"/,
+      `org.opencontainers.image.version="${manifest.version}"`,
     );
     fs.writeFileSync(dockerfilePath, dockerfile, 'utf8');
   }
