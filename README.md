@@ -1,179 +1,135 @@
 # kubus Node
 
-### Local & distributed Gaussian splatting for a decentralised spatial archive.
+[![CI](https://img.shields.io/github/actions/workflow/status/kubus-project/kubus-node/pr-validation.yml?branch=master&label=CI)](https://github.com/kubus-project/kubus-node/actions/workflows/pr-validation.yml)
+[![Current release including prereleases](https://img.shields.io/github/v/release/kubus-project/kubus-node?include_prereleases&label=release)](https://github.com/kubus-project/kubus-node/releases)
+[![npm edge publication pending](https://img.shields.io/badge/npm-edge%20pending-777777)](#release-channels)
+[![Docker runtime](https://img.shields.io/badge/runtime-Docker-777777)](docs/RELEASES.md)
+[![Source available](https://img.shields.io/badge/source-available-777777)](#source-status)
 
-Process spatial captures on your own GPU — or use an available GPU on the
-Kubus network. Published spatial archives are distributed through
-community-run nodes instead of depending on a single storage provider.
+Local runtime and public archive Node for art.kubus.
 
-**Your GPU when you have one. The Kubus network when you don't.**
+Keep the public art archive available. Process Spatial captures on your own
+hardware. Connect securely from art.kubus.
 
-> kubus Node is a network participant, not a standalone Gaussian-splatting
-> utility. The official runtime makes spatial-processing functionality
-> available while the node is actively contributing storage and availability
-> to the public art archive.
+[Download for Windows](https://node.kubus.site/download/windows) ·
+[Install](https://node.kubus.site/install) ·
+[Documentation](https://node.kubus.site/docs) ·
+[node.kubus.site](https://node.kubus.site)
 
-**Private compute in exchange for public infrastructure.** Operators receive local reconstruction, private local jobs, spatial-archive access and optional distributed GPU access. In return, every active official runtime must contribute backend-policy-compliant capacity to the canonical public archive.
+## Install
 
-```mermaid
-flowchart TD
-  C[Spatial capture] --> N[kubus Node]
-  N -->|compatible local GPU| L[Local Gaussian reconstruction]
-  N -->|network processing| P[Selected compute kubus Node]
-  P --> G[Private Gaussian-splat result]
-  L --> R[Review]
-  G --> R
-  R -->|explicit publish| A[Canonical spatial archive]
-  A --> A1[Node A]
-  A --> A2[Node B]
-  A --> A3[Node C]
-  A1 --> K1[Archive KUB8]
-  P --> K2[Compute KUB8]
-```
+### Windows
 
-## In 30 seconds
+[Download kubus Node for Windows x64](https://node.kubus.site/download/windows).
+Have Docker Desktop running with its WSL 2 backend, install kubus Node, and open
+setup. Sign in to art.kubus, review the permissions, and authorize the Node.
+It then appears in My Nodes. Normal setup does not require a manual operator token.
 
-kubus Node combines five boundaries in one source-available runtime:
+### npm
 
-- a Kubo/IPFS public archive participant with deterministic, byte-aware HOT/WARM/COLD replication;
-- a paired `/local/v1` API for art.kubus without exposing operator credentials;
-- an optional NVIDIA/CUDA Nerfstudio + gsplat worker for local Gaussian-splat reconstruction;
-- an optional distributed-compute provider that receives encrypted temporary IPFS payloads under backend-issued leases;
-- deliberate CID-first publication: private inputs and outputs are never canonical merely because a node reports them.
-
-The art.kubus backend is the matchmaking and canonical trust boundary. It does not proxy large capture bytes and it is not a central Gaussian-processing server.
-
-## Local Gaussian splatting
-
-The local path is phone → paired node → private capture → local NVIDIA GPU → unpublished preview → user review → optional publication. Raw RGB, camera poses, intrinsics and depth remain below the node's private data root. Local/self jobs create no compute reward.
-
-The worker uses the official Nerfstudio `1.1.5` image, `splatfacto`, and its compatible pinned `gsplat 1.4.0`. NVIDIA/CUDA is the only supported reconstruction target in this alpha. CPU reconstruction is not claimed or silently simulated.
-
-## Distributed GPU compute
-
-GPU sharing is opt-in. A requester discovers fresh, contributing, compatible nodes; chooses automatic ranking or a specific provider; encrypts the capture locally with AES-256-GCM; wraps the data key to the provider's X25519 key through HKDF; and adds only encrypted bytes to Kubo. The provider temporarily pins, decrypts and processes those bytes, returns content-addressed output, and removes its plaintext work directory.
-
-The remote provider necessarily sees plaintext source data while running the job. Transport encryption protects the path and backend, not against the selected provider. For maximum privacy, process locally.
-
-## Mandatory network participation
-
-kubus Node is a network participant, not a standalone Gaussian-splatting utility. `NetworkParticipationGate` exposes `UNCONFIGURED`, `JOINING`, `CONTRIBUTING`, `DEGRADED`, and `LOCKED`. Spatial processing becomes available only after the node has verified its contribution to the public art archive: registration, backend policy, healthy Kubo, policy-minimum configured capacity, a synchronized non-empty canonical pin plan, successful reconciliation of every planned CID, an active scheduler, and an accepted current heartbeat must coincide. A heartbeat alone establishes liveness, not participation. `MAX_PINNED_BYTES=1`, production skip-pinning, `kubus-node gui`, and direct local API calls do not bypass the gate.
-
-A short outage may enter `DEGRADED` only after successful participation was previously verified: running work is not killed, canonical public content remains readable, and diagnostics remain available. New work locks after the grace period. A fresh or never-verified node remains `JOINING`. See [participation](docs/PARTICIPATION.md).
-
-## First install (Windows, no terminal)
-
-Download and extract `kubus-node-windows-vX.Y.Z.zip`, then open
-`Start-KubusNodeSetup.cmd`. It checks that Docker Desktop is running and has at
-least 10 GiB free, pulls the immutable images recorded in
-`docker-compose.release.yml`, starts the local stack, and opens
-`http://127.0.0.1:8787/setup`. The setup page collects the scoped Node token,
-creates a random GUI credential, writes a mode-0600 configuration beside the
-durable Node identity, then restarts into the normal GUI. The LAN toggle
-detects the PC's private address and recreates the runtime on `0.0.0.0`; when
-off it remains loopback-only. Normal pairing never asks a user to type an IP
-address. Stopping/uninstalling preserves Docker volumes by default; the
-explicit volume-delete confirmation is the only destructive path.
-
-Windows is archive-only in this release. Local NVIDIA reconstruction is only
-supported on validated Linux Docker + NVIDIA/CUDA hosts; use remote processing
-from Windows rather than claiming unsupported local GPU support.
-
-## Operator CLI (npm)
-
-`@kubus/kubus-node` is an optional cross-platform control and bootstrap CLI.
-It is not a second Node implementation: production services always run from
-the digest-pinned Kubernetes Node and spatial-worker container images in the
-release manifest. The Windows ZIP remains the preferred normal-user Windows
-installer.
-
-Linux x64 and Windows x64 operators can install the exact release CLI with:
+The alpha channel is `edge`. These are the channel commands:
 
 ```sh
-npm install -g @kubus/kubus-node
-# or without a global install
-npx @kubus/kubus-node setup
+npm install -g @kubus/kubus-node@edge
+kubus-node setup
 ```
 
-Docker Engine plus Compose v2 is required. `kubus-node setup` validates Docker,
-pulls the immutable release images, starts only the loopback bootstrap service,
-and opens the same setup wizard as the Windows installer. No checkout, source
-build, manual `.env`, or `docker compose --build` is used. `setup --headless`
-starts that loopback wizard without opening a browser, for access through an
-SSH tunnel on a server. `kubus-node doctor --json` is safe for automation.
-
-Use `kubus-node update` only after deliberately selecting the desired released
-CLI version (for example `npx @kubus/kubus-node@beta update`); it applies that
-package's verified immutable runtime manifest and preserves Docker volumes.
-`npm uninstall -g @kubus/kubus-node` removes only the CLI. It never removes the
-Node runtime, identity, pairings, Kubo archive, or captures. Use
-`kubus-node uninstall` to stop the runtime while preserving data, or add both
-`--delete-data --yes-delete-data` for the explicitly destructive path.
-
-NPM channels track runtime channels: alpha uses `edge`, beta uses `beta`, and
-stable uses `latest`. macOS is intentionally unsupported for this alpha CLI.
-
-## Quick start (operators)
+Or, without a global install:
 
 ```sh
-cp .env.example .env
+npx @kubus/kubus-node@edge setup
+```
+
+**Publication status, verified 2026-09-11:** alpha.5's public npm publication
+failed after its tested GitHub assets were published. The public registry
+currently returns 404. Until this is repaired, install the exact official
+release tarball instead:
+
+```sh
+npm install -g https://github.com/kubus-project/kubus-node/releases/download/v0.8.0-alpha.5/kubus-kubus-node-0.8.0-alpha.5.tgz
+kubus-node setup
+```
+
+Use `kubus-node doctor --json` for diagnostics. Both installers start the
+release's digest-pinned Docker runtime; they do not build a checkout.
+
+## What it does
+
+- Stores and serves canonical public cultural records in the distributed archive.
+- Runs local Gaussian reconstruction on compatible NVIDIA/CUDA hardware, or requests processing from a selected network provider.
+- Connects owned Nodes to art.kubus using the supported WebRTC/TURN transport.
+
+The official runtime requires archive participation. Sharing a GPU as a remote
+compute provider is optional. [Runtime guide](docs/node-runtime-guide.md).
+
+## Privacy
+
+**PROCESS ≠ PUBLISH. SYNC ≠ PUBLISH.**
+
+Local processing keeps raw capture processing on your Node. A selected remote
+provider necessarily sees plaintext while processing; transport encryption does
+not make that provider blind. Output in ordinary Kubo is unlisted and
+non-canonical until publication, but someone who knows its CID may be able to
+retrieve it. Explicit authorized publication creates canonical public state.
+[Privacy details](docs/PRIVACY.md).
+
+## Requirements
+
+- Windows x64 or Linux x64; Docker Engine with Compose v2. The npm CLI needs Node.js >=20.19 and npm >=10. macOS is unsupported by this alpha CLI.
+- No GPU is needed for archive participation. Windows can request remote processing; local Windows GPU reconstruction is not validated in this release.
+- Local reconstruction/provider: validated Linux Docker host, NVIDIA/CUDA, NVIDIA Container Toolkit and sufficient VRAM. CPU reconstruction is unsupported.
+- Archive capacity is controlled by backend policy. The source example allocates 50 GiB; the Windows launcher checks at least 10 GiB free. Allow additional space for runtime images, captures and output.
+
+## Architecture
+
+[Architecture](docs/architecture.md) · [Local API](docs/LOCAL_API.md) ·
+[Spatial](docs/SPATIAL.md) · [Remote transport](docs/REMOTE_TRANSPORT.md) ·
+[Distributed compute](docs/DISTRIBUTED_COMPUTE.md) ·
+[Participation](docs/PARTICIPATION.md) · [Security](docs/security.md)
+
+The backend is the matchmaking and canonical trust boundary, not a central
+capture-processing server. Archive contribution, compute-provider compensation
+and public Spatial contribution are separate records. KUB8 settlement remains
+pending; there is no guaranteed payout or market return. [Contribution details](docs/REWARDS.md).
+
+## Development
+
+Installing a released Node does not require source development. For a checkout:
+
+```sh
+git clone https://github.com/kubus-project/kubus-node.git
+cd kubus-node
+npm ci
+npm run typecheck
+npm test
+```
+
+Configure `.env` from `.env.example` using the [operator guide](docs/operator-guide.md), then:
+
+```sh
 docker compose up --build
-```
-
-Set a scoped operator token, operator identity, node label, reachable endpoint and strong local GUI token. The backend policy currently controls the minimum committed public-archive capacity; the example allocates 50 GiB.
-
-Spatial-capable NVIDIA/CUDA host:
-
-```sh
+# Compatible NVIDIA/CUDA development host:
 docker compose --profile spatial up --build
 ```
 
-Kubo RPC and worker HTTP remain private to the Compose network. The Kubo gateway and node UI are loopback-bound by default.
+## Release channels
 
-## Hardware
+| Release | npm / image alias |
+| --- | --- |
+| Alpha | `edge` |
+| Beta | `beta` |
+| Stable | `latest` |
 
-- Archive-only: any current x86-64/ARM64 Docker host with enough disk for the configured contribution.
-- Reconstruction/provider: Linux Docker host, NVIDIA GPU and driver compatible with the pinned Nerfstudio CUDA image, plus adequate VRAM for the requested tier.
-- Remote-provider mode: explicitly set `OFFER_REMOTE_COMPUTE=true`; use concurrency, queue, input-size and free-VRAM limits from `.env.example`.
+Floating image tags are discovery aliases. Reproducible operation uses the
+manifest's image digests and `docker-compose.release.yml` in the official
+[release ZIP](https://node.kubus.site/download/zip). Verify the
+[checksums](https://node.kubus.site/download/checksums) and inspect the
+[manifest](https://node.kubus.site/download/manifest). GitHub Actions artifacts
+are not public distribution endpoints. [Release contract](docs/RELEASES.md).
 
-## Capture privacy and publication
+## Source status
 
-Private captures and encrypted temporary inputs never enter the public object registry or public pin set. Processed output added to the node's ordinary Kubo is **unpublished and unlisted, not cryptographically private**: it is not canonical or replicated by archive policy, but a party who learns its CID may be able to retrieve it. Publication requires an authenticated artwork owner (or authorised moderator), valid CID/size/MIME roles, retrievability where policy requires it, and backend canonicalisation. Supported spatial roles are `spatial_preview` (HOT), `spatial_mobile` (WARM), and `spatial_archive` (COLD), grouped under one object/version bundle.
-
-CID identity is canonical. Retrieval is local Kubo first, then IPFS/provider discovery and Kubus peers, then configured HTTP gateways with CID verification; legacy backend files are a final compatibility fallback where still required. No architecture depends on `ipfs.io`.
-
-## Two KUB8 contribution rails
-
-Archive availability uses the historical `public-archive-stewardship-1` records unchanged and current `public-archive-stewardship-2` bundle-aware scoring. Verified canonical bytes, retrieval, reliability, policy classes, capped logarithmic weighting and diminishing returns drive an independent archive pool.
-
-Distributed compute uses backend-issued leases, distinct requester/provider operators, signed provider receipts, a separately signed requester acknowledgement, retrievable output, `spatial-compute-units-1`, fraud caps and a separate compute pool. Raw GPU seconds, owning hardware, local jobs, failed/expired/cancelled work and duplicate receipts earn zero.
-
-Both are pending control-plane records. Settlement is not active; KUB8 has no guaranteed payout or market return.
-
-## Architecture and APIs
-
-- [Architecture](docs/architecture.md)
-- [Local API](docs/LOCAL_API.md)
-- [Spatial processing](docs/SPATIAL.md)
-- [Participation gate](docs/PARTICIPATION.md)
-- [Distributed compute](docs/DISTRIBUTED_COMPUTE.md)
-- [Rewards](docs/REWARDS.md)
-- [Privacy](docs/PRIVACY.md)
-- [Remote paired-device transport](docs/REMOTE_TRANSPORT.md)
-- [Security](docs/security.md)
-- [Operator guide](docs/operator-guide.md)
-- [Release channels](docs/RELEASES.md)
-
-## Current limitations
-
-- Alpha transport uses encrypted temporary IPFS payloads; direct QUIC/libp2p job transfer is not yet the preferred implementation.
-- A selected compute provider sees plaintext while processing. Secure hardware/provider-proof privacy is not claimed.
-- Reconstruction currently exports the archival PLY variant. Additional preview/mobile optimisation remains renderer-version dependent.
-- Browser clients do not call insecure LAN nodes from HTTPS; Flutter Web uses browser-safe public resolution.
-- KUB8 settlement is pending-record-only. The alpha abuse controls are not claimed to be Sybil-proof.
-
-## Releases and source status
-
-Channels are `alpha → edge`, `beta → beta`, and stable → `latest`; an alpha image never updates `latest`. Exact SemVer tags and image tags are immutable.
-
-This repository is source available and publicly inspectable, but it remains `UNLICENSED`. No MIT, Apache, GPL or other open-source grant applies to kubus Node itself. Nerfstudio and gsplat retain their Apache-2.0 licenses; other third-party notices are documented separately.
+kubus Node is **source available** and **UNLICENSED**. No open-source licence
+grant applies to kubus Node itself. Third-party components retain their own
+licences. Protocol and implementation detail previously in this README remains
+in the [runtime guide](docs/node-runtime-guide.md) and the linked documentation.

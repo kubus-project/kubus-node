@@ -1,22 +1,27 @@
 # Operator Guide
 
-For a normal Windows installation, extract `kubus-node-windows-vX.Y.Z.zip` and
-open `Start-KubusNodeSetup.cmd`. It pulls the immutable images recorded in the
-shipped `docker-compose.release.yml`, opens the loopback-only setup page, and
-never builds from source or needs a checkout. No `.env` editing is required.
-The setup page writes `config.env` beside `LOCAL_STATE_PATH` with restrictive
-permissions, creates a random GUI token, and restarts the container into the
-ordinary GUI. When LAN pairing is enabled, the installer detects the host LAN
-address and recreates the port binding; users do not enter a manual LAN URL.
-Docker volumes and this configuration are retained by default when stopping the
-Node.
+For a normal Windows installation, use the official Windows EXE from
+[node.kubus.site](https://node.kubus.site/download/windows). Run Docker Desktop
+with WSL 2, install kubus Node, and open setup. Sign in to art.kubus, review the
+permissions and authorize the Node. The release ZIP's `Start-KubusNodeSetup.cmd`
+is an alternative launcher. Both paths use the shipped digest-pinned Compose
+runtime, preserve Docker volumes by default, and require no source checkout or
+manual operator-token entry. Account-authorized setup is included in alpha.5.
 
-For managed/headless deployments, install Node.js 20+ and Docker. In art.kubus, sign in with the operator wallet and open Settings > Wallet > Availability Node. Create a scoped operator token, copy it once, and paste it into `.env` as `KUBUS_OPERATOR_TOKEN`.
+For a managed server, `kubus-node setup --headless` opens the same loopback
+wizard for access through an SSH tunnel. See the [installation overview](../README.md#install)
+for the current npm publication status and supported platforms.
+
+## Advanced manual configuration and source development
+
+Manual configuration is for managed deployments and development. Supply a
+properly scoped operator credential and the required local secrets yourself;
+the normal account-authorized installer provisions its own credentials.
 
 Configure every required value in `.env.example`, then run:
 
 ```sh
-npm install
+npm ci
 npm run build
 ```
 
@@ -126,7 +131,7 @@ Spatial processing is available only to kubus Nodes participating in the public 
 
 A node that has never been configured opens a short guided setup instead of the dashboard; it reports the real state of each prerequisite and can be skipped at any point.
 
-The GUI cannot spend funds and never shows `KUBUS_OPERATOR_TOKEN`, Authorization headers, private keys, seed phrases, or raw backend credentials. Technical identifiers such as peer IDs and CIDs are truncated for display and copyable in full. This Kubus Node GUI is not the Kubo WebUI; Kubo WebUI/RPC on `5001` stays private.
+The GUI cannot spend funds and never shows `KUBUS_OPERATOR_TOKEN`, Authorization headers, private keys, seed phrases, or raw backend credentials. Technical identifiers such as peer IDs and CIDs are truncated for display and copyable in full. This kubus Node GUI is not the Kubo WebUI; Kubo WebUI/RPC on `5001` stays private.
 
 The GUI loads no fonts, scripts, styles or icons from the internet, so it renders correctly on a node with no outbound connectivity. The pairing QR is generated on the node itself.
 
