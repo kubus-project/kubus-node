@@ -176,4 +176,4 @@ Both are pending control-plane records. Settlement is not active; KUB8 has no gu
 
 Channels are `alpha → edge`, `beta → beta`, and stable → `latest`; an alpha image never updates `latest`. Exact SemVer tags and image tags are immutable.
 
-This repository is source available and publicly inspectable, but it remains `UNLICENSED`. No MIT, Apache, GPL or other open-source grant applies to kubus Node itself. Nerfstudio and gsplat retain their Apache-2.0 licenses; other third-party notices are documented separately.
+kubus Node is open-source software licensed under the GNU Affero General Public License v3.0 only (`AGPL-3.0-only`); see [`LICENSE`](LICENSE). You may run, inspect, modify and redistribute it under the terms of the AGPL. If you run a modified version to interact with users over a network, the AGPL requires making the corresponding source available to those users. Third-party components, including Nerfstudio and gsplat, retain their own licenses (see [`docs/THIRD_PARTY_LICENSES.md`](docs/THIRD_PARTY_LICENSES.md)). This software license does not grant any rights to the art.kubus/kubus trademarks or branding (see [`TRADEMARKS.md`](TRADEMARKS.md)).
