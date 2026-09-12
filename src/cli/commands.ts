@@ -153,9 +153,15 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   if (command !== 'start') throw new Error(`Unknown command: ${command}`);
   await jobs.start();
   await capabilities.refresh();
-  const gui = (config.guiEnabled || config.localApiEnabled) ? await startGuiServer({ api, kubo, store, config, logger, actionLock, analytics, localApi }) : null;
-  let scheduler: Scheduler | null = null;
+  // Declared before the GUI so its late-bound diagnostics read the live client.
   let signaling: NodeSignalingClient | null = null;
+  const gui = (config.guiEnabled || config.localApiEnabled)
+    ? await startGuiServer({
+      api, kubo, store, config, logger, actionLock, analytics, localApi,
+      remoteConnections: () => signaling?.connectionDiagnostics() ?? [],
+    })
+    : null;
+  let scheduler: Scheduler | null = null;
   const startupAbort = new AbortController();
   const startup = recoverNetworkStartup({
     signal: startupAbort.signal,

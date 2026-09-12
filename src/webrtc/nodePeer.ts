@@ -4,6 +4,7 @@ import type { NodeIdentity } from '../identity/nodeIdentity.js';
 import type { LocalApiDeps } from '../localApi/dispatch.js';
 import type { Logger } from '../logging/logger.js';
 import { ChannelServer, type ChannelTransport } from './channelServer.js';
+import { describeSelectedPair, type PeerRouteDiagnostics } from './peerRoute.js';
 
 /**
  * One WebRTC peer connection with a paired device.
@@ -151,11 +152,21 @@ export class NodePeer {
    * traffic is still DTLS-encrypted end to end and the relay never holds a key.
    */
   isRelayed(): boolean {
+    return this.routeDiagnostics().route === 'relay';
+  }
+
+  /**
+   * The selected candidate pair, reduced to candidate kinds.
+   *
+   * Addresses, ports and candidate lines are dropped inside
+   * `describeSelectedPair`, so nothing that maps this machine's interfaces
+   * leaves the peer. A pair the ICE stack cannot report yet reads as unknown.
+   */
+  routeDiagnostics(): PeerRouteDiagnostics {
     try {
-      const pair = this.connection.getSelectedCandidatePair();
-      return pair?.local?.type === 'relay' || pair?.remote?.type === 'relay';
+      return describeSelectedPair(this.connection.getSelectedCandidatePair());
     } catch {
-      return false;
+      return describeSelectedPair(null);
     }
   }
 

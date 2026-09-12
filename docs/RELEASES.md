@@ -33,6 +33,17 @@ the destructive `kubus-node uninstall --delete-data --yes-delete-data` path.
 
 The compose bundle contains no credentials. Operators must create `.env` from the included example and supply their own scoped token and local secrets.
 
+## v0.8.0-alpha.6 — Remote Connection Diagnostics
+
+- **Relay visibility for operators:** Settings → Technical details lists every connected art.kubus device and how it is carried — a direct peer connection or a TURN relay — from the WebRTC selected candidate pair. Only candidate kinds are shown (`host`, `srflx`, `prflx`, `relay`; `udp`, `tcp`, `tls`); no address, port or candidate line is ever displayed or logged, and relay vocabulary stays out of every headline.
+- **Operator log line:** each established remote connection logs `webrtc route established` with its route, candidate kinds and the first eight characters of the session id, which is the same session the backend embeds in the TURN credential username.
+
+## v0.8.0-alpha.5 — Account-Authorized Setup
+
+- **Account-authorized setup:** ordinary setup no longer asks for a scoped operator token. The Node starts an installation signed by its Ed25519 identity, the account holder authorizes it with the setup code in art.kubus, and the Node collects its credential by proving the same identity. Manual token entry remains only under Advanced setup.
+- **Explicit permission rotation:** a Node paired before the current scope contract can be re-credentialed from the app without changing its Node ID, Ed25519 identity, pairings, captures or archive. The superseded credential is retired only after the replacement is durably stored.
+- **Known issue:** the npm publication step failed — `@kubus/kubus-node` has no trusted publisher registered on npmjs.com — so the tarball is available only as a GitHub release asset.
+
 ## v0.8.0-alpha.4 — Spatial Network Integration
 
 This alpha completes the integrity and product pass for real spatial-network testing:

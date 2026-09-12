@@ -412,5 +412,13 @@ describe('node WebRTC peer, end to end', () => {
     // No relay is configured here, so a relayed pair would mean the detection
     // is wrong rather than that a relay was used.
     expect(harness.peer.isRelayed()).toBe(false);
+
+    // The same answer, read from a real selected pair: candidate kinds only.
+    const diagnostics = harness.peer.routeDiagnostics();
+    expect(diagnostics.route).toBe('direct');
+    expect(['host', 'prflx', 'srflx']).toContain(diagnostics.local?.type);
+    expect(['host', 'prflx', 'srflx']).toContain(diagnostics.remote?.type);
+    // Keys, not substrings: "transport" legitimately contains "port".
+    expect(JSON.stringify(diagnostics)).not.toMatch(/"(address|port|candidate|priority|mid)"|candidate:|\d+\.\d+\.\d+\.\d+/);
   });
 });

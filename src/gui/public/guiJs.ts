@@ -1006,8 +1006,23 @@ function renderSettings() {
     identifier('Node ID', model.node.nodeId, advanced.nodeId) +
     identifier('Peer ID', model.node.peerId, advanced.peerId) +
     detailRow('Network endpoint', advanced.backendUrl) +
+    remoteConnectionRows(advanced.remoteConnections) +
     '</div></details>' +
     '</section>';
+}
+
+/*
+ * Whether an art.kubus device is reaching this node through a TURN relay.
+ * Lives only inside Technical details: the route is diagnostic, and relay
+ * vocabulary never belongs in a headline. Values arrive allowlisted by the
+ * server — candidate kinds and a short session prefix, never an address.
+ */
+function remoteConnectionRows(connections) {
+  if (!connections || !connections.length) return detailRow('Remote connections', 'None active');
+  return connections.map(function (c) {
+    return detailRow('Remote session ' + c.session,
+      c.route + ' · ' + c.detail + (c.verified ? '' : ' · identity not yet verified'));
+  }).join('');
 }
 
 /* --- onboarding --------------------------------------------------------- */

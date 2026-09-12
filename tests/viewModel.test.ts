@@ -54,6 +54,35 @@ function input(overrides: Partial<ViewModelInput> = {}): ViewModelInput {
   };
 }
 
+describe('remote connection diagnostics', () => {
+  it('shows none, rather than an empty placeholder, when nothing is connected', () => {
+    expect(buildViewModel(input()).advanced.remoteConnections).toEqual([]);
+  });
+
+  it('names the route an operator is asking about, including a TURN relay', () => {
+    const model = buildViewModel(input({
+      remoteConnections: [
+        { session: 'AbCdEfGh', verified: true, route: 'relay', local: { type: 'relay', transport: 'udp' }, remote: { type: 'srflx', transport: 'udp' } },
+        { session: 'IjKlMnOp', verified: true, route: 'direct', local: { type: 'host', transport: 'udp' }, remote: { type: 'prflx', transport: 'udp' } },
+        { session: 'QrStUvWx', verified: false, route: 'unknown', local: null, remote: null },
+      ],
+    }));
+    expect(model.advanced.remoteConnections).toEqual([
+      { session: 'AbCdEfGh', verified: true, route: 'Relayed through TURN', detail: 'local relay/udp · remote srflx/udp' },
+      { session: 'IjKlMnOp', verified: true, route: 'Direct peer connection', detail: 'local host/udp · remote prflx/udp' },
+      { session: 'QrStUvWx', verified: false, route: 'Route not yet reported', detail: 'Candidate types not yet reported' },
+    ]);
+  });
+
+  it('keeps relay vocabulary out of the headline', () => {
+    const model = buildViewModel(input({
+      remoteConnections: [{ session: 'AbCdEfGh', verified: true, route: 'relay', local: { type: 'relay', transport: 'udp' }, remote: { type: 'srflx', transport: 'udp' } }],
+    }));
+    const headline = JSON.stringify({ alerts: model.alerts, overview: model.overview, participation: model.participation });
+    expect(headline).not.toMatch(/TURN|relay|srflx|ICE/i);
+  });
+});
+
 describe('participation language', () => {
   it('translates every runtime state into operator language', () => {
     const cases = [
