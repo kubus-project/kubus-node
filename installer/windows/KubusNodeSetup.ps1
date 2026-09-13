@@ -1,25 +1,37 @@
-param([switch]$FinalizeSetup)
+param(
+  [switch]$FinalizeSetup,
+  [switch]$Manage
+)
 
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
+# Setup is browser-first. The launcher never asks a person to read a terminal:
+# it opens one local page that reports every step, including the parts that take
+# minutes (pulling the runtime images) and the part that used to be invisible
+# (the Node restarting into its configured runtime).
+#
+# The progress page is served by a raw TcpListener rather than HttpListener,
+# because this installer runs with PrivilegesRequired=lowest and HttpListener
+# needs an administrator URL reservation. Loopback only; GET only; it serves a
+# static page and a status document and accepts no mutations.
 
 $ErrorActionPreference = 'Stop'
 $releaseRoot = $PSScriptRoot
 $composeFile = Join-Path $releaseRoot 'docker-compose.release.yml'
 $dataRoot = Join-Path $env:LOCALAPPDATA 'kubus-node'
 $runtimeEnv = Join-Path $dataRoot 'runtime.env'
+$nodeOrigin = 'http://127.0.0.1:8787'
 
 function Show-Problem([string]$message) {
+  Add-Type -AssemblyName System.Windows.Forms
   [System.Windows.Forms.MessageBox]::Show($message, 'kubus Node Setup', 'OK', 'Error') | Out-Null
 }
 
 function Test-Docker {
   if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    throw 'Docker Desktop is required. Install Docker Desktop, enable its WSL 2 backend, then run this launcher again.'
+    throw 'Docker Desktop is required. Install Docker Desktop, enable its WSL 2 backend, then start kubus Node setup again.'
   }
-  & docker info --format '{{.ServerVersion}}' | Out-Null
+  & docker info --format '{{.ServerVersion}}' *> $null
   if ($LASTEXITCODE -ne 0) {
-    throw 'Docker Desktop is installed but its daemon is not running. Start Docker Desktop and run this launcher again.'
+    throw 'Docker Desktop is installed but its engine is not running. Start Docker Desktop, wait until it reports Running, then start kubus Node setup again.'
   }
 }
 
@@ -31,7 +43,7 @@ function Write-RuntimeTopology([bool]$allowLan) {
     $address = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
       Where-Object { $_.IPAddress -match '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)' -and $_.PrefixOrigin -ne 'WellKnown' } |
       Select-Object -First 1 -ExpandProperty IPAddress
-    if (-not $address) { throw 'LAN access was selected, but no private IPv4 address was found. Connect this PC to the intended network and start setup again.' }
+    if (-not $address) { throw 'LAN access was selected, but this PC has no private IPv4 address. Connect it to the intended network and start setup again.' }
     $bindAddress = '0.0.0.0'
     $lanUrl = "http://${address}:8787"
   }
@@ -40,7 +52,7 @@ function Write-RuntimeTopology([bool]$allowLan) {
 
 function Invoke-NodeCompose([string[]]$arguments) {
   & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile @arguments
-  if ($LASTEXITCODE -ne 0) { throw 'Docker could not complete the kubus Node operation. Open Docker Desktop, check its resources, then retry.' }
+  if ($LASTEXITCODE -ne 0) { throw 'Docker could not complete this step. Open Docker Desktop, check that it is running and has disk space, then start setup again.' }
 }
 
 function Read-SetupConfig {
@@ -49,13 +61,207 @@ function Read-SetupConfig {
   return ($config -join "`n")
 }
 
-function Wait-NodeReady {
-  for ($attempt = 0; $attempt -lt 40; $attempt++) {
-    $status = & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile ps --format json 2>$null
-    if ($LASTEXITCODE -eq 0 -and $status -match 'healthy') { return }
-    Start-Sleep -Seconds 3
+function Test-Url([string]$url) {
+  try {
+    $request = [System.Net.HttpWebRequest]::Create($url)
+    $request.Method = 'GET'
+    $request.Timeout = 3000
+    $request.AllowAutoRedirect = $false
+    $response = $request.GetResponse()
+    $response.Close()
+    return $true
+  } catch [System.Net.WebException] {
+    # A redirect or any HTTP status still means something is listening and
+    # answering, which is the only question being asked here.
+    if ($_.Exception.Response) { return $true }
+    return $false
+  } catch { return $false }
+}
+
+function Get-FreePort([int]$preferred) {
+  foreach ($candidate in @($preferred, 0)) {
+    try {
+      $probe = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $candidate)
+      $probe.Start()
+      $port = ([System.Net.IPEndPoint]$probe.LocalEndpoint).Port
+      $probe.Stop()
+      return $port
+    } catch { continue }
   }
-  throw 'kubus Node did not become ready in time. Docker Desktop can show the runtime logs; your identity and configuration remain preserved.'
+  throw 'No local port was available for the setup page.'
+}
+
+function Get-ProgressPage {
+  return @'
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Setting up kubus Node</title>
+<style>
+body{max-width:38rem;margin:3rem auto;padding:0 1rem;font:16px system-ui;line-height:1.55;color:#111}
+h1{font-size:1.5rem;margin-bottom:.25rem}
+p.lead{color:#555;margin-top:0}
+ol{list-style:none;padding:0;margin:2rem 0}
+li{padding:.6rem 0 .6rem 2rem;position:relative;color:#999}
+li.active{color:#111;font-weight:600}
+li.done{color:#111}
+li.done::before{content:"\2713";position:absolute;left:0;color:#1a7f37}
+li.active::before{content:"";position:absolute;left:.15rem;top:1rem;width:.8rem;height:.8rem;border:2px solid #111;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+#detail{color:#555;font-size:.9rem;min-height:1.4rem;white-space:pre-wrap;word-break:break-word}
+#err{display:none;background:#fff4f4;border:1px solid #f0c0c0;padding:1rem;border-radius:.4rem}
+</style>
+<h1>Setting up kubus Node</h1>
+<p class="lead">You can leave this page open. It updates by itself.</p>
+<ol id="steps">
+  <li data-step="docker">Checking Docker Desktop</li>
+  <li data-step="pull">Downloading the kubus Node runtime</li>
+  <li data-step="start">Starting your Node</li>
+  <li data-step="wait">Waiting for your Node to answer</li>
+  <li data-step="handoff">Opening setup</li>
+</ol>
+<p id="detail"></p>
+<div id="err"><strong>Setup stopped.</strong><p id="errtext"></p>
+<p>Your Node data and identity are untouched. Fix the problem above, then start kubus Node setup again.</p></div>
+<script>
+var order=['docker','pull','start','wait','handoff'];
+function paint(at){
+  order.forEach(function(name,i){
+    var li=document.querySelector('li[data-step="'+name+'"]');
+    li.className = at<0 ? '' : (i<at?'done':(i===at?'active':''));
+  });
+}
+async function tick(){
+  try{
+    var r=await fetch('/status',{cache:'no-store'});
+    var s=await r.json();
+    document.getElementById('detail').textContent=s.message||'';
+    paint(order.indexOf(s.step));
+    if(s.error){
+      document.getElementById('err').style.display='block';
+      document.getElementById('errtext').textContent=s.error;
+      paint(-1);
+      return;
+    }
+    if(s.done&&s.nextUrl){
+      order.forEach(function(name){document.querySelector('li[data-step="'+name+'"]').className='done'});
+      location.href=s.nextUrl;
+      return;
+    }
+  }catch(e){/* the launcher is busy; keep polling */}
+  setTimeout(tick,1000);
+}
+tick();
+</script>
+'@
+}
+
+function Start-StatusServer([hashtable]$sync, [int]$port) {
+  $script = {
+    $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $port)
+    $listener.Start()
+    while (-not $sync.stopServer) {
+      if (-not $listener.Pending()) { Start-Sleep -Milliseconds 50; continue }
+      $client = $listener.AcceptTcpClient()
+      try {
+        $stream = $client.GetStream()
+        $reader = New-Object System.IO.StreamReader($stream)
+        $requestLine = $reader.ReadLine()
+        $path = '/'
+        if ($requestLine -match '^[A-Z]+\s+(\S+)') { $path = $Matches[1] }
+        if ($path -like '/status*') {
+          $payload = [ordered]@{ step = $sync.step; message = $sync.message; error = $sync.error; nextUrl = $sync.nextUrl; done = $sync.done } | ConvertTo-Json -Compress
+          $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
+          $type = 'application/json; charset=utf-8'
+        } else {
+          $bytes = [Text.Encoding]::UTF8.GetBytes($sync.page)
+          $type = 'text/html; charset=utf-8'
+        }
+        $head = "HTTP/1.1 200 OK`r`nContent-Type: $type`r`nContent-Length: $($bytes.Length)`r`nCache-Control: no-store`r`nX-Content-Type-Options: nosniff`r`nConnection: close`r`n`r`n"
+        $headBytes = [Text.Encoding]::ASCII.GetBytes($head)
+        $stream.Write($headBytes, 0, $headBytes.Length)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush()
+      } catch { } finally { $client.Close() }
+    }
+    $listener.Stop()
+  }
+  $runspace = [runspacefactory]::CreateRunspace()
+  $runspace.Open()
+  $runspace.SessionStateProxy.SetVariable('sync', $sync)
+  $runspace.SessionStateProxy.SetVariable('port', $port)
+  $shell = [powershell]::Create()
+  $shell.Runspace = $runspace
+  $shell.AddScript($script) | Out-Null
+  $shell.BeginInvoke() | Out-Null
+  return @{ Shell = $shell; Runspace = $runspace }
+}
+
+function Set-Step([hashtable]$sync, [string]$step, [string]$message) {
+  $sync.step = $step
+  $sync.message = $message
+}
+
+function Start-SetupFlow {
+  $port = Get-FreePort 8799
+  $sync = [hashtable]::Synchronized(@{
+    step = 'docker'; message = 'Checking Docker Desktop...'; error = $null
+    nextUrl = $null; done = $false; stopServer = $false; page = (Get-ProgressPage)
+  })
+  $server = Start-StatusServer $sync $port
+  Start-Sleep -Milliseconds 250
+  Start-Process "http://127.0.0.1:$port/"
+
+  try {
+    Test-Docker
+
+    $drive = Get-PSDrive -Name ([IO.Path]::GetPathRoot($dataRoot).TrimEnd(':', '\'))
+    if ($drive.Free -lt 10GB) { throw 'At least 10 GB of free disk space is required before starting kubus Node.' }
+    if (-not (Test-Path -LiteralPath $composeFile)) { throw 'This release bundle is incomplete: docker-compose.release.yml is missing. Reinstall kubus Node.' }
+    Write-RuntimeTopology $false
+
+    # The pull is the long part. Its output is the only honest progress signal
+    # available, so it is surfaced line by line instead of leaving the page
+    # looking stalled for minutes.
+    Set-Step $sync 'pull' 'Downloading the kubus Node runtime. This can take several minutes the first time.'
+    & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile pull 2>&1 | ForEach-Object {
+      $line = "$_".Trim()
+      if ($line) { $sync.message = $line }
+    }
+    if ($LASTEXITCODE -ne 0) { throw 'The kubus Node runtime could not be downloaded. Check this PC''s internet connection and Docker Desktop, then start setup again.' }
+
+    Set-Step $sync 'start' 'Starting your Node...'
+    Invoke-NodeCompose @('up', '-d')
+
+    Set-Step $sync 'wait' 'Waiting for your Node to answer...'
+    $target = $null
+    for ($attempt = 0; $attempt -lt 120; $attempt++) {
+      # A Node that has never been configured serves /setup; one that is already
+      # configured serves /gui and redirects /setup to it. Either answer means
+      # the runtime is up, and each sends the person to the right place.
+      if (Test-Url "$nodeOrigin/setup") { $target = "$nodeOrigin/setup"; break }
+      if (Test-Url "$nodeOrigin/gui") { $target = "$nodeOrigin/gui"; break }
+      Start-Sleep -Seconds 2
+    }
+    if (-not $target) { throw 'Your Node started but did not answer in time. It keeps running in Docker - open Docker Desktop to see its logs, then start setup again.' }
+
+    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
+      '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-File', $PSCommandPath, '-FinalizeSetup'
+    )
+
+    Set-Step $sync 'handoff' 'Your Node is running. Opening setup...'
+    $sync.nextUrl = $target
+    $sync.done = $true
+    # Long enough for the page to poll once and navigate.
+    Start-Sleep -Seconds 5
+  } catch {
+    $sync.error = $_.Exception.Message
+    $sync.message = ''
+    # Keep the page alive so the reason stays readable instead of vanishing.
+    Start-Sleep -Seconds 600
+  } finally {
+    $sync.stopServer = $true
+    Start-Sleep -Milliseconds 200
+    try { $server.Shell.Dispose(); $server.Runspace.Dispose() } catch { }
+  }
 }
 
 function Complete-SetupTransition {
@@ -65,32 +271,19 @@ function Complete-SetupTransition {
     if ($config -match '(?m)^LOCAL_API_ALLOW_LAN=(?:"true"|true)$') {
       Write-RuntimeTopology $true
       Invoke-NodeCompose @('up', '-d', '--force-recreate')
-      Wait-NodeReady
       return
     }
     if ($config -match '(?m)^LOCAL_API_ALLOW_LAN=(?:"false"|false)$') {
       Write-RuntimeTopology $false
       Invoke-NodeCompose @('up', '-d', '--force-recreate')
-      Wait-NodeReady
       return
     }
     Start-Sleep -Seconds 3
   }
 }
 
-function Start-Node {
-  Test-Docker
-  if (-not (Test-Path -LiteralPath $composeFile)) { throw 'This release bundle is incomplete: docker-compose.release.yml is missing.' }
-  Write-RuntimeTopology $false
-  $freeBytes = (Get-PSDrive -Name ([IO.Path]::GetPathRoot($dataRoot).TrimEnd(':','\'))).Free
-  if ($freeBytes -lt 10GB) { throw 'At least 10 GB of free disk space is required before starting kubus Node.' }
-  Invoke-NodeCompose @('pull')
-  Invoke-NodeCompose @('up', '-d')
-  Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-File', $PSCommandPath, '-FinalizeSetup')
-  Start-Process 'http://127.0.0.1:8787/setup'
-}
-
 function Stop-Node([bool]$removeData) {
+  Add-Type -AssemblyName System.Windows.Forms
   Test-Docker
   if (-not (Test-Path -LiteralPath $runtimeEnv)) { Write-RuntimeTopology $false }
   Invoke-NodeCompose @('down')
@@ -108,60 +301,61 @@ function Stop-Node([bool]$removeData) {
   return $deleted
 }
 
-$form = New-Object System.Windows.Forms.Form
-$form.Text = 'kubus Node Setup'
-$form.Size = New-Object System.Drawing.Size(540, 310)
-$form.StartPosition = 'CenterScreen'
-$form.FormBorderStyle = 'FixedDialog'
-$form.MaximizeBox = $false
+function Show-ManageWindow {
+  Add-Type -AssemblyName System.Windows.Forms
+  Add-Type -AssemblyName System.Drawing
 
-$intro = New-Object System.Windows.Forms.Label
-$intro.Text = 'Install and start kubus Node without a terminal. The first browser page configures your Node identity, archive capacity, and optional LAN access. Docker volumes preserve your data by default.'
-$intro.Location = New-Object System.Drawing.Point(24, 22)
-$intro.Size = New-Object System.Drawing.Size(480, 68)
-$intro.AutoSize = $false
-$form.Controls.Add($intro)
+  $form = New-Object System.Windows.Forms.Form
+  $form.Text = 'kubus Node'
+  $form.Size = New-Object System.Drawing.Size(520, 250)
+  $form.StartPosition = 'CenterScreen'
+  $form.FormBorderStyle = 'FixedDialog'
+  $form.MaximizeBox = $false
 
-$status = New-Object System.Windows.Forms.Label
-$status.Text = 'Checking Docker Desktop…'
-$status.Location = New-Object System.Drawing.Point(24, 105)
-$status.Size = New-Object System.Drawing.Size(480, 24)
-$form.Controls.Add($status)
+  $intro = New-Object System.Windows.Forms.Label
+  $intro.Text = 'Your Node runs in Docker. Stopping it pauses archive participation; your identity, pairings and captures stay on this computer unless you explicitly delete them.'
+  $intro.Location = New-Object System.Drawing.Point(24, 20)
+  $intro.Size = New-Object System.Drawing.Size(460, 56)
+  $form.Controls.Add($intro)
 
-$start = New-Object System.Windows.Forms.Button
-$start.Text = 'Start setup'
-$start.Location = New-Object System.Drawing.Point(24, 155)
-$start.Size = New-Object System.Drawing.Size(150, 36)
-$start.Add_Click({
-  try { $start.Enabled = $false; $status.Text = 'Starting kubus Node…'; Start-Node; $status.Text = 'Node started. Your browser is opening the setup page.' }
-  catch { $status.Text = 'Setup could not start.'; Show-Problem $_.Exception.Message }
-  finally { $start.Enabled = $true }
-})
-$form.Controls.Add($start)
+  $status = New-Object System.Windows.Forms.Label
+  $status.Text = ''
+  $status.Location = New-Object System.Drawing.Point(24, 84)
+  $status.Size = New-Object System.Drawing.Size(460, 24)
+  $form.Controls.Add($status)
 
-$remove = New-Object System.Windows.Forms.Button
-$remove.Text = 'Stop / uninstall'
-$remove.Location = New-Object System.Drawing.Point(188, 155)
-$remove.Size = New-Object System.Drawing.Size(150, 36)
-$remove.Add_Click({
-  try {
-    $deleted = Stop-Node $deleteData.Checked
-    if ($deleted) { $status.Text = 'Node stopped and its Docker volumes were removed.' }
-    else { $status.Text = 'Node stopped. Its data and identity were preserved.' }
-  }
-  catch { Show-Problem $_.Exception.Message }
-})
-$form.Controls.Add($remove)
+  $dashboard = New-Object System.Windows.Forms.Button
+  $dashboard.Text = 'Open dashboard'
+  $dashboard.Location = New-Object System.Drawing.Point(24, 118)
+  $dashboard.Size = New-Object System.Drawing.Size(150, 34)
+  $dashboard.Add_Click({ Start-Process "$nodeOrigin/gui" })
+  $form.Controls.Add($dashboard)
 
-$deleteData = New-Object System.Windows.Forms.CheckBox
-$deleteData.Text = 'Also permanently delete Node data and identity'
-$deleteData.Location = New-Object System.Drawing.Point(24, 202)
-$deleteData.Size = New-Object System.Drawing.Size(360, 24)
-$deleteData.Checked = $false
-$form.Controls.Add($deleteData)
+  $deleteData = New-Object System.Windows.Forms.CheckBox
+  $deleteData.Text = 'Also permanently delete Node data and identity'
+  $deleteData.Location = New-Object System.Drawing.Point(24, 164)
+  $deleteData.Size = New-Object System.Drawing.Size(400, 24)
+  $deleteData.Checked = $false
+  $form.Controls.Add($deleteData)
 
-$form.Controls.Add((New-Object System.Windows.Forms.Label -Property @{ Text = 'GPU reconstruction is only enabled on supported Linux Docker + NVIDIA/CUDA hosts. Windows uses archive participation and remote processing.'; Location = New-Object System.Drawing.Point(24, 236); Size = New-Object System.Drawing.Size(480, 38); AutoSize = $false }))
+  $stop = New-Object System.Windows.Forms.Button
+  $stop.Text = 'Stop Node'
+  $stop.Location = New-Object System.Drawing.Point(188, 118)
+  $stop.Size = New-Object System.Drawing.Size(150, 34)
+  $stop.Add_Click({
+    try {
+      $deleted = Stop-Node $deleteData.Checked
+      if ($deleted) { $status.Text = 'Node stopped and its Docker volumes were removed.' }
+      else { $status.Text = 'Node stopped. Its data and identity were preserved.' }
+    } catch { Show-Problem $_.Exception.Message }
+  })
+  $form.Controls.Add($stop)
+
+  [void]$form.ShowDialog()
+}
 
 if ($FinalizeSetup) { Complete-SetupTransition; exit }
-try { Test-Docker; $status.Text = 'Docker Desktop is ready.' } catch { $status.Text = 'Docker Desktop needs attention.' }
-[void]$form.ShowDialog()
+if ($Manage) { Show-ManageWindow; exit }
+
+try { Start-SetupFlow }
+catch { Show-Problem $_.Exception.Message }

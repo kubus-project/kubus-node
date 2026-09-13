@@ -324,7 +324,7 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
 
 function setupHtml(nonce: string): string {
   return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Set up kubus Node</title>
-<style>body{max-width:42rem;margin:3rem auto;padding:0 1rem;font:16px system-ui;line-height:1.5}label{display:block;margin:1rem 0}input{box-sizing:border-box;width:100%;padding:.6rem}button{padding:.7rem 1rem}small{color:#555}code{font:600 1.6rem/1.2 ui-monospace,monospace;letter-spacing:.16em}details{margin:1.5rem 0;border-top:1px solid #ddd;padding-top:1rem}#step2{display:none}</style>
+<style>body{max-width:42rem;margin:3rem auto;padding:0 1rem;font:16px system-ui;line-height:1.5}label{display:block;margin:1rem 0}input{box-sizing:border-box;width:100%;padding:.6rem}button{padding:.7rem 1rem}small{color:#555}code{font:600 1.6rem/1.2 ui-monospace,monospace;letter-spacing:.16em}details{margin:1.5rem 0;border-top:1px solid #ddd;padding-top:1rem}#step2,#step3{display:none}#dash{display:none}</style>
 <h1>Set up kubus Node</h1><p>Your captures stay on your Node. The network receives archive participation and short-lived connection coordination, never capture bytes.</p>
 <form id="f">
 <label>Node name<input name="nodeLabel" required maxlength="80"></label>
@@ -343,11 +343,32 @@ function setupHtml(nonce: string): string {
 <p>Open art.kubus, sign in, and choose <strong>Add a Node</strong>. Enter this code:</p>
 <p><code id="code"></code></p>
 <p><small>Node fingerprint: <span id="fp"></span></small></p></section>
+<section id="step3"><h2 id="kubus-setup-waiting">Finishing setup</h2>
+<p id="w">Your Node is restarting with its new configuration. This page will say so as soon as it answers again — usually under a minute.</p>
+<p><a id="dash" href="/gui">Open dashboard</a></p></section>
 <p id="m" role="status"></p>
 <script>
 const body=()=>{let d=Object.fromEntries(new FormData(f));d.allowLan=f.allowLan.checked;d.offerRemoteCompute=f.offerRemoteCompute.checked;d.advanced=adv.checked;return d};
 const send=(p,d)=>fetch(p,{method:'POST',headers:{'content-type':'application/json','x-kubus-setup-nonce':'${nonce}'},body:JSON.stringify(d)});
-const save=async()=>{let r=await send('/setup/config',body());m.textContent=r.ok?'Saved. Node is restarting…':'Could not save setup. Check every field and try again.'};
+/* Saving restarts the runtime, so this bootstrap server is about to disappear.
+   Ending at "saved" is what made a working Node look like a failed install:
+   nothing ever confirmed it came back. Watch the runtime's own dashboard route
+   instead — it answers only once the configured Node has replaced this. */
+const connected=()=>{document.getElementById('kubus-setup-waiting').textContent='Your Node is connected';
+  w.textContent='Setup is complete. This Node is registered with art.kubus and is participating in the public archive.';
+  dash.textContent='Open dashboard';dash.style.display='inline-block'};
+const waitForRuntime=()=>{step3.style.display='block';m.textContent='';go.disabled=true;
+  const startedAt=Date.now();
+  const tick=async()=>{
+    try{const r=await fetch('/gui',{cache:'no-store'});if(r.ok){connected();return}}catch(e){}
+    if(Date.now()-startedAt>180000){
+      w.textContent='Your Node is taking longer than usual to answer. It keeps running in Docker, so nothing is lost — open the dashboard to check on it.';
+      dash.style.display='inline-block';return}
+    setTimeout(tick,2000)};
+  setTimeout(tick,2000)};
+const save=async()=>{let r=await send('/setup/config',body());
+  if(!r.ok){m.textContent='Could not save setup. Check every field and try again.';return}
+  waitForRuntime()};
 f.onsubmit=async e=>{e.preventDefault();
   if(adv.checked){m.textContent='Saving…';return save()}
   m.textContent='Starting authorization…';

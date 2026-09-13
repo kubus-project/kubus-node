@@ -157,6 +157,40 @@ describe('local GUI safety helpers', () => {
     }
   });
 
+  it('redirects a refreshed setup tab to the dashboard instead of 404ing', async () => {
+    // Setup ends by restarting into this runtime, which retires the bootstrap
+    // server that served /setup. A tab still pointing there must land
+    // somewhere real: a 404 at that moment reads as a broken install.
+    const config = {
+      ...baseConfig,
+      guiEnabled: true,
+      guiPort: 0,
+      nodeLabel: 'local-node',
+      guiDisplayUrl: 'http://127.0.0.1:8787/gui',
+      guiFallbackUrl: 'http://127.0.0.1:8787/gui',
+    } as AppConfig;
+    const server = await startGuiServer({
+      api: { getHealth: async () => ({ ok: true }) } as never,
+      kubo: { id: async () => ({ ID: 'peer' }), version: async () => ({ Version: '0.41.0' }), repoStat: async () => ({}) } as never,
+      store: {
+        snapshot: () => ({
+          version: 1, publicPinSet: [], rewardableCids: [], desiredCids: [],
+          pinnedCids: [], failedCids: {}, activeCommitments: [],
+        }),
+      } as never,
+      config,
+      logger: { info: () => undefined } as never,
+      actionLock: new ActionLock(),
+    });
+    try {
+      const response = await fetch(server.url.replace('/gui', '/setup'), { redirect: 'manual' });
+      expect(response.status).toBe(302);
+      expect(response.headers.get('location')).toBe('/gui');
+    } finally {
+      await server.close();
+    }
+  });
+
   describe('redesigned GUI endpoints', () => {
     const nodeConfig = {
       ...baseConfig,

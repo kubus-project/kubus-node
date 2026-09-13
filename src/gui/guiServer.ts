@@ -103,6 +103,15 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     writeJson(res, 404, { success: false, error: 'GUI disabled' });
     return;
   }
+  // Setup finishes by restarting into this runtime, which retires the
+  // bootstrap server that served /setup. A tab still open on that address —
+  // or a refresh of it — must land on the dashboard rather than a 404 that
+  // reads as a broken install.
+  if ((req.method === 'GET' || req.method === 'HEAD') && parsed.pathname === '/setup') {
+    res.writeHead(302, { location: '/gui', 'cache-control': 'no-store' });
+    res.end();
+    return;
+  }
   if ((req.method === 'GET' || req.method === 'HEAD') && parsed.pathname === '/gui') {
     if (req.method === 'HEAD') {
       writeHead(res, 200, 'text/html; charset=utf-8');
