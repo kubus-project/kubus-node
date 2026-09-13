@@ -38,6 +38,45 @@ describe('release packaging', () => {
     expect(pkg.scripts.build).toBe('tsc -p tsconfig.json');
   });
 
+  it('never leaves a console window in front of the operator', async () => {
+    // `start "kubus Node Setup" powershell.exe` opened a visible console that
+    // sat there for the whole of setup, doing nothing a person could read.
+    // That is what made a normal install feel untrustworthy.
+    const launcher = await readFile(path.join(repoRoot, 'installer', 'windows', 'Start-KubusNodeSetup.cmd'), 'utf8');
+    expect(launcher).toContain('-WindowStyle Hidden');
+    expect(launcher).not.toMatch(/start\s+"kubus Node Setup"/);
+  });
+
+  it('reports setup progress in a local page rather than a hidden console', async () => {
+    const setup = await readFile(path.join(repoRoot, 'installer', 'windows', 'KubusNodeSetup.ps1'), 'utf8');
+    // HttpListener needs an administrator URL reservation, and this installer
+    // runs with PrivilegesRequired=lowest, so the page must be served by a raw
+    // socket or it fails for exactly the people it exists for.
+    expect(setup).toContain('New-Object System.Net.Sockets.TcpListener');
+    // Match actual use, not the word: the file explains in a comment why
+    // HttpListener is unusable here.
+    expect(setup).not.toMatch(/New-Object System\.Net\.HttpListener|\[System\.Net\.HttpListener\]/);
+    // The image pull is the multi-minute step; silence there is what looked
+    // like a hang.
+    expect(setup).toMatch(/Downloading the kubus Node runtime/);
+  });
+
+  it('waits for the Node to answer before sending anyone to it', async () => {
+    const setup = await readFile(path.join(repoRoot, 'installer', 'windows', 'KubusNodeSetup.ps1'), 'utf8');
+    // Opening the Node's address immediately after `up -d` produced a browser
+    // connection error, which reads as "the install failed".
+    const started = setup.indexOf("Invoke-NodeCompose @('up', '-d')");
+    // Anchor on the step transition, not the page's step list, which names the
+    // same wait earlier in the file.
+    const waiting = setup.indexOf("Set-Step $sync 'wait'");
+    expect(started).toBeGreaterThan(-1);
+    expect(waiting).toBeGreaterThan(started);
+    // A fresh Node serves /setup; an already configured one serves /gui. Both
+    // are accepted, so an upgrade lands on the dashboard rather than a 404.
+    expect(setup).toContain('Test-Url "$nodeOrigin/setup"');
+    expect(setup).toContain('Test-Url "$nodeOrigin/gui"');
+  });
+
   it('keeps the executable path the image and the npm bin agree on', async () => {
     // `rootDir: "."` is what puts the entry point at dist/src/index.js. If the
     // emit layout ever changes, the Dockerfile CMD and the bin entry both

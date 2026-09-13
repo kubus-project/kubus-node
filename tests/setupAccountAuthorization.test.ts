@@ -140,6 +140,21 @@ describe('account-authorized Node setup', () => {
     expect(html.slice(html.indexOf('Advanced setup'))).toMatch(/operatorToken/);
   });
 
+  it('does not leave the operator at "restarting" with no way to tell it worked', async () => {
+    const { html } = await setup();
+    // Saving restarts the runtime, which is invisible from the page. Ending
+    // there is why a working Node reads as a failed install: the last thing
+    // anyone saw was "restarting". The page has to watch for the runtime
+    // coming back and then say so.
+    expect(html).toMatch(/kubus-setup-waiting/);
+    // It watches the runtime's own dashboard route, which only answers once
+    // the configured Node has replaced this bootstrap server.
+    expect(html).toMatch(/\/gui/);
+    expect(html).toMatch(/Open dashboard/i);
+    // And it must say the Node is connected, not merely that a file was saved.
+    expect(html).toMatch(/connected/i);
+  });
+
   it('refuses a pasted operator token on the ordinary path', async () => {
     const { origin, headers, configPath } = await setup();
     const response = await fetch(`${origin}/setup/config`, {

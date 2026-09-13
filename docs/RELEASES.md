@@ -33,6 +33,35 @@ the destructive `kubus-node uninstall --delete-data --yes-delete-data` path.
 
 The compose bundle contains no credentials. Operators must create `.env` from the included example and supply their own scoped token and local secrets.
 
+## v0.8.0-alpha.7 — Setup You Can Watch
+
+Windows setup is browser-first. An experienced operator reported that install
+"did not connect", when the Node had in fact registered and was sending healthy
+heartbeats: nothing ever said so. Every defect below made a working install look
+like a failed one.
+
+- **Progress you can see.** The launcher opens one local page reporting each
+  step: Docker check, runtime download (with live output from the pull, the
+  multi-minute part), starting, waiting for the Node, hand-off. This previously
+  ran behind a hidden console while a dialog said only "Starting...".
+- **No premature browser tab.** Setup used to open the Node address immediately
+  after `up -d`, before anything was listening, so the first thing a person saw
+  was a connection error. The launcher now waits until the Node answers.
+- **An ending.** The setup page no longer stops at "Node is restarting". It
+  watches for the configured runtime to come back, then states that the Node is
+  connected and links to the dashboard.
+- **`/setup` no longer 404s.** After setup, the runtime redirects it to the
+  dashboard, so a refreshed tab lands somewhere real.
+- **No terminal.** `Start-KubusNodeSetup.cmd` hands to a hidden PowerShell and
+  exits instead of leaving a console window open.
+- **Failures are visible**, in plain language, and state that Node data and
+  identity are untouched.
+- **Manage is separate.** Stopping the Node and the explicit delete-data path
+  moved to their own "Manage kubus Node" entry.
+
+All launcher text is ASCII: Windows PowerShell reads `.ps1` as ANSI unless it
+carries a BOM, so typographic punctuation rendered as mojibake in the page.
+
 ## v0.8.0-alpha.6 — Remote Connection Diagnostics
 
 - **Relay visibility for operators:** Settings → Technical details lists every connected art.kubus device and how it is carried — a direct peer connection or a TURN relay — from the WebRTC selected candidate pair. Only candidate kinds are shown (`host`, `srflx`, `prflx`, `relay`; `udp`, `tcp`, `tls`); no address, port or candidate line is ever displayed or logged, and relay vocabulary stays out of every headline.
