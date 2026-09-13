@@ -1,6 +1,6 @@
 # Third-party software
 
-kubus Node itself remains `UNLICENSED`: viewing this public repository does not grant an open-source license. Dependencies retain their own licenses.
+kubus-node is licensed under AGPL-3.0-only (see [`../LICENSE`](../LICENSE)). The third-party components listed below retain their respective licenses. Nothing in this document relicenses those components.
 
 Key spatial and storage components in the 0.8 alpha line are:
 

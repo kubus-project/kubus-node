@@ -2,7 +2,7 @@
   "name": "@kubus/kubus-node",
   "version": "0.8.0-alpha.6",
   "description": "Local runtime and public archive node for art.kubus",
-  "license": "UNLICENSED",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "bin": {
     "kubus-node": "./dist/src/index.js"
