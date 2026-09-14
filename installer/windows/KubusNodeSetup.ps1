@@ -51,8 +51,46 @@ function Write-RuntimeTopology([bool]$allowLan) {
 }
 
 function Invoke-NodeCompose([string[]]$arguments) {
-  & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile @arguments
-  if ($LASTEXITCODE -ne 0) { throw 'Docker could not complete this step. Open Docker Desktop, check that it is running and has disk space, then start setup again.' }
+  # Capturing docker's own words requires redirecting stderr, and PowerShell 5.1
+  # turns redirected native stderr into ErrorRecords, which under 'Stop' would
+  # abort on ordinary progress output. Same guard as the pull step.
+  $previousPreference = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $output = & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile @arguments 2>&1
+  } finally {
+    $ErrorActionPreference = $previousPreference
+  }
+  if ($LASTEXITCODE -ne 0) {
+    # A generic "check that Docker is running" was shown to an operator while
+    # Docker was running and healthy, which made a real failure unfixable.
+    # Docker's own last lines are what makes it diagnosable.
+    $detail = ($output | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Select-Object -Last 3) -join ' / '
+    if (-not $detail) { $detail = "docker compose $($arguments -join ' ') exited with code $LASTEXITCODE" }
+    throw "Docker could not complete this step. $detail"
+  }
+  return $output
+}
+
+function Start-NodeRuntime($sync) {
+  # Upgrading recreates the agent, which stops the previous container first. An
+  # older Node can take the full stop grace period and be killed, and compose
+  # has been observed returning non-zero having created the new container
+  # without starting it. Retrying completes the upgrade instead of reporting a
+  # failed install over a Node that is merely slow to stop.
+  $lastError = $null
+  for ($attempt = 1; $attempt -le 3; $attempt++) {
+    try {
+      Invoke-NodeCompose @('up', '-d') | Out-Null
+      return
+    } catch {
+      $lastError = $_
+      if ($attempt -ge 3) { break }
+      $sync.message = "Your previous Node is still stopping. Retrying ($attempt of 2)..."
+      Start-Sleep -Seconds 5
+    }
+  }
+  throw $lastError
 }
 
 function Read-SetupConfig {
@@ -244,7 +282,7 @@ function Start-SetupFlow {
     if ($LASTEXITCODE -ne 0) { throw 'The kubus Node runtime could not be downloaded. Check this PC''s internet connection and Docker Desktop, then start setup again.' }
 
     Set-Step $sync 'start' 'Starting your Node...'
-    Invoke-NodeCompose @('up', '-d')
+    Start-NodeRuntime $sync
 
     Set-Step $sync 'wait' 'Waiting for your Node to answer...'
     $target = $null
