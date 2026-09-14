@@ -4,7 +4,7 @@
 [![Current release including prereleases](https://img.shields.io/github/v/release/kubus-project/kubus-node?include_prereleases&label=release)](https://github.com/kubus-project/kubus-node/releases)
 [![npm edge publication pending](https://img.shields.io/badge/npm-edge%20pending-777777)](#release-channels)
 [![Docker runtime](https://img.shields.io/badge/runtime-Docker-777777)](docs/RELEASES.md)
-[![Source available](https://img.shields.io/badge/source-available-777777)](#source-status)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-777777)](LICENSE)
 
 Local runtime and public archive Node for art.kubus.
 
@@ -40,13 +40,12 @@ Or, without a global install:
 npx @kubus/kubus-node@edge setup
 ```
 
-**Publication status, verified 2026-09-11:** alpha.5's public npm publication
-failed after its tested GitHub assets were published. The public registry
-currently returns 404. Until this is repaired, install the exact official
+**Publication status, checked 2026-09-14:** alpha.6 is published on GitHub, but
+the public npm edge package remains unavailable. Until this is repaired, install the exact official
 release tarball instead:
 
 ```sh
-npm install -g https://github.com/kubus-project/kubus-node/releases/download/v0.8.0-alpha.5/kubus-kubus-node-0.8.0-alpha.5.tgz
+npm install -g https://github.com/kubus-project/kubus-node/releases/download/v0.8.0-alpha.6/kubus-kubus-node-0.8.0-alpha.6.tgz
 kubus-node setup
 ```
 
@@ -129,7 +128,11 @@ are not public distribution endpoints. [Release contract](docs/RELEASES.md).
 
 ## Source status
 
-kubus Node is **source available** and **UNLICENSED**. No open-source licence
-grant applies to kubus Node itself. Third-party components retain their own
-licences. Protocol and implementation detail previously in this README remains
-in the [runtime guide](docs/node-runtime-guide.md) and the linked documentation.
+Current kubus Node source is **open source under AGPL-3.0-only**; see [LICENSE](LICENSE).
+Third-party components retain their [own licences](docs/THIRD_PARTY_LICENSES.md).
+The software licence does not grant rights to the [kubus branding](TRADEMARKS.md)
+or automatically cover artwork and archive content. The published alpha.6 tag
+predates this licensing change and still contains its earlier UNLICENSED notice.
+Check the licensing information included with downloaded release artifacts.
+Protocol and implementation detail previously in this README remains in the
+[runtime guide](docs/node-runtime-guide.md) and the linked documentation.

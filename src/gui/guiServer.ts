@@ -15,6 +15,7 @@ import { refreshRewards } from '../operator/rewards.js';
 import { buildStatusSummary, refreshStatus } from '../operator/status.js';
 import type { ActionLock } from '../runtime/actionLock.js';
 import type { LocalStore } from '../state/localStore.js';
+import type { RemoteConnectionDiagnostic } from '../webrtc/peerRoute.js';
 import { guiCss } from './public/guiCss.js';
 import { guiJs } from './public/guiJs.js';
 import { assertGuiConfig, authorizeGuiRequest, guiRemoteMode, sendUnauthorized } from './guiAuth.js';
@@ -46,6 +47,8 @@ export interface GuiDeps {
   localApi?: LocalApiDeps;
   /** Optional so narrow tests of unrelated routes don't need to construct one. */
   analytics?: AnalyticsStore;
+  /** Late-bound: signaling starts after registration, long after the GUI does. */
+  remoteConnections?: () => RemoteConnectionDiagnostic[];
 }
 
 const ANALYTICS_RANGES: readonly AnalyticsRange[] = ['24h', '7d', '30d'];
@@ -98,6 +101,15 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
   if (deps.localApi && await handleLocalApi(req, res, deps.localApi)) return;
   if (!deps.config.guiEnabled && parsed.pathname.startsWith('/gui')) {
     writeJson(res, 404, { success: false, error: 'GUI disabled' });
+    return;
+  }
+  // Setup finishes by restarting into this runtime, which retires the
+  // bootstrap server that served /setup. A tab still open on that address —
+  // or a refresh of it — must land on the dashboard rather than a 404 that
+  // reads as a broken install.
+  if ((req.method === 'GET' || req.method === 'HEAD') && parsed.pathname === '/setup') {
+    res.writeHead(302, { location: '/gui', 'cache-control': 'no-store' });
+    res.end();
     return;
   }
   if ((req.method === 'GET' || req.method === 'HEAD') && parsed.pathname === '/gui') {
@@ -367,6 +379,7 @@ async function buildGuiView(deps: GuiDeps) {
       operatorTokenConfigured: Boolean(deps.config.operatorToken),
     },
     captureCount: captures.length,
+    remoteConnections: deps.remoteConnections?.() ?? [],
   });
 }
 

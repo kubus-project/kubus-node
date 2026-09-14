@@ -22,4 +22,4 @@ The gate lives in the shared job/runtime boundary and local API result boundary.
 
 ## Enforcement boundary
 
-kubus Node is source available and runs on operator-owned hardware. No truthful design can cryptographically prevent a hardware owner from modifying visible source. The enforceable product rule is narrower: the unmodified official runtime, Docker stack, local API and worker require an active participation lease for useful compute. This is not DRM and the project does not claim otherwise.
+kubus Node is open-source (AGPL-3.0-only) software that runs on operator-owned hardware. No truthful design can cryptographically prevent a hardware owner from modifying visible source. The enforceable product rule is narrower: the unmodified official runtime, Docker stack, local API and worker require an active participation lease for useful compute. This is not DRM and the project does not claim otherwise.

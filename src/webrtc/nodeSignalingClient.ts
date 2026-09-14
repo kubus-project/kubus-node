@@ -5,6 +5,7 @@ import type { NodeIdentity } from '../identity/nodeIdentity.js';
 import type { LocalApiDeps } from '../localApi/dispatch.js';
 import type { Logger } from '../logging/logger.js';
 import { NodePeer, type IceServerConfig } from './nodePeer.js';
+import { summarizeConnections, type RemoteConnectionDiagnostic } from './peerRoute.js';
 
 /**
  * The Node half of the short-lived signaling rendezvous.
@@ -107,6 +108,14 @@ export class NodeSignalingClient {
       await this.emitAck(socket, 'node:withdraw', {}).catch(() => undefined);
     }
     socket.disconnect();
+  }
+
+  /**
+   * How each connected device is carried, for the operator GUI.
+   * Candidate kinds and a short session prefix only — see `peerRoute.ts`.
+   */
+  connectionDiagnostics(): RemoteConnectionDiagnostic[] {
+    return summarizeConnections(this.activePeers.entries());
   }
 
   private async announce(): Promise<void> {
@@ -212,6 +221,18 @@ export class NodeSignalingClient {
     clearTimeout(session.timer);
     if (reason === 'session:negotiated' && session.peer?.currentState === 'connected') {
       this.activePeers.set(sessionId, session.peer);
+      // One line per established connection, so an operator can tell a relayed
+      // session from a direct one after the fact. Kinds only, never an address;
+      // the prefix matches the session id the backend embeds in TURN usernames.
+      const route = session.peer.routeDiagnostics();
+      this.options.logger.info({
+        session: sessionId.slice(0, 8),
+        route: route.route,
+        localType: route.local?.type ?? null,
+        remoteType: route.remote?.type ?? null,
+        localTransport: route.local?.transport ?? null,
+        remoteTransport: route.remote?.transport ?? null,
+      }, 'webrtc route established');
       return;
     }
     session.peer?.close();

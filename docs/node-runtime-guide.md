@@ -33,7 +33,7 @@ flowchart TD
 
 ## In 30 seconds
 
-kubus Node combines five boundaries in one source-available runtime:
+kubus Node combines five boundaries in one open-source runtime:
 
 - a Kubo/IPFS public archive participant with deterministic, byte-aware HOT/WARM/COLD replication;
 - a paired `/local/v1` API for art.kubus without exposing operator credentials;
@@ -63,7 +63,7 @@ A short outage may enter `DEGRADED` only after successful participation was prev
 
 ## Released installation
 
-Use the [installation overview](../README.md#install). The published alpha.5
+Use the [installation overview](../README.md#install). The published alpha.6
 Windows EXE opens account-authorized setup: sign in to art.kubus, review the
 permissions, and authorize the Node. Normal setup does not require pasting an
 operator token. Docker Desktop with its WSL 2 backend must be running. The ZIP
@@ -72,7 +72,7 @@ launcher remains an alternative and preserves Docker volumes by default.
 The release's CLI supports Windows x64 and Linux x64, with Node.js >=20.19,
 npm >=10, Docker Engine and Compose v2. It starts the same digest-pinned runtime.
 The alpha channel is `edge`, beta is `beta`, stable is `latest`.
-As of 2026-09-11, the alpha.5 npm publication failed; use the official GitHub
+As of 2026-09-14, the public npm edge package remains unavailable; use the official GitHub
 release tarball until the public registry channel is restored.
 
 `kubus-node setup --headless` serves the loopback setup wizard for access through
@@ -149,4 +149,4 @@ Both are pending control-plane records. Settlement is not active; KUB8 has no gu
 
 Channels are `alpha → edge`, `beta → beta`, and stable → `latest`; an alpha image never updates `latest`. Exact SemVer tags and image tags are immutable.
 
-This repository is source available and publicly inspectable, but it remains `UNLICENSED`. No MIT, Apache, GPL or other open-source grant applies to kubus Node itself. Nerfstudio and gsplat retain their Apache-2.0 licenses; other third-party notices are documented separately.
+Current kubus Node source is licensed under `AGPL-3.0-only`; see [LICENSE](../LICENSE). Third-party software retains its [own licences](THIRD_PARTY_LICENSES.md), and the software licence does not grant rights to the [kubus branding](../TRADEMARKS.md) or automatically cover artwork and archive content. The published alpha.6 tag predates this change and retains its earlier bundled licensing notice.
