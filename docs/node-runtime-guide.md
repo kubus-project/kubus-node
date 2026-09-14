@@ -63,7 +63,7 @@ A short outage may enter `DEGRADED` only after successful participation was prev
 
 ## Released installation
 
-Use the [installation overview](../README.md#install). The published alpha.6
+Use the [installation overview](../README.md#install). The published alpha.7
 Windows EXE opens account-authorized setup: sign in to art.kubus, review the
 permissions, and authorize the Node. Normal setup does not require pasting an
 operator token. Docker Desktop with its WSL 2 backend must be running. The ZIP

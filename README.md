@@ -40,12 +40,12 @@ Or, without a global install:
 npx @kubus/kubus-node@edge setup
 ```
 
-**Publication status, checked 2026-09-14:** alpha.6 is published on GitHub, but
+**Publication status, checked 2026-09-14:** alpha.7 is published on GitHub, but
 the public npm edge package remains unavailable. Until this is repaired, install the exact official
 release tarball instead:
 
 ```sh
-npm install -g https://github.com/kubus-project/kubus-node/releases/download/v0.8.0-alpha.6/kubus-kubus-node-0.8.0-alpha.6.tgz
+npm install -g https://github.com/kubus-project/kubus-node/releases/download/v0.8.0-alpha.7/kubus-kubus-node-0.8.0-alpha.7.tgz
 kubus-node setup
 ```
 
