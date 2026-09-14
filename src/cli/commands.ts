@@ -192,10 +192,13 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     startupAbort.abort();
     // Backend requests have their own timeouts. A request completing after
     // shutdown cannot activate services because recovery checks the signal.
-    await Promise.race([startup, new Promise<void>((resolve) => { setTimeout(resolve, 10000).unref(); })]);
+    // This wait was 10s, which is Docker's entire stop grace period on its own,
+    // so every stop was SIGKILLed here while startup finished reconciling pins
+    // in the background. Aborting is what matters; waiting is a courtesy.
+    await Promise.race([startup, new Promise<void>((resolve) => { setTimeout(resolve, STARTUP_ABORT_GRACE_MS).unref(); })]);
     await scheduler?.stop();
     await signaling?.stop();
-  } }, gui, remoteCompute);
+  } }, gui, remoteCompute, null, logger);
 }
 
 async function bootstrapOnce(api: KubusApiClient, kubo: KuboClient, store: LocalStore, config: ReturnType<typeof parseEnv>, capabilities: CapabilityRegistry, gate?: NetworkParticipationGate, identity?: ComputeIdentityService) {
@@ -243,19 +246,96 @@ async function doctor(api: KubusApiClient, kubo: KuboClient, config: ReturnType<
   console.log(JSON.stringify(report, null, 2));
 }
 
-async function waitForShutdown(
+// Docker's default stop grace period is 10 seconds. A shutdown that has not
+// finished by then is SIGKILLed, which can truncate the state file mid-write,
+// so teardown is given a deadline inside that window rather than being allowed
+// to block forever.
+// Total must leave clear margin under the grace period: an 8s budget plus the
+// forced-exit delay measured 9.8s against a 10s limit, which is a coin flip.
+export const SHUTDOWN_DEADLINE_MS = 5000;
+// Each step is bounded on its own, so one step that never returns cannot stop
+// the others from running. Closing the GUI still happens when the scheduler
+// hangs, and the log names whichever step was at fault.
+export const SHUTDOWN_STEP_BUDGET_MS = 1500;
+const FORCED_EXIT_DELAY_MS = 500;
+// How long shutdown waits for an aborted startup to unwind before moving on.
+// Must stay inside a single step's budget or the scheduler step always stalls.
+export const STARTUP_ABORT_GRACE_MS = 1000;
+
+export async function waitForShutdown(
   scheduler: { stop(): Promise<void> } | null,
   gui?: GuiServerHandle | null,
   remoteCompute?: RemoteComputeRuntime,
   signaling?: NodeSignalingClient | null,
+  logger?: { info(obj: unknown, msg?: string): void; warn(obj: unknown, msg?: string): void },
+  options: {
+    deadlineMs?: number;
+    stepBudgetMs?: number;
+    // Injectable so tests can observe the forced exit instead of being killed by it.
+    forceExit?: () => void;
+  } = {},
 ): Promise<void> {
-  await new Promise<void>((resolve) => {
-    const done = () => resolve();
-    process.once('SIGINT', done);
-    process.once('SIGTERM', done);
+  const deadlineMs = options.deadlineMs ?? SHUTDOWN_DEADLINE_MS;
+  const forceExit = options.forceExit ?? (() => process.exit(0));
+  const signal = await new Promise<string>((resolve) => {
+    process.once('SIGINT', () => resolve('SIGINT'));
+    process.once('SIGTERM', () => resolve('SIGTERM'));
   });
-  await scheduler?.stop();
-  remoteCompute?.stop();
-  await signaling?.stop();
-  await gui?.close();
+  logger?.info({ signal, deadlineMs }, 'shutdown requested');
+
+  const startedAt = Date.now();
+  const stepBudget = options.stepBudgetMs ?? SHUTDOWN_STEP_BUDGET_MS;
+  const stalled: string[] = [];
+
+  const runStep = async (name: string, run: () => Promise<void> | void): Promise<void> => {
+    const remaining = deadlineMs - (Date.now() - startedAt);
+    if (remaining <= 0) {
+      stalled.push(name);
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const budget = Math.min(stepBudget, remaining);
+    const timeout = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), budget);
+      timer.unref();
+    });
+    const stepStartedAt = Date.now();
+    const outcome = await Promise.race([
+      (async (): Promise<'done' | 'failed'> => {
+        try {
+          await run();
+          return 'done';
+        } catch (error) {
+          logger?.warn({ step: name, err: error instanceof Error ? error.message : String(error) }, 'shutdown step failed');
+          return 'failed';
+        }
+      })(),
+      timeout,
+    ]);
+    if (timer) clearTimeout(timer);
+    if (outcome === 'timeout') {
+      stalled.push(name);
+      logger?.warn({ step: name, budgetMs: budget }, 'shutdown step did not finish in time');
+    } else {
+      logger?.info({ step: name, ms: Date.now() - stepStartedAt, outcome }, 'shutdown step finished');
+    }
+  };
+
+  await runStep('scheduler', async () => { await scheduler?.stop(); });
+  await runStep('remoteCompute', () => { remoteCompute?.stop(); });
+  await runStep('signaling', async () => { await signaling?.stop(); });
+  await runStep('gui', async () => { await gui?.close(); });
+
+  if (stalled.length > 0) {
+    logger?.warn({ stalled, ms: Date.now() - startedAt }, 'shutdown completed with stalled steps; exiting anyway');
+  } else {
+    logger?.info({ ms: Date.now() - startedAt }, 'shutdown complete');
+  }
+
+  // Completing teardown is not the same as exiting: one lingering handle (a
+  // keep-alive socket, an un-unref'd interval) keeps the event loop running and
+  // the container is then SIGKILLed anyway. This timer is unref'd, so it does
+  // not hold the loop open when the process is ready to exit on its own, and it
+  // fires only if something else is still holding it.
+  setTimeout(forceExit, FORCED_EXIT_DELAY_MS).unref();
 }

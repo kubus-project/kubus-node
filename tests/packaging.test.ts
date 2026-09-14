@@ -116,6 +116,30 @@ describe('release packaging', () => {
     expect(setup).not.toMatch(/\$sync\.error = \$_\.Exception\.Message/);
   });
 
+  it('tells the operator what docker actually said when a step fails', async () => {
+    const setup = await readFile(path.join(repoRoot, 'installer', 'windows', 'KubusNodeSetup.ps1'), 'utf8');
+    // "Open Docker Desktop, check that it is running" was shown to an operator
+    // while Docker was running and healthy, which made the failure unfixable.
+    expect(setup).toMatch(/Select-Object -Last 3/);
+    expect(setup).toContain('throw "Docker could not complete this step. $detail"');
+    expect(setup).not.toMatch(/throw 'Docker could not complete this step\. Open Docker Desktop/);
+  });
+
+  it('does not fail the install because the previous Node was slow to stop', async () => {
+    const setup = await readFile(path.join(repoRoot, 'installer', 'windows', 'KubusNodeSetup.ps1'), 'utf8');
+    // Upgrading recreates the agent. Compose has been observed returning
+    // non-zero having created the new container without starting it, while the
+    // old one was still being killed.
+    expect(setup).toContain('function Start-NodeRuntime');
+    expect(setup).toMatch(/for \(\$attempt = 1; \$attempt -le 3; \$attempt\+\+\)/);
+    // The start step must go through the retry, not call compose directly.
+    const startStep = setup.indexOf("Set-Step $sync 'start'");
+    expect(startStep).toBeGreaterThan(-1);
+    const afterStart = setup.slice(startStep, startStep + 200);
+    expect(afterStart).toContain('Start-NodeRuntime $sync');
+    expect(afterStart).not.toContain("Invoke-NodeCompose @('up', '-d')");
+  });
+
   it('keeps the executable path the image and the npm bin agree on', async () => {
     // `rootDir: "."` is what puts the entry point at dist/src/index.js. If the
     // emit layout ever changes, the Dockerfile CMD and the bin entry both
