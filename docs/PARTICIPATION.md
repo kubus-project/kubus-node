@@ -10,7 +10,9 @@ The official kubus Node distribution implements **private compute in exchange fo
 - `DEGRADED`: a previously verified node has a transient failure and remains inside its lease/grace window.
 - `LOCKED`: no verified lease exists or grace expired. New useful operations return HTTP 423 with `NETWORK_PARTICIPATION_REQUIRED`.
 
-`CONTRIBUTING` requires a valid operator identity, registered node, current backend policy, healthy private Kubo RPC, public pinning enabled, configured capacity at or above `minimumContributionCapacityBytes`, a current non-empty canonical pin-set sync, successful reconciliation of every planned CID, active scheduler, accepted fresh heartbeat and no production skip-pinning mode. Configured capacity is an offer, not proof of contribution.
+`CONTRIBUTING` requires a valid operator identity, registered node, current backend policy, healthy private Kubo RPC, public pinning enabled, configured capacity at or above `minimumContributionCapacityBytes`, a current canonical pin-set sync whose completeness the backend has explicitly confirmed, successful reconciliation of every planned CID, active scheduler, accepted fresh heartbeat and no production skip-pinning mode. Configured capacity is an offer, not proof of contribution.
+
+What is verified is confirmed completeness, not size. A canonical archive that is legitimately empty satisfies the requirement once the backend reports the pin set as complete, so the first nodes on an empty archive can contribute. An empty pin set whose completeness is unknown does not: that is indistinguishable from a sync that never arrived, and the node stays `JOINING`.
 
 A heartbeat alone does not establish participation. The accepted heartbeat renews a verified lease only when all archive checks are simultaneously true. Until the first such verification, the persisted state has no verification generation or lease and the node remains `JOINING`; restart cannot turn that state into `DEGRADED`.
 
