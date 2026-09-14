@@ -77,6 +77,45 @@ describe('release packaging', () => {
     expect(setup).toContain('Test-Url "$nodeOrigin/gui"');
   });
 
+  it('does not let docker progress on stderr abort a pull that is succeeding', async () => {
+    const setup = await readFile(path.join(repoRoot, 'installer', 'windows', 'KubusNodeSetup.ps1'), 'utf8');
+    // Windows PowerShell 5.1 wraps every redirected stderr line from a native
+    // command in an ErrorRecord. `docker compose pull` writes its progress to
+    // stderr, so under this script's 'Stop' preference the first progress line
+    // became a terminating error and reported "Image ipfs/kubo:v0.43.0 Pulling"
+    // as the reason setup failed, on a pull that exited 0.
+    expect(setup).toContain("$ErrorActionPreference = 'Stop'");
+    const lines = setup.split('\n');
+    const redirects = lines
+      .map((line, index) => ({ line, index }))
+      .filter((entry) => entry.line.includes('2>&1'));
+    // If this ever drops to zero the guard below silently stops testing anything.
+    expect(redirects.length).toBeGreaterThan(0);
+    for (const { line, index } of redirects) {
+      const before = lines.slice(Math.max(0, index - 6), index).join('\n');
+      const after = lines.slice(index, index + 10).join('\n');
+      expect(
+        before,
+        `stderr redirect is not relaxed before it runs: ${line.trim()}`,
+      ).toContain("$ErrorActionPreference = 'Continue'");
+      expect(
+        after,
+        `stderr redirect does not restore the preference: ${line.trim()}`,
+      ).toContain('$ErrorActionPreference = $previousPreference');
+    }
+    // Relaxing the preference only works because the real outcome is still read
+    // from the exit code.
+    expect(setup).toMatch(/\$ErrorActionPreference = \$previousPreference\s*\n\s*}\s*\n\s*if \(\$LASTEXITCODE -ne 0\)/);
+  });
+
+  it('never shows a raw native command line as the reason setup stopped', async () => {
+    const setup = await readFile(path.join(repoRoot, 'installer', 'windows', 'KubusNodeSetup.ps1'), 'utf8');
+    // "Image ... Pulling" is a normal progress line. Presenting one as the
+    // failure reason told the operator the install had broken when it had not.
+    expect(setup).toContain("$_.CategoryInfo.Reason -eq 'NativeCommandError'");
+    expect(setup).not.toMatch(/\$sync\.error = \$_\.Exception\.Message/);
+  });
+
   it('keeps the executable path the image and the npm bin agree on', async () => {
     // `rootDir: "."` is what puts the entry point at dist/src/index.js. If the
     // emit layout ever changes, the Dockerfile CMD and the bin entry both

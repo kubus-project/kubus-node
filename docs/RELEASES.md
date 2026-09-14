@@ -33,6 +33,29 @@ the destructive `kubus-node uninstall --delete-data --yes-delete-data` path.
 
 The compose bundle contains no credentials. Operators must create `.env` from the included example and supply their own scoped token and local secrets.
 
+## v0.8.0-alpha.8 — Setup Survives Its Own Progress Output
+
+alpha.7 could not complete a Windows install. Setup stopped at the download step
+and reported `Image ipfs/kubo:v0.43.0 Pulling` as the reason it failed, which is
+a normal progress line from a pull that was succeeding.
+
+- **The pull no longer aborts on its own output.** `docker compose pull` writes
+  progress to stderr, and Windows PowerShell 5.1 wraps every redirected stderr
+  line in an `ErrorRecord`. Under the launcher's `Stop` preference the first
+  progress line became a terminating error, so the download was abandoned
+  seconds after it began even though it exited successfully. The preference is
+  now relaxed for the duration of the pull only; the outcome is still taken from
+  the exit code, so a genuine download failure is still reported.
+- **A native command line is never shown as the reason setup stopped.** Only the
+  launcher's own messages are written for the person reading the page; anything
+  else now reports which step stopped and that Node data and identity are
+  untouched.
+
+This shipped in alpha.7 with the live pull output that made it visible. The
+packaging tests asserted the text of the launcher, not its behaviour, so a
+construct that reads correctly and fails at runtime passed review. Both defects
+above now have regression tests that fail against the alpha.7 launcher.
+
 ## v0.8.0-alpha.7 — Setup You Can Watch
 
 Windows setup is browser-first. An experienced operator reported that install

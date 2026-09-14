@@ -221,10 +221,25 @@ function Start-SetupFlow {
     # The pull is the long part. Its output is the only honest progress signal
     # available, so it is surfaced line by line instead of leaving the page
     # looking stalled for minutes.
+    #
+    # docker compose writes that progress to stderr, and Windows PowerShell 5.1
+    # wraps every redirected stderr line in an ErrorRecord. Under the script's
+    # 'Stop' preference the FIRST progress line would therefore become a
+    # terminating error and abort a pull that was in fact succeeding, reporting
+    # a normal line such as "Image ipfs/kubo:v0.43.0 Pulling" as the failure.
+    # The preference is relaxed for the duration of the pull only, so progress
+    # stays visible; the real outcome is taken from the exit code below, which
+    # still catches a genuine failure.
     Set-Step $sync 'pull' 'Downloading the kubus Node runtime. This can take several minutes the first time.'
-    & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile pull 2>&1 | ForEach-Object {
-      $line = "$_".Trim()
-      if ($line) { $sync.message = $line }
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+      & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile pull 2>&1 | ForEach-Object {
+        $line = "$_".Trim()
+        if ($line) { $sync.message = $line }
+      }
+    } finally {
+      $ErrorActionPreference = $previousPreference
     }
     if ($LASTEXITCODE -ne 0) { throw 'The kubus Node runtime could not be downloaded. Check this PC''s internet connection and Docker Desktop, then start setup again.' }
 
@@ -253,7 +268,15 @@ function Start-SetupFlow {
     # Long enough for the page to poll once and navigate.
     Start-Sleep -Seconds 5
   } catch {
-    $sync.error = $_.Exception.Message
+    # Only the deliberate 'throw' messages in this script are written for the
+    # person reading the page. Anything else is an internal error, and a raw
+    # native-command line ("Image ... Pulling") must never be presented as the
+    # reason setup stopped, because it reads as a failure when it is not one.
+    $reason = "$($_.Exception.Message)".Trim()
+    if ($_.CategoryInfo.Reason -eq 'NativeCommandError' -or -not $reason) {
+      $reason = "Setup could not finish the '$($sync.step)' step. Open Docker Desktop, check that it is running, then start kubus Node setup again."
+    }
+    $sync.error = $reason
     $sync.message = ''
     # Keep the page alive so the reason stays readable instead of vanishing.
     Start-Sleep -Seconds 600
