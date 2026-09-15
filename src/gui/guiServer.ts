@@ -20,6 +20,7 @@ import { guiCss } from './public/guiCss.js';
 import { guiJs } from './public/guiJs.js';
 import { assertGuiConfig, authorizeGuiRequest, guiRemoteMode, sendUnauthorized } from './guiAuth.js';
 import { guiHtml } from './templates/index.js';
+import { GuiHandoffs, guiSessionCookie, sameGuiOrigin } from './guiSession.js';
 import { spatialViewerBootstrapJs, spatialViewerHtml } from './templates/spatialViewer.js';
 import { spatialViewerBundle } from './public/vendor/spatialViewerBundle.js';
 import { handleLocalApi, type LocalApiDeps } from '../localApi/localApiRouter.js';
@@ -60,8 +61,9 @@ export interface GuiServerHandle {
 
 export async function startGuiServer(deps: GuiDeps): Promise<GuiServerHandle> {
   if (deps.config.guiEnabled) assertGuiConfig(deps.config);
+  const handoffs = new GuiHandoffs();
   const server = http.createServer((req, res) => {
-    void handleRequest(req, res, deps).catch((error) => {
+    void handleRequest(req, res, deps, handoffs).catch((error) => {
       writeJson(res, Number((error as Error & { statusCode?: number }).statusCode || 500), {
         success: false,
         error: String((error as Error).message || error),
@@ -96,11 +98,36 @@ export async function startGuiServer(deps: GuiDeps): Promise<GuiServerHandle> {
   };
 }
 
-async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: GuiDeps): Promise<void> {
+async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: GuiDeps, handoffs: GuiHandoffs): Promise<void> {
+  res.setHeader('Referrer-Policy', 'no-referrer');
   const parsed = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
   if (deps.localApi && await handleLocalApi(req, res, deps.localApi)) return;
   if (!deps.config.guiEnabled && parsed.pathname.startsWith('/gui')) {
     writeJson(res, 404, { success: false, error: 'GUI disabled' });
+    return;
+  }
+  if (req.method === 'POST' && parsed.pathname === '/gui/session') {
+    if (!sameGuiOrigin(req)) { writeJson(res, 403, { success: false }); return; }
+    if (req.headers['content-type']?.split(';')[0]?.trim() !== 'application/json') {
+      writeJson(res, 415, { success: false }); return;
+    }
+    const body = await readGuiJson(req, 1024);
+    if (!deps.config.guiToken || !handoffs.consume(body?.ticket)) { sendUnauthorized(res); return; }
+    res.setHeader('Set-Cookie', guiSessionCookie(deps.config.guiToken, Date.now(), req.headers.origin?.startsWith('https://')));
+    writeJson(res, 200, { success: true });
+    return;
+  }
+  if (req.method === 'POST' && parsed.pathname === '/gui/api/session/handoff') {
+    // Only the launcher holding the configured credential can mint a login.
+    if (!deps.config.guiToken || req.headers.authorization !== `Bearer ${deps.config.guiToken}`) {
+      sendUnauthorized(res); return;
+    }
+    await readGuiJson(req, 1024);
+    const ticket = handoffs.issue();
+    if (!ticket) { writeJson(res, 429, { success: false }); return; }
+    // Intentional secret response to an authenticated launcher, never logged.
+    writeHead(res, 201, 'application/json; charset=utf-8');
+    res.end(JSON.stringify({ ticket }));
     return;
   }
   // Setup finishes by restarting into this runtime, which retires the
@@ -414,13 +441,13 @@ async function createGuiPairing(deps: GuiDeps) {
   };
 }
 
-async function readGuiJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+async function readGuiJson(req: IncomingMessage, maxBytes = 64 * 1024): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     const bytes = Buffer.from(chunk as Buffer);
     size += bytes.length;
-    if (size > 64 * 1024) {
+    if (size > maxBytes) {
       const error = new Error('request_too_large') as Error & { statusCode?: number };
       error.statusCode = 413;
       throw error;

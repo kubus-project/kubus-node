@@ -47,6 +47,9 @@ export function redactSecrets<T>(value: T): T {
         normalizedKey.includes('token') ||
         normalizedKey.includes('authorization') ||
         normalizedKey.includes('secret') ||
+        normalizedKey.includes('ticket') ||
+        normalizedKey === 'cookie' ||
+        normalizedKey === 'set-cookie' ||
         normalizedKey.includes('privatekey') ||
         normalizedKey.includes('seed')
       ) {

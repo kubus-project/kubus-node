@@ -162,10 +162,12 @@ function renderAuth() {
   $('#app').innerHTML = '<main class="auth"><form class="auth-card" id="authForm">' +
     '<div class="brand"><div class="brand-name">kubus Node</div>' +
     '<div class="brand-descriptor">Local runtime + public archive node</div></div>' +
-    '<p class="t-body">Enter the local GUI token configured as NODE_GUI_TOKEN to open this node.</p>' +
+    '<p class="t-body">Open kubus Node from the Windows Start menu to securely open your dashboard.</p>' +
+    '<p class="t-meta">The launcher signs in this browser automatically. Your Node keeps running when this browser session expires.</p>' +
+    '<details><summary>Advanced operator access</summary>' +
     '<label for="token">GUI token' +
     '<input id="token" type="password" autocomplete="current-password" required></label>' +
-    '<button class="button primary" type="submit">Open node</button>' +
+    '<button class="button primary" type="submit">Open node</button></details>' +
     '<p class="t-meta">This GUI controls local node operations only. It cannot move funds.</p>' +
     '</form></main>';
   $('#authForm').addEventListener('submit', (event) => {
@@ -1479,11 +1481,35 @@ async function refresh() {
   }
 }
 
-window.addEventListener('hashchange', () => {
+window.addEventListener('hashchange', async () => {
+  if (new URLSearchParams(location.hash.slice(1)).has('handoff')) {
+    await acceptGuiHandoff();
+    await refresh();
+    return;
+  }
   const section = location.hash.replace('#', '');
   if (section && section !== activeSection) navigate(section);
 });
 
-void refresh();
-setInterval(() => { void refresh(); }, 10000);
+async function acceptGuiHandoff() {
+  const fragment = new URLSearchParams(location.hash.slice(1));
+  const ticket = fragment.get('handoff');
+  if (ticket) {
+    history.replaceState(null, '', location.pathname + location.search);
+    try {
+      const response = await fetch('/gui/session', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin', body: JSON.stringify({ ticket }),
+      });
+      if (response.ok) localStorage.removeItem(TOKEN_KEY);
+      else announce('Open kubus Node from the Windows launcher to sign in again.');
+    } catch (_error) { announce('Open kubus Node from the Windows launcher to sign in again.'); }
+  }
+}
+async function startGui() {
+  await acceptGuiHandoff();
+  await refresh();
+  setInterval(() => { void refresh(); }, 10000);
+}
+void startGui();
 `;
