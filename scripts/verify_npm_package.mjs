@@ -14,6 +14,9 @@ for (const file of files) {
 }
 if ((await stat(tarball)).size > 25 * 1024 * 1024) throw new Error('npm package exceeds the 25 MiB operator CLI limit.');
 const packageJson = JSON.parse(tarText(tarball, 'package/package.json'));
+if (packageJson.repository?.type !== 'git' || packageJson.repository?.url !== 'git+https://github.com/kubus-project/kubus-node.git') {
+  throw new Error('npm provenance requires the canonical GitHub repository metadata.');
+}
 for (const key of ['preinstall', 'install', 'postinstall', 'prepack', 'prepare']) {
   if (packageJson.scripts?.[key]) throw new Error(`Published npm package must not contain a ${key} lifecycle script.`);
 }
