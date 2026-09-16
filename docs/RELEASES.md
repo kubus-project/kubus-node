@@ -19,6 +19,12 @@ survive Node restarts. Persistent credentials never enter the handoff URL or
 browser storage. Existing installations retain their identity, data and LAN
 setting. Manual GUI tokens remain available under Advanced operator access.
 
+The publication job now installs npm 11.19.1 explicitly. The previous pinned
+Node version bundled npm 10.9.2, which cannot perform npm trusted-publisher
+authentication. The package owner must still authorize this repository's
+`release.yml` workflow for direct publishing in npm's trusted-publisher settings.
+Provenance, immutable artifact checks and publication failures remain enforced.
+
 ## Canonical runtime and npm channel
 
 One release creates the immutable Node image, immutable spatial-worker image,
