@@ -15,25 +15,35 @@ describe.skipIf(process.platform !== 'win32')('real Windows PowerShell launcher 
     const child = spawn('powershell.exe', ['-NoProfile', '-File', path.resolve('tests/fixtures/gui-progress.ps1'), '-Port', String(port)], { windowsHide: true });
     const exited = once(child, 'exit');
     try {
-      await once(child.stdout, 'data');
+      await Promise.race([
+        once(child.stdout, 'data'),
+        exited.then(() => { throw new Error('Progress fixture exited before becoming ready'); }),
+      ]);
       const origin = `http://127.0.0.1:${port}`;
-      const request = (headers: Record<string, string> = {}) => fetch(`${origin}/status`, { headers });
-      expect(await (await request()).json()).toMatchObject({ nextUrl: 'test-only-handoff' });
+      // This small HTTP/1.1 server intentionally closes every response. Do not
+      // let undici pre-open an idle keepalive socket ahead of the next request.
+      const request = (headers: Record<string, string> = {}, method = 'GET') => new Promise<{ status?: number; body: string }>((resolve, reject) => {
+        const req = http.request(`${origin}/status`, { headers, method, agent: false }, (response) => {
+          let body = '';
+          response.setEncoding('utf8');
+          response.on('data', (chunk: string) => { body += chunk; });
+          response.on('end', () => resolve({ status: response.statusCode, body }));
+        });
+        req.on('error', reject);
+        req.setTimeout(5000, () => req.destroy(new Error('Progress request timed out')));
+        req.end();
+      });
+      expect(JSON.parse((await request()).body)).toMatchObject({ nextUrl: 'test-only-handoff' });
       const deniedHeaders: Record<string, string>[] = [{ host: 'attacker.test' }, { origin: 'https://attacker.test' }, { 'sec-fetch-site': 'cross-site' }];
       for (const headers of deniedHeaders) {
-        const status = await new Promise<number | undefined>((resolve, reject) => {
-          http.get(`${origin}/status`, { headers }, (response) => {
-            response.resume(); resolve(response.statusCode);
-          }).on('error', reject);
-        });
-        expect(status, JSON.stringify(headers)).toBe(403);
+        expect((await request(headers)).status, JSON.stringify(headers)).toBe(403);
       }
-      expect((await fetch(`${origin}/status`, { method: 'POST' })).status).toBe(403);
+      expect((await request({}, 'POST')).status).toBe(403);
     } finally {
       child.stdin.end('\n');
       await exited;
     }
-  });
+  }, 20_000);
 
   it('authenticates over HTTP and returns only the one-use fragment', async () => {
     let calls = 0;
