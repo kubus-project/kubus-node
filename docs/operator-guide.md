@@ -11,6 +11,18 @@ address and recreates the port binding; users do not enter a manual LAN URL.
 Docker volumes and this configuration are retained by default when stopping the
 Node.
 
+The setup browser receives an HttpOnly session after configuration is saved.
+Opening the Windows launcher again uses the stored GUI credential to request a
+single-use handoff (60-second lifetime), then opens the dashboard without asking
+for a token. The persistent credential never enters a URL or browser storage.
+Browser sessions last 12 hours and survive Node restarts; rotating the GUI
+credential invalidates them. Expired sessions can be reopened from the Start
+menu. Manually entering a GUI token remains an advanced operator recovery path.
+The loopback progress server rejects foreign Host/Origin and cross-site requests.
+The handoff endpoint requires the configured GUI bearer credential; browser
+exchange requires same-origin JSON, and cookie-authenticated mutations enforce
+Origin. None of this authorizes the phone's separate paired-device API.
+
 For managed/headless deployments, install Node.js 20+ and Docker. In art.kubus, sign in with the operator wallet and open Settings > Wallet > Availability Node. Create a scoped operator token, copy it once, and paste it into `.env` as `KUBUS_OPERATOR_TOKEN`.
 
 Configure every required value in `.env.example`, then run:

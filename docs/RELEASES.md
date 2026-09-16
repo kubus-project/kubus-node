@@ -10,6 +10,21 @@ kubus Node uses SemVer. Exact Git and container tags are immutable.
 
 An alpha or beta never updates `latest`. Every `v*` tag runs type checking, tests, the TypeScript build, dependency audit, node and worker image builds, release-bundle checksums, and SPDX SBOM generation before GitHub release assets are published. A failed workflow is a failed release, regardless of whether the Git tag exists.
 
+## v0.8.0-alpha.10 — Open the dashboard after setup
+
+Setup now establishes an HttpOnly browser session. Reopening the Windows
+launcher exchanges the saved GUI credential for a single-use, 60-second browser
+handoff; no token needs to be copied from Docker. Sessions last 12 hours and
+survive Node restarts. Persistent credentials never enter the handoff URL or
+browser storage. Existing installations retain their identity, data and LAN
+setting. Manual GUI tokens remain available under Advanced operator access.
+
+The publication job now installs npm 11.19.1 explicitly. The previous pinned
+Node version bundled npm 10.9.2, which cannot perform npm trusted-publisher
+authentication. The package owner must still authorize this repository's
+`release.yml` workflow for direct publishing in npm's trusted-publisher settings.
+Provenance, immutable artifact checks and publication failures remain enforced.
+
 ## Canonical runtime and npm channel
 
 One release creates the immutable Node image, immutable spatial-worker image,

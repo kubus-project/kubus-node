@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AppConfig } from '../config/schema.js';
+import { sameGuiOrigin, validGuiSession } from './guiSession.js';
 
 export function isLoopbackRemote(address?: string | null): boolean {
   const normalized = (address || '').toLowerCase();
@@ -26,7 +27,9 @@ export function authorizeGuiRequest(req: IncomingMessage, config: AppConfig): bo
   const header = req.headers.authorization || '';
   if (header === `Bearer ${config.guiToken}`) return true;
   const cookie = req.headers.cookie || '';
-  return cookie.split(';').some((part) => part.trim() === `kubus_node_gui=${encodeURIComponent(config.guiToken || '')}`);
+  const value = cookie.split(';').map((part) => part.trim()).find((part) => part.startsWith('kubus_node_gui='))?.slice('kubus_node_gui='.length);
+  if (!value || !validGuiSession(value, config.guiToken)) return false;
+  return ['GET', 'HEAD'].includes(req.method || '') || sameGuiOrigin(req);
 }
 
 export function sendUnauthorized(res: ServerResponse): void {

@@ -5,6 +5,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { startSetupServer, type SetupServerHandle } from '../src/gui/setupServer.js';
+import { validGuiSession } from '../src/gui/guiSession.js';
 
 let server: SetupServerHandle | undefined;
 let directory: string | undefined;
@@ -74,8 +75,14 @@ describe('setup HTTP security boundary', () => {
     // only when the person explicitly asked for it.
     const body = JSON.stringify({ advanced: true, nodeLabel: 'Home', apiBaseUrl: 'https://api.kubus.site', operatorWallet: 'wallet', operatorToken: 'kubus_node_test' });
     const send = () => fetch(`${origin}/setup/config`, { method: 'POST', headers, body });
-    expect((await send()).status).toBe(201);
+    const response = await send();
+    expect(response.status).toBe(201);
     const saved = await fs.readFile(configPath, 'utf8');
+    const secret = JSON.parse(saved.match(/^NODE_GUI_TOKEN=(.+)$/m)![1]!) as string;
+    const cookie = response.headers.get('set-cookie')!;
+    expect(cookie).toContain('HttpOnly');
+    expect(cookie).not.toContain(secret);
+    expect(validGuiSession(cookie.split(';')[0]!.split('=')[1]!, secret)).toBe(true);
     expect((await send()).status).toBe(409);
     expect(await fs.readFile(configPath, 'utf8')).toBe(saved);
     // Let the production restart callback execute while process.exit is mocked.

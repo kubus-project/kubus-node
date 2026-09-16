@@ -91,6 +91,9 @@ jobs:
         run: |
           npm ci
           npm run build
+      - name: Exercise the launcher browser handoff on Windows PowerShell
+        shell: pwsh
+        run: npm test -- tests/windowsGuiHandoff.test.ts
       - name: Parse installer and verify shipped-layout references
         shell: pwsh
         run: |

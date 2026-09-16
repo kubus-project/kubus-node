@@ -140,6 +140,8 @@ jobs:
         with:
           node-version: 22.15.0
           registry-url: https://registry.npmjs.org
+      - name: Install the trusted-publishing capable npm CLI
+        run: npm install --global npm@11.19.1
       - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ghcr.io/kubus-project/kubus-node@${{ needs.images.outputs.node_digest }}
