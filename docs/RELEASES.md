@@ -46,7 +46,17 @@ hooks. `npm uninstall -g @kubus/kubus-node` removes only the CLI; Docker
 volumes and the durable Node identity remain until the operator explicitly runs
 the destructive `kubus-node uninstall --delete-data --yes-delete-data` path.
 
-The compose bundle contains no credentials. Operators must create `.env` from the included example and supply their own scoped token and local secrets.
+The release Compose bundle contains no credentials. Normal installation uses account-authorized setup to provision configuration. Only advanced manual/source deployments create `.env` from the example and supply their own scoped credentials.
+
+## v0.8.0-alpha.5 distribution status — verified 2026-09-11
+
+Source validation, image builds, package parity and Windows EXE verification
+passed in [the release run](https://github.com/kubus-project/kubus-node/actions/runs/34257125605).
+The tested assets were published to GitHub Releases. The final npm publication
+step failed, so the overall workflow is failed and the release is not fully
+distributed. The public npm registry currently returns 404. The official npm
+tarball is available in GitHub Releases as a temporary installation path; do not
+claim the `edge` registry channel is available until publication is repaired.
 
 ## v0.8.0-alpha.9 — The Node Stops When Asked
 
