@@ -51,12 +51,55 @@ function Write-RuntimeTopology([bool]$allowLan) {
 }
 
 function Invoke-NodeCompose([string[]]$arguments) {
-  & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile @arguments
-  if ($LASTEXITCODE -ne 0) { throw 'Docker could not complete this step. Open Docker Desktop, check that it is running and has disk space, then start setup again.' }
+  # Capturing docker's own words requires redirecting stderr, and PowerShell 5.1
+  # turns redirected native stderr into ErrorRecords, which under 'Stop' would
+  # abort on ordinary progress output. Same guard as the pull step.
+  $previousPreference = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $output = & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile @arguments 2>&1
+  } finally {
+    $ErrorActionPreference = $previousPreference
+  }
+  if ($LASTEXITCODE -ne 0) {
+    # A generic "check that Docker is running" was shown to an operator while
+    # Docker was running and healthy, which made a real failure unfixable.
+    # Docker's own last lines are what makes it diagnosable.
+    $detail = ($output | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Select-Object -Last 3) -join ' / '
+    if (-not $detail) { $detail = "docker compose $($arguments -join ' ') exited with code $LASTEXITCODE" }
+    throw "Docker could not complete this step. $detail"
+  }
+  return $output
+}
+
+function Start-NodeRuntime($sync) {
+  # Upgrading recreates the agent, which stops the previous container first. An
+  # older Node can take the full stop grace period and be killed, and compose
+  # has been observed returning non-zero having created the new container
+  # without starting it. Retrying completes the upgrade instead of reporting a
+  # failed install over a Node that is merely slow to stop.
+  $lastError = $null
+  for ($attempt = 1; $attempt -le 3; $attempt++) {
+    try {
+      Invoke-NodeCompose @('up', '-d') | Out-Null
+      return
+    } catch {
+      $lastError = $_
+      if ($attempt -ge 3) { break }
+      $sync.message = "Your previous Node is still stopping. Retrying ($attempt of 2)..."
+      Start-Sleep -Seconds 5
+    }
+  }
+  throw $lastError
 }
 
 function Read-SetupConfig {
-  $config = & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile exec -T kubus-node-agent sh -lc 'test -s /var/lib/kubus-node/config.env && cat /var/lib/kubus-node/config.env' 2>$null
+  if (-not (Test-Path -LiteralPath $runtimeEnv)) { return $null }
+  $previousPreference = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $config = & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile exec -T kubus-node-agent sh -lc 'test -s /var/lib/kubus-node/config.env && cat /var/lib/kubus-node/config.env' 2>$null
+  } finally { $ErrorActionPreference = $previousPreference }
   if ($LASTEXITCODE -ne 0) { return $null }
   return ($config -join "`n")
 }
@@ -76,6 +119,23 @@ function Test-Url([string]$url) {
     if ($_.Exception.Response) { return $true }
     return $false
   } catch { return $false }
+}
+
+function Get-DashboardHandoff([string]$config) {
+  if ($config -notmatch '(?m)^NODE_GUI_TOKEN=(.+)\r?$') {
+    throw 'The saved GUI credential is missing. Your Node data is preserved; repair its configuration before opening the dashboard.'
+  }
+  $encoded = $Matches[1].Trim()
+  $guiCredential = if ($encoded.StartsWith('"')) { $encoded | ConvertFrom-Json } else { $encoded }
+  if (-not $guiCredential) { throw 'The saved GUI credential is empty.' }
+  try {
+    $handoff = Invoke-RestMethod -Uri "$nodeOrigin/gui/api/session/handoff" -Method Post -ContentType 'application/json' -Body '{}' -Headers @{ Authorization = "Bearer $guiCredential" } -TimeoutSec 10
+    if ($handoff.ticket -notmatch '^[A-Za-z0-9_-]{43}$') { throw 'Invalid handoff' }
+    return "$nodeOrigin/gui#handoff=$($handoff.ticket)"
+  } catch {
+    # Never surface the request, credential, or ticket in an error or progress log.
+    throw 'The dashboard could not authorize this browser. Start kubus Node again to retry; your Node data is preserved.'
+  } finally { $guiCredential = $null }
 }
 
 function Get-FreePort([int]$preferred) {
@@ -156,15 +216,45 @@ tick();
 
 function Start-StatusServer([hashtable]$sync, [int]$port) {
   $script = {
+    function Read-BoundedLine($reader) {
+      $line = New-Object Text.StringBuilder
+      while ($true) {
+        $value = $reader.Read()
+        if ($value -lt 0 -or $value -eq 10) { return $line.ToString().TrimEnd([char]13) }
+        if ($line.Length -ge 8192) { throw 'Request line too large' }
+        [void]$line.Append([char]$value)
+      }
+    }
     $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $port)
     $listener.Start()
+    $sync.listening = $true
     while (-not $sync.stopServer) {
       if (-not $listener.Pending()) { Start-Sleep -Milliseconds 50; continue }
       $client = $listener.AcceptTcpClient()
       try {
         $stream = $client.GetStream()
+        $stream.ReadTimeout = 3000
+        $stream.WriteTimeout = 3000
         $reader = New-Object System.IO.StreamReader($stream)
-        $requestLine = $reader.ReadLine()
+        $requestLine = Read-BoundedLine $reader
+        $headers = @{}
+        $headerBytes = 0
+        while ($line = Read-BoundedLine $reader) {
+          $headerBytes += $line.Length
+          if ($headerBytes -gt 8192) { throw 'Request headers too large' }
+          if ($line -match '^([^:]+):\s*(.*)$') { $headers[$Matches[1].ToLowerInvariant()] = $Matches[2].Trim() }
+        }
+        # The status document can contain a single-use browser handoff. Reject
+        # DNS rebinding and cross-site reads rather than exposing it to a page
+        # hosted on an unrelated origin. No CORS access is granted.
+        if ($requestLine -notmatch '^GET /(?:status)?(?:\?[^ ]*)? HTTP/1\.[01]$' -or
+            $headers['host'] -ne "127.0.0.1:$port" -or
+            $headers['sec-fetch-site'] -eq 'cross-site' -or
+            ($headers['origin'] -and $headers['origin'] -ne "http://127.0.0.1:$port")) {
+          $denied = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 403 Forbidden`r`nContent-Length: 0`r`nConnection: close`r`n`r`n")
+          $stream.Write($denied, 0, $denied.Length)
+          continue
+        }
         $path = '/'
         if ($requestLine -match '^[A-Z]+\s+(\S+)') { $path = $Matches[1] }
         if ($path -like '/status*') {
@@ -216,20 +306,36 @@ function Start-SetupFlow {
     $drive = Get-PSDrive -Name ([IO.Path]::GetPathRoot($dataRoot).TrimEnd(':', '\'))
     if ($drive.Free -lt 10GB) { throw 'At least 10 GB of free disk space is required before starting kubus Node.' }
     if (-not (Test-Path -LiteralPath $composeFile)) { throw 'This release bundle is incomplete: docker-compose.release.yml is missing. Reinstall kubus Node.' }
-    Write-RuntimeTopology $false
+    $existingConfig = Read-SetupConfig
+    Write-RuntimeTopology ($existingConfig -match '(?m)^LOCAL_API_ALLOW_LAN=(?:"true"|true)$')
 
     # The pull is the long part. Its output is the only honest progress signal
     # available, so it is surfaced line by line instead of leaving the page
     # looking stalled for minutes.
+    #
+    # docker compose writes that progress to stderr, and Windows PowerShell 5.1
+    # wraps every redirected stderr line in an ErrorRecord. Under the script's
+    # 'Stop' preference the FIRST progress line would therefore become a
+    # terminating error and abort a pull that was in fact succeeding, reporting
+    # a normal line such as "Image ipfs/kubo:v0.43.0 Pulling" as the failure.
+    # The preference is relaxed for the duration of the pull only, so progress
+    # stays visible; the real outcome is taken from the exit code below, which
+    # still catches a genuine failure.
     Set-Step $sync 'pull' 'Downloading the kubus Node runtime. This can take several minutes the first time.'
-    & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile pull 2>&1 | ForEach-Object {
-      $line = "$_".Trim()
-      if ($line) { $sync.message = $line }
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+      & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile pull 2>&1 | ForEach-Object {
+        $line = "$_".Trim()
+        if ($line) { $sync.message = $line }
+      }
+    } finally {
+      $ErrorActionPreference = $previousPreference
     }
     if ($LASTEXITCODE -ne 0) { throw 'The kubus Node runtime could not be downloaded. Check this PC''s internet connection and Docker Desktop, then start setup again.' }
 
     Set-Step $sync 'start' 'Starting your Node...'
-    Invoke-NodeCompose @('up', '-d')
+    Start-NodeRuntime $sync
 
     Set-Step $sync 'wait' 'Waiting for your Node to answer...'
     $target = $null
@@ -243,9 +349,14 @@ function Start-SetupFlow {
     }
     if (-not $target) { throw 'Your Node started but did not answer in time. It keeps running in Docker - open Docker Desktop to see its logs, then start setup again.' }
 
-    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
-      '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-File', $PSCommandPath, '-FinalizeSetup'
-    )
+    $savedConfig = Read-SetupConfig
+    if ($savedConfig) {
+      $target = Get-DashboardHandoff $savedConfig
+    } else {
+      Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
+        '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-File', $PSCommandPath, '-FinalizeSetup'
+      )
+    }
 
     Set-Step $sync 'handoff' 'Your Node is running. Opening setup...'
     $sync.nextUrl = $target
@@ -253,7 +364,15 @@ function Start-SetupFlow {
     # Long enough for the page to poll once and navigate.
     Start-Sleep -Seconds 5
   } catch {
-    $sync.error = $_.Exception.Message
+    # Only the deliberate 'throw' messages in this script are written for the
+    # person reading the page. Anything else is an internal error, and a raw
+    # native-command line ("Image ... Pulling") must never be presented as the
+    # reason setup stopped, because it reads as a failure when it is not one.
+    $reason = "$($_.Exception.Message)".Trim()
+    if ($_.CategoryInfo.Reason -eq 'NativeCommandError' -or -not $reason) {
+      $reason = "Setup could not finish the '$($sync.step)' step. Open Docker Desktop, check that it is running, then start kubus Node setup again."
+    }
+    $sync.error = $reason
     $sync.message = ''
     # Keep the page alive so the reason stays readable instead of vanishing.
     Start-Sleep -Seconds 600
@@ -328,7 +447,10 @@ function Show-ManageWindow {
   $dashboard.Text = 'Open dashboard'
   $dashboard.Location = New-Object System.Drawing.Point(24, 118)
   $dashboard.Size = New-Object System.Drawing.Size(150, 34)
-  $dashboard.Add_Click({ Start-Process "$nodeOrigin/gui" })
+  $dashboard.Add_Click({
+    try { Start-Process (Get-DashboardHandoff (Read-SetupConfig)) }
+    catch { $status.Text = 'Could not open the dashboard. Start kubus Node and try again.' }
+  })
   $form.Controls.Add($dashboard)
 
   $deleteData = New-Object System.Windows.Forms.CheckBox

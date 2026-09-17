@@ -1,22 +1,29 @@
 # Operator Guide
 
-For a normal Windows installation, use the official Windows EXE from
-[node.kubus.site](https://node.kubus.site/download/windows). Run Docker Desktop
-with WSL 2, install kubus Node, and open setup. Sign in to art.kubus, review the
-permissions and authorize the Node. The release ZIP's `Start-KubusNodeSetup.cmd`
-is an alternative launcher. Both paths use the shipped digest-pinned Compose
-runtime, preserve Docker volumes by default, and require no source checkout or
-manual operator-token entry. Account-authorized setup is included in alpha.5.
+For a normal Windows installation, extract `kubus-node-windows-vX.Y.Z.zip` and
+open `Start-KubusNodeSetup.cmd`. It pulls the immutable images recorded in the
+shipped `docker-compose.release.yml`, opens the loopback-only setup page, and
+never builds from source or needs a checkout. No `.env` editing is required.
+The setup page writes `config.env` beside `LOCAL_STATE_PATH` with restrictive
+permissions, creates a random GUI token, and restarts the container into the
+ordinary GUI. When LAN pairing is enabled, the installer detects the host LAN
+address and recreates the port binding; users do not enter a manual LAN URL.
+Docker volumes and this configuration are retained by default when stopping the
+Node.
 
-For a managed server, `kubus-node setup --headless` opens the same loopback
-wizard for access through an SSH tunnel. See the [installation overview](../README.md#install)
-for the current npm publication status and supported platforms.
+The setup browser receives an HttpOnly session after configuration is saved.
+Opening the Windows launcher again uses the stored GUI credential to request a
+single-use handoff (60-second lifetime), then opens the dashboard without asking
+for a token. The persistent credential never enters a URL or browser storage.
+Browser sessions last 12 hours and survive Node restarts; rotating the GUI
+credential invalidates them. Expired sessions can be reopened from the Start
+menu. Manually entering a GUI token remains an advanced operator recovery path.
+The loopback progress server rejects foreign Host/Origin and cross-site requests.
+The handoff endpoint requires the configured GUI bearer credential; browser
+exchange requires same-origin JSON, and cookie-authenticated mutations enforce
+Origin. None of this authorizes the phone's separate paired-device API.
 
-## Advanced manual configuration and source development
-
-Manual configuration is for managed deployments and development. Supply a
-properly scoped operator credential and the required local secrets yourself;
-the normal account-authorized installer provisions its own credentials.
+For managed/headless deployments, install Node.js 20+ and Docker. In art.kubus, sign in with the operator wallet and open Settings > Wallet > Availability Node. Create a scoped operator token, copy it once, and paste it into `.env` as `KUBUS_OPERATOR_TOKEN`.
 
 Configure every required value in `.env.example`, then run:
 

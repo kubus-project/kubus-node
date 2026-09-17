@@ -10,6 +10,21 @@ kubus Node uses SemVer. Exact Git and container tags are immutable.
 
 An alpha or beta never updates `latest`. Every `v*` tag runs type checking, tests, the TypeScript build, dependency audit, node and worker image builds, release-bundle checksums, and SPDX SBOM generation before GitHub release assets are published. A failed workflow is a failed release, regardless of whether the Git tag exists.
 
+## v0.8.0-alpha.10 — Open the dashboard after setup
+
+Setup now establishes an HttpOnly browser session. Reopening the Windows
+launcher exchanges the saved GUI credential for a single-use, 60-second browser
+handoff; no token needs to be copied from Docker. Sessions last 12 hours and
+survive Node restarts. Persistent credentials never enter the handoff URL or
+browser storage. Existing installations retain their identity, data and LAN
+setting. Manual GUI tokens remain available under Advanced operator access.
+
+The publication job now installs npm 11.19.1 explicitly. The previous pinned
+Node version bundled npm 10.9.2, which cannot perform npm trusted-publisher
+authentication. The package owner must still authorize this repository's
+`release.yml` workflow for direct publishing in npm's trusted-publisher settings.
+Provenance, immutable artifact checks and publication failures remain enforced.
+
 ## Canonical runtime and npm channel
 
 One release creates the immutable Node image, immutable spatial-worker image,
@@ -42,6 +57,59 @@ step failed, so the overall workflow is failed and the release is not fully
 distributed. The public npm registry currently returns 404. The official npm
 tarball is available in GitHub Releases as a temporary installation path; do not
 claim the `edge` registry channel is available until publication is repaired.
+
+## v0.8.0-alpha.9 — The Node Stops When Asked
+
+alpha.8 fixed the download but the install still failed, at the next step:
+"Docker could not complete this step. Open Docker Desktop, check that it is
+running" — shown while Docker was running and healthy.
+
+- **The Node shuts down instead of being killed.** Every stop ended in
+  `exit 137`, a SIGKILL after the grace period expired, because shutdown never
+  finished. One teardown step waited up to **10 seconds** for an aborted startup
+  to unwind, which is Docker's entire default `stop_grace_period` spent inside a
+  single step. The Node writes a 30 MB state file, so a SIGKILL could truncate
+  it mid-write. That wait is now 1s, teardown is bounded per step and overall,
+  and a stop takes ~2.3s ending in `exit 0`.
+- **Shutdown says what it is doing.** The runtime previously logged nothing at
+  all between receiving SIGTERM and being killed, so a hang was undiagnosable.
+  Each step now logs its outcome and duration, and a stalled step is named.
+- **One stuck step no longer skips the rest.** Teardown steps are bounded
+  individually, so the GUI socket still closes when the scheduler stalls.
+- **Docker's real error reaches the operator.** A failed Compose step reported a
+  fixed sentence and discarded Compose's output. The last lines of Docker's own
+  output are now included.
+- **A slow-stopping Node no longer fails the install.** Upgrading recreates the
+  agent; Compose was seen returning non-zero having created the new container
+  without starting it while the old one was still being killed. The start step
+  retries.
+
+The upgrade path from an older Node is what exposed this: the previous container
+took the full grace period to die. Installing over a stopped Node would have
+looked fine.
+
+## v0.8.0-alpha.8 — Setup Survives Its Own Progress Output
+
+alpha.7 could not complete a Windows install. Setup stopped at the download step
+and reported `Image ipfs/kubo:v0.43.0 Pulling` as the reason it failed, which is
+a normal progress line from a pull that was succeeding.
+
+- **The pull no longer aborts on its own output.** `docker compose pull` writes
+  progress to stderr, and Windows PowerShell 5.1 wraps every redirected stderr
+  line in an `ErrorRecord`. Under the launcher's `Stop` preference the first
+  progress line became a terminating error, so the download was abandoned
+  seconds after it began even though it exited successfully. The preference is
+  now relaxed for the duration of the pull only; the outcome is still taken from
+  the exit code, so a genuine download failure is still reported.
+- **A native command line is never shown as the reason setup stopped.** Only the
+  launcher's own messages are written for the person reading the page; anything
+  else now reports which step stopped and that Node data and identity are
+  untouched.
+
+This shipped in alpha.7 with the live pull output that made it visible. The
+packaging tests asserted the text of the launcher, not its behaviour, so a
+construct that reads correctly and fails at runtime passed review. Both defects
+above now have regression tests that fail against the alpha.7 launcher.
 
 ## v0.8.0-alpha.7 — Setup You Can Watch
 

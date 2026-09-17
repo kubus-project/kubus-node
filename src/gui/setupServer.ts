@@ -4,6 +4,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { persistedConfigPath } from '../config/env.js';
 import { loadOrCreateNodeIdentity } from '../identity/nodeIdentity.js';
+import { guiSessionCookie } from './guiSession.js';
 import {
   InstallationError, claimInstallation, confirmInstallation, pollInstallation, startInstallation,
   type StartedInstallation,
@@ -174,6 +175,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, confi
       }
       security.credential = undefined;
       security.completed = true;
+      res.setHeader('Set-Cookie', guiSessionCookie(config.NODE_GUI_TOKEN!));
       sendJson(res, 201, { success: true, restartRequired: true });
       // Compose uses `restart: unless-stopped`; closing this bootstrap process
       // is therefore the convergence point from unconfigured -> normal runtime.

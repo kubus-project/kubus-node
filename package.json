@@ -1,8 +1,12 @@
 {
   "name": "@kubus/kubus-node",
-  "version": "0.8.0-alpha.7",
+  "version": "0.8.0-alpha.10",
   "description": "Local runtime and public archive node for art.kubus",
   "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kubus-project/kubus-node.git"
+  },
   "type": "module",
   "bin": {
     "kubus-node": "./dist/src/index.js"

@@ -77,6 +77,69 @@ describe('release packaging', () => {
     expect(setup).toContain('Test-Url "$nodeOrigin/gui"');
   });
 
+  it('does not let docker progress on stderr abort a pull that is succeeding', async () => {
+    const setup = await readFile(path.join(repoRoot, 'installer', 'windows', 'KubusNodeSetup.ps1'), 'utf8');
+    // Windows PowerShell 5.1 wraps every redirected stderr line from a native
+    // command in an ErrorRecord. `docker compose pull` writes its progress to
+    // stderr, so under this script's 'Stop' preference the first progress line
+    // became a terminating error and reported "Image ipfs/kubo:v0.43.0 Pulling"
+    // as the reason setup failed, on a pull that exited 0.
+    expect(setup).toContain("$ErrorActionPreference = 'Stop'");
+    const lines = setup.split('\n');
+    const redirects = lines
+      .map((line, index) => ({ line, index }))
+      .filter((entry) => entry.line.includes('2>&1'));
+    // If this ever drops to zero the guard below silently stops testing anything.
+    expect(redirects.length).toBeGreaterThan(0);
+    for (const { line, index } of redirects) {
+      const before = lines.slice(Math.max(0, index - 6), index).join('\n');
+      const after = lines.slice(index, index + 10).join('\n');
+      expect(
+        before,
+        `stderr redirect is not relaxed before it runs: ${line.trim()}`,
+      ).toContain("$ErrorActionPreference = 'Continue'");
+      expect(
+        after,
+        `stderr redirect does not restore the preference: ${line.trim()}`,
+      ).toContain('$ErrorActionPreference = $previousPreference');
+    }
+    // Relaxing the preference only works because the real outcome is still read
+    // from the exit code.
+    expect(setup).toMatch(/\$ErrorActionPreference = \$previousPreference\s*\n\s*}\s*\n\s*if \(\$LASTEXITCODE -ne 0\)/);
+  });
+
+  it('never shows a raw native command line as the reason setup stopped', async () => {
+    const setup = await readFile(path.join(repoRoot, 'installer', 'windows', 'KubusNodeSetup.ps1'), 'utf8');
+    // "Image ... Pulling" is a normal progress line. Presenting one as the
+    // failure reason told the operator the install had broken when it had not.
+    expect(setup).toContain("$_.CategoryInfo.Reason -eq 'NativeCommandError'");
+    expect(setup).not.toMatch(/\$sync\.error = \$_\.Exception\.Message/);
+  });
+
+  it('tells the operator what docker actually said when a step fails', async () => {
+    const setup = await readFile(path.join(repoRoot, 'installer', 'windows', 'KubusNodeSetup.ps1'), 'utf8');
+    // "Open Docker Desktop, check that it is running" was shown to an operator
+    // while Docker was running and healthy, which made the failure unfixable.
+    expect(setup).toMatch(/Select-Object -Last 3/);
+    expect(setup).toContain('throw "Docker could not complete this step. $detail"');
+    expect(setup).not.toMatch(/throw 'Docker could not complete this step\. Open Docker Desktop/);
+  });
+
+  it('does not fail the install because the previous Node was slow to stop', async () => {
+    const setup = await readFile(path.join(repoRoot, 'installer', 'windows', 'KubusNodeSetup.ps1'), 'utf8');
+    // Upgrading recreates the agent. Compose has been observed returning
+    // non-zero having created the new container without starting it, while the
+    // old one was still being killed.
+    expect(setup).toContain('function Start-NodeRuntime');
+    expect(setup).toMatch(/for \(\$attempt = 1; \$attempt -le 3; \$attempt\+\+\)/);
+    // The start step must go through the retry, not call compose directly.
+    const startStep = setup.indexOf("Set-Step $sync 'start'");
+    expect(startStep).toBeGreaterThan(-1);
+    const afterStart = setup.slice(startStep, startStep + 200);
+    expect(afterStart).toContain('Start-NodeRuntime $sync');
+    expect(afterStart).not.toContain("Invoke-NodeCompose @('up', '-d')");
+  });
+
   it('keeps the executable path the image and the npm bin agree on', async () => {
     // `rootDir: "."` is what puts the entry point at dist/src/index.js. If the
     // emit layout ever changes, the Dockerfile CMD and the bin entry both
