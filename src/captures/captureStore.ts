@@ -149,6 +149,12 @@ export const ORPHAN_SWEEP_INTERVAL_MS = DRAFT_IDLE_GRACE_MS / 2;
  */
 const MARKER_REFRESH_MS = 60 * 1000;
 
+/** True when a queued or running job in `jobs` reads `captureId`. */
+function activeJobOn(jobs: Record<string, unknown> | undefined, captureId: string): boolean {
+  return (Object.values(jobs || {}) as Array<{ input?: { captureId?: string }; state?: string }>)
+    .some((job) => job.input?.captureId === captureId && ['queued', 'running'].includes(job.state || ''));
+}
+
 async function* oneChunk(bytes: Buffer): AsyncIterable<Buffer> {
   yield bytes;
 }
@@ -170,6 +176,9 @@ interface DraftEntry {
 
   /** When this draft's marker was last written, in epoch milliseconds. */
   markerTouchedAt: number;
+
+  /** File writes queued or running against this draft. */
+  writesInFlight: number;
 }
 
 export class CaptureStore {
@@ -193,6 +202,15 @@ export class CaptureStore {
    * replacement, leaving two durable replicas of one capture.
    */
   private commitLock: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Whole-package uploads (`create`) still being written.
+   *
+   * They have no draft entry and no marker, and are only recorded in state
+   * once every file has landed, so without this a sweep running while one is
+   * written would see an unowned directory.
+   */
+  private readonly creating = new Set<string>();
 
   /** The sweep in progress, so a slow one is never overlapped by the next. */
   private sweeping: Promise<number> | null = null;
@@ -218,9 +236,10 @@ export class CaptureStore {
     if (payload.files.length > 5000) throw localError(413, 'capture_file_count_exceeded');
     const id = crypto.randomUUID();
     const directory = path.join(this.root, id);
-    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    this.creating.add(id);
     let sizeBytes = 0;
     try {
+      await fs.mkdir(directory, { recursive: true, mode: 0o700 });
       for (const file of payload.files) {
         const relative = safeRelativePath(file.path);
         const bytes = Buffer.from(file.contentBase64, 'base64');
@@ -251,6 +270,10 @@ export class CaptureStore {
     } catch (error) {
       await fs.rm(directory, { recursive: true, force: true });
       throw error;
+    } finally {
+      // Released only after the record is in state, so the directory is
+      // never unclaimed in between.
+      this.creating.delete(id);
     }
   }
 
@@ -285,6 +308,7 @@ export class CaptureStore {
       files: new Map(),
       lock: Promise.resolve(),
       markerTouchedAt: Date.now(),
+      writesInFlight: 0,
     });
     try {
       await fs.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -324,9 +348,10 @@ export class CaptureStore {
 
     // Queue behind any in-flight mutation of this draft. Chained on the entry
     // so uploads to different drafts still proceed in parallel.
+    entry.writesInFlight += 1;
     const result = entry.lock.then(
       () => this.writeDraftFileStreamExclusive(entry, rawPath, chunks, mimeType, maxBytes),
-    );
+    ).finally(() => { entry.writesInFlight -= 1; });
     // Keep the chain alive even if this write rejects, so one failed upload
     // does not poison every later one.
     entry.lock = result.catch(() => undefined);
@@ -515,6 +540,10 @@ export class CaptureStore {
       // or to two. The old directory is removed only after that write: a
       // crash in between leaves it unreferenced, and the orphan sweep takes it.
       await this.store.update((state) => {
+        // Asked again inside the mutation, which nothing interleaves with: a
+        // job queued on the old replica since the check above must not lose
+        // its capture while it waits to run. Thrown before anything changes.
+        if (replaces && activeJobOn(state.jobs, replaces.id)) throw localError(409, 'capture_in_use');
         const captures = (state.captures ??= {});
         if (replaces && (captures[replaces.id] as CaptureRecord | undefined)?.directory === replaces.directory) {
           delete captures[replaces.id];
@@ -545,8 +574,7 @@ export class CaptureStore {
 
   /** True while a queued or running job reads this capture. */
   private hasActiveJob(captureId: string): boolean {
-    const jobs = Object.values(this.store.snapshot().jobs || {}) as Array<{ input?: { captureId?: string }; state?: string }>;
-    return jobs.some((job) => job.input?.captureId === captureId && ['queued', 'running'].includes(job.state || ''));
+    return activeJobOn(this.store.snapshot().jobs, captureId);
   }
 
   /** Abandons a draft and deletes anything already uploaded. */
@@ -558,6 +586,12 @@ export class CaptureStore {
     // the directory it was writing into.
     this.drafts.delete(id);
     await entry.lock.catch(() => undefined);
+    if (this.store.snapshot().captures?.[id]) {
+      // A commit already under way when the discard arrived won. Its record
+      // owns this directory now; removing it would leave that record
+      // pointing at nothing.
+      throw localError(409, 'capture_draft_committed');
+    }
     await fs.rm(entry.draft.directory, { recursive: true, force: true });
   }
 
@@ -647,7 +681,9 @@ export class CaptureStore {
    * which a committing upload is claimed by neither.
    */
   private ownsDirectory(name: string): boolean {
-    return this.drafts.has(name) || Boolean(this.store.snapshot().captures?.[name]);
+    return this.drafts.has(name)
+      || this.creating.has(name)
+      || Boolean(this.store.snapshot().captures?.[name]);
   }
 
   /**
@@ -697,8 +733,14 @@ export class CaptureStore {
   async getDraft(id: string): Promise<CaptureDraft & { files: string[] }> {
     const entry = this.drafts.get(id);
     if (!entry) throw localError(404, 'capture_draft_not_found');
-    await entry.lock.catch(() => undefined);
-    await this.reconcile(entry);
+    // Answered at once, never behind a write. The write still in flight may
+    // belong to a connection that died without the server noticing yet, and
+    // this is the very request a client makes to find out what to resend.
+    // Accounting only ever lists completed files, so the file in flight is
+    // simply not reported yet. Reconciling waits until nothing is writing, so
+    // it never interleaves with a write's own accounting; the commit
+    // reconciles regardless.
+    if (entry.writesInFlight === 0) await this.reconcile(entry);
     return { ...structuredClone(entry.draft), files: [...entry.files.keys()] };
   }
 

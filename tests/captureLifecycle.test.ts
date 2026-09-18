@@ -382,3 +382,98 @@ describe('discarding a draft mid-write', () => {
     expect(await exists(draft.directory)).toBe(false);
   });
 });
+
+describe('second-review findings', () => {
+  it('a sweep never reclaims a whole-package upload still being written', async () => {
+    const { store } = await newNode();
+    let sweptDuringCreate: number | undefined;
+    // Sweep the moment the package's first file lands, while create() is
+    // still writing the rest.
+    const writeFile = fs.writeFile;
+    let swept = false;
+    vi.spyOn(fs, 'writeFile').mockImplementation(async (...args: Parameters<typeof fs.writeFile>) => {
+      await writeFile(...args);
+      if (!swept && String(args[0]).includes(`${path.sep}rgb${path.sep}`)) {
+        swept = true;
+        sweptDuringCreate = await store.reclaimOrphanedDirectories();
+      }
+    });
+    const jpg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString('base64');
+    const record = await store.create({
+      schema: 'kubus.capture/1',
+      artworkId: 'art-1',
+      capturedAt: '2026-01-01T00:00:00.000Z',
+      metadata: {},
+      files: [
+        { path: 'rgb/00000.jpg', contentBase64: jpg },
+        { path: 'rgb/00001.jpg', contentBase64: jpg },
+        { path: 'frames.json', contentBase64: framesDocument([{ rgbPath: 'rgb/00000.jpg' }, { rgbPath: 'rgb/00001.jpg' }]).toString('base64') },
+      ],
+    });
+    vi.restoreAllMocks();
+
+    expect(swept).toBe(true);
+    expect(sweptDuringCreate).toBe(0);
+    expect((await store.inspect(record.id)).ok).toBe(true);
+  });
+
+  it('a discard that loses the race to a commit leaves the committed capture intact', async () => {
+    const { store } = await newNode();
+    const draft = await completeDraft(store);
+    const committing = store.commitDraft(draft.id);
+    // Arrives while the commit is already validating.
+    await new Promise((resolve) => setImmediate(resolve));
+    const discarding = store.discardDraft(draft.id);
+
+    const record = await committing;
+    await expect(discarding).rejects.toMatchObject({ statusCode: 409, code: 'capture_draft_committed' });
+    expect((await store.inspect(record.id)).ok).toBe(true);
+  });
+
+  it('a job queued on the damaged replica during a repair keeps its capture', async () => {
+    const keyed: CaptureDraftPayload = { ...payload, metadata: { ...payload.metadata, localCaptureId: 'capture-local-race' } };
+    const { local, store } = await newNode();
+    const damaged = await store.commitDraft((await completeDraft(store, keyed)).id);
+    await fs.rm(path.join(damaged.directory, 'rgb/00000.jpg'));
+    const repair = await completeDraft(store, keyed);
+
+    // A job is queued on the old replica after the early in-use check, just
+    // before the swap.
+    const update = local.update.bind(local);
+    let injected = false;
+    vi.spyOn(local, 'update').mockImplementation(async (mutator) => {
+      if (!injected) {
+        injected = true;
+        await update((state) => {
+          (state.jobs ??= {}).late = { id: 'late', state: 'queued', input: { captureId: damaged.id } };
+        });
+      }
+      return update(mutator);
+    });
+
+    await expect(store.commitDraft(repair.id)).rejects.toMatchObject({ statusCode: 409, code: 'capture_in_use' });
+    vi.restoreAllMocks();
+    expect(store.get(damaged.id).directory).toBe(damaged.directory);
+    expect(await exists(path.join(damaged.directory, 'frames.json'))).toBe(true);
+    expect((await store.getDraft(repair.id)).fileCount).toBe(4);
+  });
+
+  it('a draft status request is answered while a write is stuck', async () => {
+    const { store } = await newNode();
+    const draft = await store.beginDraft(payload);
+    await store.writeDraftFile(draft.id, 'frames.json', framesDocument([{ rgbPath: 'rgb/00000.jpg' }]), 'application/json');
+    const file = pausedStream();
+    // A connection that died without the server noticing: never released.
+    void store.writeDraftFileStream(draft.id, 'rgb/00000.jpg', file.chunks, 'image/jpeg').catch(() => undefined);
+    await file.started;
+
+    const status = await Promise.race([
+      store.getDraft(draft.id),
+      new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 500)),
+    ]);
+    expect(status).not.toBe('hung');
+    // Only completed files are reported, so the stuck one is resent.
+    expect((status as { files: string[] }).files).toEqual(['frames.json']);
+    file.release();
+  });
+});
