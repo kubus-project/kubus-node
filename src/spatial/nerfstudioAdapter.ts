@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { arCorePoseToCameraToWorldMatrix, poseFromFramePayload, type ArCorePose } from './poseConversion.js';
+import { isPlainObject } from '../captures/capturePackage.js';
 
 /**
  * Adapts a `kubus.capture/1` directory (the canonical, engine-neutral mobile
@@ -95,7 +96,7 @@ async function readFramesDocument(captureDirectory: string): Promise<{ frames: A
   } catch {
     throw new CaptureAdapterError('capture_dataset_invalid', 'frames.json is not valid JSON');
   }
-  const document = parsed as { schema?: unknown; frames?: unknown };
+  const document = isPlainObject(parsed) ? parsed : {};
   if (document.schema !== 'kubus.capture.frames/1' || !Array.isArray(document.frames) || document.frames.length === 0) {
     throw new CaptureAdapterError('capture_dataset_invalid', 'frames.json does not match schema kubus.capture.frames/1');
   }
@@ -134,6 +135,12 @@ function validateFrames(captureDirectory: string, frames: Array<Record<string, u
   let missingRgbCount = 0;
 
   frames.forEach((frame, index) => {
+    // Untrusted: a `null` entry is valid JSON and must count as an unusable
+    // frame, not crash the job with a TypeError.
+    if (!isPlainObject(frame)) {
+      missingRgbCount += 1;
+      return;
+    }
     const pose = poseFromFramePayload(frame);
     if (!pose) {
       missingPoseCount += 1;

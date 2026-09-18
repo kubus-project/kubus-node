@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { LocalStore } from '../state/localStore.js';
 import { localError } from '../localApi/pairingService.js';
-import { declaredFrameCount, inspectCapturePackage, type CapturePackageReport } from './capturePackage.js';
+import { declaredFrameCount, inspectCapturePackage, isPlainObject, type CapturePackageReport } from './capturePackage.js';
 
 export interface CaptureFilePayload { path: string; contentBase64: string; mimeType?: string }
 export interface CapturePackagePayload {
@@ -110,13 +110,14 @@ const MAX_CAPTURE_FILES = 5000;
  * Marks a directory as an upload in progress, for processes that cannot see
  * this one's in-memory draft map.
  *
- * `reclaimOrphanedDirectories` runs in whichever process happens to start,
- * and a second process — the container healthcheck runs `kubus-node status` —
- * has an empty draft map, so every live transfer looks orphaned to it. The
- * serving process keeps its accounting in memory and never learns that its
- * directory was emptied underneath it, so the commit reports a complete
- * package over a directory holding only whatever arrived since. The marker is
- * the cross-process signal that the in-memory map cannot be.
+ * Any process other than the serving one — the container healthcheck runs
+ * `kubus-node status` every 30 seconds — has an empty draft map, so every live
+ * transfer looks orphaned to it. Builds up to 0.8.0-alpha.10 swept from every
+ * command, and the serving process, keeping its accounting in memory, never
+ * learned that its directory was emptied underneath it: the commit reported a
+ * complete package over a directory holding only whatever arrived since. Only
+ * serving commands sweep now, but the marker remains the cross-process signal
+ * that the in-memory map cannot be.
  */
 const DRAFT_MARKER = '.draft.json';
 
@@ -129,6 +130,24 @@ const DRAFT_MARKER = '.draft.json';
  * sweep rather than held forever.
  */
 const DRAFT_IDLE_GRACE_MS = 30 * 60 * 1000;
+
+/**
+ * How often the serving process re-sweeps for orphans.
+ *
+ * The startup sweep alone cannot finish the job: a restart shortly after an
+ * interrupted upload finds that directory's marker still fresh and must spare
+ * it, and nothing would ever look again. Half the grace period bounds how long
+ * an abandoned directory can outlive it, without polling the disk.
+ */
+export const ORPHAN_SWEEP_INTERVAL_MS = DRAFT_IDLE_GRACE_MS / 2;
+
+/**
+ * How often a single long file refreshes its draft's marker mid-stream.
+ *
+ * The marker is otherwise rewritten only when a file completes, and one large
+ * file over a slow relay can take longer than the grace period.
+ */
+const MARKER_REFRESH_MS = 60 * 1000;
 
 async function* oneChunk(bytes: Buffer): AsyncIterable<Buffer> {
   yield bytes;
@@ -148,6 +167,9 @@ interface DraftEntry {
    * under-reports size and lets the file and byte ceilings be exceeded.
    */
   lock: Promise<unknown>;
+
+  /** When this draft's marker was last written, in epoch milliseconds. */
+  markerTouchedAt: number;
 }
 
 export class CaptureStore {
@@ -161,6 +183,19 @@ export class CaptureStore {
    * retries — the same outcome as any other interrupted transfer.
    */
   private readonly drafts = new Map<string, DraftEntry>();
+
+  /**
+   * Serializes commits across drafts.
+   *
+   * A commit that replaces a damaged replica reads the record it retires,
+   * validates, then swaps. Two commits for the same local capture interleaving
+   * across those awaits would both retire the same record and both install a
+   * replacement, leaving two durable replicas of one capture.
+   */
+  private commitLock: Promise<unknown> = Promise.resolve();
+
+  /** The sweep in progress, so a slow one is never overlapped by the next. */
+  private sweeping: Promise<number> | null = null;
 
   constructor(dataRoot: string, private readonly store: LocalStore) {
     this.root = path.join(dataRoot, 'private', 'captures');
@@ -234,8 +269,6 @@ export class CaptureStore {
     }
     const id = crypto.randomUUID();
     const directory = path.join(this.root, id);
-    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-    await touchDraftMarker(directory, id);
     const draft: CaptureDraft = {
       id,
       state: 'draft',
@@ -244,12 +277,22 @@ export class CaptureStore {
       fileCount: 0,
       sizeBytes: 0,
     };
+    // Registered before the directory exists, so a sweep in this process can
+    // never observe the directory without its owner.
     this.drafts.set(id, {
       draft,
       payload,
       files: new Map(),
       lock: Promise.resolve(),
+      markerTouchedAt: Date.now(),
     });
+    try {
+      await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    } catch (error) {
+      this.drafts.delete(id);
+      throw error;
+    }
+    await touchDraftMarker(directory, id);
     return structuredClone(draft);
   }
 
@@ -324,6 +367,10 @@ export class CaptureStore {
           const result = await handle.write(bytes, offset, bytes.byteLength - offset);
           offset += result.bytesWritten;
         }
+        if (Date.now() - entry.markerTouchedAt >= MARKER_REFRESH_MS) {
+          entry.markerTouchedAt = Date.now();
+          await touchDraftMarker(entry.draft.directory, entry.draft.id);
+        }
       }
       if (written === 0) throw localError(400, 'capture_file_empty');
       await handle.close();
@@ -339,6 +386,7 @@ export class CaptureStore {
     entry.draft.fileCount = entry.files.size;
     // Rewritten rather than touched so a marker lost to an outside sweep
     // comes back, and so the next sweep sees a live transfer.
+    entry.markerTouchedAt = Date.now();
     await touchDraftMarker(entry.draft.directory, entry.draft.id);
     return structuredClone(entry.draft);
   }
@@ -353,11 +401,27 @@ export class CaptureStore {
    * record instead makes the retry converge.
    */
   async commitDraft(id: string): Promise<CaptureRecord> {
-    const entry = this.drafts.get(id);
-    if (!entry) throw localError(404, 'capture_draft_not_found');
+    const result = this.commitLock.then(() => {
+      const entry = this.drafts.get(id);
+      if (!entry) throw localError(404, 'capture_draft_not_found');
+      // Behind this draft's own writes too, so the package is inspected only
+      // once every file already sent has either landed or failed.
+      const committed = entry.lock.catch(() => undefined).then(() => this.commitDraftExclusive(id, entry));
+      entry.lock = committed.catch(() => undefined);
+      return committed;
+    });
+    this.commitLock = result.catch(() => undefined);
+    return result;
+  }
+
+  private async commitDraftExclusive(id: string, entry: DraftEntry): Promise<CaptureRecord> {
+    // Rechecked now the queue has drained: a commit queued behind another
+    // commit of this same draft finds it already gone.
+    if (this.drafts.get(id) !== entry) throw localError(404, 'capture_draft_not_found');
     if (entry.files.size === 0) throw localError(400, 'capture_package_empty');
 
     const localCaptureId = localCaptureIdOf(entry.payload);
+    let replaces: CaptureRecord | undefined;
     if (localCaptureId) {
       const existing = (Object.values(this.store.snapshot().captures || {}) as CaptureRecord[])
         .find((record) => record.localCaptureId === localCaptureId);
@@ -372,12 +436,15 @@ export class CaptureStore {
           // A retry of an already-committed capture. Drop the redundant
           // upload rather than leaving its directory stranded on disk.
           this.drafts.delete(id);
-          await fs.rm(entry.draft.directory, { recursive: true, force: true });
+          if (path.resolve(entry.draft.directory) !== path.resolve(existing.directory)) {
+            await fs.rm(entry.draft.directory, { recursive: true, force: true });
+          }
           return structuredClone(existing);
         }
-        // Replace it, so one local capture still maps to one durable replica
-        // rather than accumulating a second.
-        await this.delete(existing.id).catch(() => undefined);
+        // Replaced only once the upload proves to be a complete package. A
+        // damaged replica still holds whatever survived, and a repair that
+        // turns out to be broken too must not cost the user that as well.
+        replaces = existing;
       }
     }
 
@@ -411,9 +478,14 @@ export class CaptureStore {
       });
     }
 
+    if (replaces && this.hasActiveJob(replaces.id)) {
+      // A job is reading the old replica. Swapping it out mid-run would fail
+      // that job for a reason unrelated to its own work; the draft stays, so
+      // the commit can simply be repeated once the job has finished.
+      throw localError(409, 'capture_in_use');
+    }
+
     try {
-      // The marker is transfer bookkeeping, not capture content.
-      await fs.rm(path.join(draft.directory, DRAFT_MARKER), { force: true }).catch(() => undefined);
       const files = [...entry.files.entries()].map(([filePath, meta]) => ({
         path: filePath,
         mimeType: meta.mimeType,
@@ -438,21 +510,54 @@ export class CaptureStore {
         `${JSON.stringify({ ...payload, files }, null, 2)}\n`,
         { mode: 0o600 },
       );
-      await this.store.update((state) => { (state.captures ??= {})[draft.id] = record; });
+      // One state write both installs the replacement and retires what it
+      // replaces, so at no point does the local capture map to zero replicas
+      // or to two. The old directory is removed only after that write: a
+      // crash in between leaves it unreferenced, and the orphan sweep takes it.
+      await this.store.update((state) => {
+        const captures = (state.captures ??= {});
+        if (replaces && (captures[replaces.id] as CaptureRecord | undefined)?.directory === replaces.directory) {
+          delete captures[replaces.id];
+        }
+        captures[draft.id] = record;
+      });
       this.drafts.delete(id);
+      // The marker is transfer bookkeeping, not capture content. Removed only
+      // now, so the directory is never unowned and unmarked at the same time.
+      await fs.rm(path.join(draft.directory, DRAFT_MARKER), { force: true }).catch(() => undefined);
+      if (replaces && path.resolve(replaces.directory) !== path.resolve(draft.directory)) {
+        await fs.rm(replaces.directory, { recursive: true, force: true }).catch(() => undefined);
+      }
       return record;
     } catch (error) {
-      await fs.rm(draft.directory, { recursive: true, force: true });
-      this.drafts.delete(id);
+      if (this.store.snapshot().captures?.[draft.id]) {
+        // The record landed and something after it failed. The directory now
+        // belongs to that record; removing it would leave it pointing at
+        // nothing.
+        this.drafts.delete(id);
+      }
+      // Otherwise the draft stays exactly as it was: every uploaded file is
+      // still there, the replaced record is untouched, and the commit can be
+      // repeated. An abandoned draft is reclaimed by the orphan sweep.
       throw error;
     }
+  }
+
+  /** True while a queued or running job reads this capture. */
+  private hasActiveJob(captureId: string): boolean {
+    const jobs = Object.values(this.store.snapshot().jobs || {}) as Array<{ input?: { captureId?: string }; state?: string }>;
+    return jobs.some((job) => job.input?.captureId === captureId && ['queued', 'running'].includes(job.state || ''));
   }
 
   /** Abandons a draft and deletes anything already uploaded. */
   async discardDraft(id: string): Promise<void> {
     const entry = this.drafts.get(id);
     if (!entry) throw localError(404, 'capture_draft_not_found');
+    // Forgotten first so nothing new can start; then removed only once the
+    // write already in flight has finished, which would otherwise recreate
+    // the directory it was writing into.
     this.drafts.delete(id);
+    await entry.lock.catch(() => undefined);
     await fs.rm(entry.draft.directory, { recursive: true, force: true });
   }
 
@@ -469,6 +574,36 @@ export class CaptureStore {
    * touched. Returns the number reclaimed.
    */
   async reclaimOrphanedDirectories(): Promise<number> {
+    // Joined rather than overlapped: two sweeps racing over one directory
+    // gain nothing and double the disk work.
+    if (this.sweeping) return this.sweeping;
+    this.sweeping = this.sweepOnce().finally(() => { this.sweeping = null; });
+    return this.sweeping;
+  }
+
+  /**
+   * Re-sweeps on a schedule for as long as this process serves uploads.
+   *
+   * Owned by the serving process, because only it knows which drafts are
+   * live: a sweep anywhere else is exactly the healthcheck bug. The timer is
+   * unref'd, so it never keeps a stopping process alive.
+   */
+  startOrphanSweeps(options: {
+    intervalMs?: number;
+    onReclaimed?: (count: number) => void;
+    onError?: (error: unknown) => void;
+  } = {}): { stop(): void } {
+    const timer = setInterval(() => {
+      this.reclaimOrphanedDirectories().then(
+        (count) => { if (count > 0) options.onReclaimed?.(count); },
+        (error: unknown) => options.onError?.(error),
+      );
+    }, options.intervalMs ?? ORPHAN_SWEEP_INTERVAL_MS);
+    timer.unref();
+    return { stop: () => clearInterval(timer) };
+  }
+
+  private async sweepOnce(): Promise<number> {
     let entries: string[];
     try {
       entries = await fs.readdir(this.root);
@@ -477,10 +612,9 @@ export class CaptureStore {
       return 0;
     }
 
-    const known = new Set(Object.keys(this.store.snapshot().captures || {}));
     let removed = 0;
     for (const name of entries) {
-      if (known.has(name) || this.drafts.has(name)) continue;
+      if (this.ownsDirectory(name)) continue;
       const directory = path.join(this.root, name);
       try {
         const stat = await fs.stat(directory);
@@ -491,6 +625,10 @@ export class CaptureStore {
         // longer exist.
         const markerAge = await draftMarkerAgeMs(directory);
         if (markerAge !== null && markerAge < DRAFT_IDLE_GRACE_MS) continue;
+        // Asked again after the last await and immediately before removal:
+        // a draft opened or committed while this sweep was reading the disk
+        // has an owner now, and the answer from the top of the loop is stale.
+        if (this.ownsDirectory(name)) continue;
         await fs.rm(directory, { recursive: true, force: true });
         removed += 1;
       } catch {
@@ -499,6 +637,17 @@ export class CaptureStore {
       }
     }
     return removed;
+  }
+
+  /**
+   * True when a stored capture or a live draft of this process claims `name`.
+   *
+   * Synchronous on purpose. A commit records its capture before it forgets its
+   * draft, so with no await between the two questions there is no moment at
+   * which a committing upload is claimed by neither.
+   */
+  private ownsDirectory(name: string): boolean {
+    return this.drafts.has(name) || Boolean(this.store.snapshot().captures?.[name]);
   }
 
   /**
@@ -572,11 +721,12 @@ export class CaptureStore {
     const record = this.get(id);
     let declaredPaths: string[] = [];
     try {
-      const manifest = JSON.parse(
+      const manifest: unknown = JSON.parse(
         await fs.readFile(path.join(record.directory, 'capture.json'), 'utf8'),
-      ) as { files?: Array<{ path?: unknown }> };
-      declaredPaths = (manifest.files ?? [])
-        .map((file) => file.path)
+      );
+      const files = isPlainObject(manifest) && Array.isArray(manifest.files) ? manifest.files : [];
+      declaredPaths = files
+        .map((file: unknown) => (isPlainObject(file) ? file.path : undefined))
         .filter((filePath): filePath is string => typeof filePath === 'string');
     } catch {
       // A capture without a readable manifest still has to answer for its
@@ -591,8 +741,7 @@ export class CaptureStore {
 
   async delete(id: string): Promise<void> {
     const record = this.get(id);
-    const jobs = Object.values(this.store.snapshot().jobs || {}) as Array<{ input?: { captureId?: string }; state?: string }>;
-    if (jobs.some((job) => job.input?.captureId === id && ['queued', 'running'].includes(job.state || ''))) throw localError(409, 'capture_in_use');
+    if (this.hasActiveJob(id)) throw localError(409, 'capture_in_use');
     await fs.rm(record.directory, { recursive: true, force: true });
     await this.store.update((state) => { if (state.captures) delete state.captures[id]; });
   }

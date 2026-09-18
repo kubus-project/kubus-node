@@ -37,6 +37,14 @@ export interface CapturePackageReport {
 /** Enough for a phone to show and repair, bounded so an error stays small. */
 const MISSING_PATH_LIMIT = 50;
 
+/** Matches the store's per-capture file ceiling: one image per frame at least. */
+const MAX_FRAMES = 5000;
+
+/** A non-null, non-array object — the only shape any capture document may take. */
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 /**
  * Normalizes a capture-relative path and refuses anything that would escape.
  *
@@ -128,17 +136,30 @@ export async function inspectCapturePackage(
     return report('capture_frames_invalid', 'frames.json is not valid JSON');
   }
 
-  const document = parsed as { schema?: unknown; frames?: unknown };
-  if (document.schema !== 'kubus.capture.frames/1') {
+  // Everything below reads client data. `null`, an array or a bare string is
+  // valid JSON and must be a finding, not a TypeError surfacing as a 500.
+  if (!isPlainObject(parsed)) {
+    return report('capture_frames_invalid', 'frames.json is not a JSON object');
+  }
+  if (typeof parsed.schema !== 'string' || parsed.schema !== 'kubus.capture.frames/1') {
     return report('capture_frames_invalid', 'frames.json does not declare schema kubus.capture.frames/1');
   }
-  if (!Array.isArray(document.frames) || document.frames.length === 0) {
+  if (!Array.isArray(parsed.frames) || parsed.frames.length === 0) {
     return report('capture_frames_invalid', 'frames.json declares no frames');
   }
+  // Every frame needs its own image file, so a document declaring more frames
+  // than a capture may hold files is wrong without looking further — and is
+  // refused before it can cost one filesystem stat per entry.
+  if (parsed.frames.length > MAX_FRAMES) {
+    return report('capture_frames_invalid', `frames.json declares more than ${MAX_FRAMES} frames`);
+  }
 
-  const frames = document.frames as Array<Record<string, unknown>>;
+  const frames: unknown[] = parsed.frames;
   const missingFrameFiles: string[] = [];
-  for (const frame of frames) {
+  for (const [index, frame] of frames.entries()) {
+    if (!isPlainObject(frame)) {
+      return report('capture_frames_invalid', `Frame ${index} is not a JSON object`, [], frames.length);
+    }
     // The RGB image is the one file every frame must carry: a frame without
     // it cannot contribute to a reconstruction at all.
     const rgb = captureRelativePath(frame.rgbPath);

@@ -90,6 +90,14 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     if (reclaimedCaptures > 0) {
       logger.info(`captures: reclaimed ${reclaimedCaptures} orphaned capture ${reclaimedCaptures === 1 ? 'directory' : 'directories'}`);
     }
+    // The startup sweep must spare a directory whose marker is still fresh —
+    // a restart moments after an interrupted upload — so it cannot be the
+    // last word. This process owns the draft map, which makes it the only
+    // place a later sweep is safe.
+    captures.startOrphanSweeps({
+      onReclaimed: (count) => logger.info(`captures: reclaimed ${count} orphaned capture ${count === 1 ? 'directory' : 'directories'}`),
+      onError: (error) => logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'captures: orphan sweep failed'),
+    });
   }
   // Own file, own directory — same rationale as identity above: bounded
   // derived counters, never appended into state.json's single growing file.
