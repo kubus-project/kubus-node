@@ -505,7 +505,18 @@ describe('local GUI safety helpers', () => {
         const captures = new CaptureStore(dir, store);
         const capture = await captures.create({
           schema: 'kubus.capture/1', artworkId: 'artwork-1', capturedAt: new Date().toISOString(), metadata: {},
-          files: [{ path: 'rgb/00000.jpg', contentBase64: Buffer.from([0xff]).toString('base64') }],
+          // A complete package: job creation refuses an incomplete capture
+          // before a worker is ever reached, and this test is about the GUI's
+          // create/cancel routes.
+          files: [
+            { path: 'rgb/00000.jpg', contentBase64: Buffer.from([0xff]).toString('base64') },
+            {
+              path: 'frames.json',
+              contentBase64: Buffer.from(
+                JSON.stringify({ schema: 'kubus.capture.frames/1', frames: [{ rgbPath: 'rgb/00000.jpg' }] }),
+              ).toString('base64'),
+            },
+          ],
         });
         const jobs = new JobRuntime({
           store, captureStore: captures, kubo: {} as never, logger: { warn: () => undefined } as never,

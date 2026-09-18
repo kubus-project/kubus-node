@@ -32,6 +32,18 @@ import { PermissionUpdateService } from '../setup/permissionUpdate.js';
 import { AnalyticsStore } from '../analytics/analyticsStore.js';
 import { recoverNetworkStartup } from '../runtime/networkStartup.js';
 
+/**
+ * Whether a command may sweep orphaned capture directories.
+ *
+ * Only the commands that then serve uploads. `status` is the container
+ * healthcheck: a second process, running every 30 seconds, whose in-memory
+ * draft map is necessarily empty, so to it every live transfer looks
+ * orphaned.
+ */
+export function reclaimsOrphanedCaptures(command: string): boolean {
+  return command === 'start' || command === 'gui';
+}
+
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const command = argv[0] || 'start';
   let config: ReturnType<typeof parseEnv>;
@@ -67,9 +79,25 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   // Streaming-upload drafts are in-memory, so a restart mid-transfer leaves a
   // capture directory with no owner. Reclaim those before serving, or every
   // interrupted upload permanently consumes disk.
-  const reclaimedCaptures = await captures.reclaimOrphanedDirectories();
-  if (reclaimedCaptures > 0) {
-    logger.info(`captures: reclaimed ${reclaimedCaptures} orphaned capture ${reclaimedCaptures === 1 ? 'directory' : 'directories'}`);
+  //
+  // Only the commands that go on to serve uploads may sweep. `status` is the
+  // container healthcheck and runs every 30 seconds in a second process whose
+  // draft map is empty, so sweeping there deleted whatever transfer was in
+  // flight while the serving process carried on accounting for files that no
+  // longer existed — and committed the capture as complete.
+  if (reclaimsOrphanedCaptures(command)) {
+    const reclaimedCaptures = await captures.reclaimOrphanedDirectories();
+    if (reclaimedCaptures > 0) {
+      logger.info(`captures: reclaimed ${reclaimedCaptures} orphaned capture ${reclaimedCaptures === 1 ? 'directory' : 'directories'}`);
+    }
+    // The startup sweep must spare a directory whose marker is still fresh —
+    // a restart moments after an interrupted upload — so it cannot be the
+    // last word. This process owns the draft map, which makes it the only
+    // place a later sweep is safe.
+    captures.startOrphanSweeps({
+      onReclaimed: (count) => logger.info(`captures: reclaimed ${count} orphaned capture ${count === 1 ? 'directory' : 'directories'}`),
+      onError: (error) => logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'captures: orphan sweep failed'),
+    });
   }
   // Own file, own directory — same rationale as identity above: bounded
   // derived counters, never appended into state.json's single growing file.

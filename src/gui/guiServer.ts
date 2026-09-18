@@ -28,7 +28,7 @@ import { localError } from '../localApi/pairingService.js';
 import { buildViewModel } from './viewModel.js';
 import { renderQrSvg } from './qr.js';
 import {
-  getCaptureSummary,
+  getCaptureDiagnostics,
   getJobSummary,
   getSpatialRecord,
   listCaptureSummaries,
@@ -270,7 +270,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
   const captureMatch = parsed.pathname.match(/^\/gui\/api\/captures\/([^/]+)$/);
   if (req.method === 'GET' && captureMatch) {
     const local = requireLocalApi(deps);
-    writeJson(res, 200, { success: true, data: getCaptureSummary(local.captures, decodeURIComponent(captureMatch[1]!)) });
+    // Diagnostics rather than the bare record: the one question an operator
+    // has about a capture is whether it can still be processed.
+    writeJson(res, 200, { success: true, data: await getCaptureDiagnostics(local.captures, decodeURIComponent(captureMatch[1]!)) });
     return;
   }
   const captureContentMatch = parsed.pathname.match(/^\/gui\/api\/captures\/([^/]+)\/content\/(.+)$/);

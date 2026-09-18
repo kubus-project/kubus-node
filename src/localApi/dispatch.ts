@@ -486,7 +486,7 @@ async function route(
 
   const draftMatch = path.match(/^\/local\/v1\/captures\/drafts\/([^/]+)$/);
   if (method === 'GET' && draftMatch) {
-    return jsonResponse(200, captures.getDraft(draftMatch[1]!));
+    return jsonResponse(200, await captures.getDraft(draftMatch[1]!));
   }
   if (method === 'DELETE' && draftMatch) {
     if (!(await pairing.authorize(credential, 'captures:create'))) throw localError(403, 'scope_required');

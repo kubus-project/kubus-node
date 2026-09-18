@@ -10,6 +10,37 @@ kubus Node uses SemVer. Exact Git and container tags are immutable.
 
 An alpha or beta never updates `latest`. Every `v*` tag runs type checking, tests, the TypeScript build, dependency audit, node and worker image builds, release-bundle checksums, and SPDX SBOM generation before GitHub release assets are published. A failed workflow is a failed release, regardless of whether the Git tag exists.
 
+## v0.8.0-alpha.11 — Captures Arrive Whole
+
+**Upgrade from alpha.10 before processing any capture.** On alpha.10 the
+container healthcheck deleted in-flight capture uploads every 30 seconds. A
+transfer could report every file delivered while the Node held only the ones
+sent since the last healthcheck, and reconstruction then failed with `ENOENT`.
+
+- **Only the serving process reclaims abandoned uploads.** The orphan sweep ran
+  before every CLI command, including the healthcheck's `kubus-node status`,
+  which runs in a second process that cannot see the live upload. `status` and
+  `doctor` no longer change anything on disk. The serving process re-sweeps
+  every 15 minutes, so an upload abandoned just before a restart is still
+  reclaimed once its 30-minute grace period ends.
+- **A capture is checked before it is stored.** Committing an upload verifies
+  that `frames.json` is well formed and that every image, depth and confidence
+  file it names is present and non-empty. A package that fails is refused with
+  a typed error naming what is missing, and the upload stays open so the phone
+  sends only those files.
+- **No GPU run for a broken capture, and one run per capture.** A reconstruction
+  request re-checks the stored capture first. Simultaneous requests for the
+  same capture share a single job.
+- **Repairing a damaged capture cannot lose more data.** Re-uploading a capture
+  whose stored copy lost files replaces it only after the new upload passes the
+  same checks, in a single state write. If the repair is incomplete, the damaged
+  copy is left exactly as it was.
+- **The operator dashboard says whether a capture can still be processed**, so a
+  broken transfer is not mistaken for a failed reconstruction.
+
+Captures damaged by alpha.10 stay damaged. The dashboard identifies them, and
+re-sending one from the phone replaces it.
+
 ## v0.8.0-alpha.10 — Open the dashboard after setup
 
 Setup now establishes an HttpOnly browser session. Reopening the Windows

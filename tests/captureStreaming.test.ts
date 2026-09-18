@@ -20,6 +20,37 @@ async function newStore(): Promise<CaptureStore> {
   return new CaptureStore(dir, local);
 }
 
+/**
+ * Uploads the canonical frame document every `kubus.capture/1` package must
+ * carry, referencing images already streamed into the draft. Returns its size
+ * so a test can still assert exact byte accounting.
+ */
+async function addFrames(store: CaptureStore, draftId: string, rgbPaths: string[]): Promise<number> {
+  const document = Buffer.from(
+    `${JSON.stringify({ schema: 'kubus.capture.frames/1', frames: rgbPaths.map((rgbPath) => ({ rgbPath })) })}
+`,
+  );
+  await store.writeDraftFile(draftId, 'frames.json', document, 'application/json');
+  return document.byteLength;
+}
+
+/**
+ * Backdates a draft's activity marker, standing in for a transfer whose owner
+ * died rather than one that is merely between files.
+ */
+async function ageDraftMarker(directory: string, ms: number): Promise<void> {
+  const marker = path.join(directory, '.draft.json');
+  const when = new Date(Date.now() - ms);
+  await fs.utimes(marker, when, when);
+}
+
+/** A second process over the same data root, as `kubus-node status` is. */
+async function attachStore(dataRoot: string): Promise<CaptureStore> {
+  const local = new LocalStore(path.join(dataRoot, 'state.json'));
+  await local.load();
+  return new CaptureStore(dataRoot, local);
+}
+
 const draftPayload: CaptureDraftPayload = {
   schema: 'kubus.capture/1',
   artworkId: 'art-1',
@@ -39,15 +70,17 @@ describe('streaming capture upload', () => {
       throw new Error('simulated transport interruption');
     };
     await expect(store.writeDraftFileStream(draft.id, 'payload.bin', interrupted())).rejects.toThrow('simulated transport interruption');
-    expect(store.getDraft(draft.id).files).toEqual([]);
-    expect(store.getDraft(draft.id).sizeBytes).toBe(0);
+    expect((await store.getDraft(draft.id)).files).toEqual([]);
+    expect((await store.getDraft(draft.id)).sizeBytes).toBe(0);
     const expected = createHash('sha256');
     const complete = async function* () {
       for (let index = 0; index < chunkCount; index++) { expected.update(chunk); yield chunk; }
     };
     await store.writeDraftFileStream(draft.id, 'payload.bin', complete());
+    await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(16, 7), 'image/jpeg');
+    const framesBytes = await addFrames(store, draft.id, ['rgb/00000.jpg']);
     const record = await store.commitDraft(draft.id);
-    expect(record.sizeBytes).toBe(110 * 1024 * 1024);
+    expect(record.sizeBytes).toBe(110 * 1024 * 1024 + 16 + framesBytes);
     const actual = createHash('sha256');
     for await (const bytes of createReadStream(path.join(record.directory, 'payload.bin'))) actual.update(bytes);
     expect(actual.digest('hex')).toBe(expected.digest('hex'));
@@ -63,12 +96,13 @@ describe('streaming capture upload', () => {
 
     const payload = Buffer.from([0xff, 0xd8, 0xff, 0x00, 0x01]);
     await store.writeDraftFile(draft.id, 'rgb/00000.jpg', payload, 'image/jpeg');
+    const framesBytes = await addFrames(store, draft.id, ['rgb/00000.jpg']);
     const record = await store.commitDraft(draft.id);
 
     const written = await fs.readFile(path.join(record.directory, 'rgb/00000.jpg'));
     expect(written.equals(payload)).toBe(true);
-    expect(record.sizeBytes).toBe(payload.byteLength);
-    expect(record.fileCount).toBe(1);
+    expect(record.sizeBytes).toBe(payload.byteLength + framesBytes);
+    expect(record.fileCount).toBe(2);
     expect(record.state).toBe('stored');
     expect(record.private).toBe(true);
   });
@@ -83,6 +117,7 @@ describe('streaming capture upload', () => {
     };
 
     const progress = await store.writeDraftFileStream(draft.id, 'rgb/00000.jpg', chunks(), 'image/jpeg');
+    await addFrames(store, draft.id, ['rgb/00000.jpg']);
     const record = await store.commitDraft(draft.id);
     const written = await fs.readFile(path.join(record.directory, 'rgb/00000.jpg'), 'utf8');
 
@@ -119,7 +154,7 @@ describe('streaming capture upload', () => {
     await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(10));
     await store.writeDraftFile(draft.id, 'rgb/00001.jpg', Buffer.alloc(10));
 
-    const progress = store.getDraft(draft.id);
+    const progress = await store.getDraft(draft.id);
 
     expect(progress.files).toEqual(['rgb/00000.jpg', 'rgb/00001.jpg']);
     expect(progress.sizeBytes).toBe(20);
@@ -130,6 +165,7 @@ describe('streaming capture upload', () => {
     const draft = await store.beginDraft(draftPayload);
     await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(4), 'image/jpeg');
     await store.writeDraftFile(draft.id, 'transforms.json', Buffer.from('{}'), 'application/json');
+    await addFrames(store, draft.id, ['rgb/00000.jpg']);
 
     const record = await store.commitDraft(draft.id);
 
@@ -141,6 +177,7 @@ describe('streaming capture upload', () => {
     expect(manifest.files).toEqual([
       { path: 'rgb/00000.jpg', mimeType: 'image/jpeg' },
       { path: 'transforms.json', mimeType: 'application/json' },
+      { path: 'frames.json', mimeType: 'application/json' },
     ]);
     // The manifest records paths only: bytes live on disk, never inline.
     expect(JSON.stringify(manifest)).not.toContain('contentBase64');
@@ -150,6 +187,7 @@ describe('streaming capture upload', () => {
     const store = await newStore();
     const draft = await store.beginDraft(draftPayload);
     await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(8));
+    await addFrames(store, draft.id, ['rgb/00000.jpg']);
 
     const record = await store.commitDraft(draft.id);
 
@@ -175,6 +213,7 @@ describe('streaming capture validation', () => {
     // Leading slashes are stripped rather than rejected, so the write lands
     // under the capture directory instead of escaping to a system path.
     await store.writeDraftFile(draft.id, '/etc/passwd', Buffer.alloc(4));
+    await addFrames(store, draft.id, ['etc/passwd']);
     const record = await store.commitDraft(draft.id);
 
     const written = path.join(record.directory, 'etc/passwd');
@@ -228,7 +267,7 @@ describe('concurrent draft accounting', () => {
       store.writeDraftFile(draft.id, 'rgb/00001.jpg', Buffer.alloc(100)),
     ]);
 
-    const progress = store.getDraft(draft.id);
+    const progress = await store.getDraft(draft.id);
     expect(progress.fileCount).toBe(2);
     expect(progress.sizeBytes).toBe(200);
   });
@@ -243,7 +282,7 @@ describe('concurrent draft accounting', () => {
       ),
     );
 
-    const progress = store.getDraft(draft.id);
+    const progress = await store.getDraft(draft.id);
     expect(progress.fileCount).toBe(25);
     expect(progress.sizeBytes).toBe(250);
     expect(progress.files).toHaveLength(25);
@@ -258,7 +297,7 @@ describe('concurrent draft accounting', () => {
       store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(30)),
     ]);
 
-    const progress = store.getDraft(draft.id);
+    const progress = await store.getDraft(draft.id);
     expect(progress.fileCount).toBe(1);
     expect(progress.sizeBytes).toBe(30);
   });
@@ -283,8 +322,10 @@ describe('orphaned draft reclamation', () => {
     const draft = await store.beginDraft(draftPayload);
     await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(64));
 
-    // Simulate a restart: the in-memory draft is gone, the directory is not.
+    // Simulate a restart: the in-memory draft is gone, the directory is not,
+    // and nothing has written to it since.
     await store.forgetDraftsForTesting();
+    await ageDraftMarker(draft.directory, 60 * 60 * 1000);
     await expect(fs.access(draft.directory)).resolves.toBeUndefined();
 
     const reclaimed = await store.reclaimOrphanedDirectories();
@@ -297,6 +338,7 @@ describe('orphaned draft reclamation', () => {
     const store = await newStore();
     const draft = await store.beginDraft(draftPayload);
     await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(8));
+    await addFrames(store, draft.id, ['rgb/00000.jpg']);
     const record = await store.commitDraft(draft.id);
 
     const reclaimed = await store.reclaimOrphanedDirectories();
@@ -334,12 +376,14 @@ describe('commit idempotency', () => {
     const store = await newStore();
     const first = await store.beginDraft(keyed);
     await store.writeDraftFile(first.id, 'rgb/00000.jpg', Buffer.alloc(8));
+    await addFrames(store, first.id, ['rgb/00000.jpg']);
     const committed = await store.commitDraft(first.id);
 
     // The client never saw the response, so it uploads a fresh draft and
     // commits again with the same local capture id.
     const retry = await store.beginDraft(keyed);
     await store.writeDraftFile(retry.id, 'rgb/00000.jpg', Buffer.alloc(8));
+    await addFrames(store, retry.id, ['rgb/00000.jpg']);
     const second = await store.commitDraft(retry.id);
 
     expect(second.id).toBe(committed.id);
@@ -350,10 +394,12 @@ describe('commit idempotency', () => {
     const store = await newStore();
     const first = await store.beginDraft(keyed);
     await store.writeDraftFile(first.id, 'rgb/00000.jpg', Buffer.alloc(8));
+    await addFrames(store, first.id, ['rgb/00000.jpg']);
     await store.commitDraft(first.id);
 
     const retry = await store.beginDraft(keyed);
     await store.writeDraftFile(retry.id, 'rgb/00000.jpg', Buffer.alloc(8));
+    await addFrames(store, retry.id, ['rgb/00000.jpg']);
     await store.commitDraft(retry.id);
 
     await expect(fs.access(retry.directory)).rejects.toThrow();
@@ -368,6 +414,7 @@ describe('commit idempotency', () => {
         metadata: { ...draftPayload.metadata, localCaptureId: id },
       });
       await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(8));
+      await addFrames(store, draft.id, ['rgb/00000.jpg']);
       await store.commitDraft(draft.id);
     }
 
@@ -379,6 +426,7 @@ describe('commit idempotency', () => {
     for (let i = 0; i < 2; i++) {
       const draft = await store.beginDraft(draftPayload);
       await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(8));
+      await addFrames(store, draft.id, ['rgb/00000.jpg']);
       await store.commitDraft(draft.id);
     }
 
@@ -395,13 +443,14 @@ describe('streaming capture lifecycle', () => {
     await store.discardDraft(draft.id);
 
     await expect(fs.access(draft.directory)).rejects.toThrow();
-    expect(() => store.getDraft(draft.id)).toThrow();
+    await expect(store.getDraft(draft.id)).rejects.toThrow();
   });
 
   it('a committed draft can no longer be appended to', async () => {
     const store = await newStore();
     const draft = await store.beginDraft(draftPayload);
     await store.writeDraftFile(draft.id, 'rgb/00000.jpg', Buffer.alloc(4));
+    await addFrames(store, draft.id, ['rgb/00000.jpg']);
     await store.commitDraft(draft.id);
 
     await expect(
@@ -423,5 +472,48 @@ describe('streaming capture lifecycle', () => {
 
     expect(record.fileCount).toBe(1);
     expect(record.sizeBytes).toBe(6);
+  });
+});
+
+describe('reclamation against a concurrently serving process', () => {
+  /**
+   * Reproduces the transfer corruption seen on a real node.
+   *
+   * The container healthcheck runs `kubus-node status`, which is a second
+   * process over the same data root. Its `CaptureStore` has an empty draft
+   * map, so every in-flight upload directory looks orphaned to it. The
+   * serving process keeps its accounting in memory and never notices, so the
+   * commit reports a complete package over a directory that has been emptied.
+   */
+  it('a second process must not reclaim a draft the serving process is filling', async () => {
+    const serving = await newStore();
+    const draft = await serving.beginDraft(draftPayload);
+    const rgbPaths = Array.from({ length: 10 }, (_, index) => `rgb/0000${index}.jpg`);
+    for (let index = 0; index < 5; index++) {
+      await serving.writeDraftFile(draft.id, rgbPaths[index]!, Buffer.alloc(64, index));
+    }
+
+    const healthcheck = await attachStore(path.resolve(draft.directory, '..', '..', '..'));
+    await healthcheck.reclaimOrphanedDirectories();
+
+    for (let index = 5; index < 10; index++) {
+      await serving.writeDraftFile(draft.id, rgbPaths[index]!, Buffer.alloc(64, index));
+    }
+    await addFrames(serving, draft.id, rgbPaths);
+    const record = await serving.commitDraft(draft.id);
+
+    const manifest = JSON.parse(await fs.readFile(path.join(record.directory, 'capture.json'), 'utf8')) as {
+      files: Array<{ path: string }>;
+    };
+    const missing: string[] = [];
+    for (const file of manifest.files) {
+      try {
+        await fs.access(path.join(record.directory, file.path));
+      } catch {
+        missing.push(file.path);
+      }
+    }
+    expect(missing).toEqual([]);
+    expect(record.fileCount).toBe(11);
   });
 });

@@ -99,6 +99,45 @@ export function getCaptureSummary(captures: CaptureStore, id: string): CaptureRe
   return captures.get(id);
 }
 
+/** A capture record plus whether its package is actually still processable. */
+export interface CaptureDiagnostics extends CaptureRecord {
+  validation: {
+    ok: boolean;
+    code?: string;
+    /** Operator-facing summary. Never an absolute filesystem path. */
+    message?: string;
+    missingCount: number;
+    frameCount: number;
+  };
+}
+
+/**
+ * A capture with its integrity restated from disk.
+ *
+ * `state: 'stored'` records what was true at commit. An operator looking at a
+ * failed job needs to know which of two very different things happened: the
+ * transfer did not deliver a whole package, or the GPU could not process a
+ * whole one. Missing filenames stay out of it — the count is what the operator
+ * acts on, and the detail belongs in the technical log.
+ */
+export async function getCaptureDiagnostics(
+  captures: CaptureStore,
+  id: string,
+): Promise<CaptureDiagnostics> {
+  const record = captures.get(id);
+  const report = await captures.inspect(id);
+  return {
+    ...record,
+    validation: {
+      ok: report.ok,
+      code: report.code,
+      message: report.message,
+      missingCount: report.missingCount,
+      frameCount: report.frameCount,
+    },
+  };
+}
+
 /**
  * Streams one spatial variant's bytes from Kubo, honoring an HTTP `Range`
  * header when present. The variant's `sizeBytes` (recorded from a real

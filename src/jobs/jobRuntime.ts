@@ -66,6 +66,8 @@ function durationOf(job: LocalJob): number | undefined {
 export class JobRuntime {
   private running = new Map<string, AbortController>();
   private dispatching = false;
+  /** Tail of the in-flight reconstruction request per capture id. */
+  private readonly captureLocks = new Map<string, Promise<void>>();
   constructor(
     private readonly deps: {
       store: LocalStore;
@@ -117,15 +119,80 @@ export class JobRuntime {
     const captureId = typeof input.captureId === 'string' ? input.captureId : '';
     if (!captureId) throw localError(400, 'job_capture_required');
     this.deps.captureStore.get(captureId);
+
+    if (type !== 'spatial.reconstruct') return this.insert(type, input);
+
+    // The check for an attempt in flight, the package inspection and the
+    // insertion form one critical section per capture. Checked and inserted
+    // separately, two taps arriving together both see no active job while
+    // each awaits the inspection, and both reserve a GPU run.
+    return this.exclusiveForCapture(captureId, async () => {
+      // A second tap, or a retry of a failure the processor could never have
+      // fixed, must not cost another GPU run. An attempt already in flight is
+      // the answer to "process this capture".
+      const active = this.activeReconstruction(this.deps.store.snapshot().jobs, captureId);
+      if (active) return structuredClone(active);
+
+      // Reconstruction reads every frame off disk. Proving the package is
+      // complete here costs a few stats; discovering it inside the worker
+      // costs a GPU reservation, a job record and the operator's attention.
+      const inspection = await this.deps.captureStore.inspect(captureId);
+      if (!inspection.ok) {
+        throw localError(422, inspection.code!, {
+          message: inspection.message,
+          missingPaths: inspection.missingPaths,
+          missingCount: inspection.missingCount,
+        });
+      }
+      return this.insert(type, input, captureId);
+    });
+  }
+
+  /**
+   * Records a queued job. For a reconstruction, re-asks inside the state
+   * mutation itself, which nothing can interleave with, whether an attempt is
+   * already active — so the guarantee holds even for a caller that reached
+   * this runtime without going through [exclusiveForCapture].
+   */
+  private async insert(type: JobType, input: Record<string, unknown>, reconstructs?: string): Promise<LocalJob> {
     const now = new Date().toISOString();
     const job: LocalJob = {
       id: crypto.randomUUID(), type, capability: capabilityFor(type), state: 'queued', stage: 'queued', progress: 0,
       input: structuredClone(input), createdAt: now, updatedAt: now,
       logs: [{ at: now, level: 'info', message: 'Job queued' }],
     };
-    await this.deps.store.update((state) => { (state.jobs ??= {})[job.id] = job; });
+    let existing: LocalJob | undefined;
+    await this.deps.store.update((state) => {
+      existing = reconstructs ? this.activeReconstruction(state.jobs, reconstructs) : undefined;
+      if (!existing) (state.jobs ??= {})[job.id] = job;
+    });
+    if (existing) return structuredClone(existing);
     this.schedule();
     return job;
+  }
+
+  private activeReconstruction(jobs: Record<string, unknown> | undefined, captureId: string): LocalJob | undefined {
+    return (Object.values(jobs || {}) as LocalJob[]).find((job) =>
+      job.type === 'spatial.reconstruct'
+      && (job.input as { captureId?: unknown } | undefined)?.captureId === captureId
+      && ['queued', 'running'].includes(job.state));
+  }
+
+  /**
+   * Runs `work` after every earlier call for the same capture has settled.
+   *
+   * Keyed per capture, so requests for unrelated captures never wait on each
+   * other; a failed call does not block the ones queued behind it.
+   */
+  private exclusiveForCapture<T>(captureId: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.captureLocks.get(captureId) ?? Promise.resolve();
+    const result = previous.then(work);
+    const tail = result.then(() => undefined, () => undefined);
+    this.captureLocks.set(captureId, tail);
+    void tail.then(() => {
+      if (this.captureLocks.get(captureId) === tail) this.captureLocks.delete(captureId);
+    });
+    return result;
   }
 
   async cancel(id: string): Promise<LocalJob> {

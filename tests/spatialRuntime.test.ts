@@ -57,7 +57,7 @@ describe('private spatial runtime', () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-spatial-')); dirs.push(dir);
     const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
     const captures = new CaptureStore(dir, store);
-    const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: [{ path: 'frames/0001.jpg', contentBase64: Buffer.from('frame').toString('base64') }] });
+    const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: validCaptureFiles() });
     expect(capture.private).toBe(true);
     expect(store.snapshot().desiredCids).toEqual([]);
     const jobs = new JobRuntime({ store, captureStore: captures, kubo: {} as never, logger: { warn: () => undefined } as never, dataRoot: dir, concurrency: 1,
@@ -78,7 +78,7 @@ describe('private spatial runtime', () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-spatial-')); dirs.push(dir);
     const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
     const captures = new CaptureStore(dir, store);
-    const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: [{ path: 'frames/0001.jpg', contentBase64: Buffer.from('frame').toString('base64') }] });
+    const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: validCaptureFiles() });
 
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
@@ -254,5 +254,119 @@ describe('private spatial runtime', () => {
 
   it('validates the versioned renderer-neutral spatial manifest', () => {
     expect(validateSpatialManifest({ schema: 'kubus.spatial/1', type: 'gaussianSplat', id: 's1', artworkId: 'a1', captureId: 'c1', captureProvenance: { source: 'localCapture', captureId: 'c1' }, capturedAt: '2026-08-10T00:00:00Z', createdAt: '2026-08-10T00:00:00Z', variants: [{ role: 'spatial_mobile', cid: 'cid', sizeBytes: 1, mimeType: 'application/octet-stream', format: 'spz', storageClass: 'warm' }], processing: { protocol: 'kubus.spatial-job/1', workerVersion: 'kubus-spatial-worker/1', reconstruction: { engine: 'nerfstudio', method: 'splatfacto', iterations: 15000, outputFormat: 'spz' } } }).schema).toBe('kubus.spatial/1');
+  });
+});
+
+describe('reconstruction preconditions', () => {
+  /** A JobRuntime with no worker: nothing here should ever reach one. */
+  async function runtimeFor(files: Array<{ path: string; contentBase64: string }>, concurrency = 1) {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-precondition-')); dirs.push(dir);
+    const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
+    const captures = new CaptureStore(dir, store);
+    const capture = await captures.create({
+      schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(),
+      metadata: { intrinsics: true }, files,
+    });
+    const jobs = new JobRuntime({
+      store, captureStore: captures, kubo: {} as never, logger: { warn: () => undefined } as never,
+      dataRoot: dir, concurrency, workerUrl: 'http://kubus-spatial-worker:8790',
+      participationGate: { assertUsefulOperation: async () => undefined } as never,
+      workerAuth: { issue: async () => 'token' } as never,
+    });
+    return { jobs, captures, capture };
+  }
+
+  it('refuses to queue a reconstruction when the capture lost files after it was stored', async () => {
+    const { jobs, capture } = await runtimeFor(validCaptureFiles());
+    // Exactly the production failure: the manifest still names the frame, the
+    // directory no longer holds it.
+    await fs.rm(path.join(capture.directory, 'rgb/00000.jpg'), { force: true });
+
+    await expect(jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' }))
+      .rejects.toMatchObject({ statusCode: 422, code: 'capture_package_incomplete' });
+    expect(jobs.list()).toHaveLength(0);
+  });
+
+  it('refuses to queue a reconstruction for a capture with no frames.json', async () => {
+    const { jobs, capture } = await runtimeFor([
+      { path: 'rgb/00000.jpg', contentBase64: Buffer.from([0xff, 0xd8]).toString('base64') },
+    ]);
+
+    await expect(jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' }))
+      .rejects.toMatchObject({ statusCode: 422, code: 'capture_frames_missing' });
+    expect(jobs.list()).toHaveLength(0);
+  });
+
+  it('answers a second Process tap with the attempt already in flight', async () => {
+    // Nothing is dispatched, so the first attempt stays queued and the race
+    // the user actually triggers — two taps before anything finishes — is
+    // what is tested.
+    const { jobs, capture } = await runtimeFor(validCaptureFiles(), 0);
+
+    const first = await jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' });
+    const second = await jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' });
+
+    expect(jobs.get(first.id).state).toBe('queued');
+    expect(second.id).toBe(first.id);
+    expect(jobs.list()).toHaveLength(1);
+  });
+
+  it('simultaneous Process requests reserve exactly one reconstruction', async () => {
+    const { jobs, capture } = await runtimeFor(validCaptureFiles(), 0);
+
+    // Arriving together, not one after the other: every request is past its
+    // first await before any has inserted a job.
+    const results = await Promise.all(Array.from({ length: 5 }, () =>
+      jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' })));
+
+    expect(new Set(results.map((job) => job.id)).size).toBe(1);
+    expect(jobs.list()).toHaveLength(1);
+  });
+
+  it('refuses simultaneous requests for a broken capture without queuing anything', async () => {
+    const { jobs, capture } = await runtimeFor(validCaptureFiles(), 0);
+    await fs.rm(path.join(capture.directory, 'rgb/00000.jpg'), { force: true });
+
+    const results = await Promise.allSettled([
+      jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' }),
+      jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' }),
+    ]);
+
+    expect(results.map((result) => result.status)).toEqual(['rejected', 'rejected']);
+    expect(jobs.list()).toHaveLength(0);
+  });
+
+  it('does not make requests for unrelated captures wait on each other', async () => {
+    const { jobs, captures, capture } = await runtimeFor(validCaptureFiles(), 0);
+    const other = await captures.create({
+      schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(),
+      metadata: {}, files: validCaptureFiles(),
+    });
+    // Holds the first capture's inspection open; the second must not queue
+    // behind it.
+    const inspect = captures.inspect.bind(captures);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    vi.spyOn(captures, 'inspect').mockImplementation(async (id) => {
+      if (id === capture.id) await held;
+      return inspect(id);
+    });
+
+    const slow = jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' });
+    const fast = await jobs.create('spatial.reconstruct', { captureId: other.id, artworkId: 'art-1' });
+    expect(fast.input.captureId).toBe(other.id);
+    release();
+    await slow;
+    expect(jobs.list()).toHaveLength(2);
+  });
+
+  it('allows a deliberate new attempt once the previous one has ended', async () => {
+    const { jobs, capture } = await runtimeFor(validCaptureFiles(), 0);
+    const first = await jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' });
+    await jobs.cancel(first.id);
+
+    const second = await jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' });
+    expect(second.id).not.toBe(first.id);
+    expect(jobs.get(second.id).state).toBe('queued');
   });
 });
