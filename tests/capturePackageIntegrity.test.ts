@@ -5,6 +5,7 @@ import path from 'node:path';
 import { CaptureStore, type CaptureDraftPayload } from '../src/captures/captureStore.js';
 import { LocalStore } from '../src/state/localStore.js';
 import { reclaimsOrphanedCaptures } from '../src/cli/commands.js';
+import { getCaptureDiagnostics } from '../src/gui/spatialGuiApi.js';
 
 const dirs: string[] = [];
 afterEach(async () =>
@@ -294,5 +295,62 @@ describe('orphan reclamation is bounded to serving commands', () => {
     for (const command of ['status', 'doctor', 'register', 'sync', 'pin', 'heartbeat', 'rewards']) {
       expect(reclaimsOrphanedCaptures(command)).toBe(false);
     }
+  });
+});
+
+describe('repairing a stored capture that lost files', () => {
+  const keyed = { ...payload, metadata: { ...payload.metadata, localCaptureId: 'capture-local-damaged' } };
+
+  it('replaces the damaged replica instead of answering with it', async () => {
+    const store = await newStore();
+    const first = await completeDraft(store, keyed);
+    const damaged = await store.commitDraft(first.id);
+    // Exactly the production state: the record says stored, the directory has
+    // lost the frame the manifest names.
+    await fs.rm(path.join(damaged.directory, 'rgb/00000.jpg'));
+    expect((await store.inspect(damaged.id)).ok).toBe(false);
+
+    const repair = await completeDraft(store, keyed);
+    const record = await store.commitDraft(repair.id);
+
+    expect((await store.inspect(record.id)).ok).toBe(true);
+    // One local capture, one durable replica — not two.
+    expect(store.list()).toHaveLength(1);
+    expect(store.list()[0]!.localCaptureId).toBe('capture-local-damaged');
+    await expect(fs.access(damaged.directory)).rejects.toThrow();
+  });
+
+  it('still answers a genuine lost-response retry with the existing capture', async () => {
+    const store = await newStore();
+    const first = await completeDraft(store, keyed);
+    const committed = await store.commitDraft(first.id);
+
+    const retry = await completeDraft(store, keyed);
+    const second = await store.commitDraft(retry.id);
+
+    expect(second.id).toBe(committed.id);
+    expect(store.list()).toHaveLength(1);
+  });
+});
+
+describe('operator diagnostics', () => {
+  it('tells a broken transfer apart from a failed reconstruction', async () => {
+    const store = await newStore();
+    const healthy = await store.commitDraft((await completeDraft(store)).id);
+    expect(await getCaptureDiagnostics(store, healthy.id)).toMatchObject({
+      id: healthy.id,
+      state: 'stored',
+      validation: { ok: true, missingCount: 0, frameCount: 1 },
+    });
+
+    await fs.rm(path.join(healthy.directory, 'rgb/00000.jpg'));
+
+    const broken = await getCaptureDiagnostics(store, healthy.id);
+    expect(broken.validation.ok).toBe(false);
+    expect(broken.validation.code).toBe('capture_package_incomplete');
+    expect(broken.validation.missingCount).toBe(1);
+    // The count is what the operator acts on; the filenames stay in the log.
+    expect(JSON.stringify(broken.validation)).not.toContain('rgb/00000.jpg');
+    expect(JSON.stringify(broken.validation)).not.toContain(os.tmpdir());
   });
 });

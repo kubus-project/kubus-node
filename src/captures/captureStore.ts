@@ -352,11 +352,22 @@ export class CaptureStore {
       const existing = (Object.values(this.store.snapshot().captures || {}) as CaptureRecord[])
         .find((record) => record.localCaptureId === localCaptureId);
       if (existing) {
-        // A retry of an already-committed capture. Drop the redundant upload
-        // rather than leaving its directory stranded on disk.
-        this.drafts.delete(id);
-        await fs.rm(entry.draft.directory, { recursive: true, force: true });
-        return structuredClone(existing);
+        // Idempotency must not resurrect a replica that cannot be processed.
+        // A client re-uploading a capture it already sent is usually a lost
+        // response, but it is also how it repairs a stored capture that lost
+        // files — and answering that with the broken record would make the
+        // damage permanent.
+        const health = await this.inspect(existing.id).catch(() => undefined);
+        if (health?.ok !== false) {
+          // A retry of an already-committed capture. Drop the redundant
+          // upload rather than leaving its directory stranded on disk.
+          this.drafts.delete(id);
+          await fs.rm(entry.draft.directory, { recursive: true, force: true });
+          return structuredClone(existing);
+        }
+        // Replace it, so one local capture still maps to one durable replica
+        // rather than accumulating a second.
+        await this.delete(existing.id).catch(() => undefined);
       }
     }
 
