@@ -117,6 +117,30 @@ export class JobRuntime {
     const captureId = typeof input.captureId === 'string' ? input.captureId : '';
     if (!captureId) throw localError(400, 'job_capture_required');
     this.deps.captureStore.get(captureId);
+
+    if (type === 'spatial.reconstruct') {
+      // A second tap, or a retry of a failure the processor could never have
+      // fixed, must not cost another GPU run. An attempt already in flight is
+      // the answer to "process this capture".
+      const active = this.list().find((job) =>
+        job.type === type
+        && (job.input as { captureId?: unknown } | undefined)?.captureId === captureId
+        && ['queued', 'running'].includes(job.state));
+      if (active) return structuredClone(active);
+
+      // Reconstruction reads every frame off disk. Proving the package is
+      // complete here costs a few stats; discovering it inside the worker
+      // costs a GPU reservation, a job record and the operator's attention.
+      const inspection = await this.deps.captureStore.inspect(captureId);
+      if (!inspection.ok) {
+        throw localError(422, inspection.code!, {
+          message: inspection.message,
+          missingPaths: inspection.missingPaths,
+          missingCount: inspection.missingCount,
+        });
+      }
+    }
+
     const now = new Date().toISOString();
     const job: LocalJob = {
       id: crypto.randomUUID(), type, capability: capabilityFor(type), state: 'queued', stage: 'queued', progress: 0,

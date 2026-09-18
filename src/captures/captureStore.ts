@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { LocalStore } from '../state/localStore.js';
 import { localError } from '../localApi/pairingService.js';
+import { declaredFrameCount, inspectCapturePackage, type CapturePackageReport } from './capturePackage.js';
 
 export interface CaptureFilePayload { path: string; contentBase64: string; mimeType?: string }
 export interface CapturePackagePayload {
@@ -76,8 +77,58 @@ function safeRelativePath(raw: string): string {
   return normalized;
 }
 
+/** Records that a transfer into `directory` is live, for other processes. */
+async function touchDraftMarker(directory: string, id: string): Promise<void> {
+  try {
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    await fs.writeFile(
+      path.join(directory, DRAFT_MARKER),
+      `${JSON.stringify({ id, touchedAt: new Date().toISOString() })}
+`,
+      { mode: 0o600 },
+    );
+  } catch {
+    // Best effort. A marker that cannot be written costs the directory its
+    // cross-process protection, but must never fail the upload itself.
+  }
+}
+
+/** Milliseconds since a directory's draft marker was last written, or null. */
+async function draftMarkerAgeMs(directory: string): Promise<number | null> {
+  try {
+    const stat = await fs.stat(path.join(directory, DRAFT_MARKER));
+    return Date.now() - stat.mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
 const MAX_CAPTURE_BYTES = 5 * 1024 * 1024 * 1024;
 const MAX_CAPTURE_FILES = 5000;
+
+/**
+ * Marks a directory as an upload in progress, for processes that cannot see
+ * this one's in-memory draft map.
+ *
+ * `reclaimOrphanedDirectories` runs in whichever process happens to start,
+ * and a second process — the container healthcheck runs `kubus-node status` —
+ * has an empty draft map, so every live transfer looks orphaned to it. The
+ * serving process keeps its accounting in memory and never learns that its
+ * directory was emptied underneath it, so the commit reports a complete
+ * package over a directory holding only whatever arrived since. The marker is
+ * the cross-process signal that the in-memory map cannot be.
+ */
+const DRAFT_MARKER = '.draft.json';
+
+/**
+ * How long a draft directory is protected after its last write.
+ *
+ * Long enough to cover a stalled-but-live transfer (the client's per-file
+ * timeout is minutes, so a healthy upload refreshes this far more often),
+ * short enough that a directory stranded by a crash is reclaimed on a later
+ * sweep rather than held forever.
+ */
+const DRAFT_IDLE_GRACE_MS = 30 * 60 * 1000;
 
 async function* oneChunk(bytes: Buffer): AsyncIterable<Buffer> {
   yield bytes;
@@ -174,6 +225,7 @@ export class CaptureStore {
     const id = crypto.randomUUID();
     const directory = path.join(this.root, id);
     await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    await touchDraftMarker(directory, id);
     const draft: CaptureDraft = {
       id,
       state: 'draft',
@@ -275,6 +327,9 @@ export class CaptureStore {
     entry.files.set(relative, { bytes: written, mimeType });
     entry.draft.sizeBytes = entry.draft.sizeBytes - (existing?.bytes ?? 0) + written;
     entry.draft.fileCount = entry.files.size;
+    // Rewritten rather than touched so a marker lost to an outside sweep
+    // comes back, and so the next sweep sees a live transfer.
+    await touchDraftMarker(entry.draft.directory, entry.draft.id);
     return structuredClone(entry.draft);
   }
 
@@ -306,7 +361,38 @@ export class CaptureStore {
     }
 
     const { draft, payload } = entry;
+
+    // The integrity boundary. Everything above this point is the client's
+    // account of the transfer; below it the capture becomes durable state
+    // that a reconstruction job will be built from. A package that cannot be
+    // processed must be refused here, while the phone still holds the source.
+    const inspection = await inspectCapturePackage(draft.directory, {
+      // The set as received, before reconciliation: a file the transfer
+      // delivered and the directory has since lost is `capture_package_
+      // incomplete` — a transfer-integrity failure, distinct from a manifest
+      // referencing something that was never sent.
+      declaredPaths: entry.files.keys(),
+      expectedFrameCount: declaredFrameCount(payload),
+    });
+    if (!inspection.ok) {
+      // Bring the draft's accounting back in line with the directory, so the
+      // client's next resume asks for exactly what is gone.
+      await this.reconcile(entry);
+      // Deliberately leaves the draft intact. Everything already uploaded
+      // stays usable, so the client sends only what is missing instead of
+      // restarting a transfer that may be hundreds of megabytes.
+      throw localError(422, inspection.code!, {
+        message: inspection.message,
+        missingPaths: inspection.missingPaths,
+        missingCount: inspection.missingCount,
+        uploadedFiles: entry.files.size,
+        uploadedBytes: draft.sizeBytes,
+      });
+    }
+
     try {
+      // The marker is transfer bookkeeping, not capture content.
+      await fs.rm(path.join(draft.directory, DRAFT_MARKER), { force: true }).catch(() => undefined);
       const files = [...entry.files.entries()].map(([filePath, meta]) => ({
         path: filePath,
         mimeType: meta.mimeType,
@@ -378,6 +464,12 @@ export class CaptureStore {
       try {
         const stat = await fs.stat(directory);
         if (!stat.isDirectory()) continue;
+        // The draft map only describes this process. A transfer being served
+        // by another one is invisible here, and deleting it would destroy a
+        // live upload while its owner carries on accounting for files that no
+        // longer exist.
+        const markerAge = await draftMarkerAgeMs(directory);
+        if (markerAge !== null && markerAge < DRAFT_IDLE_GRACE_MS) continue;
         await fs.rm(directory, { recursive: true, force: true });
         removed += 1;
       } catch {
@@ -396,10 +488,47 @@ export class CaptureStore {
     this.drafts.clear();
   }
 
-  /** Draft progress, so a client can resume without re-uploading. */
-  getDraft(id: string): CaptureDraft & { files: string[] } {
+  /**
+   * Drops accounting for files the directory no longer holds.
+   *
+   * In-memory accounting records what arrived, not what survived. Anything
+   * that removed a file after upload — an outside sweep, an operator, a disk
+   * error — must not leave the draft claiming it, or a resume skips the file
+   * and the commit certifies a package that cannot be processed.
+   */
+  private async reconcile(entry: DraftEntry): Promise<string[]> {
+    const lost: string[] = [];
+    for (const [relative, meta] of [...entry.files.entries()]) {
+      let present = false;
+      try {
+        const stat = await fs.stat(path.join(entry.draft.directory, relative));
+        present = stat.isFile() && stat.size > 0;
+      } catch {
+        present = false;
+      }
+      if (present) continue;
+      entry.files.delete(relative);
+      entry.draft.sizeBytes -= meta.bytes;
+      lost.push(relative);
+    }
+    if (lost.length > 0) {
+      entry.draft.fileCount = entry.files.size;
+      if (entry.draft.sizeBytes < 0) entry.draft.sizeBytes = 0;
+    }
+    return lost;
+  }
+
+  /**
+   * Draft progress, so a client can resume without re-uploading.
+   *
+   * Reports what the directory actually holds: a client that resumes against
+   * stale accounting would skip exactly the files it needs to resend.
+   */
+  async getDraft(id: string): Promise<CaptureDraft & { files: string[] }> {
     const entry = this.drafts.get(id);
     if (!entry) throw localError(404, 'capture_draft_not_found');
+    await entry.lock.catch(() => undefined);
+    await this.reconcile(entry);
     return { ...structuredClone(entry.draft), files: [...entry.files.keys()] };
   }
 
@@ -407,6 +536,32 @@ export class CaptureStore {
     const record = this.store.snapshot().captures?.[id] as CaptureRecord | undefined;
     if (!record) throw localError(404, 'capture_not_found');
     return structuredClone(record);
+  }
+
+  /**
+   * Re-checks a stored capture against its own manifest.
+   *
+   * `state: 'stored'` records what was true at commit. Anything that removed
+   * files afterwards leaves a record that still looks processable, and the
+   * first component to notice would otherwise be the reconstruction adapter
+   * failing on a `copyFile`. Callers use this as a precondition rather than
+   * discovering it after a GPU has been reserved.
+   */
+  async inspect(id: string): Promise<CapturePackageReport> {
+    const record = this.get(id);
+    let declaredPaths: string[] = [];
+    try {
+      const manifest = JSON.parse(
+        await fs.readFile(path.join(record.directory, 'capture.json'), 'utf8'),
+      ) as { files?: Array<{ path?: unknown }> };
+      declaredPaths = (manifest.files ?? [])
+        .map((file) => file.path)
+        .filter((filePath): filePath is string => typeof filePath === 'string');
+    } catch {
+      // A capture without a readable manifest still has to answer for its
+      // frames; `inspectCapturePackage` reports whatever is actually wrong.
+    }
+    return inspectCapturePackage(record.directory, { declaredPaths });
   }
 
   list(): CaptureRecord[] {
