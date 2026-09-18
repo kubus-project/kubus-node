@@ -166,6 +166,16 @@ export class CaptureStore {
     this.root = path.join(dataRoot, 'private', 'captures');
   }
 
+  /**
+   * The legacy whole-package route, kept for clients that have not migrated.
+   *
+   * Not an integrity boundary in the way `commitDraft` is: a package arrives
+   * here in one request, so it cannot be half-transferred, and the failure
+   * this file exists to prevent — a streamed upload losing files — cannot
+   * happen on this path. A package declared here that is nevertheless
+   * unusable is caught where it would cost something, in `JobRuntime.create`,
+   * which refuses to reserve a GPU for a capture that fails `inspect`.
+   */
   async create(payload: CapturePackagePayload): Promise<CaptureRecord> {
     if (payload.schema !== 'kubus.capture/1' || !payload.capturedAt || !payload.metadata || !Array.isArray(payload.files)) {
       throw localError(400, 'capture_package_invalid');
