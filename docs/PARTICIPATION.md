@@ -1,6 +1,6 @@
 # Network participation
 
-The official kubus Node distribution implements **private compute in exchange for public infrastructure**. Useful local and remote spatial compute is available only while the runtime holds a verified archive-participation lease. Setup, status, doctor, logs, pairing and network diagnostics remain available without it.
+The official kubus node distribution implements **private compute in exchange for public infrastructure**. Useful local and remote spatial compute is available only while the runtime holds a verified archive-participation lease. Setup, status, doctor, logs, pairing and network diagnostics remain available without it.
 
 ## Gate states
 
@@ -24,4 +24,4 @@ The gate lives in the shared job/runtime boundary and local API result boundary.
 
 ## Enforcement boundary
 
-kubus Node is open-source (AGPL-3.0-only) software that runs on operator-owned hardware. No truthful design can cryptographically prevent a hardware owner from modifying visible source. The enforceable product rule is narrower: the unmodified official runtime, Docker stack, local API and worker require an active participation lease for useful compute. This is not DRM and the project does not claim otherwise.
+kubus node is open-source (AGPL-3.0-only) software that runs on operator-owned hardware. No truthful design can cryptographically prevent a hardware owner from modifying visible source. The enforceable product rule is narrower: the unmodified official runtime, Docker stack, local API and worker require an active participation lease for useful compute. This is not DRM and the project does not claim otherwise.

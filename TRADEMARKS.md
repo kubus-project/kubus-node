@@ -3,7 +3,7 @@
 ## Scope
 
 This policy governs use of the following marks (collectively, "Marks"):
-- `art.kubus`, `kubus`, `kubus Node`
+- `art.kubus`, `kubus`, `kubus node`
 - official art.kubus/kubus logos, product icons, and related visual identity
 
 The Marks are proprietary and reserved by the project maintainers, independent of the software license below.
