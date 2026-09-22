@@ -21,6 +21,15 @@ Licence: `AGPL-3.0-only`; branding is reserved (`TRADEMARKS.md`).
 
 ## Source-of-truth precedence
 
+For spatial delivery or cross-repository product work, read the current
+`art.kubus/docs/PRODUCT_UX_SEO_PROGRAM.md` master roadmap, its Wave 12
+`docs/AGENT_EXECUTION_PLAN.md` package and
+`art.kubus/docs/SPATIAL_DELIVERY_ROADMAP.md` before editing. This runtime
+already supports capture/reconstruction/manifests; preview generation,
+streamed/paged runtime LOD and capacity-aware replication are future work
+gated by Ljubljana field evidence. Do not confuse the archive PLY with normal
+viewer delivery or this runtime with `node.kubus.site`.
+
 1. The explicit, current user instruction.
 2. This `CLAUDE.md`.
 3. Repository docs under **Required reading**.
