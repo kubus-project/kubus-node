@@ -10,6 +10,20 @@ kubus Node uses SemVer. Exact Git and container tags are immutable.
 
 An alpha or beta never updates `latest`. Every `v*` tag runs type checking, tests, the TypeScript build, dependency audit, node and worker image builds, release-bundle checksums, and SPDX SBOM generation before GitHub release assets are published. A failed workflow is a failed release, regardless of whether the Git tag exists.
 
+## v0.8.1 — First stable release
+
+kubus Node 0.8.1 is the first release on the stable channel: the container
+images are tagged `latest`, the npm package is published under `latest`, and
+the GitHub Release is a normal release, not a pre-release. The version lines
+up with the rest of the kubus 0.8.1 family release (art.kubus app and backend,
+kubus.site, art.kubus.site and node.kubus.site).
+
+The runtime is the same code as v0.8.0-alpha.11, so its capture-integrity
+fixes are the reason to upgrade from anything older. Nothing about the
+protocol (still version 3), the local API, stored data or the installer
+contract changed. An alpha.11 installation upgrades in place and keeps its
+identity, data and settings.
+
 ## v0.8.0-alpha.11 — Captures Arrive Whole
 
 **Upgrade from alpha.10 before processing any capture.** On alpha.10 the
