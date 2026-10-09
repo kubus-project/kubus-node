@@ -48,38 +48,76 @@ export function spatialViewerHtml(): string {
 }
 
 /**
- * Fetches the variant itself with the same Authorization the rest of the
- * GUI uses (read from localStorage, same as guiJs.ts's `request()`), then
- * hands the renderer a `blob:` object URL - never the raw authenticated
- * API URL, which Spark's internal `fetch(url)` would call with no auth
- * header at all and simply fail against.
+ * Opens a scene through a viewer ticket.
+ *
+ * The page asks the authenticated GUI API for short-lived capabilities (one per
+ * representation) and hands the renderer same-origin content URLs. The GUI
+ * credential is used for that one request and for revoking the capability on the
+ * way out; it never travels with the content requests, and nothing is fetched
+ * whole into a Blob first, so a paged runtime tree can be read page by page with
+ * byte ranges.
+ *
+ * With no `role` the viewer shows what is meant to be viewed: the preview
+ * first, then the runtime tree. The original reconstruction is opened only when
+ * `role=spatial_archive` is requested by name.
  */
 export const spatialViewerBootstrapJs = `
 (function () {
   const status = document.querySelector('#status');
   const params = new URLSearchParams(location.search);
   const id = params.get('id');
-  const role = params.get('role') || 'spatial_archive';
+  const role = params.get('role') || '';
   const token = localStorage.getItem('kubus_node_gui_token') || '';
+  const ticketUrl = '/gui/api/spatial/' + encodeURIComponent(id || '') + '/viewer-ticket';
+  let ticketed = false;
 
   function fail(message) {
     status.hidden = false;
     status.textContent = message;
   }
 
+  function authHeaders(extra) {
+    const headers = Object.assign({ Accept: 'application/json' }, extra || {});
+    if (token) headers.Authorization = 'Bearer ' + token;
+    return headers;
+  }
+
+  // Capabilities expire on their own; closing the viewer ends them sooner.
+  function revoke() {
+    if (!ticketed) return;
+    ticketed = false;
+    try { fetch(ticketUrl, { method: 'DELETE', headers: authHeaders(), keepalive: true }); } catch (error) { /* best effort */ }
+  }
+  window.addEventListener('pagehide', function () {
+    revoke();
+    if (window.unloadSpatial) window.unloadSpatial();
+  });
+
   if (!id) { fail('No Spatial record specified.'); return; }
 
-  const headers = { Accept: 'application/octet-stream' };
-  if (token) headers.Authorization = 'Bearer ' + token;
-
-  fetch('/gui/api/spatial/' + encodeURIComponent(id) + '/content/' + encodeURIComponent(role), { headers: headers })
+  fetch(ticketUrl, {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(role ? { role: role } : {}),
+  })
     .then(function (response) {
       if (!response.ok) throw new Error('HTTP ' + response.status);
-      return response.blob();
+      return response.json();
     })
-    .then(function (blob) {
-      const objectUrl = URL.createObjectURL(blob);
-      return window.loadSpatial(objectUrl);
+    .then(function (body) {
+      const ticket = body.data;
+      ticketed = true;
+      const absolute = function (representation) { return representation ? location.origin + representation.url : undefined; };
+      const byRole = function (name) { return ticket.representations.find(function (item) { return item.role === name; }); };
+      if (!role && ticket.archiveOnly) {
+        fail('This scene has no preview yet. Create one from the scene page, or open the original reconstruction there.');
+        return undefined;
+      }
+      if (role === 'spatial_archive') return window.loadSpatial(absolute(byRole('spatial_archive')));
+      return window.loadSpatialProgressive({
+        preview: absolute(byRole('spatial_preview')),
+        runtime: absolute(byRole('spatial_mobile')),
+      });
     })
     .catch(function (error) {
       fail('This spatial archive could not be loaded.');
