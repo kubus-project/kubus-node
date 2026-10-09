@@ -32,7 +32,12 @@ services:
       NODE_GUI_ENABLED: "true"
       NODE_GUI_HOST: "0.0.0.0"
       NODE_GUI_PORT: "8787"
-      SPATIAL_WORKER_URL: http://kubus-spatial-worker:8790
+      # No colon: an *empty* value (set by setup when the worker is not run on
+      # this machine) stays empty, so the Node reports "no worker" instead of
+      # probing a container that was never started. Unset keeps the old default.
+      SPATIAL_WORKER_URL: ${SPATIAL_WORKER_URL-http://kubus-spatial-worker:8790}
+      # Why setup did or did not start the worker (a code, never free text).
+      KUBUS_SPATIAL_WORKER_STATE: ${KUBUS_SPATIAL_WORKER_STATE:-}
       WORKER_AUTH_KEY_PATH: /var/lib/kubus-node/worker-auth.key
     depends_on:
       kubo:
@@ -66,6 +71,19 @@ services:
       timeout: 5s
       retries: 5
       start_period: 60s
+    # Without this the container is started with no GPU at all on a standard
+    # Docker + NVIDIA Container Toolkit host: the NVIDIA_* variables above only
+    # take effect when nvidia is the default runtime. The `spatial` profile is
+    # activated by setup only where a GPU and Docker's NVIDIA runtime are present
+    # (or the operator sets KUBUS_SPATIAL_WORKER=on), so a CPU-only host never
+    # evaluates this reservation.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
 volumes:
   kubo-data:

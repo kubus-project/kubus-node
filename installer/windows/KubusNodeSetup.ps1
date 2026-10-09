@@ -19,6 +19,12 @@ $composeFile = Join-Path $releaseRoot 'docker-compose.release.yml'
 $dataRoot = Join-Path $env:LOCALAPPDATA 'kubus-node'
 $runtimeEnv = Join-Path $dataRoot 'runtime.env'
 $nodeOrigin = 'http://127.0.0.1:8787'
+# The services that make a Node. The GPU Spatial worker is optional, lives
+# behind the `spatial` Compose profile and is started on its own, so that a
+# machine without a usable GPU is never made to fail by it.
+$baseServices = @('kubo', 'kubus-node-agent')
+$workerService = 'kubus-spatial-worker'
+$workerUrl = 'http://kubus-spatial-worker:8790'
 
 function Show-Problem([string]$message) {
   Add-Type -AssemblyName System.Windows.Forms
@@ -47,7 +53,200 @@ function Write-RuntimeTopology([bool]$allowLan) {
     $bindAddress = '0.0.0.0'
     $lanUrl = "http://${address}:8787"
   }
-  @("NODE_BIND_ADDRESS=$bindAddress", "NODE_LAN_URL=$lanUrl") | Set-Content -LiteralPath $runtimeEnv -Encoding ascii
+  # Only these two keys change. This used to write the whole file, which erased
+  # every other key in it - including the Spatial worker decision made a moment
+  # earlier and anything the operator had added.
+  Set-RuntimeEnvValues ([ordered]@{ NODE_BIND_ADDRESS = $bindAddress; NODE_LAN_URL = $lanUrl })
+}
+
+# runtime.env belongs to the operator. These functions change only the keys they
+# are asked to and keep every other line - comments, unknown keys, secrets,
+# order, line endings - exactly as found. Values are limited to a plain alphabet
+# so there is nothing to quote and no way to add a second line.
+function Get-RuntimeEnvText {
+  if (-not (Test-Path -LiteralPath $runtimeEnv)) { return '' }
+  return [System.IO.File]::ReadAllText($runtimeEnv)
+}
+
+function Get-RuntimeEnvValue([string]$key, [string]$text) {
+  if ($null -eq $text) { $text = Get-RuntimeEnvText }
+  $found = $null
+  foreach ($line in ($text -split "`r?`n")) {
+    if ($line -match '^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$' -and $Matches[1] -ceq $key) {
+      $found = ($Matches[2].Trim() -replace '^(["''])(.*)\1$', '$2')
+    }
+  }
+  return $found
+}
+
+function Merge-RuntimeEnvText([string]$text, [System.Collections.IDictionary]$updates, [string]$defaultEol = "`r`n") {
+  foreach ($key in $updates.Keys) {
+    if ($key -cnotmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw "Refusing to write an environment key named '$key'." }
+    $value = $updates[$key]
+    if ($null -ne $value -and "$value" -cnotmatch '^[A-Za-z0-9_.:/@,+=-]*$') { throw "Refusing to write an unsafe value for $key." }
+  }
+  $crlf = [regex]::Matches($text, "`r`n").Count
+  $lf = [regex]::Matches($text, "(?<!`r)`n").Count
+  $eol = $defaultEol
+  if ($crlf -gt 0 -or $lf -gt 0) { if ($crlf -gt $lf) { $eol = "`r`n" } else { $eol = "`n" } }
+
+  $pending = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+  $order = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($key in $updates.Keys) { $pending[[string]$key] = $updates[$key]; $order.Add([string]$key) }
+  $placed = New-Object 'System.Collections.Generic.HashSet[string]'
+
+  $lines = New-Object 'System.Collections.Generic.List[string]'
+  if ($text.Length -gt 0) {
+    foreach ($line in ($text -split "`r?`n")) { $lines.Add($line) }
+    if ($text.EndsWith("`n")) { $lines.RemoveAt($lines.Count - 1) }
+  }
+
+  $out = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($line in $lines) {
+    if ($line -match '^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$') {
+      $name = $Matches[1]
+      if ($pending.ContainsKey($name)) {
+        # A repeated key collapses to one assignment, at the first one's place.
+        if ($placed.Contains($name)) { continue }
+        [void]$placed.Add($name)
+        if ($null -ne $pending[$name]) { $out.Add("$name=$($pending[$name])") }
+        continue
+      }
+    }
+    $out.Add($line)
+  }
+  foreach ($name in $order) {
+    if (-not $placed.Contains($name) -and $null -ne $pending[$name]) { $out.Add("$name=$($pending[$name])") }
+  }
+  if ($out.Count -eq 0) { return '' }
+  return (($out.ToArray() -join $eol) + $eol)
+}
+
+function Set-RuntimeEnvValues([System.Collections.IDictionary]$updates) {
+  New-Item -ItemType Directory -Force -Path $dataRoot | Out-Null
+  $current = Get-RuntimeEnvText
+  $next = Merge-RuntimeEnvText $current $updates
+  if ($next -ceq $current) { return }
+  # Written beside the original and moved over it: a crash leaves the old file
+  # or the new one, never half of one.
+  $temporary = Join-Path $dataRoot ('.runtime.env.' + [guid]::NewGuid().ToString('N') + '.tmp')
+  try {
+    [System.IO.File]::WriteAllText($temporary, $next, (New-Object System.Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $temporary -Destination $runtimeEnv -Force
+  } finally {
+    if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+  }
+}
+
+function Get-ComposeProfiles([string]$current, [bool]$enabled) {
+  $profiles = @("$current".Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -ne 'spatial' })
+  if ($enabled) { $profiles += 'spatial' }
+  if ($profiles.Count -eq 0) { return $null }
+  return ($profiles -join ',')
+}
+
+# Whether this PC runs the GPU Spatial worker, and why. `auto` (the default)
+# runs it only when an NVIDIA GPU is present AND Docker has the NVIDIA runtime a
+# GPU container needs; a GPU on the host is not a GPU in the container. `on` is
+# the operator insisting; `off` never. A CPU-only PC is a complete Node.
+function Get-SpatialWorkerMode {
+  $value = $env:KUBUS_SPATIAL_WORKER
+  if ([string]::IsNullOrWhiteSpace($value)) { $value = Get-RuntimeEnvValue 'KUBUS_SPATIAL_WORKER' $null }
+  $value = "$value".Trim().ToLowerInvariant()
+  if ($value -eq '') { return 'auto' }
+  if (@('auto', 'on', 'off') -contains $value) { return $value }
+  throw 'KUBUS_SPATIAL_WORKER must be auto, on or off.'
+}
+
+function Get-HostGpuCount {
+  # A PC without an NVIDIA driver has no nvidia-smi; that is "no GPU", not an error.
+  $previousPreference = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $output = & nvidia-smi '--query-gpu=name,memory.total,driver_version' '--format=csv,noheader,nounits' 2>$null
+    if ($LASTEXITCODE -ne 0) { return 0 }
+    return @($output | Where-Object { "$_" -match '^.+,\s*\d+(\.\d+)?\s*,\s*\S+\s*$' }).Count
+  } catch {
+    return 0
+  } finally {
+    $ErrorActionPreference = $previousPreference
+  }
+}
+
+function Test-DockerNvidiaRuntime {
+  $previousPreference = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $json = & docker info --format '{{json .Runtimes}}' 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $runtimes = ($json -join '') | ConvertFrom-Json
+    if ($null -eq $runtimes) { return $null }
+    return [bool](@($runtimes.PSObject.Properties.Name) -contains 'nvidia')
+  } catch {
+    return $null
+  } finally {
+    $ErrorActionPreference = $previousPreference
+  }
+}
+
+function Resolve-SpatialWorkerPlan([string]$mode, [bool]$platformSupported, [int]$gpuCount, $dockerNvidiaRuntime) {
+  if ($mode -eq 'off') { return [pscustomobject]@{ Mode = $mode; Start = $false; State = 'operator_off' } }
+  if (-not $platformSupported) { return [pscustomobject]@{ Mode = $mode; Start = $false; State = 'unsupported_platform' } }
+  if ($mode -eq 'on') { return [pscustomobject]@{ Mode = $mode; Start = $true; State = 'enabled' } }
+  if ($gpuCount -eq 0) { return [pscustomobject]@{ Mode = $mode; Start = $false; State = 'no_nvidia_gpu' } }
+  if ($dockerNvidiaRuntime -ne $true) { return [pscustomobject]@{ Mode = $mode; Start = $false; State = 'docker_gpu_unconfirmed' } }
+  return [pscustomobject]@{ Mode = $mode; Start = $true; State = 'enabled' }
+}
+
+function Get-SpatialWorkerPlan {
+  $mode = Get-SpatialWorkerMode
+  $supported = [Environment]::Is64BitOperatingSystem
+  $gpus = 0
+  $runtime = $null
+  # `off` runs no probe at all: it must work on a PC where nvidia-smi hangs.
+  if ($mode -eq 'auto' -and $supported) {
+    $gpus = Get-HostGpuCount
+    if ($gpus -gt 0) { $runtime = Test-DockerNvidiaRuntime }
+  }
+  return Resolve-SpatialWorkerPlan $mode $supported $gpus $runtime
+}
+
+# Records the decision in runtime.env and clears away a worker that is no longer wanted.
+function Update-SpatialWorkerPlan {
+  $plan = Get-SpatialWorkerPlan
+  $url = ''
+  if ($plan.Start) { $url = $workerUrl }
+  Set-RuntimeEnvValues ([ordered]@{
+    KUBUS_SPATIAL_WORKER = $plan.Mode
+    KUBUS_SPATIAL_WORKER_STATE = $plan.State
+    SPATIAL_WORKER_URL = $url
+    COMPOSE_PROFILES = (Get-ComposeProfiles (Get-RuntimeEnvValue 'COMPOSE_PROFILES' $null) $plan.Start)
+  })
+  if (-not $plan.Start) {
+    try { Invoke-NodeCompose @('--profile', '*', 'rm', '-sf', $workerService) | Out-Null } catch { }
+  }
+  return $plan
+}
+
+# Never throws: a Node must not fail to start because its optional GPU worker
+# could not. A failure is recorded (so the Node can say why) and turns the worker
+# off until the next setup tries again.
+function Start-SpatialWorker($sync) {
+  $profiles = Get-RuntimeEnvValue 'COMPOSE_PROFILES' $null
+  if (-not (@("$profiles".Split(',') | ForEach-Object { $_.Trim() }) -contains 'spatial')) { return }
+  try {
+    if ($sync) { $sync.message = 'Downloading the Spatial worker. This is a large download.' }
+    Invoke-NodeCompose @('pull', $workerService) | Out-Null
+    if ($sync) { $sync.message = 'Starting the Spatial worker...' }
+    Invoke-NodeCompose @('up', '-d', $workerService) | Out-Null
+  } catch {
+    Set-RuntimeEnvValues ([ordered]@{
+      KUBUS_SPATIAL_WORKER_STATE = 'worker_start_failed'
+      SPATIAL_WORKER_URL = ''
+      COMPOSE_PROFILES = (Get-ComposeProfiles (Get-RuntimeEnvValue 'COMPOSE_PROFILES' $null) $false)
+    })
+    try { Invoke-NodeCompose @('--profile', '*', 'rm', '-sf', $workerService) | Out-Null } catch { }
+  }
 }
 
 function Invoke-NodeCompose([string[]]$arguments) {
@@ -81,7 +280,7 @@ function Start-NodeRuntime($sync) {
   $lastError = $null
   for ($attempt = 1; $attempt -le 3; $attempt++) {
     try {
-      Invoke-NodeCompose @('up', '-d') | Out-Null
+      Invoke-NodeCompose (@('up', '-d') + $baseServices) | Out-Null
       return
     } catch {
       $lastError = $_
@@ -308,6 +507,7 @@ function Start-SetupFlow {
     if (-not (Test-Path -LiteralPath $composeFile)) { throw 'This release bundle is incomplete: docker-compose.release.yml is missing. Reinstall kubus Node.' }
     $existingConfig = Read-SetupConfig
     Write-RuntimeTopology ($existingConfig -match '(?m)^LOCAL_API_ALLOW_LAN=(?:"true"|true)$')
+    Update-SpatialWorkerPlan | Out-Null
 
     # The pull is the long part. Its output is the only honest progress signal
     # available, so it is surfaced line by line instead of leaving the page
@@ -325,7 +525,7 @@ function Start-SetupFlow {
     $previousPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-      & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile pull 2>&1 | ForEach-Object {
+      & docker compose -p kubus-node --env-file $runtimeEnv -f $composeFile pull @baseServices 2>&1 | ForEach-Object {
         $line = "$_".Trim()
         if ($line) { $sync.message = $line }
       }
@@ -336,6 +536,7 @@ function Start-SetupFlow {
 
     Set-Step $sync 'start' 'Starting your Node...'
     Start-NodeRuntime $sync
+    Start-SpatialWorker $sync
 
     Set-Step $sync 'wait' 'Waiting for your Node to answer...'
     $target = $null
@@ -389,12 +590,14 @@ function Complete-SetupTransition {
     $config = Read-SetupConfig
     if ($config -match '(?m)^LOCAL_API_ALLOW_LAN=(?:"true"|true)$') {
       Write-RuntimeTopology $true
-      Invoke-NodeCompose @('up', '-d', '--force-recreate')
+      Invoke-NodeCompose (@('up', '-d', '--force-recreate') + $baseServices)
+      Start-SpatialWorker $null
       return
     }
     if ($config -match '(?m)^LOCAL_API_ALLOW_LAN=(?:"false"|false)$') {
       Write-RuntimeTopology $false
-      Invoke-NodeCompose @('up', '-d', '--force-recreate')
+      Invoke-NodeCompose (@('up', '-d', '--force-recreate') + $baseServices)
+      Start-SpatialWorker $null
       return
     }
     Start-Sleep -Seconds 3
@@ -405,7 +608,9 @@ function Stop-Node([bool]$removeData) {
   Add-Type -AssemblyName System.Windows.Forms
   Test-Docker
   if (-not (Test-Path -LiteralPath $runtimeEnv)) { Write-RuntimeTopology $false }
-  Invoke-NodeCompose @('down')
+  # Every profile: `down` without it would leave a Spatial worker running that
+  # nothing left knows about.
+  Invoke-NodeCompose @('--profile', '*', 'down')
   $deleted = $false
   if ($removeData) {
     $answer = [System.Windows.Forms.MessageBox]::Show(

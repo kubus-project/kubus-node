@@ -44,6 +44,8 @@ export interface AppConfig {
   localDataPath: string;
   jobConcurrency: number;
   spatialWorkerUrl?: string;
+  /** Why setup did or did not start the Spatial worker, as a code from installer/spatialWorker. Absent outside the packaged runtime. */
+  spatialWorkerState?: string;
   offerRemoteCompute: boolean;
   remoteComputePaused: boolean;
   remoteComputeMaxConcurrency: number;

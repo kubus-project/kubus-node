@@ -114,6 +114,13 @@ jobs:
       - name: Exercise the launcher browser handoff on Windows PowerShell
         shell: pwsh
         run: npm test -- tests/windowsGuiHandoff.test.ts
+      - name: Run the installer's runtime.env and GPU-worker logic on Windows PowerShell 5.1
+        shell: pwsh
+        env:
+          # The installer ships to, and runs on, Windows PowerShell 5.1. These
+          # extract its real functions by AST and require the TypeScript's answers.
+          KUBUS_TEST_PWSH: powershell.exe
+        run: npm test -- tests/windowsInstallerEnv.test.ts
       - name: Parse installer and verify shipped-layout references
         shell: pwsh
         run: |

@@ -69,7 +69,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   const api = new KubusApiClient({ baseUrl: config.apiBaseUrl, auth: new BearerAuthProvider(config.operatorToken) });
   const kubo = new KuboClient(config.ipfsRpcUrl);
   const actionLock = new ActionLock();
-  const capabilities = new CapabilityRegistry(kubo, config.spatialWorkerUrl);
+  const capabilities = new CapabilityRegistry(kubo, config.spatialWorkerUrl, config.spatialWorkerState);
   const participationGate = new NetworkParticipationGate({ store, config, kubo });
   const workerAuth = new WorkerAuthService(config.workerAuthKeyPath);
   await workerAuth.initialize();

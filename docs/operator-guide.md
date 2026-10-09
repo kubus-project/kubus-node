@@ -162,3 +162,26 @@ Even then a capture is removed only when **all** of these hold:
 - fewer than five captures have already been removed in this sweep (oldest first; the rest wait for the next sweep).
 
 Having a preview or runtime representation authorizes nothing. The sweeper deletes only the capture's own directory and record: it never touches Kubo, pins, scenes or manifests. It does not know about your backups: a copy of the data directory made earlier still has the capture. `KUBUS_RETENTION_SWEEP_INTERVAL_MS` (default one hour) sets how often it looks.
+
+## The GPU Spatial worker
+
+A Node is a complete archive and storage participant without it. The worker adds local Gaussian-splat reconstruction on an NVIDIA GPU, and it is optional: nothing about starting your Node depends on it, and a failure to start it never stops the Node.
+
+`KUBUS_SPATIAL_WORKER` (in `runtime.env`, or in the environment of `kubus-node setup|start|update`; the environment wins and is then remembered):
+
+- `auto` (default): run the worker only when **both** an NVIDIA GPU is present on the host (`nvidia-smi` lists it) **and** Docker has the `nvidia` runtime a GPU container needs. A GPU on the host is not a GPU in the container, so one without the other is reported, not guessed at.
+- `on`: you insist. Detection that found nothing does not veto you; the start is still non-fatal.
+- `off`: never. No GPU probe is run at all.
+
+Setup records its decision in `runtime.env` (merged into the file; your other keys, comments and secrets are left exactly as they were) and the Node shows the reason on the dashboard:
+
+| `KUBUS_SPATIAL_WORKER_STATE` | Meaning |
+| --- | --- |
+| `enabled` | The worker was started. Its own health, not this note, says whether the GPU is usable. |
+| `no_nvidia_gpu` | No NVIDIA GPU was found. The Node runs without the worker. |
+| `docker_gpu_unconfirmed` | A GPU was found but Docker's NVIDIA runtime was not. Install the NVIDIA Container Toolkit (Linux) or enable GPU support in Docker Desktop (Windows), or set `KUBUS_SPATIAL_WORKER=on` to try anyway. |
+| `operator_off` | You turned it off. |
+| `unsupported_platform` | Linux x64 and Windows x64 only. |
+| `worker_start_failed` | The image could not be pulled or the container could not be started. The Node runs without it; run `docker compose --project-name kubus-node logs kubus-spatial-worker`. The next `setup`, `start` or `update` tries again. |
+
+The worker is behind the Compose `spatial` profile, recorded as `COMPOSE_PROFILES=spatial` in `runtime.env` (your other profiles are kept). `stop`, `restart`, `logs`, `status` and `uninstall` address every profile, so a worker you have since turned off is not left running. `kubus-node setup --check` shows what would happen, and why, without changing anything.
