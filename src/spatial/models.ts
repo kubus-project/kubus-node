@@ -86,6 +86,7 @@ export interface SpatialManifest {
   createdAt: string;
 }
 
+const KNOWN_ROLES: ReadonlySet<string> = new Set<SpatialVariantRole>(['spatial_preview', 'spatial_mobile', 'spatial_archive', 'model3d']);
 const BUNDLE_FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MAX_BUNDLE_FILES = 20_000;
 
@@ -113,6 +114,9 @@ function validateVariant(variant: Partial<SpatialVariant>): void {
   if (!Number.isSafeInteger(variant.sizeBytes) || (variant.sizeBytes as number) < 0 || !variant.mimeType || !variant.format) {
     throw new Error('spatial_manifest_variant_invalid');
   }
+  // An unknown role has no storage policy, so it could claim any class - and
+  // the public pin set and replication planner key off that class.
+  if (!KNOWN_ROLES.has(String(variant.role))) throw new Error('spatial_manifest_variant_role_invalid');
   const hasCid = typeof variant.cid === 'string' && variant.cid.length > 0;
   const hasRoot = typeof variant.rootCid === 'string' && variant.rootCid.length > 0;
   // Exactly one: a variant that named both would let two readers disagree about

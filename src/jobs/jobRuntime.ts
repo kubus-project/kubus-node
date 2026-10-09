@@ -392,6 +392,7 @@ export class JobRuntime {
         ? (this.deps.autoDerivatives === false ? [] : DERIVATIVE_ORDER)
         : (job.input.derivatives as DerivativeKind[]);
       record = await this.derive(job, record, workspace, master, kinds, controller, metrics);
+      if (job.type !== 'spatial.reconstruct') this.assertDerivationProduced(record, kinds);
 
       await this.stage(id, 'cleaning_workspace', 0.97, 'Removing temporary processing files');
       await this.removeWorkspace(id, workspace);
@@ -544,7 +545,14 @@ export class JobRuntime {
         else { metrics.runtimeBytes = variant.sizeBytes; metrics.runtimeMs = body.derivative.durationMs; }
         await this.patchJob(job.id, (entry) => { entry.logs.push({ at: new Date().toISOString(), level: 'info', message: `The ${label} is ready (${variant.sizeBytes} bytes)` }); });
       } catch (error) {
-        if (controller.signal.aborted) throw error;
+        if (controller.signal.aborted) {
+          // Cancelled, not failed: nothing was learned about the derivative, so
+          // the note that it is being made must go. Left behind it would read
+          // "running" until the next restart, and hide the retry the operator
+          // is entitled to.
+          await this.records.markDerivative(current.id, kind, null).catch(() => undefined);
+          throw error;
+        }
         const failure = error instanceof ImportError
           ? { code: error.code, message: error.message }
           : { code: String((error as { code?: string }).code || 'derivative_failed'), message: String((error as Error).message || error) };
@@ -554,6 +562,22 @@ export class JobRuntime {
       }
     }
     return current;
+  }
+
+  /**
+   * A reconstruction that loses a derivative is still a success: its point, the
+   * master, is durable and the derivative can be retried. A *retry* has no other
+   * point. When every derivative it was asked for is still missing it did
+   * nothing, and reporting "completed" would tell the operator the opposite.
+   * Producing some of them is progress and stays a success; the scene's
+   * derivative status records what remains.
+   */
+  private assertDerivationProduced(record: SpatialStoreRecord, kinds: DerivativeKind[]): void {
+    if (kinds.length === 0) return;
+    const summary = summarizeDerivatives(record);
+    if (kinds.some((kind) => summary[kind].state === 'ready')) return;
+    const reason = kinds.map((kind) => summary[kind].error).find(Boolean);
+    throw Object.assign(new Error(reason?.message ?? 'The derivative could not be created.'), { code: reason?.code ?? 'derivative_failed' });
   }
 
   /** One call to the worker. Throws a coded error for any failure, carrying the worker's own code when it sent one. */
