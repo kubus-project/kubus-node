@@ -20,6 +20,11 @@ const TOKEN_PATTERNS = [
   /("authorization"\s*:\s*"Bearer\s+)[^"]+(")/gi,
   /("KUBUS_OPERATOR_TOKEN"\s*:\s*")[^"]+(")/gi,
   /("NODE_GUI_TOKEN"\s*:\s*")[^"]+(")/gi,
+  // A Spatial viewer capability is the credential and lives in the URL path,
+  // so any message that quotes a content URL (an error, a proxy line) would
+  // otherwise carry it. Deliberately not length-bound: a truncated or
+  // malformed token in an error text is still a prefix of a live one.
+  /(\/gui\/content\/)[A-Za-z0-9_-]+/g,
 ];
 
 export function redactSecrets<T>(value: T): T {
