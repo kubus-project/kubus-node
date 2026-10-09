@@ -44,6 +44,8 @@ export interface AppConfig {
   localDataPath: string;
   jobConcurrency: number;
   spatialWorkerUrl?: string;
+  /** Why setup did or did not start the Spatial worker, as a code from installer/spatialWorker. Absent outside the packaged runtime. */
+  spatialWorkerState?: string;
   offerRemoteCompute: boolean;
   remoteComputePaused: boolean;
   remoteComputeMaxConcurrency: number;
@@ -52,4 +54,9 @@ export interface AppConfig {
   remoteComputeMinimumFreeVramBytes: number;
   participationGraceMs: number;
   workerAuthKeyPath: string;
+  /** Source-capture retention sweeper. `off` (the default) never deletes; `dry-run` reports what it would. */
+  retentionSweep: 'off' | 'dry-run' | 'on';
+  retentionSweepIntervalMs: number;
+  /** No capture younger than this is ever removed by retention. */
+  retentionGraceMs: number;
 }

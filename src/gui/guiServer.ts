@@ -26,6 +26,8 @@ import { spatialViewerBundle } from './public/vendor/spatialViewerBundle.js';
 import { handleLocalApi, type LocalApiDeps } from '../localApi/localApiRouter.js';
 import { localError } from '../localApi/pairingService.js';
 import { buildViewModel } from './viewModel.js';
+import { issueViewerTickets, isViewerContentPath, serveViewerContent } from './spatialDelivery.js';
+import { ViewerCapabilities } from './viewerCapabilities.js';
 import { renderQrSvg } from './qr.js';
 import {
   getCaptureDiagnostics,
@@ -50,6 +52,12 @@ export interface GuiDeps {
   analytics?: AnalyticsStore;
   /** Late-bound: signaling starts after registration, long after the GUI does. */
   remoteConnections?: () => RemoteConnectionDiagnostic[];
+  /**
+   * The Spatial viewer's grants. One per server, so tests (and a second server
+   * in the same process) never share capabilities; omitted, the server makes
+   * its own. Held in memory only: a restart revokes every outstanding grant.
+   */
+  viewerCapabilities?: ViewerCapabilities;
 }
 
 const ANALYTICS_RANGES: readonly AnalyticsRange[] = ['24h', '7d', '30d'];
@@ -62,8 +70,9 @@ export interface GuiServerHandle {
 export async function startGuiServer(deps: GuiDeps): Promise<GuiServerHandle> {
   if (deps.config.guiEnabled) assertGuiConfig(deps.config);
   const handoffs = new GuiHandoffs();
+  const viewer = deps.viewerCapabilities ?? new ViewerCapabilities();
   const server = http.createServer((req, res) => {
-    void handleRequest(req, res, deps, handoffs).catch((error) => {
+    void handleRequest(req, res, deps, handoffs, viewer).catch((error) => {
       writeJson(res, Number((error as Error & { statusCode?: number }).statusCode || 500), {
         success: false,
         error: String((error as Error).message || error),
@@ -98,7 +107,7 @@ export async function startGuiServer(deps: GuiDeps): Promise<GuiServerHandle> {
   };
 }
 
-async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: GuiDeps, handoffs: GuiHandoffs): Promise<void> {
+async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: GuiDeps, handoffs: GuiHandoffs, viewer: ViewerCapabilities): Promise<void> {
   res.setHeader('Referrer-Policy', 'no-referrer');
   const parsed = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
   if (deps.localApi && await handleLocalApi(req, res, deps.localApi)) return;
@@ -166,6 +175,16 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
   }
   if (req.method === 'GET' && parsed.pathname === '/gui/assets/spatial-viewer.bundle.js') {
     writeText(res, 200, spatialViewerBundle, 'application/javascript; charset=utf-8');
+    return;
+  }
+  // The Spatial viewer's content route sits deliberately *before* the GUI
+  // credential gate: Spark fetches chunks by plain URL and cannot send an
+  // Authorization header. That makes the capability in the path the only
+  // credential here, and serveViewerContent verifies it on every request
+  // (scene, variant, expiry) - there is no unauthenticated fall-through, and no
+  // path from this route to anything but the one variant a grant was minted for.
+  if (isViewerContentPath(parsed.pathname)) {
+    await serveViewerContent(req, res, { kubo: deps.kubo, capabilities: viewer }, parsed.pathname);
     return;
   }
   if (!parsed.pathname.startsWith('/gui/api/')) {
@@ -241,10 +260,22 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     // path to keep honest with reality.
     const local = requireLocalApi(deps);
     const body = await readGuiJson(req);
+    const type = typeof body.type === 'string' ? body.type : 'spatial.reconstruct';
+    if (type === 'spatial.optimize' || type === 'spatial.generate_preview') {
+      // A derivative retry names the scene whose preserved master it derives
+      // from; it never names a capture, because it never trains.
+      const spatialId = typeof body.spatialId === 'string' ? body.spatialId : '';
+      if (!spatialId) throw localError(400, 'job_spatial_required');
+      if (body.derivatives !== undefined && (!Array.isArray(body.derivatives) || !body.derivatives.every((kind) => kind === 'preview' || kind === 'runtime'))) {
+        throw localError(400, 'job_derivatives_invalid');
+      }
+      const retry = await local.jobs.create(type, { spatialId, derivatives: body.derivatives, force: body.force === true });
+      writeJson(res, 201, { success: true, data: retry });
+      return;
+    }
     const captureId = typeof body.captureId === 'string' ? body.captureId : '';
     if (!captureId) throw localError(400, 'job_capture_required');
     const capture = local.captures.get(captureId);
-    const type = typeof body.type === 'string' ? body.type : 'spatial.reconstruct';
     const job = await local.jobs.create(type as never, { captureId, artworkId: capture.artworkId, markerId: capture.markerId });
     writeJson(res, 201, { success: true, data: job });
     return;
@@ -288,6 +319,26 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
   const spatialManifestMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/manifest$/);
   if (req.method === 'GET' && spatialManifestMatch) {
     writeJson(res, 200, { success: true, data: getSpatialRecord(deps.store, decodeURIComponent(spatialManifestMatch[1]!)).manifest });
+    return;
+  }
+  const viewerTicketMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/viewer-ticket$/);
+  if (viewerTicketMatch && req.method === 'POST') {
+    // Behind the GUI credential (and, for a cookie session, the same-origin
+    // check that every non-GET request gets): only an authenticated operator
+    // can mint a capability.
+    const body = await readGuiJson(req, 1024);
+    if (body.role !== undefined && typeof body.role !== 'string') throw localError(400, 'viewer_role_invalid');
+    const ticket = issueViewerTickets(
+      { store: deps.store, capabilities: viewer },
+      decodeURIComponent(viewerTicketMatch[1]!),
+      { role: body.role as string | undefined },
+    );
+    writeCapabilityJson(res, 201, { success: true, data: ticket });
+    return;
+  }
+  if (viewerTicketMatch && req.method === 'DELETE') {
+    const revoked = viewer.revokeSpatial(decodeURIComponent(viewerTicketMatch[1]!));
+    writeJson(res, 200, { success: true, data: { revoked } });
     return;
   }
   const spatialContentMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/content\/([^/]+)$/);
@@ -642,6 +693,24 @@ function writeHead(res: ServerResponse, statusCode: number, contentType: string)
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
   });
+}
+
+/**
+ * A response whose point is to hand an authenticated caller a capability URL.
+ *
+ * It bypasses `redactSecrets` on purpose - the same narrow exemption the pairing
+ * code gets - because the redaction rule for `/gui/content/<token>` would blank
+ * the one thing the response exists to deliver. Only server-built, typed values
+ * go through it (see issueViewerTickets), never request-derived text. It is
+ * `no-store`, and nothing logs response bodies.
+ */
+function writeCapabilityJson(res: ServerResponse, statusCode: number, payload: unknown): void {
+  res.writeHead(statusCode, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+  });
+  res.end(JSON.stringify(payload));
 }
 
 function writeJson(

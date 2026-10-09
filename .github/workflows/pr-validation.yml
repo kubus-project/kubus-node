@@ -27,6 +27,26 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm test
+      - name: Spatial bundles against a real, disposable Kubo
+        shell: bash
+        run: |
+          # The unit suites fake Kubo. This one starts the pinned release in a
+          # throwaway repository (offline, loopback only) and checks the facts
+          # those fakes assume: file stats, ranged reads inside a bundle,
+          # recursive pins and what garbage collection keeps. The archive is
+          # verified against the checksum published with the release.
+          set -euo pipefail
+          version=v0.43.0
+          archive="kubo_${version}_linux-amd64.tar.gz"
+          base="https://github.com/ipfs/kubo/releases/download/${version}"
+          mkdir -p "$RUNNER_TEMP/kubo"
+          cd "$RUNNER_TEMP/kubo"
+          curl --fail --silent --show-error --location --retry 3 -O "${base}/${archive}"
+          curl --fail --silent --show-error --location --retry 3 -O "${base}/${archive}.sha512"
+          sha512sum --check "${archive}.sha512"
+          tar -xzf "$archive"
+          cd "$GITHUB_WORKSPACE"
+          KUBUS_TEST_KUBO_BIN="$RUNNER_TEMP/kubo/kubo/ipfs" npm test -- --run tests/spatialKubo.integration.test.ts
       - run: npm audit --audit-level=high
       - run: git diff --check
 
@@ -94,6 +114,13 @@ jobs:
       - name: Exercise the launcher browser handoff on Windows PowerShell
         shell: pwsh
         run: npm test -- tests/windowsGuiHandoff.test.ts
+      - name: Run the installer's runtime.env and GPU-worker logic on Windows PowerShell 5.1
+        shell: pwsh
+        env:
+          # The installer ships to, and runs on, Windows PowerShell 5.1. These
+          # extract its real functions by AST and require the TypeScript's answers.
+          KUBUS_TEST_PWSH: powershell.exe
+        run: npm test -- tests/windowsInstallerEnv.test.ts
       - name: Parse installer and verify shipped-layout references
         shell: pwsh
         run: |
@@ -124,16 +151,58 @@ jobs:
           if (-not $tarball) { throw 'npm package tarball missing.' }
           node scripts/verify_npm_package.mjs --tarball $tarball
 
+  spatial-worker:
+    name: Spatial worker with the pinned tools
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the pinned derivative tools exactly as the worker image does
+        shell: bash
+        run: |
+          # The worker's tests run Niantic's spz and Spark's build-lod on a
+          # synthetic master and check their output independently. The pins are
+          # read from the Dockerfile, so the tools under test cannot drift from
+          # the ones the image ships. No CUDA is needed: reconstruction (ns-train)
+          # is not covered here and needs a real GPU.
+          set -euo pipefail
+          pin() { sed -n "s/^ARG $1=\(.*\)\$/\1/p" spatial-worker/Dockerfile | head -n1; }
+          spark_ref="$(pin SPARK_REF)"; spz_ref="$(pin SPZ_REF)"; rust="$(pin RUST_TOOLCHAIN)"
+          test -n "$spark_ref" -a -n "$spz_ref" -a -n "$rust"
+          tools="$RUNNER_TEMP/tools"; mkdir -p "$tools"
+          git init "$tools/spark"
+          git -C "$tools/spark" remote add origin https://github.com/sparkjsdev/spark.git
+          git -C "$tools/spark" fetch --depth 1 origin "$spark_ref"
+          git -C "$tools/spark" checkout --detach FETCH_HEAD
+          test "$(git -C "$tools/spark" rev-parse HEAD)" = "$spark_ref"
+          rustup toolchain install "$rust" --profile minimal
+          (cd "$tools/spark/rust" && cargo +"$rust" build --release --locked -p build-lod --no-default-features)
+          python3 -m venv "$tools/venv"
+          "$tools/venv/bin/python" -m pip install --quiet numpy==2.5.3 pytest==9.1.1 httpx==0.28.1 fastapi==0.141.1 scikit-build-core nanobind python_devtools
+          CMAKE_ARGS="-DCMAKE_POSITION_INDEPENDENT_CODE=ON" "$tools/venv/bin/python" -m pip install --quiet --no-build-isolation "git+https://github.com/nianticlabs/spz.git@${spz_ref}"
+          printf '{"buildLod":{"version":"spark-v2.1.0","ref":"%s"},"spz":{"version":"v3.0.0","ref":"%s"}}\n' "$spark_ref" "$spz_ref" > "$tools/tools.json"
+          {
+            echo "KUBUS_BUILD_LOD=$tools/spark/rust/target/release/build-lod"
+            echo "KUBUS_TOOLS_MANIFEST=$tools/tools.json"
+            echo "KUBUS_REQUIRE_REAL_TOOLS=1"
+            echo "WORKER_PYTHON=$tools/venv/bin/python"
+          } >> "$GITHUB_ENV"
+      - name: Worker tests (a skipped real-tool test fails the run)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd spatial-worker
+          "$WORKER_PYTHON" -m pytest -q -rs
+
   pr-validation-required:
     name: PR validation required
     runs-on: ubuntu-24.04
-    needs: [quality, docker-runtime, package, windows-installer-contract]
+    needs: [quality, docker-runtime, package, windows-installer-contract, spatial-worker]
     if: always()
     steps:
       - name: Require every declared job to pass or be legitimately skipped
         shell: bash
         run: |
           set -euo pipefail
-          for result in "${{ needs.quality.result }}" "${{ needs.docker-runtime.result }}" "${{ needs.package.result }}" "${{ needs.windows-installer-contract.result }}"; do
+          for result in "${{ needs.quality.result }}" "${{ needs.docker-runtime.result }}" "${{ needs.package.result }}" "${{ needs.windows-installer-contract.result }}" "${{ needs.spatial-worker.result }}"; do
             test "$result" = success -o "$result" = skipped || { echo "Required validation result: $result"; exit 1; }
           done

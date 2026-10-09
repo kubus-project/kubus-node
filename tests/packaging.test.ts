@@ -65,7 +65,9 @@ describe('release packaging', () => {
     const setup = await readFile(path.join(repoRoot, 'installer', 'windows', 'KubusNodeSetup.ps1'), 'utf8');
     // Opening the Node's address immediately after `up -d` produced a browser
     // connection error, which reads as "the install failed".
-    const started = setup.indexOf("Invoke-NodeCompose @('up', '-d')");
+    // The start brings up the Node's own services; the optional GPU worker is
+    // started on its own afterwards, so it cannot make this step fail.
+    const started = setup.indexOf("Invoke-NodeCompose (@('up', '-d') + $baseServices)");
     // Anchor on the step transition, not the page's step list, which names the
     // same wait earlier in the file.
     const waiting = setup.indexOf("Set-Step $sync 'wait'");
@@ -116,6 +118,18 @@ describe('release packaging', () => {
     expect(setup).not.toMatch(/\$sync\.error = \$_\.Exception\.Message/);
   });
 
+  it('never writes runtime.env except by merging into it', async () => {
+    const setup = await readFile(path.join(repoRoot, 'installer', 'windows', 'KubusNodeSetup.ps1'), 'utf8');
+    // Writing the whole file is how finishing setup used to erase every other
+    // key in it - the operator's, and the Spatial worker decision made a moment
+    // earlier. The only writer is the merge, and it moves a temp file into place.
+    const writers = setup.split('\n').filter((line) => /\$runtimeEnv/.test(line) && /Set-Content|Out-File|Add-Content|WriteAllText|\bsc\b|>\s*\$runtimeEnv/.test(line));
+    expect(writers).toEqual([]);
+    expect(setup).toContain('Set-RuntimeEnvValues ([ordered]@{ NODE_BIND_ADDRESS = $bindAddress; NODE_LAN_URL = $lanUrl })');
+    // Every Compose call sees the same file, so a profile recorded there applies to all of them.
+    expect(setup).not.toMatch(/docker compose[^\n]*--env-file(?! \$runtimeEnv)/);
+  });
+
   it('tells the operator what docker actually said when a step fails', async () => {
     const setup = await readFile(path.join(repoRoot, 'installer', 'windows', 'KubusNodeSetup.ps1'), 'utf8');
     // "Open Docker Desktop, check that it is running" was shown to an operator
@@ -137,7 +151,7 @@ describe('release packaging', () => {
     expect(startStep).toBeGreaterThan(-1);
     const afterStart = setup.slice(startStep, startStep + 200);
     expect(afterStart).toContain('Start-NodeRuntime $sync');
-    expect(afterStart).not.toContain("Invoke-NodeCompose @('up', '-d')");
+    expect(afterStart).not.toContain("Invoke-NodeCompose (@('up', '-d') + $baseServices)");
   });
 
   it('keeps the executable path the image and the npm bin agree on', async () => {

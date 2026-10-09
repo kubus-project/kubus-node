@@ -507,13 +507,27 @@ function renderSpatialDetail(id) {
   const record = (library.spatial || []).find((r) => r.id === id);
   if (!record) return '<section class="panel">' + empty('Spatial archive not found', 'It may have been deleted.') + '</section>';
   const archive = record.variants.find((v) => v.role === 'spatial_archive');
+  const preview = record.variants.find((v) => v.role === 'spatial_preview');
+  const runtime = record.variants.find((v) => v.role === 'spatial_mobile');
+  const viewable = Boolean(preview || runtime);
+  // Derivatives are made from the preserved reconstruction, so they can only be
+  // (re)created while it exists; a missing one is offered, never assumed.
+  const missing = archive ? [preview ? null : 'preview', runtime ? null : 'runtime'].filter(Boolean) : [];
 
   return pageHeader(record.artworkId || 'Untitled', 'Processed Spatial archive.',
     '<button class="button small subtle" data-lib-back="1">Back to Spatial</button>') +
     '<section class="panel">' +
     '<div id="spatialPreviewMount" class="viewer-mount"></div>' +
-    '<div class="row"><button class="button primary" data-open-preview="' + h(record.id) + '">Open interactive preview</button>' +
-    (archive ? '<span class="t-meta">' + h(fmtBytes(archive.sizeBytes)) + ' ' + h(archive.format) + ' - loads on demand</span>' : '') +
+    '<div class="row">' +
+    (viewable ? '<button class="button primary" data-open-preview="' + h(record.id) + '">Open interactive preview</button>' : '') +
+    (missing.length ? '<button class="button' + (viewable ? ' subtle' : ' primary') + '" data-create-derivatives="' + h(record.id) + '" data-derivatives="' + h(missing.join(',')) + '">' +
+      (viewable ? 'Create the missing ' + h(missing.join(' and ')) : 'Create preview and runtime') + '</button>' : '') +
+    (archive ? '<button class="button small subtle" data-open-original="' + h(record.id) + '">Open the original (' + h(fmtBytes(archive.sizeBytes)) + ' ' + h(archive.format) + ')</button>' : '') +
+    '</div>' +
+    '<div class="stack-sm">' +
+    (preview ? '<span class="t-meta">Preview ' + h(fmtBytes(preview.sizeBytes)) + ' ' + h(preview.format) + ' - drawn first</span>' : '') +
+    (runtime ? '<span class="t-meta">Runtime ' + h(fmtBytes(runtime.sizeBytes)) + ' ' + h(runtime.format) + (runtime.fileCount ? ' in ' + h(String(runtime.fileCount)) + ' files' : '') + ' - read page by page</span>' : '') +
+    (!viewable ? '<span class="t-meta">No preview or runtime exists for this scene yet; opening the original downloads all of it.</span>' : '') +
     '</div>' +
     '</section>' +
     '<section class="panel">' +
@@ -1287,27 +1301,56 @@ function bindSectionEvents() {
       }
     });
   });
+  function openSpatialViewer(button, id, role) {
+    const mount = $('#spatialPreviewMount');
+    if (!mount) return;
+    button.disabled = true;
+    button.textContent = 'Loading…';
+    const iframe = document.createElement('iframe');
+    iframe.className = 'viewer-frame';
+    iframe.title = 'Interactive Spatial preview';
+    iframe.allow = 'fullscreen';
+    // No role means "what is meant to be viewed": preview, then runtime. The
+    // original is opened only when asked for by name.
+    iframe.src = '/gui/assets/spatial-viewer.html?id=' + encodeURIComponent(id) + (role ? '&role=' + encodeURIComponent(role) : '');
+    mount.innerHTML = '';
+    mount.appendChild(iframe);
+    const fullscreenButton = document.createElement('button');
+    fullscreenButton.className = 'button small subtle viewer-fullscreen';
+    fullscreenButton.textContent = 'Fullscreen';
+    fullscreenButton.addEventListener('click', () => {
+      if (iframe.requestFullscreen) void iframe.requestFullscreen();
+    });
+    mount.appendChild(fullscreenButton);
+    $$('[data-open-preview], [data-open-original]').forEach((other) => other.remove());
+  }
   $$('[data-open-preview]').forEach((button) => {
+    button.addEventListener('click', () => openSpatialViewer(button, button.dataset.openPreview, ''));
+  });
+  $$('[data-open-original]').forEach((button) => {
     button.addEventListener('click', () => {
-      const mount = $('#spatialPreviewMount');
-      if (!mount) return;
+      if (!confirm('The original reconstruction is the full-size scene and can be hundreds of megabytes. Open it anyway?')) return;
+      openSpatialViewer(button, button.dataset.openOriginal, 'spatial_archive');
+    });
+  });
+  $$('[data-create-derivatives]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const label = button.textContent;
       button.disabled = true;
-      button.textContent = 'Loading preview…';
-      const iframe = document.createElement('iframe');
-      iframe.className = 'viewer-frame';
-      iframe.title = 'Interactive Spatial preview';
-      iframe.allow = 'fullscreen';
-      iframe.src = '/gui/assets/spatial-viewer.html?id=' + encodeURIComponent(button.dataset.openPreview) + '&role=spatial_archive';
-      mount.innerHTML = '';
-      mount.appendChild(iframe);
-      const fullscreenButton = document.createElement('button');
-      fullscreenButton.className = 'button small subtle viewer-fullscreen';
-      fullscreenButton.textContent = 'Fullscreen';
-      fullscreenButton.addEventListener('click', () => {
-        if (iframe.requestFullscreen) void iframe.requestFullscreen();
-      });
-      mount.appendChild(fullscreenButton);
-      button.remove();
+      button.textContent = 'Starting…';
+      try {
+        const derivatives = (button.dataset.derivatives || '').split(',').filter(Boolean);
+        await request('/gui/api/jobs', {
+          method: 'POST',
+          body: JSON.stringify({ type: 'spatial.optimize', spatialId: button.dataset.createDerivatives, derivatives }),
+        });
+        announce('Creating ' + derivatives.join(' and ') + '. Progress is on the Processing page.');
+        button.textContent = 'Queued';
+      } catch (error) {
+        announce(error.message);
+        button.disabled = false;
+        button.textContent = label;
+      }
     });
   });
 

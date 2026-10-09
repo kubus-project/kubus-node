@@ -1,10 +1,19 @@
 import { existsSync } from 'node:fs';
-import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isPlaceholderRelease, parseReleaseManifest, type ReleaseManifest } from './releaseManifest.js';
+import { readEnvValue, updateEnvFile } from './runtimeEnv.js';
+import {
+  dockerHasNvidiaRuntime,
+  envUpdatesFor,
+  parseNvidiaSmi,
+  parseSpatialWorkerMode,
+  planSpatialWorker,
+  type SpatialWorkerPlan,
+} from './spatialWorker.js';
 
 export interface RuntimePaths {
   root: string;
@@ -21,16 +30,29 @@ export interface DoctorReport {
   docker: { available: boolean; compose: boolean; detail?: string };
   release: { version: string; nodeImage: string; workerImage: string; placeholder: boolean };
   runtimeConfigured: boolean;
+  /** What would happen to the GPU Spatial worker on this machine, and why. Read-only: nothing is started or written. */
+  spatialWorker: Pick<SpatialWorkerPlan, 'mode' | 'start' | 'state' | 'gpus' | 'dockerNvidiaRuntime'>;
 }
+
+export type CommandRunner = typeof run;
+
+/** Compose commands that must see every service, including one whose profile is no longer active. */
+const ALL_PROFILES = ['--profile', '*'];
+/** The services that make a Node. The Spatial worker is optional and is handled on its own. */
+const BASE_SERVICES = ['kubo', 'kubus-node-agent'];
+const WORKER_SERVICE = 'kubus-spatial-worker';
 
 export class RuntimeManager {
   readonly packageRoot: string;
   readonly paths: RuntimePaths;
   private readonly packageVersion: string;
 
-  constructor(packageRoot = findPackageRoot(), packageVersion = process.env.npm_package_version ?? '0.0.0') {
+  private readonly exec: CommandRunner;
+
+  constructor(packageRoot = findPackageRoot(), packageVersion = process.env.npm_package_version ?? '0.0.0', deps: { run?: CommandRunner } = {}) {
     this.packageRoot = packageRoot;
     this.packageVersion = packageVersion;
+    this.exec = deps.run ?? run;
     const root = runtimeRoot();
     this.paths = { root, compose: path.join(root, 'docker-compose.release.yml'), manifest: path.join(root, 'release-manifest.json'), environment: path.join(root, 'runtime.env') };
   }
@@ -54,6 +76,7 @@ export class RuntimeManager {
       docker,
       release: { version: release.version, nodeImage: release.nodeImage, workerImage: release.workerImage, placeholder: isPlaceholderRelease(release) },
       runtimeConfigured: existsSync(this.paths.compose),
+      spatialWorker: await this.planSpatialWorker(docker.available),
     };
   }
 
@@ -75,7 +98,12 @@ export class RuntimeManager {
     await mkdir(this.paths.root, { recursive: true });
     await copyFile(path.join(this.packageRoot, 'runtime', 'docker-compose.release.yml'), this.paths.compose);
     await copyFile(path.join(this.packageRoot, 'runtime', 'release-manifest.json'), this.paths.manifest);
-    if (!existsSync(this.paths.environment)) await writeFile(this.paths.environment, `NODE_BIND_ADDRESS=127.0.0.1\nNODE_LAN_URL=\n`, { mode: 0o600 });
+    // runtime.env belongs to the operator: only keys it lacks are added, and
+    // nothing that is already there is touched.
+    const existing = await this.readEnvText();
+    const defaults: Record<string, string> = { NODE_BIND_ADDRESS: '127.0.0.1', NODE_LAN_URL: '' };
+    const missing = Object.fromEntries(Object.entries(defaults).filter(([key]) => readEnvValue(existing, key) === undefined));
+    if (Object.keys(missing).length > 0 || !existsSync(this.paths.environment)) await updateEnvFile(this.paths.environment, missing);
     return manifest;
   }
 
@@ -83,8 +111,9 @@ export class RuntimeManager {
     if (options.check) return this.doctor();
     await this.preflight();
     const manifest = await this.materialize();
-    await this.compose(['pull']);
-    await this.compose(['up', '-d', 'kubo', 'kubus-node-agent']);
+    await this.prepareSpatialWorker();
+    await this.compose(['pull', ...BASE_SERVICES]);
+    await this.compose(['up', '-d', ...BASE_SERVICES]);
     await this.waitForBootstrap();
     if (options.headless) {
       console.log('Bootstrap is running at http://127.0.0.1:8787/setup. Use an SSH tunnel or local browser to complete the same setup wizard.');
@@ -95,11 +124,23 @@ export class RuntimeManager {
     return manifest;
   }
 
-  async start(): Promise<void> { await this.preflight(); await this.materialize(); await this.compose(['pull']); await this.compose(['up', '-d']); await this.waitForHealthy(); }
-  async stop(): Promise<void> { await this.requireMaterialized(); await this.compose(['stop']); }
-  async restart(): Promise<void> { await this.requireMaterialized(); await this.compose(['restart']); }
-  async logs(args: string[] = []): Promise<void> { await this.requireMaterialized(); await this.compose(['logs', '--tail', '200', ...args]); }
-  async status(): Promise<string> { await this.requireMaterialized(); return this.compose(['ps', '--format', 'json'], true); }
+  async start(): Promise<void> {
+    await this.preflight();
+    await this.materialize();
+    await this.prepareSpatialWorker();
+    await this.compose(['pull', ...BASE_SERVICES]);
+    await this.compose(['up', '-d', ...BASE_SERVICES]);
+    await this.startSpatialWorker();
+    await this.waitForHealthy();
+  }
+
+  // Teardown and inspection address every service, including a Spatial worker
+  // whose profile has since been switched off: `down` without this would leave
+  // that container running with nothing left that knows about it.
+  async stop(): Promise<void> { await this.requireMaterialized(); await this.compose([...ALL_PROFILES, 'stop']); }
+  async restart(): Promise<void> { await this.requireMaterialized(); await this.compose([...ALL_PROFILES, 'restart']); }
+  async logs(args: string[] = []): Promise<void> { await this.requireMaterialized(); await this.compose([...ALL_PROFILES, 'logs', '--tail', '200', ...args]); }
+  async status(): Promise<string> { await this.requireMaterialized(); return this.compose([...ALL_PROFILES, 'ps', '--format', 'json'], true); }
 
   async update(): Promise<ReleaseManifest> {
     // A CLI package contains exactly one verified release manifest. Operators opt
@@ -107,21 +148,23 @@ export class RuntimeManager {
     // an installed CLI to fetch mutable Compose YAML from a branch.
     await this.preflight();
     const manifest = await this.materialize();
-    await this.compose(['pull']);
-    await this.compose(['up', '-d', '--remove-orphans']);
+    await this.prepareSpatialWorker();
+    await this.compose(['pull', ...BASE_SERVICES]);
+    await this.compose(['up', '-d', '--remove-orphans', ...BASE_SERVICES]);
+    await this.startSpatialWorker();
     return manifest;
   }
 
   async uninstall(deleteData: boolean): Promise<void> {
     await this.requireMaterialized();
-    await this.compose(deleteData ? ['down', '--volumes', '--remove-orphans'] : ['down', '--remove-orphans']);
+    await this.compose([...ALL_PROFILES, ...(deleteData ? ['down', '--volumes', '--remove-orphans'] : ['down', '--remove-orphans'])]);
     if (deleteData) await rm(this.paths.root, { recursive: true, force: true });
   }
 
   async open(url = 'http://127.0.0.1:8787'): Promise<void> {
     const command = process.platform === 'win32' ? 'cmd.exe' : 'xdg-open';
     const args = process.platform === 'win32' ? ['/d', '/s', '/c', 'start', '', url] : [url];
-    await run(command, args).catch(() => undefined);
+    await this.exec(command, args).catch(() => undefined);
   }
 
   private async requireMaterialized(): Promise<void> {
@@ -130,15 +173,15 @@ export class RuntimeManager {
   }
 
   private async dockerStatus(): Promise<DoctorReport['docker']> {
-    const engine = await run('docker', ['info'], true, 15000);
+    const engine = await this.exec('docker', ['info'], true, 15000);
     if (engine.code !== 0) return { available: false, compose: false, detail: 'Docker Engine is unavailable. Install and start Docker Desktop (Windows) or Docker Engine (Linux).' };
-    const compose = await run('docker', ['compose', 'version'], true, 15000);
+    const compose = await this.exec('docker', ['compose', 'version'], true, 15000);
     if (compose.code !== 0) return { available: true, compose: false, detail: 'Docker Compose v2 is required. Install the Docker Compose plugin and retry.' };
     return { available: true, compose: true };
   }
 
   private async compose(args: string[], capture = false): Promise<string> {
-    const output = await run('docker', ['compose', '--project-name', 'kubus-node', '--env-file', this.paths.environment, '-f', this.paths.compose, ...args], capture);
+    const output = await this.exec('docker', ['compose', '--project-name', 'kubus-node', '--env-file', this.paths.environment, '-f', this.paths.compose, ...args], capture);
     if (output.code !== 0) throw new Error(`Docker Compose failed: ${output.stderr || output.stdout}`.trim());
     return output.stdout;
   }
@@ -163,12 +206,13 @@ export class RuntimeManager {
       return undefined;
     }, 600, 3000, 'Setup did not complete in time. The bootstrap remains loopback-only; rerun kubus-node setup to continue.');
     await this.writeTopology(completed.allowLan);
-    await this.compose(['up', '-d', '--force-recreate']);
+    await this.compose(['up', '-d', '--force-recreate', ...BASE_SERVICES]);
+    await this.startSpatialWorker();
     await this.waitForHealthy();
   }
 
   private async readSetupConfig(): Promise<string> {
-    const result = await run('docker', ['compose', '--project-name', 'kubus-node', '--env-file', this.paths.environment, '-f', this.paths.compose, 'exec', '-T', 'kubus-node-agent', 'sh', '-lc', 'test -s /var/lib/kubus-node/config.env && cat /var/lib/kubus-node/config.env']);
+    const result = await this.exec('docker', ['compose', '--project-name', 'kubus-node', '--env-file', this.paths.environment, '-f', this.paths.compose, 'exec', '-T', 'kubus-node-agent', 'sh', '-lc', 'test -s /var/lib/kubus-node/config.env && cat /var/lib/kubus-node/config.env']);
     return result.code === 0 ? result.stdout : '';
   }
 
@@ -181,7 +225,74 @@ export class RuntimeManager {
       bindAddress = '0.0.0.0';
       lanUrl = `http://${address}:8787`;
     }
-    await writeFile(this.paths.environment, `NODE_BIND_ADDRESS=${bindAddress}\nNODE_LAN_URL=${lanUrl}\n`, { mode: 0o600 });
+    // Only the two topology keys change. This used to write the whole file, so
+    // finishing setup erased every other key in it - including the Spatial
+    // worker decision made a moment earlier.
+    await updateEnvFile(this.paths.environment, { NODE_BIND_ADDRESS: bindAddress, NODE_LAN_URL: lanUrl });
+  }
+
+  private async readEnvText(): Promise<string> {
+    return readFile(this.paths.environment, 'utf8').catch(() => '');
+  }
+
+  /** Asks the host and Docker what a GPU container could use. Read-only. */
+  private async probeSpatialWorker(dockerAvailable: boolean): Promise<Parameters<typeof planSpatialWorker>[1]> {
+    const smi = await this.exec('nvidia-smi', ['--query-gpu=name,memory.total,driver_version', '--format=csv,noheader,nounits'], true, 10000);
+    // A machine without the tool fails to spawn it; that is "no GPU", not an error.
+    const gpus = smi.code === 0 ? parseNvidiaSmi(smi.stdout) : [];
+    let dockerNvidiaRuntime: boolean | null = null;
+    if (dockerAvailable) {
+      const info = await this.exec('docker', ['info', '--format', '{{json .Runtimes}}'], true, 15000);
+      dockerNvidiaRuntime = info.code === 0 ? dockerHasNvidiaRuntime(info.stdout) : null;
+    }
+    return { platformSupported: this.supportedPlatform(), gpus, dockerNvidiaRuntime };
+  }
+
+  /**
+   * What the operator's `KUBUS_SPATIAL_WORKER` setting means on this machine.
+   * The environment of this invocation wins over the persisted choice, so
+   * `KUBUS_SPATIAL_WORKER=on kubus-node start` is a deliberate override that
+   * is then remembered.
+   */
+  private async planSpatialWorker(dockerAvailable: boolean): Promise<SpatialWorkerPlan> {
+    const mode = parseSpatialWorkerMode(process.env.KUBUS_SPATIAL_WORKER ?? readEnvValue(await this.readEnvText(), 'KUBUS_SPATIAL_WORKER'));
+    // `off` needs no probe at all: it must work on a machine where nvidia-smi hangs.
+    const probe = mode === 'off'
+      ? { platformSupported: this.supportedPlatform(), gpus: [], dockerNvidiaRuntime: null }
+      : await this.probeSpatialWorker(dockerAvailable);
+    return planSpatialWorker(mode, probe);
+  }
+
+  /** Decides, records the decision in runtime.env, and clears away a worker that is no longer wanted. */
+  private async prepareSpatialWorker(): Promise<SpatialWorkerPlan> {
+    const plan = await this.planSpatialWorker(true);
+    await updateEnvFile(this.paths.environment, envUpdatesFor(plan, await this.readEnvText()));
+    if (!plan.start) {
+      // Switched off, or no longer possible: a container from an earlier run must not linger.
+      await this.compose([...ALL_PROFILES, 'rm', '-sf', WORKER_SERVICE]).catch(() => undefined);
+    }
+    return plan;
+  }
+
+  /**
+   * Starts the worker if the recorded decision says to. Never throws: a Node
+   * must not fail to start because its optional GPU worker could not. A failure
+   * is recorded (so the Node can say why) and turns the worker off until the
+   * next setup, start or update tries again.
+   */
+  private async startSpatialWorker(): Promise<'started' | 'skipped' | 'failed'> {
+    const profiles = readEnvValue(await this.readEnvText(), 'COMPOSE_PROFILES') ?? '';
+    if (!profiles.split(',').map((entry) => entry.trim()).includes('spatial')) return 'skipped';
+    try {
+      await this.compose(['pull', WORKER_SERVICE]);
+      await this.compose(['up', '-d', WORKER_SERVICE]);
+      return 'started';
+    } catch (error) {
+      console.warn(`The Spatial worker could not be started; the Node is running without it. ${String((error as Error).message || error).slice(0, 400)}`);
+      await updateEnvFile(this.paths.environment, envUpdatesFor({ mode: parseSpatialWorkerMode(readEnvValue(await this.readEnvText(), 'KUBUS_SPATIAL_WORKER')), start: false, state: 'worker_start_failed' }, await this.readEnvText()));
+      await this.compose([...ALL_PROFILES, 'rm', '-sf', WORKER_SERVICE]).catch(() => undefined);
+      return 'failed';
+    }
   }
 
   private async waitForHealthy(): Promise<void> {

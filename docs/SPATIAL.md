@@ -19,3 +19,9 @@ Remote encrypted input CIDs are private-compute ciphertext records. Unpublished 
 The worker pins Nerfstudio `1.1.5` and its declared compatible gsplat `1.4.0` on NVIDIA/CUDA. It exports a Gaussian PLY into the job output directory. The agent validates paths, imports bytes through Kubo, creates the manifest, and retains the source capture privately.
 
 The Flutter viewer bundles Spark `2.1.0` and Three.js `0.185.1`. It provides orbit/zoom viewing with mobile/public variants and node/public fallback. This is not true tracked AR. Camera-aligned spatial overlays require a future native AR renderer integration; no transparent WebView-over-camera approximation is used.
+
+## Delivery
+
+A scene has up to three representations, each with a fixed storage class: a small SPZ preview (`spatial_preview`, hot), a paged RAD runtime tree (`spatial_mobile`, warm, a flat bundle: `rootCid` + `entrypoint` + `fileCount`) and the reconstruction PLY (`spatial_archive`, cold). Preview and runtime are derived from the archive by pinned tools (Niantic spz v3.0.0, Spark build-lod from Spark 2.1.0) in the master's own coordinate frame, and can be regenerated from the preserved master without retraining (`spatial.optimize`, `spatial.generate_preview` with a `spatialId`). A failed derivative never loses the master.
+
+The GUI viewer never receives the GUI credential on a content request: it asks for a viewer ticket and loads same-origin capability URLs (`/gui/content/<token>/<file>`, GET/HEAD, byte ranges, short idle and absolute expiry). It draws the preview first, then the runtime tree; the archive opens only when asked for by name. Status, dependencies and open items: `docs/spatial-delivery-integration.md`.

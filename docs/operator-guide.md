@@ -99,7 +99,9 @@ The agent container runs as the non-root `node` user. If a reused `node-state` v
 
 Rotate token by creating a new scoped operator token in art.kubus, stopping the agent, replacing `KUBUS_OPERATOR_TOKEN`, and restarting. Revoke the old token after the new node status is healthy. Do not change the operator wallet unless registering a new operator identity.
 
-Expected resources depend on the public pin set size. `MAX_PINNED_CIDS` caps all canonical public CIDs mirrored by the node, including manifest and record CIDs that are not rewardable. `CID_CLASS_FILTERS` narrows classed pin-set records and reward commitments, but records without a class are still pinned so canonical public metadata is not accidentally excluded. Start with `MAX_PINNED_CIDS=100`, keep Kubo storage monitored, and raise slowly.
+Expected resources depend on the public pin set size. `MAX_PINNED_CIDS` caps all canonical public CIDs mirrored by the node, including manifest and record CIDs that are not rewardable. `CID_CLASS_FILTERS` lists the storage tiers this node takes: `hot` (the small preview of a Spatial scene), `warm` (its paged runtime representation) and `cold` (the full-resolution archive). Setup writes `hot,warm`, so a node does **not** take full archives unless its operator adds `cold`. The tier is the record's own `storageClass`, which the manifest fixes by role. The canonical manifest and signed record of every object are always pinned, and so is a record the server gave no tier, so canonical public metadata is never excluded by a filter.
+
+Within the budget (`MAX_PINNED_CIDS`, `MAX_PINNED_BYTES`) a node plans metadata first, then `hot`, then `warm`, then `cold`, and each tier only from what the one before it left: an archive can never displace a preview. `hot` content is wanted on every node and is planned in one canonical order. `warm` and `cold` are capacity-bound, so a node orders them by a hash of its own node id: nodes too small to hold everything keep different subsets, and together hold more than any one of them. Before a node is registered it uses the canonical order. A Spatial runtime bundle is one CID (the bundle root) and is pinned recursively with everything in it. Planning only chooses what to *add*: narrowing the plan or a filter never unpins anything a node already holds. Start with `MAX_PINNED_CIDS=100`, keep Kubo storage monitored, and raise slowly.
 
 `MAX_PINNED_BYTES` must meet the backend policy's `minimumContributionCapacityBytes`; setting it to a token value does not unlock compute. When the current archive is smaller than committed capacity, the node contributes every eligible available byte and remains policy-compliant. `KUBUS_SKIP_PINNING=true` is rejected as participation in production.
 
@@ -143,3 +145,43 @@ The GUI cannot spend funds and never shows `KUBUS_OPERATOR_TOKEN`, Authorization
 The GUI loads no fonts, scripts, styles or icons from the internet, so it renders correctly on a node with no outbound connectivity. The pairing QR is generated on the node itself.
 
 To review the interface without a live node, `npx tsx scripts/previewGui.ts [healthy|locked|unconfigured]` serves it against fixtures.
+
+## Source-capture retention
+
+A capture is the private, raw material a scene was made from, and on your Node it is often the only copy. **The default is to keep it.** Nothing is ever deleted unless two separate things both say so.
+
+1. **The capture asks.** When the app uploads a capture it can attach a request: `retention.deleteAfter` (an ISO 8601 date, or a date and time with an explicit offset such as `2026-12-31T00:00:00Z`) and/or `retention.deleteAfterPublication: true`. A value that is not an unambiguous, real date is dropped, which means keep.
+2. **You turn the sweeper on.** `KUBUS_RETENTION_SWEEP` is `off` by default. `dry-run` reports what would be removed without removing anything (read it in the log, and under `retentionSweep` in the state file); `on` removes. Anything else, including `true`, is rejected at start-up.
+
+Even then a capture is removed only when **all** of these hold:
+
+- its date has passed, or a scene made from it has been published (as the capture asked);
+- it is at least `KUBUS_RETENTION_GRACE_MS` old (default 24 hours), so a bad date or a clock that jumps forward cannot wipe a fresh upload;
+- no queued or running job reads it;
+- at least one scene was made from it, and **every** such scene has its reconstruction master preserved and complete in this Node's Kubo. A capture that never produced a result, or whose result is no longer here, is kept however overdue: it may be all that is left;
+- fewer than five captures have already been removed in this sweep (oldest first; the rest wait for the next sweep).
+
+Having a preview or runtime representation authorizes nothing. The sweeper deletes only the capture's own directory and record: it never touches Kubo, pins, scenes or manifests. It does not know about your backups: a copy of the data directory made earlier still has the capture. `KUBUS_RETENTION_SWEEP_INTERVAL_MS` (default one hour) sets how often it looks.
+
+## The GPU Spatial worker
+
+A Node is a complete archive and storage participant without it. The worker adds local Gaussian-splat reconstruction on an NVIDIA GPU, and it is optional: nothing about starting your Node depends on it, and a failure to start it never stops the Node.
+
+`KUBUS_SPATIAL_WORKER` (in `runtime.env`, or in the environment of `kubus-node setup|start|update`; the environment wins and is then remembered):
+
+- `auto` (default): run the worker only when **both** an NVIDIA GPU is present on the host (`nvidia-smi` lists it) **and** Docker has the `nvidia` runtime a GPU container needs. A GPU on the host is not a GPU in the container, so one without the other is reported, not guessed at.
+- `on`: you insist. Detection that found nothing does not veto you; the start is still non-fatal.
+- `off`: never. No GPU probe is run at all.
+
+Setup records its decision in `runtime.env` (merged into the file; your other keys, comments and secrets are left exactly as they were) and the Node shows the reason on the dashboard:
+
+| `KUBUS_SPATIAL_WORKER_STATE` | Meaning |
+| --- | --- |
+| `enabled` | The worker was started. Its own health, not this note, says whether the GPU is usable. |
+| `no_nvidia_gpu` | No NVIDIA GPU was found. The Node runs without the worker. |
+| `docker_gpu_unconfirmed` | A GPU was found but Docker's NVIDIA runtime was not. Install the NVIDIA Container Toolkit (Linux) or enable GPU support in Docker Desktop (Windows), or set `KUBUS_SPATIAL_WORKER=on` to try anyway. |
+| `operator_off` | You turned it off. |
+| `unsupported_platform` | Linux x64 and Windows x64 only. |
+| `worker_start_failed` | The image could not be pulled or the container could not be started. The Node runs without it; run `docker compose --project-name kubus-node logs kubus-spatial-worker`. The next `setup`, `start` or `update` tries again. |
+
+The worker is behind the Compose `spatial` profile, recorded as `COMPOSE_PROFILES=spatial` in `runtime.env` (your other profiles are kept). `stop`, `restart`, `logs`, `status` and `uninstall` address every profile, so a worker you have since turned off is not left running. `kubus-node setup --check` shows what would happen, and why, without changing anything.

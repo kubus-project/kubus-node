@@ -1,3 +1,4 @@
+import { describeSpatialWorkerState } from '../installer/spatialWorker.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 
 export type CapabilityName =
@@ -44,13 +45,17 @@ export class CapabilityRegistry {
   private lastRefreshAt = 0;
   private refreshPromise: Promise<CapabilityStatus[]> | null = null;
 
-  constructor(private readonly kubo: KuboClient, private readonly workerUrl?: string) {
+  /**
+   * @param workerState why the packaged installer did or did not start the worker
+   *   (a code; see installer/spatialWorker). Only used to explain "not configured".
+   */
+  constructor(private readonly kubo: KuboClient, private readonly workerUrl?: string, workerState?: string) {
     // "Never configured" and "configured but not yet probed" are different
     // situations for the operator: the former is a normal archive-only node,
     // the latter should read as "not responding" the moment a probe fails.
     this.workerHealth = this.workerUrl
       ? { status: 'unavailable', gpu: { available: false }, capabilities: [], detail: 'Spatial worker has not been probed yet' }
-      : { status: 'unconfigured', gpu: { available: false }, capabilities: [], detail: 'Spatial worker is not configured' };
+      : { status: 'unconfigured', gpu: { available: false }, capabilities: [], detail: describeSpatialWorkerState(workerState) ?? 'Spatial worker is not configured' };
     this.capabilitiesSnapshot = this.buildCapabilities(this.workerHealth, false);
   }
 

@@ -43,6 +43,18 @@ function parseUrl(value: string, key: string): string {
   }
 }
 
+/**
+ * Strict on purpose: this switch decides whether captures can be deleted, so
+ * `true`, `1` or a typo must not turn it on. Anything but the three words is an
+ * error that names them.
+ */
+function parseRetentionSweep(value: string | undefined): 'off' | 'dry-run' | 'on' {
+  const text = (value ?? '').trim().toLowerCase();
+  if (text === '') return 'off';
+  if (text === 'off' || text === 'dry-run' || text === 'on') return text;
+  throw new Error('KUBUS_RETENTION_SWEEP must be off, dry-run or on');
+}
+
 function boolEnv(env: NodeJS.ProcessEnv, key: string, fallback: boolean): boolean {
   const raw = env[key]?.trim().toLowerCase();
   if (!raw) return fallback;
@@ -149,6 +161,7 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
     localDataPath: path.resolve(env.LOCAL_DATA_PATH?.trim() || path.join(path.dirname(requireString(env, 'LOCAL_STATE_PATH')), 'data')),
     jobConcurrency: parseOptionalIntEnv(env, 'JOB_CONCURRENCY', 1, 1),
     spatialWorkerUrl: env.SPATIAL_WORKER_URL?.trim() ? parseUrl(env.SPATIAL_WORKER_URL.trim(), 'SPATIAL_WORKER_URL') : undefined,
+    spatialWorkerState: /^[a-z_]{1,40}$/.test(env.KUBUS_SPATIAL_WORKER_STATE?.trim() ?? '') ? env.KUBUS_SPATIAL_WORKER_STATE!.trim() : undefined,
     offerRemoteCompute: boolEnv(env, 'OFFER_REMOTE_COMPUTE', false),
     remoteComputePaused: boolEnv(env, 'REMOTE_COMPUTE_PAUSED', false),
     remoteComputeMaxConcurrency: parseOptionalIntEnv(env, 'REMOTE_COMPUTE_MAX_CONCURRENCY', 1, 1),
@@ -156,6 +169,9 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
     remoteComputeMaxInputBytes: parseOptionalBytesEnv(env, 'REMOTE_COMPUTE_MAX_INPUT_BYTES', 20 * 1024 * 1024 * 1024),
     remoteComputeMinimumFreeVramBytes: parseOptionalBytesEnv(env, 'REMOTE_COMPUTE_MINIMUM_FREE_VRAM_BYTES', 2 * 1024 * 1024 * 1024),
     participationGraceMs: parseOptionalIntEnv(env, 'PARTICIPATION_GRACE_MS', 15 * 60 * 1000, 60000),
+    retentionSweep: parseRetentionSweep(env.KUBUS_RETENTION_SWEEP),
+    retentionSweepIntervalMs: parseOptionalIntEnv(env, 'KUBUS_RETENTION_SWEEP_INTERVAL_MS', 60 * 60 * 1000, 60_000),
+    retentionGraceMs: parseOptionalIntEnv(env, 'KUBUS_RETENTION_GRACE_MS', 24 * 60 * 60 * 1000, 0),
     workerAuthKeyPath: path.resolve(env.WORKER_AUTH_KEY_PATH?.trim() || path.join(path.dirname(requireString(env, 'LOCAL_STATE_PATH')), 'worker-auth.key')),
   };
 }
