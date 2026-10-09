@@ -1,13 +1,21 @@
 import crypto from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import type { AnalyticsStore } from '../analytics/analyticsStore.js';
+import type { AnalyticsStore, ProcessingEventExtra } from '../analytics/analyticsStore.js';
 import type { CaptureStore } from '../captures/captureStore.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import { localError } from '../localApi/pairingService.js';
 import type { Logger } from '../logging/logger.js';
 import { buildNerfstudioDataset } from '../spatial/nerfstudioAdapter.js';
-import { validateSpatialManifest, type SpatialManifest, type SpatialVariant } from '../spatial/models.js';
+import { importWorkerVariant, ImportError, provenanceFrom, type WorkerDerivative, type WorkerVariant } from '../spatial/derivativeImport.js';
+import { validateSpatialManifest, type SpatialManifest } from '../spatial/models.js';
+import {
+  DERIVATIVE_ROLE,
+  SpatialRecords,
+  summarizeDerivatives,
+  type DerivativeKind,
+  type SpatialStoreRecord,
+} from '../spatial/spatialRecords.js';
 import type { LocalStore } from '../state/localStore.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
 import type { WorkerAuthService } from '../spatial/workerAuth.js';
@@ -16,18 +24,26 @@ import type { CapabilityRegistry } from '../capabilities/registry.js';
 export type JobType = 'spatial.reconstruct' | 'spatial.optimize' | 'spatial.generate_preview';
 export type JobState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
 /**
- * Truthful processing stages. `progress` stays a fixed, honest checkpoint for
- * bounded steps; it is `null` during `training`, the one stage whose real
- * duration and completion fraction this worker version does not report -
- * showing a fabricated percentage there would be worse than an indeterminate
- * spinner labelled with the real stage name.
+ * Truthful processing stages. `progress` is a fixed, honest checkpoint for
+ * bounded steps and `null` for the stages whose real duration and completion
+ * fraction the worker does not report - showing a fabricated percentage there
+ * would be worse than an indeterminate bar labelled with the real stage name.
+ *
+ * A reconstruction passes through, in order: preparing_dataset, starting_worker,
+ * training, importing (the master), generating_preview, optimizing_runtime,
+ * cleaning_workspace, completed. A derivative job (re-run on a preserved master)
+ * starts at preparing_master.
  */
 export type JobStage =
   | 'queued'
   | 'preparing_dataset'
+  | 'preparing_master'
   | 'starting_worker'
   | 'training'
   | 'importing'
+  | 'generating_preview'
+  | 'optimizing_runtime'
+  | 'cleaning_workspace'
   | 'completed'
   | 'failed'
   | 'cancelled';
@@ -41,6 +57,12 @@ export interface LocalJob {
   input: Record<string, unknown>;
   output?: Record<string, unknown>;
   error?: { code: string; message: string };
+  /**
+   * Written once the reconstruction master is durable in Kubo. A job that is
+   * re-queued after a crash resumes from here instead of training again and
+   * creating a second scene.
+   */
+  checkpoint?: { spatialId: string };
   createdAt: string;
   updatedAt: string;
   startedAt?: string;
@@ -49,11 +71,21 @@ export interface LocalJob {
 }
 
 interface WorkerOutput {
-  variants: Array<{ role: SpatialVariant['role']; path: string; mimeType: string; format: string; storageClass: SpatialVariant['storageClass'] }>;
+  variants: WorkerVariant[];
   transform?: SpatialManifest['transform'];
   viewerDefaults?: Record<string, unknown>;
-  processing: SpatialManifest['processing'];
+  processing?: Partial<SpatialManifest['processing']>;
+  derivative?: WorkerDerivative;
+  measurements?: { masterBytes?: number; masterSplats?: number; trainingMs?: number; exportMs?: number };
+  error?: string;
+  detail?: string | { code?: string; message?: string };
 }
+
+const WORKER_TYPE: Record<DerivativeKind, JobType> = { preview: 'spatial.generate_preview', runtime: 'spatial.optimize' };
+const DERIVATIVE_STAGE: Record<DerivativeKind, JobStage> = { preview: 'generating_preview', runtime: 'optimizing_runtime' };
+const DERIVATIVE_CAPABILITY: Record<DerivativeKind, string> = { preview: 'spatial.generate_preview', runtime: 'spatial.optimize' };
+const DERIVATIVE_ORDER: DerivativeKind[] = ['preview', 'runtime'];
+const DERIVATION_TYPES: JobType[] = ['spatial.optimize', 'spatial.generate_preview'];
 
 const capabilityFor = (type: JobType) => type === 'spatial.reconstruct' ? 'spatial.reconstruction' : 'spatial.optimization';
 
@@ -63,11 +95,22 @@ function durationOf(job: LocalJob): number | undefined {
   return Date.parse(job.completedAt) - Date.parse(job.startedAt);
 }
 
+/** Worker failures arrive as FastAPI `{detail:{code,message}}`, or the older `{error}`. */
+function workerFailure(status: number, body: WorkerOutput): { code: string; message: string } {
+  const detail = body.detail;
+  if (detail && typeof detail === 'object' && typeof detail.code === 'string') {
+    return { code: detail.code, message: String(detail.message || detail.code) };
+  }
+  const text = typeof detail === 'string' ? detail : body.error;
+  return { code: status === 503 ? 'worker_unsupported' : 'worker_failed', message: text || `worker_http_${status}` };
+}
+
 export class JobRuntime {
   private running = new Map<string, AbortController>();
   private dispatching = false;
   /** Tail of the in-flight reconstruction request per capture id. */
   private readonly captureLocks = new Map<string, Promise<void>>();
+  private readonly records: SpatialRecords;
   constructor(
     private readonly deps: {
       store: LocalStore;
@@ -83,8 +126,17 @@ export class JobRuntime {
       capabilities?: CapabilityRegistry;
       /** Optional: local processing analytics. Absent in tests that do not care about it. */
       analytics?: AnalyticsStore;
+      /** Make the preview and runtime derivatives as part of a reconstruction. On unless an operator turns it off. */
+      autoDerivatives?: boolean;
     },
-  ) {}
+  ) {
+    this.records = new SpatialRecords({ store: deps.store, kubo: deps.kubo });
+  }
+
+  /** Where every job's scratch space lives. Nothing here is ever a durable output. */
+  private get workspaceRoot(): string {
+    return path.join(this.deps.dataRoot, 'private', 'jobs');
+  }
 
   async start(): Promise<void> {
     await this.deps.store.update((state) => {
@@ -97,7 +149,30 @@ export class JobRuntime {
         }
       }
     });
+    await this.records.clearStaleRunning();
+    // Whatever a previous process left behind is unreachable: a re-queued job
+    // rebuilds its workspace from scratch (or from the preserved master), so
+    // nothing in here is worth keeping and all of it is worth the disk back.
+    await this.reclaimWorkspaces();
     this.schedule();
+  }
+
+  /** Removes every job workspace on disk. Called when nothing can be running. */
+  async reclaimWorkspaces(): Promise<number> {
+    let removed = 0;
+    let entries: string[];
+    try {
+      entries = await fs.readdir(this.workspaceRoot);
+    } catch {
+      return 0;
+    }
+    for (const entry of entries) {
+      if (this.running.has(entry)) continue;
+      await fs.rm(path.join(this.workspaceRoot, entry), { recursive: true, force: true }).then(() => { removed += 1; }, (error) => {
+        this.deps.logger.warn({ code: (error as NodeJS.ErrnoException).code }, 'could not remove a stale job workspace');
+      });
+    }
+    return removed;
   }
 
   list(): LocalJob[] {
@@ -116,11 +191,12 @@ export class JobRuntime {
     // must not revoke an owner's ability to process their own local capture.
     if (input.remoteComputeJobId) await this.deps.participationGate.assertUsefulOperation('remote_compute_execution');
     if (!['spatial.reconstruct', 'spatial.optimize', 'spatial.generate_preview'].includes(type)) throw localError(400, 'job_type_unsupported');
+
+    if (DERIVATION_TYPES.includes(type)) return this.createDerivation(type, input);
+
     const captureId = typeof input.captureId === 'string' ? input.captureId : '';
     if (!captureId) throw localError(400, 'job_capture_required');
     this.deps.captureStore.get(captureId);
-
-    if (type !== 'spatial.reconstruct') return this.insert(type, input);
 
     // The check for an attempt in flight, the package inspection and the
     // insertion form one critical section per capture. Checked and inserted
@@ -149,6 +225,38 @@ export class JobRuntime {
   }
 
   /**
+   * A derivative job regenerates the preview and/or runtime representation of a
+   * scene whose master is already preserved. It never trains: it exists so a
+   * failed derivative can be retried, a better optimiser can be applied later,
+   * and a scene made before derivatives existed can be converted on request.
+   */
+  private async createDerivation(type: JobType, input: Record<string, unknown>): Promise<LocalJob> {
+    const spatialId = typeof input.spatialId === 'string' ? input.spatialId : '';
+    if (!spatialId) throw localError(400, 'job_spatial_required');
+    const record = this.records.get(spatialId);
+    if (!record.manifest.variants.some((variant) => variant.role === 'spatial_archive')) {
+      // Without the master there is nothing to derive from, and inventing one
+      // from a derivative would present a degraded copy as the original.
+      throw localError(422, 'master_unavailable', { message: 'This scene has no preserved reconstruction to derive from.' });
+    }
+    const active = this.activeDerivation(this.deps.store.snapshot().jobs, spatialId);
+    if (active) return structuredClone(active);
+    const kinds = this.requestedKinds(type, input, record);
+    if (kinds.length === 0) throw localError(409, 'derivatives_already_ready');
+    return this.insert(type, { ...input, spatialId, captureId: record.manifest.captureId, derivatives: kinds });
+  }
+
+  private requestedKinds(type: JobType, input: Record<string, unknown>, record: SpatialStoreRecord): DerivativeKind[] {
+    const defaults: DerivativeKind[] = type === 'spatial.generate_preview' ? ['preview'] : ['preview', 'runtime'];
+    const asked = Array.isArray(input.derivatives)
+      ? DERIVATIVE_ORDER.filter((kind) => (input.derivatives as unknown[]).includes(kind))
+      : defaults;
+    const summary = summarizeDerivatives(record);
+    // `force` regenerates something that already exists, e.g. with a better optimiser.
+    return asked.filter((kind) => input.force === true || summary[kind].state !== 'ready');
+  }
+
+  /**
    * Records a queued job. For a reconstruction, re-asks inside the state
    * mutation itself, which nothing can interleave with, whether an attempt is
    * already active — so the guarantee holds even for a caller that reached
@@ -164,6 +272,7 @@ export class JobRuntime {
     let existing: LocalJob | undefined;
     await this.deps.store.update((state) => {
       existing = reconstructs ? this.activeReconstruction(state.jobs, reconstructs) : undefined;
+      if (!existing && DERIVATION_TYPES.includes(type)) existing = this.activeDerivation(state.jobs, String(input.spatialId));
       if (!existing) (state.jobs ??= {})[job.id] = job;
     });
     if (existing) return structuredClone(existing);
@@ -175,6 +284,13 @@ export class JobRuntime {
     return (Object.values(jobs || {}) as LocalJob[]).find((job) =>
       job.type === 'spatial.reconstruct'
       && (job.input as { captureId?: unknown } | undefined)?.captureId === captureId
+      && ['queued', 'running'].includes(job.state));
+  }
+
+  private activeDerivation(jobs: Record<string, unknown> | undefined, spatialId: string): LocalJob | undefined {
+    return (Object.values(jobs || {}) as LocalJob[]).find((job) =>
+      DERIVATION_TYPES.includes(job.type)
+      && (job.input as { spatialId?: unknown } | undefined)?.spatialId === spatialId
       && ['queued', 'running'].includes(job.state));
   }
 
@@ -238,6 +354,9 @@ export class JobRuntime {
   }
 
   private async run(id: string, controller: AbortController): Promise<void> {
+    const workspace = path.join(this.workspaceRoot, id);
+    const metrics: ProcessingEventExtra = {};
+    let workspaceCreated = false;
     try {
       if (this.get(id).input.remoteComputeJobId) await this.deps.participationGate.assertUsefulOperation('remote_compute_execution');
       if (!this.deps.workerUrl) throw Object.assign(new Error('Spatial worker is not configured'), { code: 'worker_unavailable' });
@@ -249,73 +368,57 @@ export class JobRuntime {
         }
       }
       const job = this.get(id);
-      const capture = this.deps.captureStore.get(String(job.input.captureId));
-      const outputDirectory = path.join(this.deps.dataRoot, 'private', 'jobs', id);
-      await fs.mkdir(outputDirectory, { recursive: true, mode: 0o700 });
+      // A fresh workspace every time: a re-queued job must never inherit the
+      // half-written files of the attempt a restart interrupted.
+      await fs.rm(workspace, { recursive: true, force: true });
+      await fs.mkdir(workspace, { recursive: true, mode: 0o700 });
+      workspaceCreated = true;
       await this.patchJob(id, (current) => {
-        current.state = 'running'; current.stage = 'preparing_dataset'; current.progress = 0.05;
+        current.state = 'running';
         current.startedAt = current.updatedAt = new Date().toISOString();
-        current.logs.push({ at: current.updatedAt, level: 'info', message: 'Preparing dataset from capture' });
       });
       this.recordAnalytics('started');
 
-      // Only spatial.reconstruct trains from a raw capture; other job types
-      // (optimize, generate_preview) operate on already-processed spatial
-      // data and skip the kubus.capture/1 -> Nerfstudio translation.
-      let workerCaptureDirectory = capture.directory;
+      let record: SpatialStoreRecord;
+      let master: string;
       if (job.type === 'spatial.reconstruct') {
-        const datasetDirectory = path.join(outputDirectory, 'dataset');
-        const dataset = await buildNerfstudioDataset(capture.directory, datasetDirectory);
-        workerCaptureDirectory = dataset.datasetDirectory;
-        await this.patchJob(id, (current) => {
-          current.logs.push({
-            at: new Date().toISOString(),
-            level: 'info',
-            message: `Dataset ready: ${dataset.frameCount} view(s)${dataset.droppedFrameCount ? `, ${dataset.droppedFrameCount} frame(s) dropped as unusable` : ''}`,
-          });
-        });
+        ({ record, master } = await this.reconstruct(job, workspace, controller, metrics));
+      } else {
+        record = this.records.get(String(job.input.spatialId));
+        master = await this.materializeMaster(job.id, record, workspace);
       }
 
+      const kinds = job.type === 'spatial.reconstruct'
+        ? (this.deps.autoDerivatives === false ? [] : DERIVATIVE_ORDER)
+        : (job.input.derivatives as DerivativeKind[]);
+      record = await this.derive(job, record, workspace, master, kinds, controller, metrics);
+
+      await this.stage(id, 'cleaning_workspace', 0.97, 'Removing temporary processing files');
+      await this.removeWorkspace(id, workspace);
+      const output = { ...record, derivativeSummary: summarizeDerivatives(record) };
       await this.patchJob(id, (current) => {
-        current.stage = 'starting_worker'; current.progress = 0.15; current.updatedAt = new Date().toISOString();
-        current.logs.push({ at: current.updatedAt, level: 'info', message: 'Starting spatial worker' });
-      });
-      await this.patchJob(id, (current) => {
-        // Training runs as a single blocking call in this worker version, so
-        // there is no real interim percentage to report - an indeterminate
-        // stage is honest, a fabricated one is not.
-        current.stage = 'training'; current.progress = null; current.updatedAt = new Date().toISOString();
-        current.logs.push({ at: current.updatedAt, level: 'info', message: 'Training (this can take a while; progress is not reported mid-run by this worker version)' });
-      });
-      const response = await fetch(`${this.deps.workerUrl}/v1/process`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Kubus-Worker-Authorization': await this.deps.workerAuth.issue(id, job.type) }, signal: controller.signal,
-        body: JSON.stringify({ jobId: id, type: job.type, captureDirectory: workerCaptureDirectory, outputDirectory, input: job.input }),
-      });
-      const body = await response.json().catch(() => ({})) as WorkerOutput & { error?: string };
-      if (!response.ok) throw Object.assign(new Error(body.error || `worker_http_${response.status}`), { code: response.status === 503 ? 'worker_unsupported' : 'worker_failed' });
-      await this.patchJob(id, (current) => {
-        current.stage = 'importing'; current.progress = 0.9; current.updatedAt = new Date().toISOString();
-        current.logs.push({ at: current.updatedAt, level: 'info', message: 'Importing spatial output into local Kubo' });
-      });
-      const spatial = await this.importOutputs(job, capture, outputDirectory, body);
-      await this.patchJob(id, (current) => {
-        current.state = 'completed'; current.stage = 'completed'; current.progress = 1; current.output = spatial;
+        current.state = 'completed'; current.stage = 'completed'; current.progress = 1; current.output = output as unknown as Record<string, unknown>;
         current.completedAt = current.updatedAt = new Date().toISOString();
         current.logs.push({ at: current.updatedAt, level: 'info', message: 'Spatial outputs imported into local Kubo' });
       });
       const finished = this.get(id);
-      const outputBytes = ((spatial as { manifest?: { variants?: Array<{ sizeBytes?: number }> } }).manifest?.variants || [])
-        .reduce((sum, variant) => sum + (variant.sizeBytes || 0), 0);
-      this.recordAnalytics('completed', { durationMs: durationOf(finished), inputBytes: capture.sizeBytes, outputBytes });
+      const outputBytes = record.manifest.variants.reduce((sum, variant) => sum + (variant.sizeBytes || 0), 0);
+      let inputBytes = 0;
+      try { inputBytes = this.deps.captureStore.get(String(record.manifest.captureId)).sizeBytes; } catch { /* the capture may have been removed since */ }
+      this.recordAnalytics('completed', { ...metrics, durationMs: durationOf(finished), inputBytes, outputBytes });
     } catch (error) {
+      // Whatever happened, the scratch space goes: a durable output is already
+      // in Kubo, and anything that is not will be rebuilt by a retry.
+      if (workspaceCreated) await this.removeWorkspace(id, workspace);
       // cancel() already finalized state, stage, and analytics before
       // aborting; this rejection is just that abort reaching here.
       if (this.get(id).state === 'cancelled') return;
       const aborted = controller.signal.aborted;
+      const failure = error instanceof ImportError ? { code: error.code, message: error.message } : undefined;
       await this.patchJob(id, (current) => {
         current.state = aborted ? 'cancelled' : 'failed';
         current.stage = aborted ? 'cancelled' : 'failed';
-        current.error = { code: String((error as { code?: string }).code || (aborted ? 'cancelled' : 'job_failed')), message: String((error as Error).message || error) };
+        current.error = failure ?? { code: String((error as { code?: string }).code || (aborted ? 'cancelled' : 'job_failed')), message: String((error as Error).message || error) };
         current.completedAt = current.updatedAt = new Date().toISOString();
         current.logs.push({ at: current.updatedAt, level: aborted ? 'warn' : 'error', message: current.error.message });
       });
@@ -325,50 +428,190 @@ export class JobRuntime {
   }
 
   /**
-   * Best-effort: analytics is a local, secondary concern. A write failure
-   * here (disk full, permissions) must never fail or retry the job itself -
-   * it is only logged.
+   * Trains the scene, imports the master into Kubo and creates the scene's
+   * record. From the moment this returns the master is durable: whatever
+   * happens to a derivative afterwards, the reconstruction is not lost.
    */
-  private recordAnalytics(
-    kind: 'started' | 'completed' | 'failed' | 'cancelled',
-    extra: { durationMs?: number; inputBytes?: number; outputBytes?: number } = {},
-  ): void {
-    if (!this.deps.analytics) return;
-    this.deps.analytics.recordProcessingEvent(kind, extra).catch((error) => {
-      this.deps.logger.warn({ code: (error as Error).message }, 'failed to record processing analytics');
-    });
-  }
-
-  private async importOutputs(job: LocalJob, capture: ReturnType<CaptureStore['get']>, outputDirectory: string, output: WorkerOutput): Promise<Record<string, unknown>> {
-    if (!Array.isArray(output.variants) || output.variants.length === 0) throw Object.assign(new Error('Worker returned no variants'), { code: 'worker_output_invalid' });
-    const variants: SpatialVariant[] = [];
-    for (const item of output.variants) {
-      const target = path.resolve(outputDirectory, item.path);
-      if (!target.startsWith(`${path.resolve(outputDirectory)}${path.sep}`)) throw new Error('worker_output_path_invalid');
-      // Streamed from disk: a Gaussian splat PLY can be hundreds of megabytes
-      // and must never be held whole in Node's memory just to re-emit it as
-      // multipart form data.
-      const { size: sizeBytes } = await fs.stat(target);
-      const added = await this.deps.kubo.addFileStreamed(target, path.basename(target));
-      if (!added.Hash) throw new Error('kubo_add_missing_cid');
-      variants.push({ role: item.role, cid: added.Hash, sizeBytes, mimeType: item.mimeType, format: item.format, storageClass: item.storageClass });
+  private async reconstruct(
+    job: LocalJob,
+    workspace: string,
+    controller: AbortController,
+    metrics: ProcessingEventExtra,
+  ): Promise<{ record: SpatialStoreRecord; master: string }> {
+    const resumed = job.checkpoint?.spatialId ? this.records.find(job.checkpoint.spatialId) : undefined;
+    if (resumed) {
+      // A crash after the master was saved: the scene exists, only its
+      // derivatives are missing. Training again would create a second scene.
+      await this.patchJob(job.id, (current) => {
+        current.logs.push({ at: new Date().toISOString(), level: 'info', message: 'Resuming from the preserved master after a restart' });
+      });
+      return { record: resumed, master: await this.materializeMaster(job.id, resumed, workspace) };
     }
+
+    const capture = this.deps.captureStore.get(String(job.input.captureId));
+    await this.stage(job.id, 'preparing_dataset', 0.05, 'Preparing dataset from capture');
+    const dataset = await buildNerfstudioDataset(capture.directory, path.join(workspace, 'dataset'));
+    await this.patchJob(job.id, (current) => {
+      current.logs.push({
+        at: new Date().toISOString(),
+        level: 'info',
+        message: `Dataset ready: ${dataset.frameCount} view(s)${dataset.droppedFrameCount ? `, ${dataset.droppedFrameCount} frame(s) dropped as unusable` : ''}`,
+      });
+    });
+
+    await this.stage(job.id, 'starting_worker', 0.15, 'Starting spatial worker');
+    // Training runs as a single blocking call in this worker version, so
+    // there is no real interim percentage to report - an indeterminate
+    // stage is honest, a fabricated one is not.
+    await this.stage(job.id, 'training', null, 'Reconstructing (this can take a while; progress is not reported mid-run by this worker version)');
+    const body = await this.callWorker(job.id, 'spatial.reconstruct', dataset.datasetDirectory, workspace, job.input, controller);
+
+    await this.stage(job.id, 'importing', 0.8, 'Saving the reconstruction to local Kubo');
+    const archiveItem = body.variants?.find((variant) => variant.role === 'spatial_archive');
+    if (!archiveItem) throw Object.assign(new Error('Worker returned no reconstruction master'), { code: 'worker_output_invalid' });
+    const archive = await importWorkerVariant(this.deps.kubo, workspace, archiveItem, 'spatial_archive');
+    metrics.masterBytes = archive.sizeBytes;
+
     const id = crypto.randomUUID();
     const manifest: SpatialManifest = {
       schema: 'kubus.spatial/1', type: 'gaussianSplat', id,
       artworkId: String(job.input.artworkId || capture.artworkId || ''), markerId: String(job.input.markerId || capture.markerId || '') || undefined,
       captureId: capture.id, captureProvenance: { source: 'localCapture', captureId: capture.id }, capturedAt: capture.capturedAt,
       capturedBy: typeof job.input.capturedBy === 'string' ? job.input.capturedBy : undefined,
-      variants, transform: output.transform, viewerDefaults: output.viewerDefaults, processing: output.processing, createdAt: new Date().toISOString(),
+      variants: [archive], transform: body.transform,
+      // The master is archival. Viewers choose a representation themselves and
+      // fall back to the master only when the person asks for it.
+      viewerDefaults: body.viewerDefaults ?? { quality: 'auto' },
+      processing: body.processing as SpatialManifest['processing'],
+      createdAt: new Date().toISOString(),
     };
     if (!manifest.artworkId) throw new Error('spatial_artwork_required');
     validateSpatialManifest(manifest);
-    const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
-    const added = await this.deps.kubo.addBytes(manifestBytes, `${id}.spatial.json`);
-    if (!added.Hash) throw new Error('kubo_add_manifest_missing_cid');
-    const record = { id, state: 'local', manifestCid: added.Hash, manifest, createdAt: manifest.createdAt, privateSourceCapture: true };
-    await this.deps.store.update((state) => { (state.spatial ??= {})[id] = record; });
-    return record;
+    const record = await this.records.create(manifest);
+    await this.patchJob(job.id, (current) => {
+      current.checkpoint = { spatialId: id };
+      current.logs.push({ at: new Date().toISOString(), level: 'info', message: 'Reconstruction master saved' });
+    });
+    return { record, master: archiveItem.path as string };
+  }
+
+  /** Brings a preserved master back from Kubo into the workspace; returns its path relative to the workspace. */
+  private async materializeMaster(jobId: string, record: SpatialStoreRecord, workspace: string): Promise<string> {
+    const archive = record.manifest.variants.find((variant) => variant.role === 'spatial_archive');
+    if (!archive?.cid) throw Object.assign(new Error('This scene has no preserved reconstruction'), { code: 'master_unavailable' });
+    await this.stage(jobId, 'preparing_master', 0.1, 'Retrieving the preserved reconstruction');
+    await fs.mkdir(path.join(workspace, 'master'), { recursive: true });
+    await this.deps.kubo.catToFile(archive.cid, path.join(workspace, 'master', 'master.ply'));
+    return path.join('master', 'master.ply');
+  }
+
+  /**
+   * Creates the requested derivatives one after another. A derivative that
+   * fails is recorded against the scene and does not stop the others, and never
+   * touches the master: each is independently retryable without training again.
+   */
+  private async derive(
+    job: LocalJob,
+    record: SpatialStoreRecord,
+    workspace: string,
+    master: string,
+    kinds: DerivativeKind[],
+    controller: AbortController,
+    metrics: ProcessingEventExtra,
+  ): Promise<SpatialStoreRecord> {
+    let current = record;
+    for (const kind of kinds) {
+      if (controller.signal.aborted) break;
+      if (summarizeDerivatives(current)[kind].state === 'ready' && job.input.force !== true) continue;
+      const label = kind === 'preview' ? 'preview' : 'runtime representation';
+      const health = this.deps.capabilities?.getWorkerHealth();
+      if (health && !health.capabilities.includes(DERIVATIVE_CAPABILITY[kind])) {
+        const error = { code: 'worker_cannot_derive', message: `This Node's worker cannot create the ${label}. Update the worker to enable it.` };
+        await this.records.markDerivative(current.id, kind, { state: 'failed', jobId: job.id, at: new Date().toISOString(), error });
+        await this.patchJob(job.id, (entry) => { entry.logs.push({ at: new Date().toISOString(), level: 'warn', message: error.message }); });
+        current = this.records.get(current.id);
+        continue;
+      }
+      await this.stage(job.id, DERIVATIVE_STAGE[kind], null, kind === 'preview' ? 'Creating the preview' : 'Optimizing for viewing');
+      await this.records.markDerivative(current.id, kind, { state: 'running', jobId: job.id, at: new Date().toISOString() });
+      try {
+        const body = await this.callWorker(job.id, WORKER_TYPE[kind], workspace, workspace, { master }, controller);
+        const item = body.variants?.find((variant) => variant.role === DERIVATIVE_ROLE[kind]);
+        if (!item || !body.derivative) throw Object.assign(new Error(`Worker returned no ${label}`), { code: 'worker_output_invalid' });
+        const variant = await importWorkerVariant(this.deps.kubo, workspace, item, DERIVATIVE_ROLE[kind]);
+        current = await this.records.attachVariant(current.id, variant, kind, provenanceFrom(body.derivative, variant.sizeBytes));
+        if (kind === 'preview') { metrics.previewBytes = variant.sizeBytes; metrics.previewMs = body.derivative.durationMs; }
+        else { metrics.runtimeBytes = variant.sizeBytes; metrics.runtimeMs = body.derivative.durationMs; }
+        await this.patchJob(job.id, (entry) => { entry.logs.push({ at: new Date().toISOString(), level: 'info', message: `The ${label} is ready (${variant.sizeBytes} bytes)` }); });
+      } catch (error) {
+        if (controller.signal.aborted) throw error;
+        const failure = error instanceof ImportError
+          ? { code: error.code, message: error.message }
+          : { code: String((error as { code?: string }).code || 'derivative_failed'), message: String((error as Error).message || error) };
+        await this.records.markDerivative(current.id, kind, { state: 'failed', jobId: job.id, at: new Date().toISOString(), error: failure });
+        await this.patchJob(job.id, (entry) => { entry.logs.push({ at: new Date().toISOString(), level: 'warn', message: `The ${label} could not be created: ${failure.message}` }); });
+        current = this.records.get(current.id);
+      }
+    }
+    return current;
+  }
+
+  /** One call to the worker. Throws a coded error for any failure, carrying the worker's own code when it sent one. */
+  private async callWorker(
+    jobId: string,
+    type: JobType,
+    captureDirectory: string,
+    outputDirectory: string,
+    input: Record<string, unknown>,
+    controller: AbortController,
+  ): Promise<WorkerOutput> {
+    const response = await fetch(`${this.deps.workerUrl}/v1/process`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Kubus-Worker-Authorization': await this.deps.workerAuth.issue(jobId, type) },
+      signal: controller.signal,
+      body: JSON.stringify({ jobId, type, captureDirectory, outputDirectory, input }),
+    });
+    const body = await response.json().catch(() => ({})) as WorkerOutput;
+    if (!response.ok) {
+      const failure = workerFailure(response.status, body);
+      throw Object.assign(new Error(failure.message), { code: failure.code });
+    }
+    return body;
+  }
+
+  /** Deletes a job workspace, retrying briefly: a worker that was just cancelled can still hold a file open. */
+  private async removeWorkspace(jobId: string, workspace: string): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await fs.rm(workspace, { recursive: true, force: true });
+        return;
+      } catch (error) {
+        if (attempt === 2) this.deps.logger.warn({ jobId, code: (error as NodeJS.ErrnoException).code }, 'could not remove a job workspace; the next start will');
+        else await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)));
+      }
+    }
+  }
+
+  private async stage(id: string, stage: JobStage, progress: number | null, message: string): Promise<void> {
+    await this.patchJob(id, (current) => {
+      current.stage = stage; current.progress = progress; current.updatedAt = new Date().toISOString();
+      current.logs.push({ at: current.updatedAt, level: 'info', message });
+    });
+  }
+
+  /**
+   * Best-effort: analytics is a local, secondary concern. A write failure
+   * here (disk full, permissions) must never fail or retry the job itself -
+   * it is only logged.
+   */
+  private recordAnalytics(
+    kind: 'started' | 'completed' | 'failed' | 'cancelled',
+    extra: ProcessingEventExtra = {},
+  ): void {
+    if (!this.deps.analytics) return;
+    this.deps.analytics.recordProcessingEvent(kind, extra).catch((error) => {
+      this.deps.logger.warn({ code: (error as Error).message }, 'failed to record processing analytics');
+    });
   }
 
   private async patchJob(id: string, mutate: (job: LocalJob) => void): Promise<void> {

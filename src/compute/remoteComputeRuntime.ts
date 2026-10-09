@@ -9,7 +9,7 @@ import type { JobRuntime, LocalJob } from '../jobs/jobRuntime.js';
 import { localError } from '../localApi/pairingService.js';
 import type { Logger } from '../logging/logger.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
-import { validateSpatialManifest, type SpatialManifest } from '../spatial/models.js';
+import { isBundleVariant, validateSpatialManifest, variantContentCid, type SpatialManifest } from '../spatial/models.js';
 import { redactSecrets } from '../logging/logBuffer.js';
 import { Backoff } from '../scheduler/backoff.js';
 import type { LocalStore } from '../state/localStore.js';
@@ -233,8 +233,15 @@ export class RemoteComputeRuntime {
     let manifest: SpatialManifest;
     try { manifest = validateSpatialManifest(JSON.parse(Buffer.from(manifestBytes).toString('utf8'))); } catch { throw localError(422, 'remote_compute_manifest_invalid'); }
     const declared = new Set(job.outputCids);
-    if (!declared.has(job.outputManifestCid) || manifest.variants.some((variant) => !declared.has(variant.cid))) throw localError(422, 'remote_compute_output_cid_mismatch');
-    for (const cid of job.outputCids) { await this.deps.kubo.catHead(cid, 1); await this.deps.kubo.pinAdd(cid); }
+    if (!declared.has(job.outputManifestCid) || manifest.variants.some((variant) => !declared.has(variantContentCid(variant)))) throw localError(422, 'remote_compute_output_cid_mismatch');
+    // A bundle root is a directory: it cannot be read as a file, so its listing is fetched instead.
+    // Pinning it recursively then keeps every chunk the entrypoint needs.
+    const bundleRoots = new Set(manifest.variants.filter(isBundleVariant).map(variantContentCid));
+    for (const cid of job.outputCids) {
+      if (bundleRoots.has(cid)) await this.deps.kubo.listBundle(cid);
+      else await this.deps.kubo.catHead(cid, 1);
+      await this.deps.kubo.pinAdd(cid);
+    }
     const id = manifest.id;
     const record = { id, state: 'private_remote', manifestCid: job.outputManifestCid, manifest, createdAt: new Date().toISOString(), privateSourceCapture: true, remoteComputeJobId: job.id };
     await this.deps.store.update((state) => { (state.spatial ??= {})[id] = record; });
@@ -408,7 +415,7 @@ export class RemoteComputeRuntime {
     const nodeId = this.deps.store.snapshot().nodeId!;
     const spatial = local.output as { manifestCid?: string; manifest?: SpatialManifest } | undefined;
     if (!spatial?.manifestCid || !spatial.manifest) throw localError(500, 'remote_output_invalid');
-    const outputCids = [spatial.manifestCid, ...spatial.manifest.variants.map((variant) => variant.cid)];
+    const outputCids = [spatial.manifestCid, ...spatial.manifest.variants.map(variantContentCid)];
     const payload = { jobId: job.id, inputHash: job.inputHash, jobSpecHash: job.jobSpecHash, outputCids, workerVersion: String(this.deps.store.snapshot().latestHeartbeat?.agentVersion || 'unknown'), protocolVersion: job.protocolVersion, completedAt: new Date().toISOString() };
     const signature = await this.deps.identity.signPayload(payload);
     await this.deps.api.submitProviderComputeOutput(job.id, { nodeId, outputManifestCid: spatial.manifestCid, outputCids, receipt: { payload, signature } });

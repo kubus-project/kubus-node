@@ -6,8 +6,10 @@ import type { CaptureRecord, CaptureStore } from '../captures/captureStore.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import type { JobRuntime, LocalJob } from '../jobs/jobRuntime.js';
 import { localError } from '../localApi/pairingService.js';
-import type { SpatialManifest } from '../spatial/models.js';
+import { isBundleVariant, type SpatialManifest } from '../spatial/models.js';
+import { summarizeDerivatives, type DerivativeKind, type DerivativeSummary, type SpatialStoreRecord } from '../spatial/spatialRecords.js';
 import type { LocalStore } from '../state/localStore.js';
+import { parseByteRange } from '../utils/byteRange.js';
 import { isValidCidLike } from '../utils/cid.js';
 
 /**
@@ -32,16 +34,15 @@ export interface SpatialRecordSummary {
   createdAt: string;
   state: string;
   manifestCid: string;
-  variants: Array<{ role: string; format: string; mimeType: string; sizeBytes: number; storageClass: string }>;
-}
-
-interface SpatialStoreRecord {
-  id: string;
-  state: string;
-  manifestCid: string;
-  manifest: SpatialManifest;
-  createdAt: string;
-  privateSourceCapture?: boolean;
+  variants: Array<{
+    role: string; format: string; mimeType: string; sizeBytes: number; storageClass: string;
+    /** Present for a bundle: the file a renderer starts from, and how many files the bundle holds. */
+    bundle?: true; entrypoint?: string; fileCount?: number;
+  }>;
+  /** Whether the preview and runtime representations exist, are being made, failed, or were never made. */
+  derivatives: Record<DerivativeKind, DerivativeSummary>;
+  /** True when the original reconstruction is the only representation there is. */
+  archiveOnly: boolean;
 }
 
 function isSpatialStoreRecord(value: unknown): value is SpatialStoreRecord {
@@ -71,7 +72,10 @@ export function listSpatialSummaries(store: LocalStore): SpatialRecordSummary[] 
         mimeType: variant.mimeType,
         sizeBytes: variant.sizeBytes,
         storageClass: variant.storageClass,
+        ...(isBundleVariant(variant) ? { bundle: true as const, entrypoint: variant.entrypoint, fileCount: variant.fileCount } : {}),
       })),
+      derivatives: summarizeDerivatives(record),
+      archiveOnly: !record.manifest.variants.some((variant) => variant.role === 'spatial_preview' || variant.role === 'spatial_mobile'),
     }))
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
@@ -155,43 +159,28 @@ export async function serveSpatialVariant(
   const record = getSpatialRecord(deps.store, spatialId);
   const variant = record.manifest.variants.find((candidate) => candidate.role === role);
   if (!variant) throw localError(404, 'spatial_variant_not_found');
-  if (!isValidCidLike(variant.cid)) throw localError(500, 'spatial_variant_cid_invalid');
+  // A bundle is many files that mean nothing one at a time; it is reached through
+  // a viewer ticket, never as a single download.
+  if (isBundleVariant(variant)) throw localError(409, 'spatial_variant_is_bundle');
+  if (!variant.cid || !isValidCidLike(variant.cid)) throw localError(500, 'spatial_variant_cid_invalid');
 
   const total = variant.sizeBytes;
   const rangeHeader = req.headers.range;
-  let start = 0;
-  let end = total > 0 ? total - 1 : 0;
-  let status = 200;
-
-  if (rangeHeader) {
-    const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
-    if (!match) throw localError(416, 'range_not_satisfiable');
-    const rawStart = match[1];
-    const rawEnd = match[2];
-    if (rawStart === '' && rawEnd === '') throw localError(416, 'range_not_satisfiable');
-    if (rawStart === '') {
-      // Suffix form (`bytes=-N`): the number is a length counted from the
-      // end of the file, not an end offset - "last N bytes".
-      start = Math.max(0, total - Number(rawEnd));
-      end = total - 1;
-    } else {
-      start = Number(rawStart);
-      end = rawEnd === '' ? total - 1 : Math.min(Number(rawEnd), total - 1);
-    }
-    if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start < 0 || start >= total) {
-      res.writeHead(416, { 'Content-Range': `bytes */${total}` });
-      res.end();
-      return;
-    }
-    status = 206;
+  const range = parseByteRange(typeof rangeHeader === 'string' ? rangeHeader : undefined, total);
+  if (range === 'unsatisfiable') {
+    res.writeHead(416, { 'Content-Range': `bytes */${total}` });
+    res.end();
+    return;
   }
+  const { start, end } = range;
+  const status = range.partial ? 206 : 200;
 
   const length = end - start + 1;
-  const { body, cancel } = await deps.kubo.catStream(variant.cid, rangeHeader ? { offset: start, length } : undefined);
+  const { body, cancel } = await deps.kubo.catStream(variant.cid, range.partial ? { offset: start, length } : undefined);
   res.on('close', cancel);
   res.writeHead(status, {
     'Content-Type': variant.mimeType,
-    'Content-Length': String(rangeHeader ? length : total),
+    'Content-Length': String(range.partial ? length : total),
     'Accept-Ranges': 'bytes',
     ...(status === 206 ? { 'Content-Range': `bytes ${start}-${end}/${total}` } : {}),
     // The manifest and its variants are private-by-default until explicitly

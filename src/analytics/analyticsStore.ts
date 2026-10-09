@@ -33,7 +33,27 @@ export interface ProcessingBucketCounters {
   totalDurationMs: number;
   totalInputBytes: number;
   totalOutputBytes: number;
+  /**
+   * Derivative facts, present only in buckets where a derivative was made.
+   * Plain sums of what the worker measured; nothing identifies a scene.
+   */
+  totalMasterBytes?: number;
+  totalPreviewBytes?: number;
+  totalRuntimeBytes?: number;
+  totalPreviewMs?: number;
+  totalRuntimeMs?: number;
 }
+
+export type ProcessingEventExtra = {
+  durationMs?: number;
+  inputBytes?: number;
+  outputBytes?: number;
+  masterBytes?: number;
+  previewBytes?: number;
+  runtimeBytes?: number;
+  previewMs?: number;
+  runtimeMs?: number;
+};
 
 function emptyProcessingCounters(): ProcessingBucketCounters {
   return { started: 0, completed: 0, failed: 0, cancelled: 0, totalDurationMs: 0, totalInputBytes: 0, totalOutputBytes: 0 };
@@ -128,7 +148,7 @@ export class AnalyticsStore {
   /** Records one processing-job transition. `at` is injectable for deterministic tests. */
   async recordProcessingEvent(
     kind: 'started' | 'completed' | 'failed' | 'cancelled',
-    extra: { durationMs?: number; inputBytes?: number; outputBytes?: number } = {},
+    extra: ProcessingEventExtra = {},
     at: number = Date.now(),
   ): Promise<void> {
     const file = this.ensureLoaded();
@@ -137,6 +157,13 @@ export class AnalyticsStore {
     if (extra.durationMs !== undefined) bucket.processing.totalDurationMs += extra.durationMs;
     if (extra.inputBytes !== undefined) bucket.processing.totalInputBytes += extra.inputBytes;
     if (extra.outputBytes !== undefined) bucket.processing.totalOutputBytes += extra.outputBytes;
+    const optional = ['masterBytes', 'previewBytes', 'runtimeBytes', 'previewMs', 'runtimeMs'] as const;
+    for (const key of optional) {
+      const value = extra[key];
+      if (value === undefined) continue;
+      const field = `total${key[0]!.toUpperCase()}${key.slice(1)}` as 'totalMasterBytes' | 'totalPreviewBytes' | 'totalRuntimeBytes' | 'totalPreviewMs' | 'totalRuntimeMs';
+      bucket.processing[field] = (bucket.processing[field] ?? 0) + value;
+    }
     this.prune(file, at);
     await this.persist(file);
   }
