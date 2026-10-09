@@ -56,7 +56,11 @@ export class KuboClient {
   }
 
   async pinAdd(cid: string): Promise<unknown> {
-    return this.post('pin/add', { arg: normalizeCid(cid), progress: 'false' });
+    // Always recursive, and said so explicitly rather than left to Kubo's default:
+    // a flat bundle is a directory, and a direct pin of its root keeps the
+    // directory block while its files are garbage collected (the root still lists
+    // them; reading them fails).
+    return this.post('pin/add', { arg: normalizeCid(cid), recursive: 'true', progress: 'false' });
   }
 
   async pinRm(cid: string): Promise<unknown> {

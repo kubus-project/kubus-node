@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { KuboClient } from '../src/ipfs/kuboClient.js';
+import { reconcilePins } from '../src/ipfs/pinning.js';
 import { importWorkerVariant } from '../src/spatial/derivativeImport.js';
 import { kuboBinary, kuboRaw, startDisposableKubo, type DisposableKubo } from './helpers/disposableKubo.js';
 
@@ -184,6 +185,21 @@ describe.skipIf(!enabled)('flat bundles on a real Kubo', () => {
       // pointed at this root would resolve to an empty shell.
       expect(await client.hasAllBlocksLocally(rootCid)).toBe(false);
       await kuboRaw(kubo.apiUrl, 'pin/rm', { arg: rootCid });
+    });
+
+    it('the reconciler pins a planned bundle root so that every file in it survives garbage collection', async () => {
+      const { dir, names } = await writeFiles({ 'scene.rad': bytes(250, 51), 'scene-0.radc': bytes(BLOCK + 11, 52), 'scene-1.radc': bytes(777, 53) });
+      const { rootCid } = await client.addDirectoryStreamed(dir, names);
+      await client.pinRm(rootCid); // as if this node had not yet taken the bundle on
+
+      const [result] = await reconcilePins(client, [{ id: 'planned', cid: rootCid, role: 'spatial_mobile', storageClass: 'warm', sizeBytes: 1 }], false);
+      expect(result).toEqual({ cid: rootCid, ok: true });
+      await gc(kubo.apiUrl);
+
+      expect(await client.hasAllBlocksLocally(rootCid)).toBe(true);
+      for (const name of names) expect(await client.fileStat(rootCid, name), name).not.toBeNull();
+      const pins = JSON.parse(await kuboRaw(kubo.apiUrl, 'pin/ls', { arg: rootCid, type: 'recursive' })) as { Keys: Record<string, { Type: string }> };
+      expect(pins.Keys[rootCid]?.Type).toBe('recursive');
     });
 
     it('KuboClient.pinAdd pins recursively, so a re-pin after a partial loss restores the whole bundle', async () => {

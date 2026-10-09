@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { KubusApiClient } from '../backend/kubusApiClient.js';
 import type { AvailabilityCommitment, PublicPinSetRecord, RewardableCid } from '../backend/models.js';
 import type { AppConfig } from '../config/schema.js';
@@ -7,24 +8,112 @@ import { probeRetrieval, RETRIEVAL_AVAILABLE_STATES } from '../ipfs/retrieval.js
 import type { LocalStore } from '../state/localStore.js';
 import { addHoursIso } from '../utils/time.js';
 
+/** A placement tier. Fixed per role by the manifest (preview HOT, runtime WARM, archive COLD). */
+export type PinTier = 'hot' | 'warm' | 'cold';
+const TIERS: readonly string[] = ['hot', 'warm', 'cold'];
+const METADATA_ROLES: readonly string[] = ['manifest', 'record'];
+
+function tierOf(value: unknown): PinTier | undefined {
+  const text = typeof value === 'string' ? value.trim() : '';
+  return TIERS.includes(text) ? (text as PinTier) : undefined;
+}
+
+/**
+ * The tier a canonical pin-set record is placed in, or undefined when the
+ * server sent none. The record's own `storageClass` is the placement tier. The
+ * `verificationClass` fallback is only for servers that predate `storageClass`:
+ * on those the backend registered the two as the same value.
+ */
+export function pinTierOf(record: Pick<PublicPinSetRecord, 'storageClass' | 'verificationClass'>): PinTier | undefined {
+  return tierOf(record.storageClass) ?? tierOf(record.verificationClass);
+}
+
+/**
+ * Whether the operator's `CID_CLASS_FILTERS` admit a pin-set record.
+ *
+ * Filters name storage tiers (`hot,warm` is what setup writes). Two kinds of
+ * record are never filtered out, because dropping them breaks the archive for
+ * everyone rather than narrowing this node's share of it: the canonical
+ * manifest and signed record that describe an object, and a record the server
+ * gave no tier at all (the operator guide has always promised those are pinned).
+ */
+function tierFilterAllows(record: PublicPinSetRecord, filters: string[]): boolean {
+  if (filters.length === 0 || METADATA_ROLES.includes(record.role)) return true;
+  const tier = pinTierOf(record);
+  return tier === undefined || filters.includes(tier);
+}
+
+/**
+ * The same question for a rewardable CID. That record carries only
+ * `verificationClass`, which the backend sets from the CID's storage class when
+ * it registers it, so it is the tier here.
+ */
 function classFilterAllows(record: { verificationClass?: string | null }, filters: string[]): boolean {
   const verificationClass = record.verificationClass?.trim();
   return filters.length === 0 || !verificationClass || filters.includes(verificationClass);
 }
 
-const CLASS_PRIORITY: Record<string, number> = { hot: 0, warm: 1, cold: 2 };
+/** Placement order: canonical metadata first, then HOT, WARM, COLD. A record with no tier sorts as WARM. */
+const TIER_PRIORITY: Record<PinTier, number> = { hot: 1, warm: 2, cold: 3 };
 const ROLE_PRIORITY: Record<string, number> = { manifest: 0, record: 1, spatial_preview: 2, media: 3, leaf: 3, spatial_mobile: 4, spatial_archive: 5 };
 
-export function planPublicPins(records: PublicPinSetRecord[], maxCids: number, maxBytes: number, filters: string[]): PublicPinSetRecord[] {
-  const sorted = records.filter((record) => classFilterAllows(record, filters)).sort((left, right) => {
-    const leftClass = left.storageClass || (['manifest', 'record'].includes(left.role) ? 'hot' : left.verificationClass) || 'warm';
-    const rightClass = right.storageClass || (['manifest', 'record'].includes(right.role) ? 'hot' : right.verificationClass) || 'warm';
-    return (CLASS_PRIORITY[leftClass] ?? 1) - (CLASS_PRIORITY[rightClass] ?? 1)
-      || (ROLE_PRIORITY[left.role] ?? 10) - (ROLE_PRIORITY[right.role] ?? 10)
-      || String(left.objectType || '').localeCompare(String(right.objectType || ''))
-      || String(left.objectId || '').localeCompare(String(right.objectId || ''))
-      || Number(left.version || 0) - Number(right.version || 0)
-      || left.cid.localeCompare(right.cid);
+function placementRank(record: PublicPinSetRecord): number {
+  if (METADATA_ROLES.includes(record.role)) return 0;
+  return TIER_PRIORITY[pinTierOf(record) ?? 'warm'];
+}
+
+function canonicalOrder(left: PublicPinSetRecord, right: PublicPinSetRecord): number {
+  return (ROLE_PRIORITY[left.role] ?? 10) - (ROLE_PRIORITY[right.role] ?? 10)
+    || String(left.objectType || '').localeCompare(String(right.objectType || ''))
+    || String(left.objectId || '').localeCompare(String(right.objectId || ''))
+    || Number(left.version || 0) - Number(right.version || 0)
+    || left.cid.localeCompare(right.cid);
+}
+
+export interface PinPlanOptions {
+  /**
+   * A value stable for this node and different between nodes (its node id).
+   *
+   * Metadata and HOT content are wanted on every node and are planned in one
+   * canonical order. WARM and COLD content is capacity-bound: if every node that
+   * cannot hold all of it kept the same first N objects, the rest would be held
+   * by nobody. With a seed those tiers are ordered by a per-node hash of the
+   * CID (rendezvous hashing), so a constrained node keeps a stable subset and
+   * different nodes keep different ones. Without a seed the order is canonical.
+   */
+  seed?: string;
+}
+
+function rendezvousScore(seed: string, cid: string): string {
+  return createHash('sha256').update(`${seed}\n${cid}`).digest('hex');
+}
+
+/**
+ * Chooses which canonical public CIDs this node pins, within its configured
+ * budget (`maxCids`, `maxBytes`).
+ *
+ * - Metadata, then HOT, then WARM, then COLD, each tier planned only from what
+ *   the tier before it left. A larger tier can never displace a smaller one, so
+ *   a node that opts into COLD archives still holds every preview first.
+ * - `filters` (CID_CLASS_FILTERS) admit tiers. The default `hot,warm` keeps
+ *   full-resolution archives off a small node; COLD is taken only by an
+ *   operator who lists it.
+ * - A record that does not fit the remaining bytes is skipped, not the whole
+ *   tier: a smaller one behind it may still fit.
+ *
+ * Planning is not removal: the reconciler only ever adds pins, so narrowing the
+ * plan can never drop the last copy of anything.
+ */
+export function planPublicPins(records: PublicPinSetRecord[], maxCids: number, maxBytes: number, filters: string[], options: PinPlanOptions = {}): PublicPinSetRecord[] {
+  const seed = options.seed?.trim();
+  const sorted = records.filter((record) => tierFilterAllows(record, filters)).sort((left, right) => {
+    const rank = placementRank(left) - placementRank(right);
+    if (rank !== 0) return rank;
+    // Only the capacity-bound tiers are spread across nodes.
+    if (seed && placementRank(left) >= TIER_PRIORITY.warm) {
+      return rendezvousScore(seed, left.cid).localeCompare(rendezvousScore(seed, right.cid)) || left.cid.localeCompare(right.cid);
+    }
+    return canonicalOrder(left, right);
   });
   const selected: PublicPinSetRecord[] = [];
   let plannedBytes = 0;
@@ -81,7 +170,7 @@ export async function syncPublicPinSet(api: KubusApiClient, store: LocalStore, c
   if (pinSetResponse.complete !== true || total !== publicPinSet.length) {
     throw new Error('The canonical public pin set is incomplete.');
   }
-  const desired = planPublicPins(publicPinSet, config.maxPinnedCids, config.maxPinnedBytes, config.cidClassFilters);
+  const desired = planPublicPins(publicPinSet, config.maxPinnedCids, config.maxPinnedBytes, config.cidClassFilters, { seed: store.snapshot().nodeId });
   const rewardable = (rewardableResponse.records || [])
     .filter((record) => classFilterAllows(record, config.cidClassFilters));
   await store.update((state) => {
