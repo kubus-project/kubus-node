@@ -13,6 +13,7 @@ every result, so a derivative always says what made it.
 """
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import pathlib
@@ -23,7 +24,7 @@ import subprocess
 import time
 from typing import Any
 
-from splat_ply import read_header, splat_count, write_reduced_ply
+from splat_ply import splat_count, write_reduced_ply
 from worker_errors import WorkerError
 
 # Spark 2.1.0 reads SPZ versions 1 to 3 and rejects 4. The `spz` library
@@ -34,6 +35,7 @@ BUILD_LOD_BINARY = os.environ.get("KUBUS_BUILD_LOD", "build-lod")
 TOOLS_MANIFEST = pathlib.Path(os.environ.get("KUBUS_TOOLS_MANIFEST", "/opt/kubus/tools.json"))
 BUNDLE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 RAD_MAGIC = 0x30444152  # "RAD0", little endian
+SPZ_MAGIC = 0x5053474E  # "NGSP", little endian
 
 
 def tool_versions() -> dict[str, Any]:
@@ -64,6 +66,21 @@ def have_build_lod() -> bool:
     return shutil.which(BUILD_LOD_BINARY) is not None
 
 
+def read_spz_header(path: pathlib.Path) -> dict[str, int]:
+    """Reads the 16-byte header of the gzip-compressed SPZ container: magic, version, points, SH degree."""
+    try:
+        with gzip.open(path, "rb") as handle:
+            prefix = handle.read(16)
+        if len(prefix) < 16:
+            raise ValueError("short")
+        magic, version, points, sh_degree = struct.unpack("<IIIB", prefix[:13])
+    except (OSError, EOFError, ValueError, struct.error) as error:
+        raise WorkerError("preview_invalid", "The preview is not a valid SPZ file.", 500) from error
+    if magic != SPZ_MAGIC:
+        raise WorkerError("preview_invalid", "The preview is not a valid SPZ file.", 500)
+    return {"version": version, "points": points, "shDegree": sh_degree}
+
+
 def generate_preview(master: pathlib.Path, output: pathlib.Path, target_splats: int | None = None) -> dict[str, Any]:
     """Writes `output/preview.spz` and returns its measured description."""
     try:
@@ -77,8 +94,19 @@ def generate_preview(master: pathlib.Path, output: pathlib.Path, target_splats: 
     destination = output / "preview.spz"
     try:
         source_splats, kept = write_reduced_ply(master, reduced, target, drop_sh=True)
+        # The preview must land in the master's frame, because Spark draws the PLY
+        # master exactly as stored and an SPZ exactly as stored too (it takes the
+        # file to already be in the three.js frame and converts nothing). The
+        # library converts between frames at both ends - PLY (RDF) to the cloud,
+        # cloud to the file's native RUB - so asking for RUB at the first step and
+        # RUB at the second turned every preview into the master rotated half a turn
+        # about X: upside down, then flipping the right way up when the runtime
+        # replaced it. Declaring the cloud RDF on the way in and RUB on the way out
+        # converts nothing, and the file holds the master's own coordinates. Checked
+        # numerically against the master (positions agree to the file's 12-bit
+        # quantisation) and by rendering both in Spark 2.1.0.
         unpack = spz.UnpackOptions()
-        unpack.to_coord = spz.CoordinateSystem.RUB
+        unpack.to_coord = spz.CoordinateSystem.RDF
         cloud = spz.load_splat_from_ply(str(reduced), unpack)
         pack = spz.PackOptions()
         pack.version = SPZ_VERSION
@@ -93,6 +121,12 @@ def generate_preview(master: pathlib.Path, output: pathlib.Path, target_splats: 
         reduced.unlink(missing_ok=True)
     if not destination.is_file() or destination.stat().st_size == 0:
         raise WorkerError("preview_failed", "The preview encoder produced no output.", 500)
+    # The binding logs a missing field and carries on, then writes a valid but empty
+    # container, so a successful return proves nothing: the file's own header has to
+    # say it holds the splats that were asked for, in the version the renderer reads.
+    written = read_spz_header(destination)
+    if written["version"] != SPZ_VERSION or written["points"] != kept:
+        raise WorkerError("preview_failed", "The preview encoder did not keep the splats it was given.", 500)
     versions = tool_versions()
     return {
         "path": f"{output.name}/preview.spz",
@@ -103,7 +137,7 @@ def generate_preview(master: pathlib.Path, output: pathlib.Path, target_splats: 
         "durationMs": int((time.monotonic() - started) * 1000),
         "tool": "spz",
         "toolVersion": str(versions.get("spz", {}).get("version", "unknown")),
-        "settings": {"spzVersion": SPZ_VERSION, "targetSplats": target, "shDegree": 0},
+        "settings": {"spzVersion": SPZ_VERSION, "targetSplats": target, "shDegree": 0, "frame": "master"},
     }
 
 
