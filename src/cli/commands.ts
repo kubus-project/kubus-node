@@ -19,6 +19,7 @@ import { Scheduler } from '../scheduler/loops.js';
 import { LocalStore } from '../state/localStore.js';
 import { CapabilityRegistry } from '../capabilities/registry.js';
 import { PairingService } from '../localApi/pairingService.js';
+import { RetentionSweeper } from '../captures/retention.js';
 import { CaptureStore } from '../captures/captureStore.js';
 import { JobRuntime } from '../jobs/jobRuntime.js';
 import { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
@@ -181,6 +182,18 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   if (command !== 'start') throw new Error(`Unknown command: ${command}`);
   await jobs.start();
   await capabilities.refresh();
+  // Source-capture retention is opt-in twice over: the capture has to carry its
+  // own deletion request, and the operator has to turn this on. Only the serving
+  // process runs it, for the same reason only it sweeps orphaned uploads.
+  const retention = config.retentionSweep === 'off'
+    ? null
+    : new RetentionSweeper({ mode: config.retentionSweep, store, captures, kubo, logger, graceMs: config.retentionGraceMs });
+  if (retention) {
+    logger.info({ mode: config.retentionSweep, graceMs: config.retentionGraceMs, intervalMs: config.retentionSweepIntervalMs }, config.retentionSweep === 'dry-run'
+      ? 'retention: dry run enabled; captures will be reported, never removed'
+      : 'retention: enabled; captures that carry a deletion request may be removed when it is due and their result is preserved');
+    retention.start(config.retentionSweepIntervalMs, 60_000, (error) => logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'retention: sweep failed'));
+  }
   // Declared before the GUI so its late-bound diagnostics read the live client.
   let signaling: NodeSignalingClient | null = null;
   const gui = (config.guiEnabled || config.localApiEnabled)
@@ -224,6 +237,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     // so every stop was SIGKILLed here while startup finished reconciling pins
     // in the background. Aborting is what matters; waiting is a courtesy.
     await Promise.race([startup, new Promise<void>((resolve) => { setTimeout(resolve, STARTUP_ABORT_GRACE_MS).unref(); })]);
+    retention?.stop();
     await scheduler?.stop();
     await signaling?.stop();
   } }, gui, remoteCompute, null, logger);

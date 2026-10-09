@@ -145,3 +145,20 @@ The GUI cannot spend funds and never shows `KUBUS_OPERATOR_TOKEN`, Authorization
 The GUI loads no fonts, scripts, styles or icons from the internet, so it renders correctly on a node with no outbound connectivity. The pairing QR is generated on the node itself.
 
 To review the interface without a live node, `npx tsx scripts/previewGui.ts [healthy|locked|unconfigured]` serves it against fixtures.
+
+## Source-capture retention
+
+A capture is the private, raw material a scene was made from, and on your Node it is often the only copy. **The default is to keep it.** Nothing is ever deleted unless two separate things both say so.
+
+1. **The capture asks.** When the app uploads a capture it can attach a request: `retention.deleteAfter` (an ISO 8601 date, or a date and time with an explicit offset such as `2026-12-31T00:00:00Z`) and/or `retention.deleteAfterPublication: true`. A value that is not an unambiguous, real date is dropped, which means keep.
+2. **You turn the sweeper on.** `KUBUS_RETENTION_SWEEP` is `off` by default. `dry-run` reports what would be removed without removing anything (read it in the log, and under `retentionSweep` in the state file); `on` removes. Anything else, including `true`, is rejected at start-up.
+
+Even then a capture is removed only when **all** of these hold:
+
+- its date has passed, or a scene made from it has been published (as the capture asked);
+- it is at least `KUBUS_RETENTION_GRACE_MS` old (default 24 hours), so a bad date or a clock that jumps forward cannot wipe a fresh upload;
+- no queued or running job reads it;
+- at least one scene was made from it, and **every** such scene has its reconstruction master preserved and complete in this Node's Kubo. A capture that never produced a result, or whose result is no longer here, is kept however overdue: it may be all that is left;
+- fewer than five captures have already been removed in this sweep (oldest first; the rest wait for the next sweep).
+
+Having a preview or runtime representation authorizes nothing. The sweeper deletes only the capture's own directory and record: it never touches Kubo, pins, scenes or manifests. It does not know about your backups: a copy of the data directory made earlier still has the capture. `KUBUS_RETENTION_SWEEP_INTERVAL_MS` (default one hour) sets how often it looks.

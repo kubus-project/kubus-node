@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { LocalStore } from '../state/localStore.js';
 import { localError } from '../localApi/pairingService.js';
+import { normalizeRetention, type CaptureRetention } from './retention.js';
 import { declaredFrameCount, inspectCapturePackage, isPlainObject, type CapturePackageReport } from './capturePackage.js';
 
 export interface CaptureFilePayload { path: string; contentBase64: string; mimeType?: string }
@@ -13,7 +14,7 @@ export interface CapturePackagePayload {
   capturedAt: string;
   metadata: Record<string, unknown>;
   files: CaptureFilePayload[];
-  retention?: { deleteAfter?: string };
+  retention?: CaptureRetention;
 }
 /** Metadata that opens a streaming capture upload. Files arrive separately. */
 export interface CaptureDraftPayload {
@@ -22,7 +23,7 @@ export interface CaptureDraftPayload {
   markerId?: string;
   capturedAt: string;
   metadata: Record<string, unknown>;
-  retention?: { deleteAfter?: string };
+  retention?: CaptureRetention;
 }
 
 /** Progress of an in-flight streaming upload. */
@@ -47,7 +48,7 @@ export interface CaptureRecord {
   sizeBytes: number;
   fileCount: number;
   directory: string;
-  retention?: { deleteAfter?: string };
+  retention?: CaptureRetention;
 
   /**
    * Client-supplied idempotency key from `metadata.localCaptureId`.
@@ -262,7 +263,7 @@ export class CaptureStore {
         sizeBytes,
         fileCount: payload.files.length,
         directory,
-        retention: payload.retention,
+        retention: normalizeRetention(payload.retention),
       };
       await fs.writeFile(path.join(directory, 'capture.json'), `${JSON.stringify({ ...payload, files: payload.files.map(({ path: filePath, mimeType }) => ({ path: safeRelativePath(filePath), mimeType })) }, null, 2)}\n`, { mode: 0o600 });
       await this.store.update((state) => { (state.captures ??= {})[id] = record; });
@@ -527,7 +528,7 @@ export class CaptureStore {
         sizeBytes: draft.sizeBytes,
         fileCount: entry.files.size,
         directory: draft.directory,
-        retention: payload.retention,
+        retention: normalizeRetention(payload.retention),
         localCaptureId,
       };
       await fs.writeFile(
