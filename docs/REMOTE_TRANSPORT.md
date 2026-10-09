@@ -1,6 +1,6 @@
 # Remote paired-device transport
 
-kubus Node exposes the same `/local/v1` dispatcher through a local HTTP route
+kubus node exposes the same `/local/v1` dispatcher through a local HTTP route
 and through one reliable, ordered WebRTC data channel. The two adapters do not
 have separate authorization or mutation logic.
 

@@ -1,6 +1,6 @@
 # Releases
 
-kubus Node uses SemVer. Exact Git and container tags are immutable.
+kubus node uses SemVer. Exact Git and container tags are immutable.
 
 | Version | Container channel | Intended use |
 |---|---|---|

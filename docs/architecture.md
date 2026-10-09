@@ -1,10 +1,10 @@
 # Architecture
 
-The backend determines what is canonical. Kubus Nodes store, process, retrieve, and serve the public archive. Flutter is the spatial interface.
+The backend determines what is canonical. kubus nodes store, process, retrieve, and serve the public archive. Flutter is the spatial interface.
 
 ```mermaid
 flowchart LR
-  A[art.kubus] -->|paired local API| N[kubus Node]
+  A[art.kubus] -->|paired local API| N[kubus node]
   N -->|control metadata| B[art.kubus backend]
   N -->|private signed job| W[spatial worker]
   N <-->|CID data plane| I[(Kubo / IPFS)]
@@ -15,7 +15,7 @@ flowchart LR
 ## Runtime boundaries
 
 - **Backend control plane:** identity and authorization, ownership, canonical manifests and signed records, public-object registry, network policy, verification, scoring, and pending KUB8 accounting.
-- **Kubus Node:** persistent identity, Kubo/IPFS, local authentication, private captures, generic jobs, capability health, byte-aware public replication, publication handoff, availability contribution, and safe telemetry.
+- **kubus node:** persistent identity, Kubo/IPFS, local authentication, private captures, generic jobs, capability health, byte-aware public replication, publication handoff, availability contribution, and safe telemetry.
 - **Optional spatial worker:** reconstruction, Gaussian training/export, optimization/conversion and preview production behind a private service boundary. It never owns auth, publication, Kubo, or node identity.
 - **art.kubus app:** ARCore/ARKit tracking, capture guidance, paired-node transfer, job/status UI, orbit spatial viewing, and public/network fallbacks.
 

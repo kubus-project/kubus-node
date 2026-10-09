@@ -1,4 +1,4 @@
-# kubus Node
+# kubus node
 
 [![CI](https://img.shields.io/github/actions/workflow/status/kubus-project/kubus-node/pr-validation.yml?branch=master&label=CI)](https://github.com/kubus-project/kubus-node/actions/workflows/pr-validation.yml)
 [![Current release including prereleases](https://img.shields.io/github/v/release/kubus-project/kubus-node?include_prereleases&label=release)](https://github.com/kubus-project/kubus-node/releases)
@@ -20,8 +20,8 @@ hardware. Connect securely from art.kubus.
 
 ### Windows
 
-[Download kubus Node for Windows x64](https://node.kubus.site/download/windows).
-Have Docker Desktop running with its WSL 2 backend, install kubus Node, and open
+[Download kubus node for Windows x64](https://node.kubus.site/download/windows).
+Have Docker Desktop running with its WSL 2 backend, install kubus node, and open
 setup. Sign in to art.kubus, review the permissions, and authorize the Node.
 It then appears in My Nodes. Normal setup does not require a manual operator token.
 
@@ -128,7 +128,7 @@ are not public distribution endpoints. [Release contract](docs/RELEASES.md).
 
 ## Source status
 
-Current kubus Node source is **open source under AGPL-3.0-only**; see [LICENSE](LICENSE).
+Current kubus node source is **open source under AGPL-3.0-only**; see [LICENSE](LICENSE).
 Third-party components retain their [own licences](docs/THIRD_PARTY_LICENSES.md).
 The software licence does not grant rights to the [kubus branding](TRADEMARKS.md)
 or automatically cover artwork and archive content. The published alpha.6 tag

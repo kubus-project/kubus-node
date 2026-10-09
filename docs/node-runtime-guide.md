@@ -1,4 +1,4 @@
-# kubus Node — runtime guide
+# kubus node — runtime guide
 
 ### Local & distributed Gaussian splatting for a decentralised spatial archive.
 
@@ -8,7 +8,7 @@ community-run nodes instead of depending on a single storage provider.
 
 **Your GPU when you have one. The kubus network when you don't.**
 
-> kubus Node is a network participant, not a standalone Gaussian-splatting
+> kubus node is a network participant, not a standalone Gaussian-splatting
 > utility. The official runtime makes spatial-processing functionality
 > available while the node is actively contributing storage and availability
 > to the public art archive.
@@ -17,9 +17,9 @@ community-run nodes instead of depending on a single storage provider.
 
 ```mermaid
 flowchart TD
-  C[Spatial capture] --> N[kubus Node]
+  C[Spatial capture] --> N[kubus node]
   N -->|compatible local GPU| L[Local Gaussian reconstruction]
-  N -->|network processing| P[Selected compute kubus Node]
+  N -->|network processing| P[Selected compute kubus node]
   P --> G[Unpublished Gaussian-splat result]
   L --> R[Review]
   G --> R
@@ -33,7 +33,7 @@ flowchart TD
 
 ## In 30 seconds
 
-kubus Node combines five boundaries in one open-source runtime:
+kubus node combines five boundaries in one open-source runtime:
 
 - a Kubo/IPFS public archive participant with deterministic, byte-aware HOT/WARM/COLD replication;
 - a paired `/local/v1` API for art.kubus without exposing operator credentials;
@@ -57,7 +57,7 @@ The remote provider necessarily sees plaintext source data while running the job
 
 ## Mandatory network participation
 
-kubus Node is a network participant, not a standalone Gaussian-splatting utility. `NetworkParticipationGate` exposes `UNCONFIGURED`, `JOINING`, `CONTRIBUTING`, `DEGRADED`, and `LOCKED`. Spatial processing becomes available only after the node has verified its contribution to the public art archive: registration, backend policy, healthy Kubo, policy-minimum configured capacity, a synchronized canonical pin plan (including the verified zero-object bootstrap case), successful reconciliation of every planned CID, an active scheduler, and an accepted current heartbeat must coincide. A heartbeat alone establishes liveness, not participation. `MAX_PINNED_BYTES=1`, production skip-pinning, `kubus-node gui`, and direct local API calls do not bypass the gate.
+kubus node is a network participant, not a standalone Gaussian-splatting utility. `NetworkParticipationGate` exposes `UNCONFIGURED`, `JOINING`, `CONTRIBUTING`, `DEGRADED`, and `LOCKED`. Spatial processing becomes available only after the node has verified its contribution to the public art archive: registration, backend policy, healthy Kubo, policy-minimum configured capacity, a synchronized canonical pin plan (including the verified zero-object bootstrap case), successful reconciliation of every planned CID, an active scheduler, and an accepted current heartbeat must coincide. A heartbeat alone establishes liveness, not participation. `MAX_PINNED_BYTES=1`, production skip-pinning, `kubus-node gui`, and direct local API calls do not bypass the gate.
 
 A short outage may enter `DEGRADED` only after successful participation was previously verified: running work is not killed, canonical public content remains readable, and diagnostics remain available. New work locks after the grace period. A fresh or never-verified node remains `JOINING`. See [participation](PARTICIPATION.md).
 
@@ -149,4 +149,4 @@ Both are pending control-plane records. Settlement is not active; KUB8 has no gu
 
 Channels are `alpha → edge`, `beta → beta`, and stable → `latest`; an alpha image never updates `latest`. Exact SemVer tags and image tags are immutable.
 
-Current kubus Node source is licensed under `AGPL-3.0-only`; see [LICENSE](../LICENSE). Third-party software retains its [own licences](THIRD_PARTY_LICENSES.md), and the software licence does not grant rights to the [kubus branding](../TRADEMARKS.md) or automatically cover artwork and archive content. The published alpha.6 tag predates this change and retains its earlier bundled licensing notice.
+Current kubus node source is licensed under `AGPL-3.0-only`; see [LICENSE](../LICENSE). Third-party software retains its [own licences](THIRD_PARTY_LICENSES.md), and the software licence does not grant rights to the [kubus branding](../TRADEMARKS.md) or automatically cover artwork and archive content. The published alpha.6 tag predates this change and retains its earlier bundled licensing notice.
