@@ -209,15 +209,37 @@ export class KuboClient {
     return (response.Objects?.[0]?.Links ?? []).map((link) => String(link.Name ?? ''));
   }
 
-  /** True when every block under `cid` is in this node's local store. Never reaches the network. */
+  /**
+   * True when every block under `cid` is in this node's local store. Never
+   * reaches the network.
+   *
+   * `refs` streams, so Kubo commits `HTTP 200` before it has walked the DAG and
+   * reports a missing block as an `Err` inside the body (`{"Ref":"","Err":
+   * "block was not found locally ..."}`). Trusting the status code therefore
+   * answered "yes" for content that garbage collection had already removed -
+   * and a pinned-but-hollow bundle root (the directory block survives a direct
+   * pin, its files do not) fails the same way. The body is the answer.
+   */
   async hasAllBlocksLocally(cid: string): Promise<boolean> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60_000);
     try {
       const url = this.url('refs', { arg: normalizeCid(cid), recursive: 'true', unique: 'true', offline: 'true' });
       const response = await fetch(url, { method: 'POST', signal: controller.signal });
-      await response.text();
-      return response.ok;
+      const text = await response.text();
+      if (!response.ok) return false;
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue;
+        let entry: { Err?: unknown };
+        try {
+          entry = JSON.parse(line) as { Err?: unknown };
+        } catch {
+          // A line that is not JSON is a stream that did not finish cleanly.
+          return false;
+        }
+        if (typeof entry.Err === 'string' && entry.Err !== '') return false;
+      }
+      return true;
     } catch {
       return false;
     } finally {

@@ -27,6 +27,26 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm test
+      - name: Spatial bundles against a real, disposable Kubo
+        shell: bash
+        run: |
+          # The unit suites fake Kubo. This one starts the pinned release in a
+          # throwaway repository (offline, loopback only) and checks the facts
+          # those fakes assume: file stats, ranged reads inside a bundle,
+          # recursive pins and what garbage collection keeps. The archive is
+          # verified against the checksum published with the release.
+          set -euo pipefail
+          version=v0.43.0
+          archive="kubo_${version}_linux-amd64.tar.gz"
+          base="https://github.com/ipfs/kubo/releases/download/${version}"
+          mkdir -p "$RUNNER_TEMP/kubo"
+          cd "$RUNNER_TEMP/kubo"
+          curl --fail --silent --show-error --location --retry 3 -O "${base}/${archive}"
+          curl --fail --silent --show-error --location --retry 3 -O "${base}/${archive}.sha512"
+          sha512sum --check "${archive}.sha512"
+          tar -xzf "$archive"
+          cd "$GITHUB_WORKSPACE"
+          KUBUS_TEST_KUBO_BIN="$RUNNER_TEMP/kubo/kubo/ipfs" npm test -- --run tests/spatialKubo.integration.test.ts
       - run: npm audit --audit-level=high
       - run: git diff --check
 
