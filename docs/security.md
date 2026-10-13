@@ -16,7 +16,7 @@ Firewall expectation: expose only the intended public gateway or reverse proxy. 
 
 ## Local GUI Security
 
-The Kubus Node GUI is local/private by default. In Docker, `NODE_GUI_HOST=0.0.0.0` binds the GUI inside the container so Docker can publish it, but Docker Compose maps the host port only as `127.0.0.1:8787:8787`. `http://my.node.kubus.site:8787/gui` works only after the operator adds a hosts-file alias to `127.0.0.1`. Do not create public DNS for `my.node.kubus.site`.
+The kubus node GUI is local/private by default. In Docker, `NODE_GUI_HOST=0.0.0.0` binds the GUI inside the container so Docker can publish it, but Docker Compose maps the host port only as `127.0.0.1:8787:8787`. `http://my.node.kubus.site:8787/gui` works only after the operator adds a hosts-file alias to `127.0.0.1`. Do not create public DNS for `my.node.kubus.site`.
 
 If `NODE_GUI_HOST=0.0.0.0` or `NODE_GUI_ALLOW_REMOTE=true`, the agent refuses to start the GUI unless `NODE_GUI_TOKEN` is set. Browser API calls then require `Authorization: Bearer <NODE_GUI_TOKEN>` or the in-memory local session cookie. The GUI token is separate from `KUBUS_OPERATOR_TOKEN`, cannot spend funds, and is not stored in local node state.
 
