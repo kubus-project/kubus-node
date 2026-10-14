@@ -52,6 +52,18 @@ async function waitForTerminal(jobs: { get: (id: string) => { state: string } },
   await new Promise((resolve) => setTimeout(resolve, 5));
 }
 
+// The job's state flips to terminal inside patchJob, before that call has
+// persisted; the matching analytics event is recorded only after it returns.
+// A fixed grace period after the state flip is therefore a race on a slow
+// disk, so wait for the condition itself.
+async function waitFor(condition: () => boolean, description: string, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(`${description} did not happen within ${timeoutMs}ms`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 describe('private spatial runtime', () => {
   it('allows local processing during a backend outage and reports the actual worker failure', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-spatial-')); dirs.push(dir);
@@ -187,6 +199,7 @@ describe('private spatial runtime', () => {
     await waitForTerminal(jobs, job.id);
 
     expect(jobs.get(job.id).state).toBe('completed');
+    await waitFor(() => analytics.query('24h')[0]?.processing.completed === 1, 'completed analytics event');
     const buckets = analytics.query('24h');
     expect(buckets).toHaveLength(1);
     expect(buckets[0]!.processing.started).toBe(1);
