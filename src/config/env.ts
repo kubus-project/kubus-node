@@ -174,7 +174,7 @@ function mergePersistedConfig(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   } catch (error) {
     // Treat a damaged configuration exactly like other invalid configuration:
     // startup stops and the setup surface gives the operator a repair route.
-    throw new Error(`Unable to read kubus Node configuration: ${String((error as Error).message || error)}`);
+    throw new Error(`Unable to read kubus node configuration: ${String((error as Error).message || error)}`);
   }
   // Compose materializes unset substitutions as empty strings. Treating those
   // as an explicit override would erase a value the setup page just persisted

@@ -22,16 +22,16 @@ $nodeOrigin = 'http://127.0.0.1:8787'
 
 function Show-Problem([string]$message) {
   Add-Type -AssemblyName System.Windows.Forms
-  [System.Windows.Forms.MessageBox]::Show($message, 'kubus Node Setup', 'OK', 'Error') | Out-Null
+  [System.Windows.Forms.MessageBox]::Show($message, 'kubus node setup', 'OK', 'Error') | Out-Null
 }
 
 function Test-Docker {
   if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    throw 'Docker Desktop is required. Install Docker Desktop, enable its WSL 2 backend, then start kubus Node setup again.'
+    throw 'Docker Desktop is required. Install Docker Desktop, enable its WSL 2 backend, then start kubus node setup again.'
   }
   & docker info --format '{{.ServerVersion}}' *> $null
   if ($LASTEXITCODE -ne 0) {
-    throw 'Docker Desktop is installed but its engine is not running. Start Docker Desktop, wait until it reports Running, then start kubus Node setup again.'
+    throw 'Docker Desktop is installed but its engine is not running. Start Docker Desktop, wait until it reports Running, then start kubus node setup again.'
   }
 }
 
@@ -134,7 +134,7 @@ function Get-DashboardHandoff([string]$config) {
     return "$nodeOrigin/gui#handoff=$($handoff.ticket)"
   } catch {
     # Never surface the request, credential, or ticket in an error or progress log.
-    throw 'The dashboard could not authorize this browser. Start kubus Node again to retry; your Node data is preserved.'
+    throw 'The dashboard could not authorize this browser. Start kubus node again to retry; your Node data is preserved.'
   } finally { $guiCredential = $null }
 }
 
@@ -154,7 +154,7 @@ function Get-FreePort([int]$preferred) {
 function Get-ProgressPage {
   return @'
 <!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Setting up kubus Node</title>
+<title>Setting up kubus node</title>
 <style>
 body{max-width:38rem;margin:3rem auto;padding:0 1rem;font:16px system-ui;line-height:1.55;color:#111}
 h1{font-size:1.5rem;margin-bottom:.25rem}
@@ -169,18 +169,18 @@ li.active::before{content:"";position:absolute;left:.15rem;top:1rem;width:.8rem;
 #detail{color:#555;font-size:.9rem;min-height:1.4rem;white-space:pre-wrap;word-break:break-word}
 #err{display:none;background:#fff4f4;border:1px solid #f0c0c0;padding:1rem;border-radius:.4rem}
 </style>
-<h1>Setting up kubus Node</h1>
+<h1>Setting up <strong><em>kubus</em></strong> node</h1>
 <p class="lead">You can leave this page open. It updates by itself.</p>
 <ol id="steps">
   <li data-step="docker">Checking Docker Desktop</li>
-  <li data-step="pull">Downloading the kubus Node runtime</li>
+  <li data-step="pull">Downloading the kubus node runtime</li>
   <li data-step="start">Starting your Node</li>
   <li data-step="wait">Waiting for your Node to answer</li>
   <li data-step="handoff">Opening setup</li>
 </ol>
 <p id="detail"></p>
 <div id="err"><strong>Setup stopped.</strong><p id="errtext"></p>
-<p>Your Node data and identity are untouched. Fix the problem above, then start kubus Node setup again.</p></div>
+<p>Your Node data and identity are untouched. Fix the problem above, then start kubus node setup again.</p></div>
 <script>
 var order=['docker','pull','start','wait','handoff'];
 function paint(at){
@@ -304,8 +304,8 @@ function Start-SetupFlow {
     Test-Docker
 
     $drive = Get-PSDrive -Name ([IO.Path]::GetPathRoot($dataRoot).TrimEnd(':', '\'))
-    if ($drive.Free -lt 10GB) { throw 'At least 10 GB of free disk space is required before starting kubus Node.' }
-    if (-not (Test-Path -LiteralPath $composeFile)) { throw 'This release bundle is incomplete: docker-compose.release.yml is missing. Reinstall kubus Node.' }
+    if ($drive.Free -lt 10GB) { throw 'At least 10 GB of free disk space is required before starting kubus node.' }
+    if (-not (Test-Path -LiteralPath $composeFile)) { throw 'This release bundle is incomplete: docker-compose.release.yml is missing. Reinstall kubus node.' }
     $existingConfig = Read-SetupConfig
     Write-RuntimeTopology ($existingConfig -match '(?m)^LOCAL_API_ALLOW_LAN=(?:"true"|true)$')
 
@@ -321,7 +321,7 @@ function Start-SetupFlow {
     # The preference is relaxed for the duration of the pull only, so progress
     # stays visible; the real outcome is taken from the exit code below, which
     # still catches a genuine failure.
-    Set-Step $sync 'pull' 'Downloading the kubus Node runtime. This can take several minutes the first time.'
+    Set-Step $sync 'pull' 'Downloading the kubus node runtime. This can take several minutes the first time.'
     $previousPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
@@ -332,7 +332,7 @@ function Start-SetupFlow {
     } finally {
       $ErrorActionPreference = $previousPreference
     }
-    if ($LASTEXITCODE -ne 0) { throw 'The kubus Node runtime could not be downloaded. Check this PC''s internet connection and Docker Desktop, then start setup again.' }
+    if ($LASTEXITCODE -ne 0) { throw 'The kubus node runtime could not be downloaded. Check this PC''s internet connection and Docker Desktop, then start setup again.' }
 
     Set-Step $sync 'start' 'Starting your Node...'
     Start-NodeRuntime $sync
@@ -370,7 +370,7 @@ function Start-SetupFlow {
     # reason setup stopped, because it reads as a failure when it is not one.
     $reason = "$($_.Exception.Message)".Trim()
     if ($_.CategoryInfo.Reason -eq 'NativeCommandError' -or -not $reason) {
-      $reason = "Setup could not finish the '$($sync.step)' step. Open Docker Desktop, check that it is running, then start kubus Node setup again."
+      $reason = "Setup could not finish the '$($sync.step)' step. Open Docker Desktop, check that it is running, then start kubus node setup again."
     }
     $sync.error = $reason
     $sync.message = ''
@@ -409,7 +409,7 @@ function Stop-Node([bool]$removeData) {
   $deleted = $false
   if ($removeData) {
     $answer = [System.Windows.Forms.MessageBox]::Show(
-      'Delete the kubus Node Docker volumes? This permanently removes Node identity, pairing credentials, archive data, and private captures.',
+      'Delete the kubus node Docker volumes? This permanently removes Node identity, pairing credentials, archive data, and private captures.',
       'Delete Node data', 'YesNo', 'Warning')
     if ($answer -eq 'Yes') {
       & docker volume rm kubus-node_node-state kubus-node_kubo-data | Out-Null
@@ -425,7 +425,7 @@ function Show-ManageWindow {
   Add-Type -AssemblyName System.Drawing
 
   $form = New-Object System.Windows.Forms.Form
-  $form.Text = 'kubus Node'
+  $form.Text = 'kubus node'
   $form.Size = New-Object System.Drawing.Size(520, 250)
   $form.StartPosition = 'CenterScreen'
   $form.FormBorderStyle = 'FixedDialog'
@@ -449,7 +449,7 @@ function Show-ManageWindow {
   $dashboard.Size = New-Object System.Drawing.Size(150, 34)
   $dashboard.Add_Click({
     try { Start-Process (Get-DashboardHandoff (Read-SetupConfig)) }
-    catch { $status.Text = 'Could not open the dashboard. Start kubus Node and try again.' }
+    catch { $status.Text = 'Could not open the dashboard. Start kubus node and try again.' }
   })
   $form.Controls.Add($dashboard)
 

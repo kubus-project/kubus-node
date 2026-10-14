@@ -12,7 +12,7 @@ import { isPlainObject } from '../captures/capturePackage.js';
  * The phone must never know Nerfstudio exists: `frames.json` carries
  * `poseTranslation`/`poseRotation`/`intrinsics` in the phone's own native
  * (ARCore) convention, and this module is the one place that understands
- * both that format and the engine's. Ownership rationale: the kubus Node
+ * both that format and the engine's. Ownership rationale: the kubus node
  * agent already understands `kubus.capture/1` end to end (capture storage,
  * streaming upload); the worker only needs to understand Nerfstudio. Doing
  * the translation here, once, keeps the worker a thin `ns-train` wrapper and

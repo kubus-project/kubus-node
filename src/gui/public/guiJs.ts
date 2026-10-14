@@ -1,5 +1,5 @@
 /**
- * kubus Node GUI client.
+ * kubus node GUI client.
  *
  * This file is a renderer and nothing more. It never decides what a state
  * "means" — the server sends a view model in operator language (see
@@ -160,9 +160,9 @@ function detailRow(label, value) {
 
 function renderAuth() {
   $('#app').innerHTML = '<main class="auth"><form class="auth-card" id="authForm">' +
-    '<div class="brand"><div class="brand-name">kubus Node</div>' +
+    '<div class="brand"><div class="brand-name"><span class="brand-kubus">kubus</span> node</div>' +
     '<div class="brand-descriptor">Local runtime + public archive node</div></div>' +
-    '<p class="t-body">Open kubus Node from the Windows Start menu to securely open your dashboard.</p>' +
+    '<p class="t-body">Open kubus node from the Windows Start menu to securely open your dashboard.</p>' +
     '<p class="t-meta">The launcher signs in this browser automatically. Your Node keeps running when this browser session expires.</p>' +
     '<details><summary>Advanced operator access</summary>' +
     '<label for="token">GUI token' +
@@ -206,7 +206,7 @@ function sectionFlags() {
 function renderShell() {
   $('#app').innerHTML = '<div class="shell">' +
     '<aside class="sidebar">' +
-    '<div class="brand"><div class="brand-name">kubus Node</div>' +
+    '<div class="brand"><div class="brand-name"><span class="brand-kubus">kubus</span> node</div>' +
     '<div class="brand-descriptor">Local runtime + public archive node</div></div>' +
     '<nav class="nav" aria-label="Sections">' + navigation() + '</nav>' +
     '<div class="sidebar-footer">' +
@@ -1043,7 +1043,7 @@ function onboardingSteps() {
   const spatial = model.spatial;
   return [
     {
-      title: 'Welcome to kubus Node',
+      title: 'Welcome to kubus node',
       body: 'Run part of the art.kubus network on hardware you control.',
       features: [
         { title: 'Public archive', body: 'Keep verified cultural records available.' },
@@ -1092,7 +1092,7 @@ function renderOnboarding() {
 
   $('#app').innerHTML = '<main class="onboarding"><section class="onboarding-card">' +
     '<div class="steps" role="img" aria-label="Step ' + (onboardingStep + 1) + ' of ' + steps.length + '">' + pips + '</div>' +
-    '<div class="brand"><div class="brand-name">kubus Node</div>' +
+    '<div class="brand"><div class="brand-name"><span class="brand-kubus">kubus</span> node</div>' +
     '<div class="brand-descriptor">Local &amp; distributed Gaussian splatting for a decentralised spatial archive.</div></div>' +
     '<div class="stack">' +
     '<h1 class="t-page">' + h(step.title) + '</h1>' +
@@ -1222,7 +1222,7 @@ function bindSectionEvents() {
       const report = diagnostics.checks
         .map((check) => (check.ok ? '[ok]   ' : '[fail] ') + check.name + (check.detail ? ' — ' + check.detail : ''))
         .join('\\n');
-      await navigator.clipboard.writeText('kubus Node diagnostic report\\n\\n' + report).catch(() => null);
+      await navigator.clipboard.writeText('kubus node diagnostic report\\n\\n' + report).catch(() => null);
       announce('Diagnostic report copied');
     });
   }
@@ -1466,7 +1466,7 @@ async function refresh() {
     // model at all becomes an error page.
     if (model === null) {
       $('#app').innerHTML = '<main class="auth"><div class="auth-card">' +
-        '<div class="brand"><div class="brand-name">kubus Node</div></div>' +
+        '<div class="brand"><div class="brand-name"><span class="brand-kubus">kubus</span> node</div></div>' +
         '<p class="t-body">This node is not responding yet.</p>' +
         '<p class="t-meta">' + h(error.message) + '</p>' +
         '<button class="button primary" onclick="location.reload()">Try again</button>' +
@@ -1502,8 +1502,8 @@ async function acceptGuiHandoff() {
         credentials: 'same-origin', body: JSON.stringify({ ticket }),
       });
       if (response.ok) localStorage.removeItem(TOKEN_KEY);
-      else announce('Open kubus Node from the Windows launcher to sign in again.');
-    } catch (_error) { announce('Open kubus Node from the Windows launcher to sign in again.'); }
+      else announce('Open kubus node from the Windows launcher to sign in again.');
+    } catch (_error) { announce('Open kubus node from the Windows launcher to sign in again.'); }
   }
 }
 async function startGui() {

@@ -58,7 +58,7 @@ describe('release packaging', () => {
     expect(setup).not.toMatch(/New-Object System\.Net\.HttpListener|\[System\.Net\.HttpListener\]/);
     // The image pull is the multi-minute step; silence there is what looked
     // like a hang.
-    expect(setup).toMatch(/Downloading the kubus Node runtime/);
+    expect(setup).toMatch(/Downloading the kubus node runtime/);
   });
 
   it('waits for the Node to answer before sending anyone to it', async () => {

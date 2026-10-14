@@ -434,7 +434,7 @@ async function createGuiPairing(deps: GuiDeps) {
     code: session.payload,
     sessionId: session.sessionId,
     expiresAt: session.expiresAt,
-    qrSvg: await renderQrSvg(session.payload, { title: 'kubus Node pairing code' }),
+    qrSvg: await renderQrSvg(session.payload, { title: 'kubus node pairing code' }),
     node: {
       label: session.node.label,
       fingerprint,

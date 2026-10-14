@@ -1,5 +1,5 @@
 /**
- * Human-facing presentation layer for kubus Node.
+ * Human-facing presentation layer for kubus node.
  *
  * Everything in this module is pure: machine state in, operator language out.
  * The GUI must never render a raw enum, error code or byte count, so this file
@@ -59,7 +59,7 @@ const PARTICIPATION: Record<ParticipationState, StateDescription> = {
   },
   JOINING: {
     title: 'Joining network',
-    body: 'kubus Node is synchronising and verifying its public archive contribution.',
+    body: 'kubus node is synchronising and verifying its public archive contribution.',
     severity: 'neutral',
   },
   DEGRADED: {
@@ -70,7 +70,7 @@ const PARTICIPATION: Record<ParticipationState, StateDescription> = {
   },
   LOCKED: {
     title: 'Network participation required',
-    body: 'Spatial processing becomes available when this kubus Node is actively contributing to the public archive.',
+    body: 'Spatial processing becomes available when this kubus node is actively contributing to the public archive.',
     severity: 'attention',
     action: { label: 'Check node status', section: 'diagnostics' },
   },
@@ -91,7 +91,7 @@ export function describeParticipation(snapshot: Pick<ParticipationSnapshot, 'sta
  * onboarding — deliberately not repeated on every gated control.
  */
 export const RECIPROCITY_EXPLANATION =
-  'kubus Node gives you local spatial processing while your node contributes storage and availability to the shared public archive.';
+  'kubus node gives you local spatial processing while your node contributes storage and availability to the shared public archive.';
 
 /**
  * Requirement checks, translated. Keys match `ParticipationSnapshot.requirements`.
@@ -215,7 +215,7 @@ export function describeLocalJob(job: { state: JobState; progress?: number }): S
     case 'running': {
       // The worker reports a real fraction, so a determinate bar is honest here.
       const stageIndex = progress >= 0.9 ? 3 : progress >= 0.6 ? 2 : 1;
-      return { title: LOCAL_JOB_STAGES[stageIndex]!, body: 'Processing on your kubus Node.', severity: 'neutral', stageIndex, determinate: true };
+      return { title: LOCAL_JOB_STAGES[stageIndex]!, body: 'Processing on your kubus node.', severity: 'neutral', stageIndex, determinate: true };
     }
     case 'completed':
       return { title: 'Complete', body: 'The spatial archive is ready.', severity: 'good', stageIndex: 4, determinate: true };
@@ -223,7 +223,7 @@ export function describeLocalJob(job: { state: JobState; progress?: number }): S
       return { title: 'Cancelled', body: 'Processing was stopped. Your capture is unchanged.', severity: 'neutral', stageIndex: 0, determinate: false };
     case 'failed':
     default:
-      return { title: 'Processing stopped', body: 'Your original capture is still available on your kubus Node.', severity: 'critical', stageIndex: 0, determinate: false };
+      return { title: 'Processing stopped', body: 'Your original capture is still available on your kubus node.', severity: 'critical', stageIndex: 0, determinate: false };
   }
 }
 
