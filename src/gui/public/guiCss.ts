@@ -251,7 +251,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 
 .brand { display: grid; gap: var(--k-space-xxs); }
 .brand-name { font-size: 16px; font-weight: 400; letter-spacing: -0.01em; }
-.brand-kubus { color: #111; font-weight: 700; font-style: italic; }
+.brand-kubus { color: inherit; font-weight: 800; font-style: italic; }
 .brand-descriptor { font-size: 12px; color: var(--k-text-tertiary); }
 
 .nav { display: grid; gap: var(--k-space-xxs); }

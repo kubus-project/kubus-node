@@ -1,4 +1,4 @@
-# kubus node
+# ***kubus*** node
 
 [![CI](https://img.shields.io/github/actions/workflow/status/kubus-project/kubus-node/pr-validation.yml?branch=master&label=CI)](https://github.com/kubus-project/kubus-node/actions/workflows/pr-validation.yml)
 [![Current release including prereleases](https://img.shields.io/github/v/release/kubus-project/kubus-node?include_prereleases&label=release)](https://github.com/kubus-project/kubus-node/releases)
