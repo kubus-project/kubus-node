@@ -1,4 +1,4 @@
-# ***kubus*** node
+# ***kubus*** Node
 
 [![CI](https://img.shields.io/github/actions/workflow/status/kubus-project/kubus-node/pr-validation.yml?branch=master&label=CI)](https://github.com/kubus-project/kubus-node/actions/workflows/pr-validation.yml)
 [![Current release including prereleases](https://img.shields.io/github/v/release/kubus-project/kubus-node?include_prereleases&label=release)](https://github.com/kubus-project/kubus-node/releases)
@@ -136,3 +136,7 @@ predates this licensing change and still contains its earlier UNLICENSED notice.
 Check the licensing information included with downloaded release artifacts.
 Protocol and implementation detail previously in this README remains in the
 [runtime guide](docs/node-runtime-guide.md) and the linked documentation.
+
+## Brand identity
+
+Product references use plain `kubus Node`; the official wordmark is ***kubus*** Node. See [Wordmark Typography](TRADEMARKS.md#brand-identity--wordmark-typography). Technical names such as `kubus-node` remain unchanged.

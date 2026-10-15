@@ -9,11 +9,11 @@
 | Runtime | `kubus-project/kubus-node` (this repo) | the software an operator installs and runs: package `@kubus/kubus-node`, binary `kubus-node`, Docker runtime, local GUI |
 | Public website | `kubus-project/node.kubus.site` | the website that explains and distributes the runtime |
 
-Public prose brand: **kubus node** (lowercase, always). Technical package,
+Public prose brand: kubus Node (lowercase `kubus`, capital `Node`, plain typography). Technical package,
 binary and repository name: **`kubus-node`**. Do not "correct" either into the
 other.
 
-kubus node is a local runtime and public archive node for art.kubus: it stores
+kubus Node is a local runtime and public archive node for art.kubus: it stores
 and serves canonical public cultural records, runs spatial (Gaussian)
 reconstruction on compatible NVIDIA/CUDA hardware or requests it from a
 selected provider, and connects owned nodes to art.kubus over WebRTC/TURN.
@@ -22,8 +22,8 @@ Licence: `AGPL-3.0-only`; branding is reserved (`TRADEMARKS.md`).
 ## Source-of-truth precedence
 
 For spatial delivery or cross-repository product work, read the current
-`art.kubus/docs/PRODUCT_UX_SEO_PROGRAM.md` master roadmap, its Wave 12
-`docs/AGENT_EXECUTION_PLAN.md` package and
+`art.kubus/docs/ROADMAP.md` roadmap,
+`art.kubus/docs/engineering/agent-orchestration.md` guidance and
 `art.kubus/docs/SPATIAL_DELIVERY_ROADMAP.md` before editing. This runtime
 already supports capture/reconstruction/manifests; preview generation,
 streamed/paged runtime LOD and capacity-aware replication are future work
@@ -75,8 +75,7 @@ Before editing:
 
 ## Naming and branding
 
-- Prose: `kubus node`, `kubus`, `art.kubus`, always lowercase, including at
-  the start of a sentence and in headings.
+- Prose: `kubus Node`, `kubus`, `art.kubus`; preserve this case in sentences and headings. Ordinary mentions remain plain.
 - Identifiers exactly: `kubus-node`, `@kubus/kubus-node`, `NODE_GUI_TOKEN`,
   `KUBUS_OPERATOR_TOKEN`, `KubusNodeSetup.ps1`, class names in code.
 - Natural acronyms stay uppercase: API, GPU, IPFS, CID.
@@ -163,7 +162,7 @@ widths and check setup, status and spatial views.
   machine outside the documented participation/publication contracts.
 - Claiming the backend is gone, full decentralization, or network facts that
   are not measured.
-- Capitalized brand prose (`Kubus Node`, `kubus Node`, `KUBUS NODE`).
+- Incorrect brand case (`Kubus Node`, `kubus node`, `KUBUS NODE`); use `kubus Node`.
 
 ## Agent end checklist
 
@@ -171,7 +170,7 @@ widths and check setup, status and spatial views.
 - [ ] lint, typecheck, tests, build green
 - [ ] released contracts unchanged, or release notes updated
 - [ ] local analytics still local; no new outbound data
-- [ ] brand prose lowercase; identifiers exact
+- [ ] brand prose in approved case and plain typography; identifiers exact
 - [ ] local `HEAD` equals the remote branch
 - [ ] PR body current; nothing merged without authorization
 
@@ -183,3 +182,13 @@ widths and check setup, status and spatial views.
 - `docs/PRIVACY.md`, `docs/security.md`
 - `docs/PARTICIPATION.md`, `docs/SPATIAL.md`, `docs/REMOTE_TRANSPORT.md`
 - `docs/RELEASES.md`, `docs/licensing.md`, `TRADEMARKS.md`
+
+## Official wordmark convention
+
+Official wordmarks are art.***kubus***, ***kubus*** and ***kubus*** Node: only `kubus` is bold
+italic; `art.` and capitalized `Node` are regular upright. Apply this beside the existing
+graphical logo in headers and explicitly designed brand compositions. Running text stays plain
+(art.kubus, kubus, kubus Node); technical identifiers retain exact spelling. Future frontend,
+redesign and branding work must preserve the [canonical wordmark
+specification](TRADEMARKS.md#brand-identity--wordmark-typography), including genuine font faces,
+responsive alignment and one combined accessible name.

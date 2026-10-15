@@ -3,7 +3,7 @@
 ## Scope
 
 This policy governs use of the following marks (collectively, "Marks"):
-- `art.kubus`, `kubus`, `kubus node`
+- `art.kubus`, `kubus`, `kubus Node`
 - official art.kubus/kubus logos, product icons, and related visual identity
 
 The Marks are proprietary and reserved by the project maintainers, independent of the software license below.
@@ -35,3 +35,13 @@ Marks referenced here are not represented to be registered trademarks unless the
 ## Contact
 
 Permission requests: support@kubus.site
+
+## Brand Identity / Wordmark Typography
+
+Official wordmarks are art.***kubus***, ***kubus*** and ***kubus*** Node: only `kubus` is bold
+italic; `art.` and capitalized `Node` are regular upright. Apply this beside the existing
+graphical logo in headers and explicitly designed brand compositions. Running text stays plain
+(art.kubus, kubus, kubus Node); technical identifiers retain exact spelling. Future frontend,
+redesign and branding work must preserve the [canonical wordmark
+specification](https://github.com/kubus-project/art.kubus.site/blob/master/docs/CONTENT-AND-BRAND.md#2-brand-identity--wordmark-typography),
+including genuine font faces, responsive alignment and one combined accessible name.
