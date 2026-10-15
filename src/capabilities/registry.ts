@@ -30,7 +30,7 @@ const DEFAULT_REFRESH_TTL_MS = 5000;
 
 /**
  * The single authoritative source of runtime capability state (Kubo health,
- * spatial worker health, derived capability flags) for this kubus Node
+ * spatial worker health, derived capability flags) for this kubus node
  * process. GUI, local API, heartbeat and job eligibility all read through the
  * same instance so they can never disagree about whether the worker is up.
  *

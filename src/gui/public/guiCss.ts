@@ -1,5 +1,5 @@
 /**
- * kubus Node GUI stylesheet.
+ * kubus node GUI stylesheet.
  *
  * Design intent: the Node is a kubus product surface, not a generic admin
  * panel — it uses the same canonical tokens and liquid-glass language as
@@ -250,7 +250,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 
 .brand { display: grid; gap: var(--k-space-xxs); }
-.brand-name { font-size: 16px; font-weight: 640; letter-spacing: -0.01em; }
+.brand-name { font-size: 16px; font-weight: 400; letter-spacing: -0.01em; }
+.brand-kubus { color: inherit; font-weight: 800; font-style: italic; }
 .brand-descriptor { font-size: 12px; color: var(--k-text-tertiary); }
 
 .nav { display: grid; gap: var(--k-space-xxs); }

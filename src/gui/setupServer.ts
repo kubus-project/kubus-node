@@ -325,12 +325,12 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
 }
 
 function setupHtml(nonce: string): string {
-  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Set up kubus Node</title>
-<style>body{max-width:42rem;margin:3rem auto;padding:0 1rem;font:16px system-ui;line-height:1.5}label{display:block;margin:1rem 0}input{box-sizing:border-box;width:100%;padding:.6rem}button{padding:.7rem 1rem}small{color:#555}code{font:600 1.6rem/1.2 ui-monospace,monospace;letter-spacing:.16em}details{margin:1.5rem 0;border-top:1px solid #ddd;padding-top:1rem}#step2,#step3{display:none}#dash{display:none}</style>
-<h1>Set up kubus Node</h1><p>Your captures stay on your Node. The network receives archive participation and short-lived connection coordination, never capture bytes.</p>
+  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Set up kubus node</title>
+<style>.brand-name{font-weight:400;font-style:normal}.brand-kubus{font-weight:800;font-style:italic}body{max-width:42rem;margin:3rem auto;padding:0 1rem;font:16px system-ui;line-height:1.5}label{display:block;margin:1rem 0}input{box-sizing:border-box;width:100%;padding:.6rem}button{padding:.7rem 1rem}small{color:#555}code{font:600 1.6rem/1.2 ui-monospace,monospace;letter-spacing:.16em}details{margin:1.5rem 0;border-top:1px solid #ddd;padding-top:1rem}#step2,#step3{display:none}#dash{display:none}</style>
+<h1>Set up <span class="brand-name"><span class="brand-kubus">kubus</span> node</span></h1><p>Your captures stay on your Node. The network receives archive participation and short-lived connection coordination, never capture bytes.</p>
 <form id="f">
 <label>Node name<input name="nodeLabel" required maxlength="80"></label>
-<label>art.kubus API URL<input name="apiBaseUrl" type="url" required value="https://api.kubus.site"></label>
+<label><span class="brand-name">art.<span class="brand-kubus">kubus</span></span> API URL<input name="apiBaseUrl" type="url" required value="https://api.kubus.site"></label>
 <label>Archive capacity (bytes)<input name="archiveBytes" type="number" min="1" value="53687091200"></label>
 <label>Archive record limit<input name="archiveRecords" type="number" min="1" value="100"></label>
 <label><input name="allowLan" type="checkbox"> Allow connections from devices on this network</label>

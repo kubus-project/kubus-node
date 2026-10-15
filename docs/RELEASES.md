@@ -10,9 +10,16 @@ kubus node uses SemVer. Exact Git and container tags are immutable.
 
 An alpha or beta never updates `latest`. Every `v*` tag runs type checking, tests, the TypeScript build, dependency audit, node and worker image builds, release-bundle checksums, and SPDX SBOM generation before GitHub release assets are published. A failed workflow is a failed release, regardless of whether the Git tag exists.
 
+## v0.8.2 — Dependency security and family branding
+
+This stable release includes the approved dependency lockfile security fixes
+and aligns the rendered kubus node brand with the rest of the 0.8.2 family.
+The brand update changes presentation only. Runtime protocols, stored data,
+identity, installer behavior, and operator interfaces are unchanged.
+
 ## v0.8.1 — First stable release
 
-kubus Node 0.8.1 is the first release on the stable channel: the container
+kubus node 0.8.1 is the first release on the stable channel: the container
 images are tagged `latest`, the npm package is published under `latest`, and
 the GitHub Release is a normal release, not a pre-release. The version lines
 up with the rest of the kubus 0.8.1 family release (art.kubus app and backend,
@@ -180,7 +187,7 @@ like a failed one.
 - **Failures are visible**, in plain language, and state that Node data and
   identity are untouched.
 - **Manage is separate.** Stopping the Node and the explicit delete-data path
-  moved to their own "Manage kubus Node" entry.
+  moved to their own "Manage kubus node" entry.
 
 All launcher text is ASCII: Windows PowerShell reads `.ps1` as ANSI unless it
 carries a BOM, so typographic punctuation rendered as mojibake in the page.

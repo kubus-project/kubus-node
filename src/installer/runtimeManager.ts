@@ -125,7 +125,7 @@ export class RuntimeManager {
   }
 
   private async requireMaterialized(): Promise<void> {
-    if (!existsSync(this.paths.compose)) throw new Error(`No installed kubus Node runtime was found at ${this.paths.root}. Run kubus-node setup first.`);
+  if (!existsSync(this.paths.compose)) throw new Error(`No installed kubus node runtime was found at ${this.paths.root}. Run kubus-node setup first.`);
     await this.preflight();
   }
 
@@ -149,7 +149,7 @@ export class RuntimeManager {
         const response = await fetch('http://127.0.0.1:8787/setup', { signal: AbortSignal.timeout(3000) });
         return response.ok;
       } catch { return false; }
-    }, 120, 3000, 'kubus Node bootstrap did not become ready in time.');
+    }, 120, 3000, 'kubus node bootstrap did not become ready in time.');
   }
 
   private async completeSetupTransition(): Promise<void> {
@@ -185,7 +185,7 @@ export class RuntimeManager {
   }
 
   private async waitForHealthy(): Promise<void> {
-    await until(async () => (await this.compose(['ps', '--format', 'json'], true)).includes('healthy'), 40, 3000, 'kubus Node did not become healthy in time. Its identity and data remain preserved; inspect kubus-node logs.');
+  await until(async () => (await this.compose(['ps', '--format', 'json'], true)).includes('healthy'), 40, 3000, 'kubus node did not become healthy in time. Its identity and data remain preserved; inspect kubus-node logs.');
   }
 }
 
@@ -199,7 +199,7 @@ export function findPackageRoot(from = path.dirname(fileURLToPath(import.meta.ur
   while (true) {
     if (existsSync(path.join(directory, 'package.json'))) return directory;
     const parent = path.dirname(directory);
-    if (parent === directory) throw new Error('Could not locate the kubus Node package root.');
+  if (parent === directory) throw new Error('Could not locate the kubus node package root.');
     directory = parent;
   }
 }

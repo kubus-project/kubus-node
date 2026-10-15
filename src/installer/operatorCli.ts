@@ -33,8 +33,8 @@ function print(value: unknown, json: boolean): void {
   if (json) { console.log(JSON.stringify(value, null, 2)); return; }
   if (typeof value === 'object' && value !== null) {
     const record = value as Record<string, unknown>;
-    if ('cli' in record && 'runtime' in record) console.log(`kubus Node CLI: ${record.cli}\nNode runtime: ${record.runtime}`);
-    else if ('runtime' in record && typeof record.runtime === 'string') console.log(`kubus Node runtime ${record.runtime}`);
+    if ('cli' in record && 'runtime' in record) console.log(`kubus node CLI: ${record.cli}\nNode runtime: ${record.runtime}`);
+    else if ('runtime' in record && typeof record.runtime === 'string') console.log(`kubus node runtime ${record.runtime}`);
     else console.log(JSON.stringify(value, null, 2));
     return;
   }

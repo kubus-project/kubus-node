@@ -14,7 +14,7 @@ export function guiHtml(): string {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <meta name="referrer" content="no-referrer">
-  <title>kubus Node</title>
+  <title>kubus node</title>
   <link rel="stylesheet" href="/gui/assets/gui.css">
 </head>
 <body>
@@ -23,7 +23,7 @@ export function guiHtml(): string {
     <div class="shell">
       <aside class="sidebar">
         <div class="brand">
-          <div class="brand-name">kubus Node</div>
+          <div class="brand-name"><span class="brand-kubus">kubus</span> node</div>
           <div class="brand-descriptor">Local runtime + public archive node</div>
         </div>
       </aside>
