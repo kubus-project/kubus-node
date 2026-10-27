@@ -227,7 +227,10 @@ describe('private spatial runtime', () => {
         // Never resolves on its own - only the cancellation's abort ends it,
         // simulating a real in-flight training run getting cancelled.
         return new Promise((_resolve, reject) => {
-          init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+          init?.signal?.addEventListener('abort', () => {
+            expect(store.snapshot().jobs?.[job.id]).toMatchObject({ state: 'cancelled' });
+            reject(new DOMException('aborted', 'AbortError'));
+          });
         });
       }
       throw new Error(`unexpected fetch to ${url}`);
@@ -256,6 +259,8 @@ describe('private spatial runtime', () => {
     const cancelled = await jobs.cancel(job.id);
     expect(cancelled.state).toBe('cancelled');
     expect(cancelled.stage).toBe('cancelled');
+    expect(jobs.health().running).toBe(0);
+    await jobs.cancel(job.id);
 
     const buckets = analytics.query('24h');
     expect(buckets).toHaveLength(1);
@@ -263,6 +268,28 @@ describe('private spatial runtime', () => {
     expect(buckets[0]!.processing.cancelled).toBe(1);
     expect(buckets[0]!.processing.completed).toBe(0);
     await analytics.flush();
+  });
+
+  it('does not cancel an operation when its terminal state cannot be persisted; retry is safe', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-cancel-persist-')); dirs.push(dir);
+    const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
+    const captures = new CaptureStore(dir, store);
+    const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: {}, files: validCaptureFiles() });
+    const jobs = new JobRuntime({ store, captureStore: captures, kubo: {} as never,
+      logger: { warn: () => undefined } as never, dataRoot: dir, concurrency: 0,
+      participationGate: { assertUsefulOperation: async () => undefined } as never,
+      workerAuth: { issue: async () => 'synthetic' } as never });
+    const job = await jobs.create('spatial.reconstruct', { captureId: capture.id });
+    const fail = vi.spyOn(fs, 'rename').mockRejectedValueOnce(new Error('synthetic storage failure'));
+    await expect(jobs.cancel(job.id)).rejects.toThrow('synthetic storage failure');
+    expect(jobs.get(job.id).state).toBe('queued');
+    expect(jobs.get(job.id).logs.filter(log => log.message === 'Job cancelled')).toHaveLength(0);
+    fail.mockRestore();
+    await jobs.cancel(job.id);
+    const disk = new LocalStore(path.join(dir, 'state.json')); await disk.load();
+    expect(disk.snapshot().jobs?.[job.id]).toMatchObject({ state: 'cancelled' });
+    await jobs.cancel(job.id);
+    expect(jobs.get(job.id).logs.filter(log => log.message === 'Job cancelled')).toHaveLength(1);
   });
 
   it('validates the versioned renderer-neutral spatial manifest', () => {

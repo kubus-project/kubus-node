@@ -66,6 +66,7 @@ function durationOf(job: LocalJob): number | undefined {
 export class JobRuntime {
   private running = new Map<string, AbortController>();
   private dispatching = false;
+  private readonly tasks = new Map<string, Promise<void>>();
   /** Tail of the in-flight reconstruction request per capture id. */
   private readonly captureLocks = new Map<string, Promise<void>>();
   constructor(
@@ -197,19 +198,29 @@ export class JobRuntime {
 
   async cancel(id: string): Promise<LocalJob> {
     const job = this.get(id);
-    if (['completed', 'failed', 'cancelled'].includes(job.state)) return job;
-    this.running.get(id)?.abort();
-    await this.patchJob(id, (current) => {
+    if (['completed', 'failed', 'cancelled'].includes(job.state)) {
+      await this.tasks.get(id);
+      return this.get(id);
+    }
+    let changed = false;
+    await this.deps.store.update((state) => {
+      const current = state.jobs?.[id] as LocalJob | undefined;
+      if (!current || ['completed', 'failed', 'cancelled'].includes(current.state)) return;
       current.state = 'cancelled';
       current.stage = 'cancelled';
       current.completedAt = current.updatedAt = new Date().toISOString();
       current.logs.push({ at: current.updatedAt, level: 'warn', message: 'Job cancelled' });
+      changed = true;
     });
-    // Finalized here, not in run()'s catch: by the time the abort causes
-    // that fetch to reject, state is already 'cancelled' and its early
-    // return (correctly) does nothing further, so this is the one place a
-    // user-initiated cancellation - queued or running - gets counted.
-    this.recordAnalytics('cancelled', { durationMs: durationOf(this.get(id)) });
+    // Persist the terminal decision before abort can reach run()'s catch.
+    // Failure to persist leaves the running operation untouched and retryable.
+    if (changed) {
+      this.running.get(id)?.abort();
+      this.recordAnalytics('cancelled', { durationMs: durationOf(this.get(id)) });
+    }
+    // This waits for Node-owned work only. Worker-process cancellation and
+    // readable-file deletion require a separate acknowledged cleanup protocol.
+    await this.tasks.get(id);
     return this.get(id);
   }
 
@@ -230,7 +241,11 @@ export class JobRuntime {
         if (!next) break;
         const controller = new AbortController();
         this.running.set(next.id, controller);
-        void this.run(next.id, controller).finally(() => { this.running.delete(next.id); this.schedule(); });
+        const task = this.run(next.id, controller).finally(() => {
+          this.running.delete(next.id); this.tasks.delete(next.id); this.schedule();
+        });
+        this.tasks.set(next.id, task);
+        void task.catch(() => this.deps.logger.warn({ jobId: next.id, code: 'job_state_persistence_failed' }, 'spatial job state could not be saved'));
       }
     } finally {
       this.dispatching = false;
@@ -248,6 +263,7 @@ export class JobRuntime {
           throw Object.assign(new Error(health.detail || 'Spatial worker is not ready'), { code: 'worker_unavailable' });
         }
       }
+      if (controller.signal.aborted || this.get(id).state === 'cancelled') return;
       const job = this.get(id);
       const capture = this.deps.captureStore.get(String(job.input.captureId));
       const outputDirectory = path.join(this.deps.dataRoot, 'private', 'jobs', id);
@@ -287,8 +303,10 @@ export class JobRuntime {
         current.stage = 'training'; current.progress = null; current.updatedAt = new Date().toISOString();
         current.logs.push({ at: current.updatedAt, level: 'info', message: 'Training (this can take a while; progress is not reported mid-run by this worker version)' });
       });
+      const authorization = await this.deps.workerAuth.issue(id, job.type);
+      if (controller.signal.aborted || this.get(id).state === 'cancelled') return;
       const response = await fetch(`${this.deps.workerUrl}/v1/process`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Kubus-Worker-Authorization': await this.deps.workerAuth.issue(id, job.type) }, signal: controller.signal,
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Kubus-Worker-Authorization': authorization }, signal: controller.signal,
         body: JSON.stringify({ jobId: id, type: job.type, captureDirectory: workerCaptureDirectory, outputDirectory, input: job.input }),
       });
       const body = await response.json().catch(() => ({})) as WorkerOutput & { error?: string };
@@ -375,6 +393,7 @@ export class JobRuntime {
     await this.deps.store.update((state) => {
       const job = state.jobs?.[id] as LocalJob | undefined;
       if (!job) throw localError(404, 'job_not_found');
+      if (job.state === 'cancelled') throw localError(409, 'job_cancelled');
       mutate(job);
     });
   }
