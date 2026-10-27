@@ -174,13 +174,24 @@ export class LocalStore {
   }
 
   async update(mutator: (state: LocalState) => void | Promise<void>): Promise<LocalState> {
-    if (!this.state) await this.load();
-    await mutator(this.state as LocalState);
-    (this.state as LocalState).updatedAt = new Date().toISOString();
-    const next = this.snapshot();
-    this.writeChain = this.writeChain.then(() => this.atomicWrite(next));
-    await this.writeChain;
-    return next;
+    // Serialize the mutation as well as the write. An async mutator must see
+    // the last committed state, and its candidate must remain invisible until
+    // persistence succeeds. Never leave a failed candidate in live memory.
+    const transaction = this.writeChain.then(async () => {
+      if (!this.state) await this.load();
+      const candidate = this.snapshot();
+      await mutator(candidate);
+      candidate.updatedAt = new Date().toISOString();
+      // Detach from references retained by a mutator before committing.
+      const next = JSON.parse(JSON.stringify(candidate)) as LocalState;
+      await this.atomicWrite(next);
+      this.state = next;
+      return this.snapshot();
+    });
+    // Recover only the scheduling tail: this caller still receives its own
+    // failure, while subsequent independent transactions can retry normally.
+    this.writeChain = transaction.then(() => undefined, () => undefined);
+    return transaction;
   }
 
   async getOrCreateNodeKey(provided?: string | null): Promise<string> {
@@ -202,8 +213,14 @@ export class LocalStore {
   private async atomicWrite(next: LocalState): Promise<void> {
     const dir = path.dirname(this.filePath);
     await fs.mkdir(dir, { recursive: true });
-    const tmp = path.join(dir, `.${path.basename(this.filePath)}.${process.pid}.${Date.now()}.tmp`);
-    await fs.writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
-    await fs.rename(tmp, this.filePath);
+    const tmp = path.join(dir, `.${path.basename(this.filePath)}.${process.pid}.${crypto.randomUUID()}.tmp`);
+    try {
+      await fs.writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+      await fs.rename(tmp, this.filePath);
+    } finally {
+      // Remove only this write's temporary file; never touch the committed
+      // state file when persistence fails. Preserve the original error.
+      await fs.rm(tmp, { force: true }).catch(() => undefined);
+    }
   }
 }
