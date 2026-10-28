@@ -1,3 +1,4 @@
+import { completedKuboError } from './fixtures/kuboErrors.js';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -44,7 +45,7 @@ it.skipIf(!rpc || !peer)('verifies managed ownership and fallback integrity agai
   await manager.acquire(cid, 'provider-input:synthetic-B');
   await manager.release(cid, 'archive:synthetic-A');
   expect(await isPinned(cid)).toBe(true);
-  const remove = vi.spyOn(kubo, 'pinRm').mockRejectedValueOnce(new Error('synthetic interrupted unpin'));
+  const remove = vi.spyOn(kubo, 'pinRm').mockRejectedValueOnce(completedKuboError('synthetic interrupted unpin'));
   await expect(manager.release(cid, 'provider-input:synthetic-B')).rejects.toThrow('synthetic interrupted');
   expect(await isPinned(cid)).toBe(true);
   const restored = new LocalStore(file);

@@ -1,3 +1,4 @@
+import { completedKuboError } from './fixtures/kuboErrors.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -129,7 +130,7 @@ it('retries an interrupted unpin after a state reload without losing shared refe
   await desired([record()]);
   await run();
   await desired([]);
-  kubo.pinRm.mockRejectedValueOnce(new Error('synthetic offline'));
+  kubo.pinRm.mockRejectedValueOnce(completedKuboError('synthetic offline'));
   await expect(run()).rejects.toThrow('synthetic offline');
   expect(store.snapshot().managedPins![canonicalPinCid(first)]!.state).toBe('release_pending');
   const restored = new LocalStore(file);

@@ -91,7 +91,7 @@ export class RemoteComputeRuntime {
       plaintextBlocked: records.filter(record => record.cleanup?.plaintext === 'blocked').length,
       inputPinReleasesPending: records.filter(record => record.cleanup?.inputPinReleasePending).length,
       managedInputUnpinsPending: Object.values(state.managedPins || {}).filter(record =>
-        record.state === 'release_pending' && /^(provider-input|requester-input):/.test(record.lastReleasedOwner || '')).length,
+        ['release_pending', 'releasing', 'release_uncertain'].includes(record.state) && /^(provider-input|requester-input):/.test(record.lastReleasedOwner || '')).length,
       requesterSubmissionsUnconfirmed: Object.values(state.privateComputeCids || {}).filter(record => record.submissionReconciliationRequired).length,
       legacyReviewRequired: records.filter(record => !record.cleanup || (!record.cleanup.pinOwner && record.cleanup.inputPinReleasePending)).length };
   }

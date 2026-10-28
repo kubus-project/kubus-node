@@ -1,3 +1,4 @@
+import { completedKuboError } from './fixtures/kuboErrors.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -123,7 +124,7 @@ it('serializes separate manager instances and preserves another owner of a share
 it('retries a durable failed unpin after restart', async () => {
   const { manager, kubo, store, file } = await fixture();
   await manager.acquire(cid, 'archive:record-A');
-  kubo.pinRm.mockRejectedValueOnce(new Error('synthetic unpin failure'));
+  kubo.pinRm.mockRejectedValueOnce(completedKuboError('synthetic unpin failure'));
   await expect(manager.release(cid, 'archive:record-A')).rejects.toThrow(
     'synthetic unpin failure',
   );
@@ -134,13 +135,51 @@ it('retries a durable failed unpin after restart', async () => {
   expect(restored.snapshot().managedPins?.[cid]?.state).toBe('released');
   expect(kubo.pinRm).toHaveBeenCalledTimes(2);
 });
+it('journals an in-flight removal before RPC and refuses new owners after an unknown outcome', async () => {
+  const { manager, kubo, store, file, pins } = await fixture();
+  await manager.acquire(cid, 'archive:record-A');
+  let finishOldRequest!: () => void;
+  const oldRequestFinished = new Promise<void>(resolve => { finishOldRequest = () => { pins.delete(cid); resolve(); }; });
+  kubo.pinRm.mockImplementationOnce(async () => {
+    expect(store.snapshot().managedPins![cid]!.state).toBe('releasing');
+    throw new Error('synthetic connection lost; server may still be working');
+  });
+  await expect(manager.release(cid, 'archive:record-A')).rejects.toThrow('connection lost');
+  expect(store.snapshot().managedPins![cid]!.state).toBe('release_uncertain');
+  await expect(manager.acquire(cid, 'provider-input:new-owner')).rejects.toThrow('pin_release_outcome_requires_review');
+  expect(kubo.pinAdd).toHaveBeenCalledTimes(1);
+  finishOldRequest();
+  await oldRequestFinished;
+  const restored = new LocalStore(file);
+  await restored.load();
+  const restarted = new ManagedPins(kubo, restored, { allowUnpin: true });
+  await restarted.reconcile();
+  await expect(restarted.acquire(cid, 'archive:new-record')).rejects.toThrow('pin_release_outcome_requires_review');
+  await expect(restarted.release(cid, 'archive:record-A')).rejects.toThrow('pin_release_outcome_requires_review');
+  expect(kubo.pinRm).toHaveBeenCalledTimes(1);
+});
+it('does not replay a crash-interrupted in-flight release on restart', async () => {
+  const { manager, kubo, store, file } = await fixture();
+  await manager.acquire(cid, 'archive:record-A');
+  await store.update(state => {
+    state.managedPins![cid]!.owners = {};
+    state.managedPins![cid]!.state = 'releasing';
+    state.managedPins![cid]!.lastReleasedOwner = 'archive:record-A';
+  });
+  const restored = new LocalStore(file);
+  await restored.load();
+  const restarted = new ManagedPins(kubo, restored, { allowUnpin: true });
+  await restarted.reconcile();
+  expect(kubo.pinRm).not.toHaveBeenCalled();
+  await expect(restarted.acquire(cid, 'archive:record-B')).rejects.toThrow('pin_release_outcome_requires_review');
+});
 it('retains a pending release when a generic missing RPC route does not establish pin absence', async () => {
   const { manager, kubo, store } = await fixture();
   await manager.acquire(cid, 'archive:record-A');
-  kubo.pinRm.mockRejectedValueOnce(new Error('HTTP 404: not found'));
+  kubo.pinRm.mockRejectedValueOnce(completedKuboError('HTTP 404: not found'));
   await expect(manager.release(cid, 'archive:record-A')).rejects.toThrow('HTTP 404');
   expect(store.snapshot().managedPins?.[cid]?.state).toBe('release_pending');
-  kubo.pinRm.mockRejectedValueOnce(new Error('not pinned'));
+  kubo.pinRm.mockRejectedValueOnce(completedKuboError('not pinned'));
   await manager.reconcile();
   expect(store.snapshot().managedPins?.[cid]?.state).toBe('released');
 });
@@ -176,7 +215,7 @@ it.each(['desired', 'spatial', 'legacy-private'])(
 it('new references prevent an older failed release from unpinning reused content', async () => {
   const { manager, kubo } = await fixture();
   await manager.acquire(cid, 'archive:record-A');
-  kubo.pinRm.mockRejectedValueOnce(new Error('offline'));
+  kubo.pinRm.mockRejectedValueOnce(completedKuboError('offline'));
   await expect(manager.release(cid, 'archive:record-A')).rejects.toThrow();
   await manager.acquire(cid, 'spatial:output-B');
   await manager.reconcile();

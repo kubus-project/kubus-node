@@ -1,3 +1,4 @@
+import { completedKuboError } from './fixtures/kuboErrors.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -83,7 +84,7 @@ it('retains legacy inputs without ownership proof rather than directly unpinning
 it('keeps a failed input release pending and retries without claiming it completed', async () => {
   const { own, runtime, kubo, store } = await fixture();
   await own();
-  kubo.pinRm.mockRejectedValueOnce(new Error('synthetic pin RPC offline'));
+  kubo.pinRm.mockRejectedValueOnce(completedKuboError('synthetic pin RPC offline'));
   await expect(runtime.cancelRequesterJob(id, 'Bearer synthetic-user-token')).rejects.toThrow('synthetic pin RPC offline');
   expect(store.snapshot().privateComputeCids![cid]!.releasedAt).toBeUndefined();
   expect(store.snapshot().managedPins![canonicalPinCid(cid)]!.state).toBe('release_pending');

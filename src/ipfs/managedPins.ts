@@ -7,7 +7,7 @@ export interface ManagedPinRecord {
   cid: string;
   ownership: 'created' | 'preexisting' | 'unknown';
   owners: Record<string, { createdAt: string }>;
-  state: 'pending' | 'pinned' | 'release_pending' | 'retained' | 'released';
+  state: 'pending' | 'pinned' | 'release_pending' | 'releasing' | 'release_uncertain' | 'retained' | 'released';
   updatedAt: string;
   reason?: string;
   lastReleasedOwner?: string;
@@ -82,6 +82,9 @@ export class ManagedPins {
     this.checkOwner(owner);
     return this.exclusive(cid, async () => {
       const previous = this.store.snapshot().managedPins?.[cid];
+      if (previous?.state === 'releasing' || previous?.state === 'release_uncertain') {
+        throw new Error('pin_release_outcome_requires_review');
+      }
       const ownership =
         !previous || previous.state === 'released'
           ? await this.probeOwnership(cid)
@@ -124,6 +127,9 @@ export class ManagedPins {
     this.checkOwner(owner);
     return this.exclusive(cid, async () => {
       const record = this.store.snapshot().managedPins?.[cid];
+      if (record?.state === 'releasing' || record?.state === 'release_uncertain') {
+        throw new Error('pin_release_outcome_requires_review');
+      }
       if (
         !record ||
         (!record.owners[owner] && record.state !== 'release_pending')
@@ -213,9 +219,21 @@ export class ManagedPins {
       }
       return { ownerReleased: true, pinRemoved: false, reason: 'pin_release_activation_required' };
     }
+    await this.store.update(next => {
+      next.managedPins![cid]!.state = 'releasing';
+      next.managedPins![cid]!.reason = 'pin_release_in_flight';
+    });
     try {
       await this.kubo.pinRm(cid);
     } catch (error) {
+      const outcome = error as { outcomeUncertain?: boolean; kuboResponseComplete?: boolean };
+      if (outcome.outcomeUncertain === true || outcome.kuboResponseComplete !== true) {
+        await this.store.update(next => {
+          next.managedPins![cid]!.state = 'release_uncertain';
+          next.managedPins![cid]!.reason = 'pin_release_outcome_requires_review';
+        });
+        throw error;
+      }
       const message = String((error as Error).message || error).toLowerCase();
       // A generic HTTP 404 or "not found" can describe an unavailable RPC
       // route, not an absent pin. Only Kubo's explicit absent-pin response

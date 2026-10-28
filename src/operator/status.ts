@@ -111,6 +111,7 @@ export function buildStatusSummary(
     managedPins: {
       releaseEnabled: config.managedPinReleaseEnabled === true,
       pendingReleaseCount: Object.values(state.managedPins || {}).filter(pin => pin.state === 'release_pending').length,
+      uncertainReleaseCount: Object.values(state.managedPins || {}).filter(pin => pin.state === 'releasing' || pin.state === 'release_uncertain').length,
       retainedCount: Object.values(state.managedPins || {}).filter(pin => pin.state === 'retained').length,
     },
     publicPinSetTotal: state.publicPinSetTotal ?? state.publicPinSet?.length ?? 0,

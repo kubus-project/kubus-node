@@ -23,6 +23,11 @@ export interface RepoStat {
   RepoPath?: string;
 }
 
+export class KuboPinReleaseOutcomeUncertain extends Error {
+  readonly outcomeUncertain = true;
+  constructor() { super('kubo_pin_release_outcome_uncertain'); }
+}
+
 export class KuboClient {
   private readonly apiBase: string;
 
@@ -181,8 +186,19 @@ export class KuboClient {
     try {
       const response = await fetch(this.url(command, params), { method: 'POST', signal: controller.signal });
       const text = await response.text();
-      if (!response.ok) throw new Error(`Kubo ${command} failed with HTTP ${response.status}: ${text.slice(0, 200)}`);
+      if (!response.ok) throw Object.assign(
+        new Error(`Kubo ${command} failed with HTTP ${response.status}: ${text.slice(0, 200)}`),
+        { kuboResponseComplete: ![502, 503, 504].includes(response.status) },
+      );
       return (text ? JSON.parse(text) : {}) as T;
+    } catch (error) {
+      // A timed-out/aborted connection does not stop an already submitted
+      // server-side unpin. Never let an unknown result become a safe retry or
+      // permit a new owner to pin ahead of a delayed older removal.
+      if (command === 'pin/rm' && !(error as { kuboResponseComplete?: boolean }).kuboResponseComplete) {
+        throw new KuboPinReleaseOutcomeUncertain();
+      }
+      throw error;
     } finally {
       clearTimeout(timeout);
     }
