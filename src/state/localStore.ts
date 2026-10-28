@@ -31,6 +31,7 @@ export interface LocalState {
   publicPinSetTotal?: number;
   /** Authoritative completeness marker for the last canonical pin-set sync. */
   publicPinSetComplete?: boolean;
+  publicPinSetGeneration?: string;
   rewardableCidTotal?: number;
   latestPublicPinSetSyncAt?: string;
   latestPinReconcileAt?: string;

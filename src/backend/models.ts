@@ -60,6 +60,8 @@ export interface PinSetResponse {
   count: number;
   /** True only when the response represents the complete canonical set. */
   complete?: boolean;
+  /** Stable digest of the full filtered canonical set, independent of page. */
+  generation?: string;
   generatedAt?: string;
   policyVersion?: string;
   limit?: number;

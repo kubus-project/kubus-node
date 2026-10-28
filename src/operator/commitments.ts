@@ -66,9 +66,13 @@ export async function syncPublicPinSet(api: KubusApiClient, store: LocalStore, c
   // confused with an incomplete canonical response.
   const allRecords = [...(firstPinSetPage.records || [])];
   const total = Number(firstPinSetPage.count || 0);
+  const generation = firstPinSetPage.generation;
+  if (generation !== undefined && !/^sha256:[a-f0-9]{64}$/.test(generation)) {
+    throw new Error('The canonical public pin set generation is invalid.');
+  }
   for (let offset = allRecords.length; offset < total; offset += pageSize) {
     const page = await api.getPublicPinSet({ limit: pageSize, offset });
-    if (page.complete !== true || Number(page.count) !== total) {
+    if (page.complete !== true || Number(page.count) !== total || page.generation !== generation) {
       throw new Error('The canonical public pin set changed during synchronization.');
     }
     allRecords.push(...(page.records || []));
@@ -81,6 +85,15 @@ export async function syncPublicPinSet(api: KubusApiClient, store: LocalStore, c
   if (pinSetResponse.complete !== true || total !== publicPinSet.length) {
     throw new Error('The canonical public pin set is incomplete.');
   }
+  if (new Set(publicPinSet.map((record) => record.id)).size !== publicPinSet.length) {
+    throw new Error('The canonical public pin set contains duplicate records.');
+  }
+  if (generation) {
+    const confirmation = await api.getPublicPinSet({ limit: 1, offset: 0 });
+    if (confirmation.complete !== true || Number(confirmation.count) !== total || confirmation.generation !== generation) {
+      throw new Error('The canonical public pin set changed before synchronization completed.');
+    }
+  }
   const desired = planPublicPins(publicPinSet, config.maxPinnedCids, config.maxPinnedBytes, config.cidClassFilters);
   const rewardable = (rewardableResponse.records || [])
     .filter((record) => classFilterAllows(record, config.cidClassFilters));
@@ -90,6 +103,8 @@ export async function syncPublicPinSet(api: KubusApiClient, store: LocalStore, c
     state.desiredCids = desired;
     state.publicPinSetTotal = pinSetResponse.count;
     state.publicPinSetComplete = pinSetResponse.complete === true;
+    // Older servers can still supply content, but do not authorize removals.
+    state.publicPinSetGeneration = generation;
     state.rewardableCidTotal = rewardableResponse.count;
     state.latestPublicPinSetSyncAt = new Date().toISOString();
   });
