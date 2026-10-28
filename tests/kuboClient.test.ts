@@ -10,4 +10,12 @@ describe('KuboClient', () => {
     await expect(client.id()).resolves.toEqual({ ID: 'peer' });
     expect(fetchMock).toHaveBeenCalledWith('http://kubo:5001/api/v0/id', expect.objectContaining({ method: 'POST' }));
   });
+  it('allows an explicitly unpinned import while preserving the existing default', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({ Hash: 'synthetic-import' })));
+    const client = new KuboClient('http://kubo:5001');
+    await client.addBytes(new Uint8Array([1]), 'synthetic.bin', { pin: false });
+    await client.addBytes(new Uint8Array([1]), 'synthetic.bin');
+    expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('pin')).toBe('false');
+    expect(new URL(String(fetchMock.mock.calls[1]?.[0])).searchParams.get('pin')).toBe('true');
+  });
 });
