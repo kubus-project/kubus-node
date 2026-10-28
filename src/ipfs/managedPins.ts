@@ -1,4 +1,5 @@
-import { CID } from 'multiformats/cid';
+import { canonicalPinCid } from '../utils/cid.js';
+export { canonicalPinCid } from '../utils/cid.js';
 import type { KuboClient } from './kuboClient.js';
 import type { LocalState, LocalStore } from '../state/localStore.js';
 
@@ -9,26 +10,12 @@ export interface ManagedPinRecord {
   state: 'pending' | 'pinned' | 'release_pending' | 'retained' | 'released';
   updatedAt: string;
   reason?: string;
+  lastReleasedOwner?: string;
 }
 export interface PinReleaseResult {
   ownerReleased: boolean;
   pinRemoved: boolean;
   reason?: string;
-}
-
-export function canonicalPinCid(raw: string): string {
-  try {
-    if (
-      typeof raw !== 'string' ||
-      !raw ||
-      raw.length > 512 ||
-      raw.trim() !== raw
-    )
-      throw new Error();
-    return CID.parse(raw).toV1().toString();
-  } catch {
-    throw new Error('invalid_content_identifier');
-  }
 }
 
 const sharedLocks = new WeakMap<LocalStore, Map<string, Promise<unknown>>>();
@@ -39,6 +26,7 @@ export class ManagedPins {
   constructor(
     private readonly kubo: Pick<KuboClient, 'pinLs' | 'pinAdd' | 'pinRm'>,
     private readonly store: LocalStore,
+    private readonly options: { allowUnpin?: boolean } = {},
   ) {
     this.locks = sharedLocks.get(store) ?? new Map();
     sharedLocks.set(store, this.locks);
@@ -148,6 +136,7 @@ export class ManagedPins {
       await this.store.update((state) => {
         const current = state.managedPins![cid]!;
         delete current.owners[owner];
+        current.lastReleasedOwner = owner;
         if (!Object.keys(current.owners).length)
           current.state = 'release_pending';
         current.updatedAt = new Date().toISOString();
@@ -181,6 +170,10 @@ export class ManagedPins {
     )) {
       if (!record.pinOwner && !record.releasedAt && same(value)) return true;
     }
+    for (const value of Object.values(state.remoteJobs || {})) {
+      const record = value as { cleanup?: { inputCid?: string; pinOwner?: string; inputPinReleasePending?: boolean } };
+      if (record.cleanup && !record.cleanup.pinOwner && record.cleanup.inputPinReleasePending !== false && same(record.cleanup.inputCid)) return true;
+    }
     return false;
   }
 
@@ -211,6 +204,15 @@ export class ManagedPins {
         reason: 'preexisting_or_unknown_pin',
       };
     }
+    if (this.options.allowUnpin !== true) {
+      if (record.state !== 'release_pending' || record.reason !== 'pin_release_activation_required') {
+        await this.store.update(next => {
+          next.managedPins![cid]!.state = 'release_pending';
+          next.managedPins![cid]!.reason = 'pin_release_activation_required';
+        });
+      }
+      return { ownerReleased: true, pinRemoved: false, reason: 'pin_release_activation_required' };
+    }
     try {
       await this.kubo.pinRm(cid);
     } catch (error) {
@@ -234,12 +236,15 @@ export class ManagedPins {
     return { ownerReleased: true, pinRemoved: true };
   }
 
-  async reconcile(): Promise<void> {
+  async reconcile({ ownerPrefix }: { ownerPrefix?: string } = {}): Promise<void> {
+    let failure: unknown;
     for (const [cid, record] of Object.entries(
       this.store.snapshot().managedPins || {},
     )) {
       if (record.state !== 'release_pending') continue;
-      await this.exclusive(cid, () => this.releaseUnreferenced(cid));
+      if (ownerPrefix && !record.lastReleasedOwner?.startsWith(ownerPrefix)) continue;
+      try { await this.exclusive(cid, () => this.releaseUnreferenced(cid)); } catch (error) { failure ??= error; }
     }
+    if (failure) throw failure;
   }
 }

@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { Readable } from 'node:stream';
-import { normalizeCid } from '../utils/cid.js';
+import { canonicalPinCid, normalizeCid } from '../utils/cid.js';
 
 export interface KuboId {
   ID: string;
@@ -69,7 +69,7 @@ export class KuboClient {
    * APIs require the whole part in memory up front; a raw streamed fetch
    * body (`duplex: 'half'`) is the only way to keep this bounded.
    */
-  async addFileStreamed(filePath: string, filename: string, timeoutMs = 30 * 60 * 1000): Promise<{ Hash?: string }> {
+  async addFileStreamed(filePath: string, filename: string, timeoutMs = 30 * 60 * 1000, { pin = true }: { pin?: boolean } = {}): Promise<{ Hash?: string }> {
     const { size } = await stat(filePath);
     const boundary = `kubusNode${crypto.randomBytes(16).toString('hex')}`;
     const header = Buffer.from(
@@ -82,7 +82,7 @@ export class KuboClient {
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const body = Readable.toWeb(Readable.from(streamMultipartFile(header, filePath, footer))) as ReadableStream<Uint8Array>;
-      const params = new URLSearchParams({ pin: 'true', 'cid-version': '0' });
+      const params = new URLSearchParams({ pin: String(pin), 'cid-version': '0' });
       const response = await fetch(`${this.apiBase}/add?${params.toString()}`, {
         method: 'POST',
         // @ts-expect-error - Node's fetch (undici) requires `duplex` for a streamed body; not yet in the DOM lib types.
@@ -105,7 +105,17 @@ export class KuboClient {
   async pinLs(cid?: string, type: 'recursive' | 'direct' | 'indirect' | 'all' = 'recursive'): Promise<unknown> {
     const params: Record<string, string> = { type };
     if (cid) params.arg = normalizeCid(cid);
-    return this.post('pin/ls', params);
+    try {
+      return await this.post('pin/ls', params);
+    } catch (error) {
+      // Existing records can keep their v0 URLs while new managed pins use
+      // v1 consistently. Preserve legacy v0 pin discovery and retry only an
+      // explicit missing-pin response against the equivalent canonical key.
+      if (!params.arg || !String((error as Error).message).toLowerCase().includes('not pinned')) throw error;
+      const canonical = canonicalPinCid(params.arg);
+      if (canonical === params.arg) throw error;
+      return this.post('pin/ls', { ...params, arg: canonical });
+    }
   }
 
   async blockStat(cid: string): Promise<unknown> {

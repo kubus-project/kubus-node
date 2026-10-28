@@ -89,7 +89,7 @@ export interface LocalState {
     maxAcceptedInputBytes: number;
     minimumFreeVramBytes: number;
   };
-  privateComputeCids?: Record<string, { jobId?: string; role: 'encrypted_input' | 'private_output'; createdAt: string; expiresAt?: string; releasedAt?: string; pinOwner?: string }>;
+  privateComputeCids?: Record<string, { jobId?: string; role: 'encrypted_input' | 'private_output'; createdAt: string; expiresAt?: string; releasedAt?: string; pinOwner?: string; submissionState?: 'prepared' | 'submitted' | 'unconfirmed'; submissionReconciliationRequired?: boolean }>;
 
   /**
    * Why the optional remote-compute capabilities are or are not currently usable.

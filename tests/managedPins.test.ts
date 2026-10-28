@@ -40,7 +40,7 @@ async function fixture(preexisting = false) {
       pins.delete(value);
     }),
   };
-  return { store, file, kubo, pins, manager: new ManagedPins(kubo, store) };
+  return { store, file, kubo, pins, manager: new ManagedPins(kubo, store, { allowUnpin: true }) };
 }
 it('journals a new owner before pinning and removes its unreferenced owned pin', async () => {
   const { store, kubo, manager } = await fixture();
@@ -57,6 +57,22 @@ it('journals a new owner before pinning and removes its unreferenced owned pin',
   });
   expect(kubo.pinRm).toHaveBeenCalledWith(cid);
   expect(store.snapshot().managedPins?.[cid]?.state).toBe('released');
+});
+it('defaults to a durable activation gate instead of removing an owned pin', async () => {
+  const { store, kubo } = await fixture();
+  const safeDefault = new ManagedPins(kubo, store);
+  await safeDefault.acquire(cid, 'provider-input:job-A');
+  expect(await safeDefault.release(cid, 'provider-input:job-A')).toMatchObject({
+    ownerReleased: true, pinRemoved: false, reason: 'pin_release_activation_required',
+  });
+  expect(kubo.pinRm).not.toHaveBeenCalled();
+  const update = vi.spyOn(store, 'update');
+  await safeDefault.reconcile();
+  expect(update).not.toHaveBeenCalled();
+  await new ManagedPins(kubo, store, { allowUnpin: true }).reconcile({ ownerPrefix: 'archive:' });
+  expect(kubo.pinRm).not.toHaveBeenCalled();
+  await new ManagedPins(kubo, store, { allowUnpin: true }).reconcile({ ownerPrefix: 'provider-input:' });
+  expect(kubo.pinRm).toHaveBeenCalledTimes(1);
 });
 it('treats equivalent v0/v1 identifiers as one pre-existing manual pin', async () => {
   const { manager, kubo, store } = await fixture(true);
@@ -91,7 +107,7 @@ it('does not remove a pin whose initial ownership probe was unavailable', async 
 });
 it('serializes separate manager instances and preserves another owner of a shared CID', async () => {
   const { manager, kubo, store } = await fixture();
-  const other = new ManagedPins(kubo, store);
+  const other = new ManagedPins(kubo, store, { allowUnpin: true });
   await Promise.all([
     manager.acquire(v0, 'archive:record-A'),
     other.acquire(cid, 'provider-input:job-B'),
@@ -114,7 +130,7 @@ it('retries a durable failed unpin after restart', async () => {
   expect(store.snapshot().managedPins?.[cid]?.state).toBe('release_pending');
   const restored = new LocalStore(file);
   await restored.load();
-  await new ManagedPins(kubo, restored).reconcile();
+  await new ManagedPins(kubo, restored, { allowUnpin: true }).reconcile();
   expect(restored.snapshot().managedPins?.[cid]?.state).toBe('released');
   expect(kubo.pinRm).toHaveBeenCalledTimes(2);
 });

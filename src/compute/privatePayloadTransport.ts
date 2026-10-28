@@ -7,6 +7,7 @@ import type { KuboClient } from '../ipfs/kuboClient.js';
 import { localError } from '../localApi/pairingService.js';
 import type { LocalStore } from '../state/localStore.js';
 import type { ComputeIdentityService } from './computeIdentity.js';
+import { ManagedPins } from '../ipfs/managedPins.js';
 
 export interface ComputeKeyEnvelope {
   algorithm: 'X25519-HKDF-SHA256-AES-256-GCM';
@@ -46,6 +47,11 @@ export class PrivatePayloadTransport {
   constructor(private readonly deps: { captures: CaptureStore; kubo: KuboClient; store: LocalStore; identity: ComputeIdentityService; dataRoot: string; maxInputBytes: number }) {}
 
   async encryptCapture(captureId: string, providerNodeId: string, providerPublicKey: string): Promise<{ inputCid: string; inputBytes: number; inputHash: string; inputKeyEnvelope: ComputeKeyEnvelope; jobSpec: Record<string, unknown> }> {
+    let providerEncryptionKey: crypto.KeyObject;
+    try {
+      providerEncryptionKey = keyObject(providerPublicKey);
+      if (providerEncryptionKey.asymmetricKeyType !== 'x25519') throw new Error();
+    } catch { throw localError(400, 'compute_provider_key_invalid'); }
     const capture = this.deps.captures.get(captureId);
     const files = await walkFiles(capture.directory);
     const rawBytes = files.reduce((sum, item) => sum + item.bytes.byteLength, 0);
@@ -60,11 +66,14 @@ export class PrivatePayloadTransport {
     const header = { schema: 'kubus.encrypted-payload/1', algorithm: 'AES-256-GCM', compression: 'gzip', iv: payloadIv.toString('base64'), authTag: payloadCipher.getAuthTag().toString('base64'), plaintextHash: crypto.createHash('sha256').update(compressed).digest('hex') };
     const encrypted = Buffer.concat([Buffer.from('KUBUSENC1\n'), Buffer.from(JSON.stringify(header)), Buffer.from('\n'), ciphertext]);
     if (encrypted.byteLength > this.deps.maxInputBytes) throw localError(413, 'remote_compute_input_too_large');
-    const added = await this.deps.kubo.addBytes(encrypted, `${captureId}.kubusenc`);
+    const added = await this.deps.kubo.addBytes(encrypted, `${captureId}.kubusenc`, { pin: false });
     if (!added.Hash) throw localError(502, 'encrypted_input_cid_missing');
+    const pinOwner = `requester-input:${crypto.randomUUID()}`;
+    await this.deps.store.update((state) => { (state.privateComputeCids ??= {})[added.Hash!] = { role: 'encrypted_input', createdAt: new Date().toISOString(), pinOwner, submissionState: 'prepared' }; });
+    await new ManagedPins(this.deps.kubo, this.deps.store).acquire(added.Hash, pinOwner);
     const context = `${providerNodeId}:${added.Hash}`;
     const ephemeral = crypto.generateKeyPairSync('x25519');
-    const shared = crypto.diffieHellman({ privateKey: ephemeral.privateKey, publicKey: keyObject(providerPublicKey) });
+    const shared = crypto.diffieHellman({ privateKey: ephemeral.privateKey, publicKey: providerEncryptionKey });
     const salt = crypto.randomBytes(32);
     const wrappingKey = Buffer.from(crypto.hkdfSync('sha256', shared, salt, Buffer.from(context), 32));
     const wrapIv = crypto.randomBytes(12);
@@ -73,7 +82,6 @@ export class PrivatePayloadTransport {
     const wrappedKey = Buffer.concat([wrapCipher.update(dataKey), wrapCipher.final()]);
     const envelope: ComputeKeyEnvelope = { algorithm: 'X25519-HKDF-SHA256-AES-256-GCM', ephemeralPublicKey: exportPublic(ephemeral.publicKey), salt: salt.toString('base64'), iv: wrapIv.toString('base64'), authTag: wrapCipher.getAuthTag().toString('base64'), wrappedKey: wrappedKey.toString('base64'), context };
     const inputHash = crypto.createHash('sha256').update(encrypted).digest('hex');
-    await this.deps.store.update((state) => { (state.privateComputeCids ??= {})[added.Hash!] = { role: 'encrypted_input', createdAt: new Date().toISOString() }; });
     return { inputCid: added.Hash, inputBytes: encrypted.byteLength, inputHash, inputKeyEnvelope: envelope, jobSpec: { captureSchema: 'kubus.capture/1', encryptedPayloadSchema: 'kubus.encrypted-payload/1', sourceBytes: rawBytes, fileCount: files.length } };
   }
 

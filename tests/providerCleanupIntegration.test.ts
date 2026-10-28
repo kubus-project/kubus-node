@@ -8,6 +8,7 @@ import { JobRuntime } from '../src/jobs/jobRuntime.js';
 import { RemoteComputeRuntime } from '../src/compute/remoteComputeRuntime.js';
 import type { RemoteRuntimeRecord } from '../src/compute/providerCleanup.js';
 import type { RemoteComputeJob } from '../src/backend/models.js';
+import { syntheticCid } from './fixtures/contentIds.js';
 const id = '11111111-1111-4111-8111-111111111111';
 const roots: string[] = [];
 afterEach(async () => {
@@ -33,7 +34,7 @@ async function fixture(
     id,
     type: 'spatial.optimize',
     state: 'ACCEPTED',
-    inputCid: 'synthetic-ciphertext',
+    inputCid: syntheticCid('synthetic-ciphertext'),
     inputHash: 'synthetic-hash',
     inputBytes: 5,
     inputKeyEnvelope: {},
@@ -45,6 +46,7 @@ async function fixture(
     ).toBeDefined();
     if (failure === 'download') throw new Error('synthetic download failure');
   });
+  const pinRm = vi.fn(async () => undefined);
   const decrypt = vi.fn(
     async (_encrypted: unknown, _envelope: unknown, directory: string) => {
       await fs.mkdir(directory, { recursive: true });
@@ -98,8 +100,9 @@ async function fixture(
       remoteComputeMaxQueueDepth: 1,
       remoteComputeMaxInputBytes: 1024,
       operatorToken: 'synthetic-token',
+      managedPinReleaseEnabled: true,
     } as never,
-    kubo: { pinAdd, cat: async () => new Uint8Array(5) } as never,
+    kubo: { pinAdd, pinRm, pinLs: async () => ({ Keys: {} }), cat: async () => new Uint8Array(5) } as never,
     api: api as never,
     transport: { decryptToDirectory: decrypt } as never,
     identity: {} as never,
@@ -119,6 +122,7 @@ async function fixture(
     runtime,
     poll,
     pinAdd,
+    pinRm,
     decrypt,
     api,
     target: path.join(root, 'private', 'remote-jobs', id),
@@ -134,7 +138,7 @@ it.each(['download', 'decrypt', 'create'] as const)(
     const record = store.snapshot().remoteJobs?.[id] as RemoteRuntimeRecord;
     expect(record.cleanup).toMatchObject({
       plaintext: 'complete',
-      inputPinReleasePending: true,
+      inputPinReleasePending: false,
     });
     expect(store.snapshot().captures?.['remote-' + id]).toBeUndefined();
     expect(api.transitionProviderComputeJob).toHaveBeenCalledWith(
@@ -174,6 +178,22 @@ it('successful preparation keeps readable source while the child is still active
     id,
     expect.objectContaining({ state: 'RUNNING' }),
   );
+});
+
+it('releases only the provider owner while preserving a shared archive pin', async () => {
+  const { poll, runtime, store, pinRm, api } = await fixture();
+  await poll();
+  const provider = store.snapshot().remoteJobs![id] as RemoteRuntimeRecord;
+  await store.update(state => {
+    const pin = Object.values(state.managedPins!)[0]!;
+    pin.owners['archive:synthetic-other-record'] = { createdAt: new Date().toISOString() };
+  });
+  api.getProviderComputeJobs.mockResolvedValueOnce({ jobs: [{ id, state: 'CANCELLED' } as RemoteComputeJob] });
+  await poll();
+  expect((store.snapshot().remoteJobs![id] as RemoteRuntimeRecord).cleanup?.inputPinReleasePending).toBe(false);
+  expect(Object.values(store.snapshot().managedPins!)[0]!.owners).not.toHaveProperty(provider.cleanup!.pinOwner!);
+  expect(pinRm).not.toHaveBeenCalled();
+  expect(runtime.cleanupDiagnostics().plaintextPending).toBe(0);
 });
 
 it('paused providers still reconcile a cancellation for previously owned work', async () => {
@@ -220,6 +240,7 @@ it('expiry cleanup runs even when provider is paused and backend cannot be reach
           ?.plaintext,
       ).toBe('complete'),
     );
+    await runtime.reconcileProviderCleanup();
     await expect(fs.stat(target)).rejects.toMatchObject({ code: 'ENOENT' });
   } finally {
     runtime.stop();
@@ -254,7 +275,7 @@ it('authorization rejection stops backend polling but preserves the independent 
     expect(runtime.cleanupDiagnostics()).toMatchObject({
       plaintextPending: 0,
       plaintextBlocked: 0,
-      inputPinReleasesPending: 1,
+      inputPinReleasesPending: 0,
     });
   } finally {
     runtime.stop();

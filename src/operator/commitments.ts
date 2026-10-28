@@ -2,7 +2,8 @@ import type { KubusApiClient } from '../backend/kubusApiClient.js';
 import type { AvailabilityCommitment, PublicPinSetRecord, RewardableCid } from '../backend/models.js';
 import type { AppConfig } from '../config/schema.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
-import { reconcilePins } from '../ipfs/pinning.js';
+import { archivePinOwner, reconcilePins } from '../ipfs/pinning.js';
+import { canonicalPinCid, ManagedPins } from '../ipfs/managedPins.js';
 import { probeRetrieval, RETRIEVAL_AVAILABLE_STATES } from '../ipfs/retrieval.js';
 import type { LocalStore } from '../state/localStore.js';
 import { addHoursIso } from '../utils/time.js';
@@ -115,7 +116,8 @@ export const syncRewardableCids = syncPublicPinSet;
 
 export async function reconcileDesiredPins(kubo: KuboClient, store: LocalStore, config: AppConfig) {
   const desired = store.snapshot().desiredCids;
-  const results = await reconcilePins(kubo, desired, config.skipPinning, config.apiBaseUrl);
+  const managed = new ManagedPins(kubo, store, { allowUnpin: config.managedPinReleaseEnabled === true });
+  const results = await reconcilePins(kubo, desired, config.skipPinning, config.apiBaseUrl, managed);
   await store.update((state) => {
     state.pinnedCids = results.filter((result) => result.ok).map((result) => result.cid);
     state.failedCids = Object.fromEntries(
@@ -123,6 +125,22 @@ export async function reconcileDesiredPins(kubo: KuboClient, store: LocalStore, 
     );
     state.latestPinReconcileAt = new Date().toISOString();
   });
+  const current = store.snapshot();
+  // A legacy or incomplete canonical list cannot authorize removal. Default
+  // release activation is off even with a verified generation.
+  if (!config.skipPinning && current.publicPinSetComplete === true && /^sha256:[a-f0-9]{64}$/.test(current.publicPinSetGeneration || '')) {
+    const wanted = new Set(current.desiredCids.map(record => `${canonicalPinCid(record.cid)}|${archivePinOwner(record)}`));
+    await managed.reconcile();
+    const failures: unknown[] = [];
+    for (const [cid, record] of Object.entries(store.snapshot().managedPins || {})) {
+      for (const owner of Object.keys(record.owners)) {
+        if (owner.startsWith('archive:') && !wanted.has(`${cid}|${owner}`)) {
+          try { await managed.release(cid, owner); } catch (error) { failures.push(error); }
+        }
+      }
+    }
+    if (failures.length) throw failures[0];
+  }
   return results;
 }
 

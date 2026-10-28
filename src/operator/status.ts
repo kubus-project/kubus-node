@@ -108,6 +108,11 @@ export function buildStatusSummary(
     desiredCidCount: state.desiredCids?.length || 0,
     pinnedCidCount: state.pinnedCids?.length || 0,
     failedCidCount: Object.keys(state.failedCids || {}).length,
+    managedPins: {
+      releaseEnabled: config.managedPinReleaseEnabled === true,
+      pendingReleaseCount: Object.values(state.managedPins || {}).filter(pin => pin.state === 'release_pending').length,
+      retainedCount: Object.values(state.managedPins || {}).filter(pin => pin.state === 'retained').length,
+    },
     publicPinSetTotal: state.publicPinSetTotal ?? state.publicPinSet?.length ?? 0,
     pinnedRewardableCidCount: state.pinnedCids?.filter((cid) => (state.rewardableCids || []).some((item) => item.cid === cid)).length || 0,
     archiveContributionEstimate: buildLocalContributionEstimate(state, state.latestStatus),

@@ -19,6 +19,7 @@ import { PrivatePayloadTransport, type ComputeKeyEnvelope } from './privatePaylo
 import { effectiveComputeProviderSettings, validateComputeProviderSettings, type ComputeProviderSettings } from './providerSettings.js';
 
 import { ProviderCleanup, type RemoteRuntimeRecord } from './providerCleanup.js';
+import { ManagedPins } from '../ipfs/managedPins.js';
 
 const POLL_INTERVAL_MS = 5000;
 const POLL_MAX_BACKOFF_MS = 60000;
@@ -38,7 +39,9 @@ export class RemoteComputeRuntime {
   constructor(private readonly deps: {
     api: KubusApiClient; kubo: KuboClient; store: LocalStore; config: AppConfig; captures: CaptureStore; jobs: JobRuntime;
     gate: NetworkParticipationGate; identity: ComputeIdentityService; transport: PrivatePayloadTransport; logger: Logger;
-  }) { this.providerCleanup = new ProviderCleanup(deps.store, deps.jobs, deps.config.localDataPath); }
+  }) { this.providerCleanup = new ProviderCleanup(deps.store, deps.jobs, deps.config.localDataPath, async (cid, owner) => {
+    await new ManagedPins(deps.kubo, deps.store, { allowUnpin: deps.config.managedPinReleaseEnabled === true }).release(cid, owner);
+  }); }
 
   start(): void {
     if (!this.cleanupTimer) {
@@ -81,15 +84,25 @@ export class RemoteComputeRuntime {
     this.timer = undefined;
   }
 
-  cleanupDiagnostics(): { plaintextPending: number; plaintextBlocked: number; inputPinReleasesPending: number; legacyReviewRequired: number } {
-    const records = (Object.values(this.deps.store.snapshot().remoteJobs || {}) as RemoteRuntimeRecord[]).filter(record => record.role === 'provider');
+  cleanupDiagnostics(): { plaintextPending: number; plaintextBlocked: number; inputPinReleasesPending: number; managedInputUnpinsPending: number; requesterSubmissionsUnconfirmed: number; legacyReviewRequired: number } {
+    const state = this.deps.store.snapshot();
+    const records = (Object.values(state.remoteJobs || {}) as RemoteRuntimeRecord[]).filter(record => record.role === 'provider');
     return { plaintextPending: records.filter(record => record.cleanup && record.cleanup.plaintext !== 'complete').length,
       plaintextBlocked: records.filter(record => record.cleanup?.plaintext === 'blocked').length,
       inputPinReleasesPending: records.filter(record => record.cleanup?.inputPinReleasePending).length,
-      legacyReviewRequired: records.filter(record => !record.cleanup).length };
+      managedInputUnpinsPending: Object.values(state.managedPins || {}).filter(record =>
+        record.state === 'release_pending' && /^(provider-input|requester-input):/.test(record.lastReleasedOwner || '')).length,
+      requesterSubmissionsUnconfirmed: Object.values(state.privateComputeCids || {}).filter(record => record.submissionReconciliationRequired).length,
+      legacyReviewRequired: records.filter(record => !record.cleanup || (!record.cleanup.pinOwner && record.cleanup.inputPinReleasePending)).length };
   }
 
   async reconcileProviderCleanup(): Promise<ReturnType<RemoteComputeRuntime['cleanupDiagnostics']>> {
+    const managed = new ManagedPins(this.deps.kubo, this.deps.store, { allowUnpin: this.deps.config.managedPinReleaseEnabled === true });
+    // Retry old private-input releases without requiring backend access or a
+    // new canonical archive response. A pin RPC failure must not prevent
+    // removal of independently owned readable source directories.
+    await managed.reconcile({ ownerPrefix: 'provider-input:' }).catch(() => undefined);
+    await managed.reconcile({ ownerPrefix: 'requester-input:' }).catch(() => undefined);
     await this.providerCleanup.reconcilePending();
     return this.cleanupDiagnostics();
   }
@@ -228,11 +241,18 @@ export class RemoteComputeRuntime {
       }, input.authorization);
       await this.deps.store.update((state) => {
         (state.remoteJobs ??= {})[job.id] = { backendJobId: job.id, role: 'requester', state: job.state, updatedAt: new Date().toISOString() } satisfies RemoteRuntimeRecord;
-        const privateCid = state.privateComputeCids?.[encrypted.inputCid]; if (privateCid) privateCid.jobId = job.id;
+        const privateCid = state.privateComputeCids?.[encrypted.inputCid];
+        if (privateCid) { privateCid.jobId = job.id; privateCid.submissionState = 'submitted'; privateCid.submissionReconciliationRequired = false; }
       });
       return job;
     } catch (error) {
-      await this.deps.kubo.pinRm(encrypted.inputCid).catch(() => undefined);
+      // The backend may have committed the job before its response was lost.
+      // Retain the encrypted input for reconciliation rather than destroying
+      // an active provider's reference after an ambiguous submission failure.
+      await this.deps.store.update(state => {
+        const record = state.privateComputeCids?.[encrypted.inputCid];
+        if (record) { record.submissionState = 'unconfirmed'; record.submissionReconciliationRequired = true; }
+      }).catch(() => this.deps.logger.warn({ code: 'requester_submission_reconciliation_journal_failed' }, 'requester input remains retained for reconciliation'));
       throw error;
     }
   }
@@ -253,9 +273,11 @@ export class RemoteComputeRuntime {
     try { manifest = validateSpatialManifest(JSON.parse(Buffer.from(manifestBytes).toString('utf8'))); } catch { throw localError(422, 'remote_compute_manifest_invalid'); }
     const declared = new Set(job.outputCids);
     if (!declared.has(job.outputManifestCid) || manifest.variants.some((variant) => !declared.has(variant.cid))) throw localError(422, 'remote_compute_output_cid_mismatch');
-    for (const cid of job.outputCids) { await this.deps.kubo.catHead(cid, 1); await this.deps.kubo.pinAdd(cid); }
+    const pinOwner = `spatial:remote-${job.id}`;
+    const managed = new ManagedPins(this.deps.kubo, this.deps.store);
+    for (const cid of job.outputCids) { await this.deps.kubo.catHead(cid, 1); await managed.acquire(cid, pinOwner); }
     const id = manifest.id;
-    const record = { id, state: 'private_remote', manifestCid: job.outputManifestCid, manifest, createdAt: new Date().toISOString(), privateSourceCapture: true, remoteComputeJobId: job.id };
+    const record = { id, state: 'private_remote', manifestCid: job.outputManifestCid, manifest, createdAt: new Date().toISOString(), privateSourceCapture: true, remoteComputeJobId: job.id, pinOwner };
     await this.deps.store.update((state) => { (state.spatial ??= {})[id] = record; });
     return record;
   }
@@ -449,7 +471,9 @@ export class RemoteComputeRuntime {
       await this.providerCleanup.runPreparation(job.id, async () => {
         const captureId = `remote-${job.id}`;
         const directory = path.join(this.deps.config.localDataPath, 'private', 'remote-jobs', job.id, 'capture');
-        await this.deps.kubo.pinAdd(job.inputCid);
+        const pinOwner = record!.cleanup?.pinOwner;
+        if (!pinOwner) throw localError(409, 'legacy_provider_pin_ownership_requires_review');
+        await new ManagedPins(this.deps.kubo, this.deps.store).acquire(job.inputCid, pinOwner);
         this.providerCleanup.assertPreparing(job.id);
         const encrypted = await this.deps.kubo.cat(job.inputCid);
         this.providerCleanup.assertPreparing(job.id);
@@ -505,7 +529,12 @@ export class RemoteComputeRuntime {
   }
 
   private async releaseRequesterInput(job: RemoteComputeJob): Promise<void> {
-    await this.deps.kubo.pinRm(job.inputCid).catch(() => undefined);
+    if (!['COMPLETED', 'DISPUTED', 'FAILED', 'CANCELLED', 'EXPIRED', 'DECLINED'].includes(job.state)) {
+      throw localError(409, 'remote_compute_not_terminal');
+    }
+    const owner = this.deps.store.snapshot().privateComputeCids?.[job.inputCid]?.pinOwner;
+    if (!owner) return; // Legacy/manual ownership requires a separate migration.
+    await new ManagedPins(this.deps.kubo, this.deps.store, { allowUnpin: this.deps.config.managedPinReleaseEnabled === true }).release(job.inputCid, owner);
     await this.deps.store.update((state) => { const item = state.privateComputeCids?.[job.inputCid]; if (item) item.releasedAt = new Date().toISOString(); });
   }
 

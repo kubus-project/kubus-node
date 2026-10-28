@@ -9,6 +9,7 @@ import { validateSpatialManifest } from '../src/spatial/models.js';
 import { LocalStore } from '../src/state/localStore.js';
 import { MIN_VIEWS_FOR_RECONSTRUCTION } from '../src/spatial/nerfstudioAdapter.js';
 import { AnalyticsStore } from '../src/analytics/analyticsStore.js';
+import { syntheticCid } from './fixtures/contentIds.js';
 
 const dirs: string[] = [];
 
@@ -194,7 +195,7 @@ describe('private spatial runtime', () => {
 
     const jobs = new JobRuntime({
       store, captureStore: captures,
-      kubo: { addFileStreamed: async () => ({ Hash: 'bafyOutputCid' }), addBytes: async () => ({ Hash: 'bafyManifestCid' }) } as never,
+      kubo: { pinAdd: async () => undefined, pinLs: async () => ({ Keys: {} }), addFileStreamed: async () => ({ Hash: syntheticCid('output') }), addBytes: async () => ({ Hash: syntheticCid('manifest') }) } as never,
       logger: { warn: () => undefined } as never,
       dataRoot: dir, concurrency: 1, workerUrl: 'http://kubus-spatial-worker:8790',
       participationGate: { assertUsefulOperation: async () => { throw new Error('backend offline and participation lease expired'); } } as never,
@@ -251,7 +252,7 @@ describe('private spatial runtime', () => {
 
     const jobs = new JobRuntime({
       store, captureStore: captures,
-      kubo: { addFileStreamed: async () => ({ Hash: 'bafyOutputCid' }), addBytes: async () => ({ Hash: 'bafyManifestCid' }) } as never,
+      kubo: { pinAdd: async () => undefined, pinLs: async () => ({ Keys: {} }), addFileStreamed: async () => ({ Hash: syntheticCid('output') }), addBytes: async () => ({ Hash: syntheticCid('manifest') }) } as never,
       logger: { warn: () => undefined } as never,
       dataRoot: dir, concurrency: 1, workerUrl: 'http://kubus-spatial-worker:8790',
       participationGate: { assertUsefulOperation: async () => undefined } as never,

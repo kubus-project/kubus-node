@@ -14,6 +14,7 @@ export interface ProviderCleanupState {
   requested: boolean;
   plaintext: 'pending' | 'blocked' | 'complete';
   inputPinReleasePending: boolean;
+  pinOwner?: string;
   reason?: string;
 }
 export interface RemoteRuntimeRecord {
@@ -34,6 +35,7 @@ export class ProviderCleanup {
     private readonly store: LocalStore,
     private readonly jobs: JobRuntime,
     private readonly dataRoot: string,
+    private readonly releaseInputPin?: (cid: string, owner: string) => Promise<void>,
   ) {}
 
   async own(job: RemoteComputeJob): Promise<RemoteRuntimeRecord> {
@@ -63,6 +65,7 @@ export class ProviderCleanup {
           requested: false,
           plaintext: 'pending',
           inputPinReleasePending: true,
+          pinOwner: `provider-input:${job.id}`,
         },
       };
       if (
@@ -120,7 +123,7 @@ export class ProviderCleanup {
       if (
         record.role !== 'provider' ||
         !record.cleanup ||
-        record.cleanup.plaintext === 'complete'
+        (record.cleanup.plaintext === 'complete' && (!record.cleanup.inputPinReleasePending || !record.cleanup.pinOwner || !this.releaseInputPin))
       )
         continue;
       if (
@@ -151,7 +154,10 @@ export class ProviderCleanup {
       !jobIdPattern.test(id)
     )
       throw new Error('provider_cleanup_ownership_unverified');
-    if (record.cleanup.plaintext === 'complete') return;
+    if (record.cleanup.plaintext === 'complete') {
+      await this.releasePin(record);
+      return;
+    }
     try {
       // An early failure/expiry must not delete a directory while download or
       // decryption can still create files beneath it.
@@ -190,14 +196,32 @@ export class ProviderCleanup {
         current.cleanup!.reason = undefined;
         current.updatedAt = new Date().toISOString();
       });
-      // Ciphertext pin release is deliberately separate. Plaintext cleanup is
-      // not proof that a shared or manually pinned CID may be unpinned.
     } catch (error) {
       await this.store.update((state) => {
         const current = state.remoteJobs?.[id] as RemoteRuntimeRecord;
         current.cleanup!.plaintext = 'blocked';
         current.cleanup!.reason = 'provider_cleanup_retry_required';
         current.updatedAt = new Date().toISOString();
+      });
+      throw error;
+    }
+    await this.releasePin(this.store.snapshot().remoteJobs![id] as RemoteRuntimeRecord);
+  }
+
+  private async releasePin(record: RemoteRuntimeRecord): Promise<void> {
+    const cleanup = record.cleanup!;
+    // Older journals do not establish pin ownership; retain them for review.
+    if (!cleanup.inputPinReleasePending || !cleanup.pinOwner || !this.releaseInputPin) return;
+    try {
+      await this.releaseInputPin(cleanup.inputCid, cleanup.pinOwner);
+      await this.store.update(state => {
+        const current = state.remoteJobs![record.backendJobId] as RemoteRuntimeRecord;
+        current.cleanup!.inputPinReleasePending = false;
+        current.cleanup!.reason = undefined;
+      });
+    } catch (error) {
+      await this.store.update(state => {
+        (state.remoteJobs![record.backendJobId] as RemoteRuntimeRecord).cleanup!.reason = 'provider_pin_release_retry_required';
       });
       throw error;
     }

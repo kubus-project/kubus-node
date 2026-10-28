@@ -21,6 +21,8 @@ export interface AppConfig {
   devSeedCid?: string;
   devAllowEmptyCids: boolean;
   skipPinning: boolean;
+  /** Enable only after exclusive Kubo ownership and legacy-reference review. */
+  managedPinReleaseEnabled?: boolean;
   verifierEndpointUrl?: string;
   isProduction: boolean;
   guiEnabled: boolean;

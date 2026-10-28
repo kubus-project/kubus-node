@@ -1,7 +1,14 @@
 import type { KuboClient } from './kuboClient.js';
 import type { PublicPinSetRecord } from '../backend/models.js';
 import { normalizeCid } from '../utils/cid.js';
-import { canonicalPinCid } from './managedPins.js';
+import { canonicalPinCid, type ManagedPins } from './managedPins.js';
+import crypto from 'node:crypto';
+
+export function archivePinOwner(item: PublicPinSetRecord): string {
+  return `archive:${crypto.createHash('sha256').update(JSON.stringify([
+    item.id, item.objectType, item.objectId, item.version, item.role,
+  ])).digest('hex')}`;
+}
 
 export interface PinResult {
   cid: string;
@@ -47,9 +54,9 @@ async function pinWithBackendFallback(
   apiBaseUrl?: string,
 ): Promise<void> {
   const cid = normalizeCid(item.cid);
-  canonicalPinCid(cid);
+  const pinCid = canonicalPinCid(cid);
   try {
-    await kubo.pinAdd(cid);
+    await kubo.pinAdd(pinCid);
     return;
   } catch (pinError) {
     try {
@@ -60,7 +67,7 @@ async function pinWithBackendFallback(
       if (!added.Hash || canonicalPinCid(added.Hash) !== canonicalPinCid(cid)) {
         throw new Error('HTTP CID bytes hashed to a different content identifier');
       }
-      await kubo.pinAdd(cid);
+      await kubo.pinAdd(pinCid);
       return;
     } catch (fallbackError) {
       throw new Error(`Native Kubo retrieval failed (${String((pinError as Error).message || pinError)}); HTTP fallback failed (${String((fallbackError as Error).message || fallbackError)})`);
@@ -68,7 +75,7 @@ async function pinWithBackendFallback(
   }
 }
 
-export async function reconcilePins(kubo: KuboClient, cids: PublicPinSetRecord[], skipPinning = false, apiBaseUrl?: string): Promise<PinResult[]> {
+export async function reconcilePins(kubo: KuboClient, cids: PublicPinSetRecord[], skipPinning = false, apiBaseUrl?: string, managed?: ManagedPins): Promise<PinResult[]> {
   const results: PinResult[] = [];
   for (const item of cids) {
     const cid = normalizeCid(item.cid);
@@ -77,7 +84,8 @@ export async function reconcilePins(kubo: KuboClient, cids: PublicPinSetRecord[]
       continue;
     }
     try {
-      await pinWithBackendFallback(kubo, item, apiBaseUrl);
+      if (managed) await managed.acquire(cid, archivePinOwner(item), () => pinWithBackendFallback(kubo, item, apiBaseUrl));
+      else await pinWithBackendFallback(kubo, item, apiBaseUrl);
       results.push({ cid, ok: true });
     } catch (error) {
       results.push({ cid, ok: false, error: String((error as Error).message || error) });

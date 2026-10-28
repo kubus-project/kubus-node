@@ -31,6 +31,8 @@ describe('byte-aware public pinning', () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () => { events.push('http'); return new Response(new Uint8Array([1])); });
     const result = await reconcilePins(kubo as never, [{ id: '1', cid: validCid, role: 'record' }], false, 'http://api.test');
     expect(kubo.pinAdd).toHaveBeenCalledTimes(2);
+    expect(kubo.pinAdd).toHaveBeenNthCalledWith(1, CID.parse(validCid).toV1().toString());
+    expect(kubo.pinAdd).toHaveBeenNthCalledWith(2, CID.parse(validCid).toV1().toString());
     expect(kubo.addBytes).toHaveBeenCalledWith(expect.any(Uint8Array), `${validCid}.bin`, { pin: false });
     expect(events).toEqual(['http', 'add', 'kubo']);
     expect(result[0]?.ok).toBe(true);

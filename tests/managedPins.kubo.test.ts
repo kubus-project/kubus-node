@@ -7,6 +7,10 @@ import { KuboClient } from '../src/ipfs/kuboClient.js';
 import { ManagedPins, canonicalPinCid } from '../src/ipfs/managedPins.js';
 import { LocalStore } from '../src/state/localStore.js';
 import { reconcilePins } from '../src/ipfs/pinning.js';
+import { reconcileDesiredPins } from '../src/operator/commitments.js';
+import { ProviderCleanup } from '../src/compute/providerCleanup.js';
+import { RemoteComputeRuntime } from '../src/compute/remoteComputeRuntime.js';
+import type { RemoteComputeJob } from '../src/backend/models.js';
 
 // Explicit isolated-fixture opt-in, with peer identity checked before writes.
 // Never point this suite at an operator's existing repository.
@@ -27,7 +31,7 @@ it.skipIf(!rpc || !peer)('verifies managed ownership and fallback integrity agai
   const file = path.join(root, 'state.json');
   const store = new LocalStore(file);
   await store.load();
-  const manager = new ManagedPins(kubo, store);
+  const manager = new ManagedPins(kubo, store, { allowUnpin: true });
   const bytes = new TextEncoder().encode(`synthetic-fixture-${crypto.randomUUID()}`);
   const added = await kubo.addBytes(bytes, 'synthetic.bin', { pin: false });
   const cid = canonicalPinCid(added.Hash!);
@@ -45,13 +49,13 @@ it.skipIf(!rpc || !peer)('verifies managed ownership and fallback integrity agai
   expect(await isPinned(cid)).toBe(true);
   const restored = new LocalStore(file);
   await restored.load();
-  await new ManagedPins(kubo, restored).reconcile();
+  await new ManagedPins(kubo, restored, { allowUnpin: true }).reconcile();
   expect(await isPinned(cid)).toBe(false);
   remove.mockRestore();
 
   await kubo.pinAdd(cid);
-  await new ManagedPins(kubo, restored).acquire(cid, 'archive:synthetic-manual');
-  await new ManagedPins(kubo, restored).release(cid, 'archive:synthetic-manual');
+  await new ManagedPins(kubo, restored, { allowUnpin: true }).acquire(cid, 'archive:synthetic-manual');
+  await new ManagedPins(kubo, restored, { allowUnpin: true }).release(cid, 'archive:synthetic-manual');
   expect(await isPinned(cid)).toBe(true); // Never adopt a pre-existing manual pin for deletion.
 
   const matching = new TextEncoder().encode(`matching-${crypto.randomUUID()}`);
@@ -78,4 +82,39 @@ it.skipIf(!rpc || !peer)('verifies managed ownership and fallback integrity agai
   expect(match?.ok).toBe(true);
   expect(await isPinned(matchingCid)).toBe(true);
   expect(await isPinned(differentCid)).toBe(false);
+
+  // Exercise the actual archive, requester-cancellation and provider-cleanup
+  // callers against one real shared pin, not only the ownership helper.
+  const sharedBytes = new TextEncoder().encode(`shared-workflow-${crypto.randomUUID()}`);
+  const sharedCid = (await kubo.addBytes(sharedBytes, 'shared.bin', { pin: false })).Hash!;
+  const requesterId = '11111111-1111-4111-8111-111111111111';
+  const providerId = '22222222-2222-4222-8222-222222222222';
+  const requesterOwner = `requester-input:${requesterId}`;
+  const sharedManager = new ManagedPins(kubo, restored, { allowUnpin: true });
+  await restored.update(state => {
+    state.privateComputeCids![sharedCid] = { role: 'encrypted_input', pinOwner: requesterOwner, createdAt: new Date().toISOString() };
+    state.desiredCids = [{ id: 'shared-archive-fixture', cid: sharedCid, role: 'record' }];
+    state.publicPinSetComplete = true;
+    state.publicPinSetGeneration = `sha256:${'a'.repeat(64)}`;
+  });
+  await sharedManager.acquire(sharedCid, requesterOwner);
+  await expect(kubo.pinLs(sharedCid)).resolves.toHaveProperty('Keys');
+  const config = { localDataPath: root, managedPinReleaseEnabled: true, skipPinning: false };
+  await reconcileDesiredPins(kubo, restored, config as never);
+  const providerCleanup = new ProviderCleanup(restored, { ensureJobQuiescent: async () => undefined } as never, root,
+    async (value, owner) => { await sharedManager.release(value, owner); });
+  await providerCleanup.own({ id: providerId, inputCid: sharedCid, expiresAt: new Date(Date.now() + 60000).toISOString() } as RemoteComputeJob);
+  await sharedManager.acquire(sharedCid, `provider-input:${providerId}`);
+  const runtime = new RemoteComputeRuntime({
+    store: restored, kubo, config,
+    api: { cancelRemoteComputeJob: async () => ({ id: requesterId, state: 'CANCELLED', inputCid: sharedCid }) },
+    jobs: {}, captures: {}, transport: {}, identity: {}, gate: {}, logger: {},
+  } as never);
+  await runtime.cancelRequesterJob(requesterId, 'Bearer synthetic-user-token');
+  expect(await isPinned(sharedCid)).toBe(true);
+  await restored.update(state => { state.desiredCids = []; });
+  await reconcileDesiredPins(kubo, restored, config as never);
+  expect(await isPinned(sharedCid)).toBe(true);
+  await providerCleanup.request(providerId);
+  expect(await isPinned(sharedCid)).toBe(false);
 }, 20000);

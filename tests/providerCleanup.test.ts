@@ -68,6 +68,32 @@ it('journals ownership before decryption and removes a partially created source 
     inputPinReleasePending: true,
   });
 });
+it('retries pin release after restart without repeating successful plaintext cleanup', async () => {
+  const { store, root, jobs, target, file } = await fixture();
+  const releasePin = vi.fn(async () => undefined).mockRejectedValueOnce(new Error('synthetic pin RPC offline'));
+  const cleanup = new ProviderCleanup(store, jobs, root, releasePin);
+  await cleanup.own(job());
+  await readable(target);
+  await expect(cleanup.request(id)).rejects.toThrow('synthetic pin RPC offline');
+  expect(record(store).cleanup).toMatchObject({ plaintext: 'complete', inputPinReleasePending: true, reason: 'provider_pin_release_retry_required' });
+  await expect(fs.stat(target)).rejects.toMatchObject({ code: 'ENOENT' });
+  const restored = new LocalStore(file);
+  await restored.load();
+  await new ProviderCleanup(restored, jobs, root, releasePin).reconcilePending();
+  expect(record(restored).cleanup?.inputPinReleasePending).toBe(false);
+  expect(releasePin).toHaveBeenCalledTimes(2);
+});
+it('preserves unverified legacy input pins even when plaintext cleanup succeeds', async () => {
+  const { store, root, jobs, target } = await fixture();
+  const releasePin = vi.fn(async () => undefined);
+  const cleanup = new ProviderCleanup(store, jobs, root, releasePin);
+  await cleanup.own(job());
+  await store.update(state => { delete (state.remoteJobs![id] as RemoteRuntimeRecord).cleanup!.pinOwner; });
+  await readable(target);
+  await cleanup.request(id);
+  expect(record(store).cleanup).toMatchObject({ plaintext: 'complete', inputPinReleasePending: true });
+  expect(releasePin).not.toHaveBeenCalled();
+});
 it('waits for download/decrypt writers before acknowledging plaintext cleanup', async () => {
   const { cleanup, target, store } = await fixture();
   await cleanup.own(job());

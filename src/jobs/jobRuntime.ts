@@ -13,6 +13,7 @@ import type { NetworkParticipationGate } from '../participation/networkParticipa
 import type { WorkerAuthService } from '../spatial/workerAuth.js';
 import { resolveWorkerOutputFile } from './workerOutput.js';
 import { JobCleanup } from './jobCleanup.js';
+import { ManagedPins } from '../ipfs/managedPins.js';
 import type { CapabilityRegistry } from '../capabilities/registry.js';
 
 export type JobType = 'spatial.reconstruct' | 'spatial.optimize' | 'spatial.generate_preview';
@@ -414,16 +415,19 @@ export class JobRuntime {
       return { item, target: await resolveWorkerOutputFile(outputDirectory, item.path) };
     }));
     const variants: SpatialVariant[] = [];
+    const id = crypto.randomUUID();
+    const pinOwner = `spatial:${id}`;
+    const managed = new ManagedPins(this.deps.kubo, this.deps.store);
     for (const { item, target } of validated) {
       // Streamed from disk: a Gaussian splat PLY can be hundreds of megabytes
       // and must never be held whole in Node's memory just to re-emit it as
       // multipart form data.
       const { size: sizeBytes } = await fs.stat(target);
-      const added = await this.deps.kubo.addFileStreamed(target, path.basename(target));
+      const added = await this.deps.kubo.addFileStreamed(target, path.basename(target), undefined, { pin: false });
       if (!added.Hash) throw new Error('kubo_add_missing_cid');
+      await managed.acquire(added.Hash, pinOwner);
       variants.push({ role: item.role, cid: added.Hash, sizeBytes, mimeType: item.mimeType, format: item.format, storageClass: item.storageClass });
     }
-    const id = crypto.randomUUID();
     const manifest: SpatialManifest = {
       schema: 'kubus.spatial/1', type: 'gaussianSplat', id,
       artworkId: String(job.input.artworkId || capture.artworkId || ''), markerId: String(job.input.markerId || capture.markerId || '') || undefined,
@@ -434,9 +438,10 @@ export class JobRuntime {
     if (!manifest.artworkId) throw new Error('spatial_artwork_required');
     validateSpatialManifest(manifest);
     const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
-    const added = await this.deps.kubo.addBytes(manifestBytes, `${id}.spatial.json`);
+    const added = await this.deps.kubo.addBytes(manifestBytes, `${id}.spatial.json`, { pin: false });
     if (!added.Hash) throw new Error('kubo_add_manifest_missing_cid');
-    const record = { id, state: 'local', manifestCid: added.Hash, manifest, createdAt: manifest.createdAt, privateSourceCapture: true };
+    await managed.acquire(added.Hash, pinOwner);
+    const record = { id, state: 'local', manifestCid: added.Hash, manifest, createdAt: manifest.createdAt, privateSourceCapture: true, pinOwner };
     await this.deps.store.update((state) => { (state.spatial ??= {})[id] = record; });
     return record;
   }
