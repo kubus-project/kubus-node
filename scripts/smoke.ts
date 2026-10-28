@@ -12,6 +12,7 @@ import { refreshRewards } from '../src/operator/rewards.js';
 import { refreshStatus } from '../src/operator/status.js';
 import { LocalStore } from '../src/state/localStore.js';
 import { normalizeCid } from '../src/utils/cid.js';
+import { acquireRuntimeLease } from '../src/runtime/runtimeLease.js';
 
 const results: { step: string; ok: boolean; detail?: string }[] = [];
 
@@ -28,6 +29,8 @@ async function step(name: string, fn: () => Promise<unknown>) {
 
 async function main() {
   const config = parseEnv();
+  const lease = await acquireRuntimeLease(config.localStatePath);
+  try {
   const store = new LocalStore(config.localStatePath);
   await store.load();
   const api = new KubusApiClient({ baseUrl: config.apiBaseUrl, auth: new BearerAuthProvider(config.operatorToken) });
@@ -70,6 +73,9 @@ async function main() {
   const failed = results.filter((result) => !result.ok);
   console.log(JSON.stringify({ ok: failed.length === 0, results }, null, 2));
   process.exitCode = failed.length === 0 ? 0 : 1;
+  } finally {
+    await lease.release();
+  }
 }
 
 main().catch((error) => {

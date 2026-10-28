@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import type { ManagedPinRecord } from '../ipfs/managedPins.js';
 import type { JobCleanupRecord } from '../jobs/jobCleanup.js';
 import type {
   AvailabilityCommitment,
@@ -25,6 +26,7 @@ export interface LocalState {
   rewardableCids: RewardableCid[];
   desiredCids: PublicPinSetRecord[];
   pinnedCids: string[];
+  managedPins?: Record<string, ManagedPinRecord>;
   failedCids: Record<string, { error: string; at: string }>;
   publicPinSetTotal?: number;
   /** Authoritative completeness marker for the last canonical pin-set sync. */
@@ -86,7 +88,7 @@ export interface LocalState {
     maxAcceptedInputBytes: number;
     minimumFreeVramBytes: number;
   };
-  privateComputeCids?: Record<string, { jobId?: string; role: 'encrypted_input' | 'private_output'; createdAt: string; expiresAt?: string; releasedAt?: string }>;
+  privateComputeCids?: Record<string, { jobId?: string; role: 'encrypted_input' | 'private_output'; createdAt: string; expiresAt?: string; releasedAt?: string; pinOwner?: string }>;
 
   /**
    * Why the optional remote-compute capabilities are or are not currently usable.
@@ -144,11 +146,13 @@ const emptyState = (): LocalState => ({
 export class LocalStore {
   private state: LocalState | null = null;
   private writeChain: Promise<void> = Promise.resolve();
+  private readOnly = false;
 
   constructor(private readonly filePath: string) {}
 
-  async load(): Promise<LocalState> {
-    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+  async load({ readOnly = false }: { readOnly?: boolean } = {}): Promise<LocalState> {
+    this.readOnly = readOnly;
+    if (!readOnly) await fs.mkdir(path.dirname(this.filePath), { recursive: true });
     try {
       const raw = await fs.readFile(this.filePath, 'utf8');
       const parsed = JSON.parse(raw) as LocalState;
@@ -159,6 +163,7 @@ export class LocalStore {
       if (code === 'ENOENT') {
         this.state = emptyState();
       } else {
+        if (readOnly) throw new Error('state_snapshot_unavailable');
         const backup = `${this.filePath}.corrupt-${Date.now()}`;
         try {
           await fs.rename(this.filePath, backup);
@@ -176,6 +181,7 @@ export class LocalStore {
   }
 
   async update(mutator: (state: LocalState) => void | Promise<void>): Promise<LocalState> {
+    if (this.readOnly) throw new Error('state_store_read_only');
     // Serialize the mutation as well as the write. An async mutator must see
     // the last committed state, and its candidate must remain invisible until
     // persistence succeeds. Never leave a failed candidate in live memory.
