@@ -65,3 +65,5 @@ Drafts are in-memory: a draft is a transfer in progress, not durable state. A no
 ### Work-directory cleanup retry (candidate)
 
 `POST /local/v1/jobs/cleanup` requires a paired credential with `jobs:read` and `jobs:create` and a completed node-identity handshake. It retries only journaled terminal-job cleanup and returns aggregate job health, including `cleanupPending` and `cleanupBlocked`. It does not clear an unverified worker-instance change, delete captures or release IPFS pins. `POST /local/v1/jobs/:id/cancel` also requires `jobs:create`.
+
+`POST /local/v1/compute/cleanup` requires `jobs:read` plus `compute:manage` and retries requested/expired owned provider cleanup. `/local/v1/status` includes aggregate `computeCleanup` counts. `DELETE /local/v1/captures/:id` requires `captures:create` in addition to the capture read scope.

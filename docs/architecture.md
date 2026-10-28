@@ -21,7 +21,7 @@ flowchart LR
 
 `CapabilityRegistry` is the source of truth for runtime capability and health. A lightweight node exposes archive and local-gateway capabilities while spatial/GPU capability remains unavailable. Registration and heartbeat metadata advertise this without requiring old nodes to send the new fields.
 
-`JobRuntime` persists job state in the atomic local store, bounds concurrency, recovers interrupted running jobs to queued state, supports cancellation, validates private paths, and imports approved worker outputs into Kubo. GPU jobs never hold `ActionLock`; availability scheduling remains independent.
+`JobRuntime` persists job state in the atomic local store, bounds concurrency, records interrupted attempts as failed, retries journaled cleanup and requires an explicit new processing attempt, supports cancellation, validates private paths, and imports approved worker outputs into Kubo. GPU jobs never hold `ActionLock`; availability scheduling remains independent.
 
 Public replica state and private local state are separate. Only backend-issued public pin-set records enter byte-aware planning. A processed output stays local until authenticated publication creates a canonical object version.
 

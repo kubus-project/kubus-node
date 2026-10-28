@@ -391,6 +391,7 @@ async function route(
       participation: await participationGate.refresh(),
       jobs: jobs.health(),
       captures: captures.list().length,
+      computeCleanup: remoteCompute?.cleanupDiagnostics?.() || null,
       computeAuthorization: {
         state: computeAuthorizationRequired(state.computeAuthorization, config.operatorToken)
           ? 'COMPUTE_AUTHORIZATION_REQUIRED' : 'OK',
@@ -503,6 +504,7 @@ async function route(
   const captureMatch = path.match(/^\/local\/v1\/captures\/([^/]+)$/);
   if (captureMatch && method === 'GET') return jsonResponse(200, captures.get(captureMatch[1]!));
   if (captureMatch && method === 'DELETE') {
+    if (!(await pairing.authorize(credential, 'captures:create'))) throw localError(403, 'scope_required');
     await captures.delete(captureMatch[1]!);
     return jsonResponse(200, { deleted: true });
   }
@@ -553,6 +555,11 @@ async function route(
         inputBytes: Number(body.inputBytes || 0),
       }),
     );
+  }
+
+  if (method === 'POST' && path === '/local/v1/compute/cleanup') {
+    if (!(await pairing.authorize(credential, 'compute:manage'))) throw localError(403, 'scope_required');
+    return jsonResponse(200, await remoteCompute.reconcileProviderCleanup());
   }
 
   if (method === 'GET' && path === '/local/v1/compute/settings') {

@@ -115,6 +115,18 @@ export class JobRuntime {
     }
   }
 
+  /** Quiescence is stronger than a terminal database state or an HTTP abort. */
+  async ensureJobQuiescent(id: string): Promise<void> {
+    await this.cancel(id);
+    const job = this.get(id);
+    let journal = this.deps.store.snapshot().jobCleanup?.[id];
+    if (journal && journal.state !== 'complete') await this.cleanup.reconcile(id);
+    journal = this.deps.store.snapshot().jobCleanup?.[id];
+    if ((journal && journal.state !== 'complete') || (!journal && job.startedAt)) {
+      throw localError(409, 'worker_quiescence_unverified');
+    }
+  }
+
   list(): LocalJob[] {
     return (Object.values(this.deps.store.snapshot().jobs || {}) as LocalJob[])
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));

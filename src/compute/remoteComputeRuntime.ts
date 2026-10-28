@@ -18,14 +18,7 @@ import type { ComputeIdentityService } from './computeIdentity.js';
 import { PrivatePayloadTransport, type ComputeKeyEnvelope } from './privatePayloadTransport.js';
 import { effectiveComputeProviderSettings, validateComputeProviderSettings, type ComputeProviderSettings } from './providerSettings.js';
 
-interface RemoteRuntimeRecord {
-  backendJobId: string;
-  localJobId?: string;
-  captureId?: string;
-  role: 'requester' | 'provider';
-  state: string;
-  updatedAt: string;
-}
+import { ProviderCleanup, type RemoteRuntimeRecord } from './providerCleanup.js';
 
 const POLL_INTERVAL_MS = 5000;
 const POLL_MAX_BACKOFF_MS = 60000;
@@ -34,6 +27,8 @@ const FAILURE_SUMMARY_INTERVAL_MS = 60000;
 
 export class RemoteComputeRuntime {
   private timer?: NodeJS.Timeout;
+  private cleanupTimer?: NodeJS.Timeout;
+  private readonly providerCleanup: ProviderCleanup;
   private polling = false;
   private stopped = true;
   private readonly backoff = new Backoff(POLL_INTERVAL_MS, POLL_MAX_BACKOFF_MS);
@@ -43,9 +38,14 @@ export class RemoteComputeRuntime {
   constructor(private readonly deps: {
     api: KubusApiClient; kubo: KuboClient; store: LocalStore; config: AppConfig; captures: CaptureStore; jobs: JobRuntime;
     gate: NetworkParticipationGate; identity: ComputeIdentityService; transport: PrivatePayloadTransport; logger: Logger;
-  }) {}
+  }) { this.providerCleanup = new ProviderCleanup(deps.store, deps.jobs, deps.config.localDataPath); }
 
   start(): void {
+    if (!this.cleanupTimer) {
+      void this.reconcileProviderCleanup().catch(() => this.deps.logger.warn({ code: 'provider_cleanup_retry_required' }, 'provider cleanup could not run'));
+      this.cleanupTimer = setInterval(() => void this.reconcileProviderCleanup().catch(() => this.deps.logger.warn({ code: 'provider_cleanup_retry_required' }, 'provider cleanup could not run')), POLL_INTERVAL_MS);
+      this.cleanupTimer.unref();
+    }
     if (!this.stopped) return;
     // A blocked verdict recorded against the credential still in use survives a
     // restart. Starting the loop anyway would re-learn the same 403 the hard
@@ -70,9 +70,28 @@ export class RemoteComputeRuntime {
   }
 
   stop(): void {
+    this.stopProviderPolling();
+    if (this.cleanupTimer) clearInterval(this.cleanupTimer);
+    this.cleanupTimer = undefined;
+  }
+
+  private stopProviderPolling(): void {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
+  }
+
+  cleanupDiagnostics(): { plaintextPending: number; plaintextBlocked: number; inputPinReleasesPending: number; legacyReviewRequired: number } {
+    const records = (Object.values(this.deps.store.snapshot().remoteJobs || {}) as RemoteRuntimeRecord[]).filter(record => record.role === 'provider');
+    return { plaintextPending: records.filter(record => record.cleanup && record.cleanup.plaintext !== 'complete').length,
+      plaintextBlocked: records.filter(record => record.cleanup?.plaintext === 'blocked').length,
+      inputPinReleasesPending: records.filter(record => record.cleanup?.inputPinReleasePending).length,
+      legacyReviewRequired: records.filter(record => !record.cleanup).length };
+  }
+
+  async reconcileProviderCleanup(): Promise<ReturnType<RemoteComputeRuntime['cleanupDiagnostics']>> {
+    await this.providerCleanup.reconcilePending();
+    return this.cleanupDiagnostics();
   }
 
   private scheduleNextPoll(delayMs: number): void {
@@ -144,7 +163,7 @@ export class RemoteComputeRuntime {
         credentialFingerprint: fingerprint,
       };
     });
-    this.stop();
+    this.stopProviderPolling();
   }
 
   /** Records that the credential worked, clearing any previous blocked verdict. */
@@ -261,12 +280,16 @@ export class RemoteComputeRuntime {
   /** Returns the delay before the next poll: the normal interval on success, a growing backoff on failure. */
   private async pollProvider(): Promise<number> {
     const settings = this.settings();
-    if (this.polling || !settings.enabled || settings.paused) return POLL_INTERVAL_MS;
+    const ownedPending = Object.values(this.deps.store.snapshot().remoteJobs || {}).some(item => {
+      const record = item as RemoteRuntimeRecord;
+      return record.role === 'provider' && record.cleanup && record.cleanup.plaintext !== 'complete';
+    });
+    if (this.polling || ((!settings.enabled || settings.paused) && !ownedPending)) return POLL_INTERVAL_MS;
     const nodeId = this.deps.store.snapshot().nodeId;
     if (!nodeId) return POLL_INTERVAL_MS;
     this.polling = true;
     try {
-      const { jobs } = await this.deps.api.getProviderComputeJobs(nodeId, ['MATCHED', 'ACCEPTED', 'INPUT_READY', 'RUNNING', 'OUTPUT_READY']);
+      const { jobs } = await this.deps.api.getProviderComputeJobs(nodeId, ['MATCHED', 'ACCEPTED', 'INPUT_READY', 'RUNNING', 'OUTPUT_READY', 'CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED']);
       for (const job of jobs) await this.handleProviderJob(job).catch((error) => this.failProviderJob(job, error));
       this.onPollSucceeded();
       await this.recordAuthorized();
@@ -363,12 +386,39 @@ export class RemoteComputeRuntime {
 
   private async handleProviderJob(job: RemoteComputeJob): Promise<void> {
     const nodeId = this.deps.store.snapshot().nodeId!;
+    const existing = this.deps.store.snapshot().remoteJobs?.[job.id] as RemoteRuntimeRecord | undefined;
+    if (['CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED'].includes(job.state)) {
+      if (existing?.role === 'provider' && existing.cleanup) await this.providerCleanup.request(job.id);
+      return;
+    }
+    if (job.state === 'OUTPUT_READY' && existing?.cleanup) {
+      await this.providerCleanup.request(job.id);
+      await this.updateRecord(job.id, 'provider', 'OUTPUT_READY');
+      return;
+    }
+    const settingsAtDispatch = this.settings();
+    if ((!settingsAtDispatch.enabled || settingsAtDispatch.paused) && !existing?.localJobId) {
+      if (existing?.cleanup) await this.providerCleanup.request(job.id);
+      return;
+    }
+    if (existing?.cleanup?.requested) {
+      await this.providerCleanup.request(job.id);
+      if (['ACCEPTED', 'INPUT_READY', 'RUNNING'].includes(job.state)) {
+        await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'FAILED', metadata: { code: 'provider_input_released' } });
+        await this.updateRecord(job.id, 'provider', 'FAILED');
+      }
+      return;
+    }
     if (job.state === 'MATCHED') {
+      if (this.cleanupDiagnostics().plaintextBlocked > 0) {
+        await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'DECLINED', metadata: { code: 'provider_cleanup_pending' } });
+        return;
+      }
       await this.deps.gate.assertUsefulOperation('remote_compute_acceptance');
       const settings = this.settings();
       const active = Object.values(this.deps.store.snapshot().remoteJobs || {}).filter((item) => {
         const record = item as RemoteRuntimeRecord;
-        return record.role === 'provider' && ['ACCEPTED', 'INPUT_READY', 'RUNNING'].includes(record.state);
+        return record.role === 'provider' && ['PREPARING', 'ACCEPTED', 'INPUT_READY', 'RUNNING'].includes(record.state);
       }).length;
       if (Number(job.inputBytes || 0) > settings.maxAcceptedInputBytes) {
         await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'DECLINED', metadata: { code: 'provider_input_too_large' } });
@@ -382,20 +432,44 @@ export class RemoteComputeRuntime {
       job.state = 'ACCEPTED';
     }
     let record = this.deps.store.snapshot().remoteJobs?.[job.id] as RemoteRuntimeRecord | undefined;
-    if (job.state === 'ACCEPTED' || (job.state === 'INPUT_READY' && !record?.localJobId)) {
-      const captureId = `remote-${job.id}`;
-      const directory = path.join(this.deps.config.localDataPath, 'private', 'remote-jobs', job.id, 'capture');
-      await this.deps.kubo.pinAdd(job.inputCid);
-      const encrypted = await this.deps.kubo.cat(job.inputCid);
-      await this.deps.transport.decryptToDirectory(encrypted, job.inputKeyEnvelope as unknown as ComputeKeyEnvelope, directory, job.inputHash);
-      const capture = await this.readRemoteCapture(captureId, directory);
-      await this.deps.captures.registerRemote(capture);
+    // A crash after local insertion but before saving its ID must not create
+    // a second worker or orphan the first worker's readable input.
+    if (record?.cleanup && !record.localJobId) {
+      const child = (Object.values(this.deps.store.snapshot().jobs || {}) as LocalJob[])
+        .find(local => local.input?.remoteComputeJobId === job.id);
+      if (child) {
+        await this.deps.store.update(state => {
+          (state.remoteJobs![job.id] as RemoteRuntimeRecord).localJobId = child.id;
+        });
+        record = this.deps.store.snapshot().remoteJobs?.[job.id] as RemoteRuntimeRecord;
+      }
+    }
+    if ((job.state === 'ACCEPTED' || job.state === 'INPUT_READY') && !record?.localJobId) {
+      record = await this.providerCleanup.own(job);
+      await this.providerCleanup.runPreparation(job.id, async () => {
+        const captureId = `remote-${job.id}`;
+        const directory = path.join(this.deps.config.localDataPath, 'private', 'remote-jobs', job.id, 'capture');
+        await this.deps.kubo.pinAdd(job.inputCid);
+        this.providerCleanup.assertPreparing(job.id);
+        const encrypted = await this.deps.kubo.cat(job.inputCid);
+        this.providerCleanup.assertPreparing(job.id);
+        await this.deps.transport.decryptToDirectory(encrypted, job.inputKeyEnvelope as unknown as ComputeKeyEnvelope, directory, job.inputHash);
+        this.providerCleanup.assertPreparing(job.id);
+        const capture = await this.readRemoteCapture(captureId, directory);
+        await this.deps.captures.registerRemote(capture);
+        this.providerCleanup.assertPreparing(job.id);
+        const local = await this.deps.jobs.create(job.type as 'spatial.reconstruct', { captureId, artworkId: capture.artworkId, markerId: capture.markerId, remoteComputeJobId: job.id });
+        await this.deps.store.update(state => {
+          const current = state.remoteJobs![job.id] as RemoteRuntimeRecord;
+          current.localJobId = local.id; current.state = 'RUNNING'; current.updatedAt = new Date().toISOString();
+        });
+      });
+      record = this.deps.store.snapshot().remoteJobs?.[job.id] as RemoteRuntimeRecord;
+    }
+    if (record?.localJobId && ['ACCEPTED', 'INPUT_READY'].includes(job.state)) {
       if (job.state === 'ACCEPTED') await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'INPUT_READY' });
-      const local = await this.deps.jobs.create(job.type as 'spatial.reconstruct', { captureId, artworkId: capture.artworkId, markerId: capture.markerId, remoteComputeJobId: job.id });
-      await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'RUNNING', metadata: { localJobId: local.id } });
-      record = { backendJobId: job.id, localJobId: local.id, captureId, role: 'provider', state: 'RUNNING', updatedAt: new Date().toISOString() };
-      await this.deps.store.update((state) => { (state.remoteJobs ??= {})[job.id] = record!; });
-      return;
+      await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'RUNNING', metadata: { localJobId: record.localJobId } });
+      job.state = 'RUNNING';
     }
     if (job.state === 'RUNNING' && record?.localJobId) {
       const local = this.deps.jobs.get(record.localJobId);
@@ -426,10 +500,8 @@ export class RemoteComputeRuntime {
     this.deps.logger.warn({ jobId: job.id, code: (error as { code?: string }).code }, 'remote compute provider job failed');
   }
 
-  private async cleanupProvider(job: RemoteComputeJob, record: RemoteRuntimeRecord): Promise<void> {
-    if (record.captureId) await this.deps.captures.removeRemote(record.captureId).catch(() => undefined);
-    await fs.rm(path.join(this.deps.config.localDataPath, 'private', 'remote-jobs', job.id), { recursive: true, force: true });
-    await this.deps.kubo.pinRm(job.inputCid).catch(() => undefined);
+  private async cleanupProvider(job: RemoteComputeJob, _record: RemoteRuntimeRecord): Promise<void> {
+    await this.providerCleanup.request(job.id);
   }
 
   private async releaseRequesterInput(job: RemoteComputeJob): Promise<void> {

@@ -1,5 +1,4 @@
-import { promises as fs } from 'node:fs';
-import path from 'node:path';
+import { jobIdPattern, removeOwnedWorkDirectory } from './ownedWorkDirectory.js';
 import type { LocalStore } from '../state/localStore.js';
 import type { WorkerAuthService } from '../spatial/workerAuth.js';
 
@@ -21,7 +20,7 @@ export class JobCleanup {
     private readonly workerAuth: WorkerAuthService, private readonly workerUrl?: string) {}
 
   async own(jobId: string, type: string): Promise<void> {
-    if (!/^[0-9a-f-]{36}$/i.test(jobId)) throw new Error('cleanup_job_id_invalid');
+    if (!jobIdPattern.test(jobId)) throw new Error('cleanup_job_id_invalid');
     await this.store.update(state => {
       if (state.jobCleanup?.[jobId]) throw new Error('cleanup_job_already_owned');
       (state.jobCleanup ??= {})[jobId] = { version: 1, jobId, type, state: 'pending',
@@ -30,7 +29,7 @@ export class JobCleanup {
   }
 
   async markWorkerAttempt(jobId: string, instanceId: string): Promise<void> {
-    if (!/^[0-9a-f-]{36}$/i.test(instanceId)) throw new Error('worker_cleanup_protocol_required');
+    if (!jobIdPattern.test(instanceId)) throw new Error('worker_cleanup_protocol_required');
     await this.store.update(state => {
       const record = state.jobCleanup?.[jobId];
       if (!record || record.state === 'complete') throw new Error('cleanup_not_owned');
@@ -70,22 +69,7 @@ export class JobCleanup {
       }
       // Resolve every existing parent. Reject symlinks/junctions rather than
       // follow a job path into captures, another job, or an external directory.
-      const root = await fs.realpath(this.dataRoot);
-      let current = root;
-      for (const part of ['private', 'jobs', jobId]) {
-        current = path.join(current, part);
-        const info = await fs.lstat(current).catch(error => {
-          if (error.code === 'ENOENT') return null;
-          throw error;
-        });
-        if (!info) break;
-        if (info.isSymbolicLink() || !info.isDirectory() || await fs.realpath(current) !== current) {
-          throw new Error('cleanup_path_not_owned');
-        }
-      }
-      const target = path.resolve(root, 'private', 'jobs', jobId);
-      if (!target.startsWith(`${root}${path.sep}`)) throw new Error('cleanup_path_outside_root');
-      await fs.rm(target, { recursive: true, force: true });
+      await removeOwnedWorkDirectory(this.dataRoot, 'jobs', jobId);
       await this.store.update(state => {
         const current = state.jobCleanup?.[jobId];
         if (current) { current.state = 'complete'; current.reason = undefined; current.updatedAt = new Date().toISOString(); }

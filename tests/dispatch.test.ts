@@ -168,7 +168,13 @@ describe('dispatchLocalRequest', () => {
     expect(value.fingerprint).toBe(deps.identity.fingerprint);
   });
 
-  it.each(['/local/v1/jobs/job-1/cancel', '/local/v1/jobs/cleanup'])('read-only credentials cannot mutate job lifecycle via %s', async route => {
+  it('read-only capture credentials cannot delete a capture', async () => {
+    vi.spyOn(deps.pairing, 'authorize').mockImplementation(async (_credential, scope) => scope === 'captures:read');
+    await expect(dispatchLocalRequest(request({ method: 'DELETE', path: '/local/v1/captures/synthetic', credential: token }), deps))
+      .rejects.toMatchObject({ code: 'scope_required' });
+  });
+
+  it.each(['/local/v1/jobs/job-1/cancel', '/local/v1/jobs/cleanup', '/local/v1/compute/cleanup'])('read-only credentials cannot mutate job lifecycle via %s', async route => {
     vi.spyOn(deps.pairing, 'authorize').mockImplementation(async (_credential, scope) => scope === 'jobs:read');
     await expect(dispatchLocalRequest(request({ method: 'POST', path: route, credential: token }), deps))
       .rejects.toMatchObject({ code: 'scope_required' });
