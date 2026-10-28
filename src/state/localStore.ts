@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import type { JobCleanupRecord } from '../jobs/jobCleanup.js';
 import type {
   AvailabilityCommitment,
   AvailabilityEpoch,
@@ -58,6 +59,7 @@ export interface LocalState {
     revokedAt?: string;
   }>;
   jobs?: Record<string, unknown>;
+  jobCleanup?: Record<string, JobCleanupRecord>;
   captures?: Record<string, unknown>;
   spatial?: Record<string, unknown>;
   participation?: {

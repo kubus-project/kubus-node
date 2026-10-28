@@ -60,3 +60,8 @@ Local GUI endpoints are served by kubus-node itself, not the Kubus backend:
 `GET /gui/api/view` returns the composed view model the GUI renders: node identity, participation state in operator language, archive, storage, spatial, compute, contribution, devices and an advanced block. It contains no tokens, keys or credential material, and reports `null` for quantities the runtime does not measure rather than substituting a placeholder. `POST /gui/api/pairing/session` returns the one-time pairing code under `code` together with a locally rendered QR SVG; it is the one GUI response whose payload is intentionally exempt from field-name redaction.
 
 The GUI is local-only by default at `http://my.node.kubus.site:8787/gui` with fallback `http://127.0.0.1:8787/gui`. If it is exposed beyond localhost, `NODE_GUI_TOKEN` is required and GUI API calls must send `Authorization: Bearer <NODE_GUI_TOKEN>`.
+
+
+### Work-directory cleanup retry (candidate)
+
+`POST /local/v1/jobs/cleanup` requires a paired credential with `jobs:read` and `jobs:create` and a completed node-identity handshake. It retries only journaled terminal-job cleanup and returns aggregate job health, including `cleanupPending` and `cleanupBlocked`. It does not clear an unverified worker-instance change, delete captures or release IPFS pins. `POST /local/v1/jobs/:id/cancel` also requires `jobs:create`.

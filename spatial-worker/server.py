@@ -1,4 +1,5 @@
 import glob
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -6,6 +7,7 @@ import json
 import os
 import pathlib
 import subprocess
+import uuid
 from typing import Any
 
 import torch
@@ -13,12 +15,23 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 
 from gpu_tier import classify_vram_tier
+from job_control import JobControl, JobCancelled
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 WORKER_AUTH_KEY_PATH = os.environ.get("WORKER_AUTH_KEY_PATH", "/var/lib/kubus-node/worker-auth.key")
 
 
-class ProcessRequest(BaseModel):
+WORKER_INSTANCE_ID = str(uuid.uuid4())
+control = JobControl("/var/lib/kubus-node/private/worker-control")
+
+
+class JobRequest(BaseModel):
+    jobId: str
+    type: str
+    workerInstanceId: str
+
+
+class ProcessRequest(JobRequest):
     jobId: str
     type: str
     captureDirectory: str
@@ -50,14 +63,18 @@ def health() -> dict[str, Any]:
             "status": "unsupported",
             "gpu": gpu,
             "capabilities": [],
-            "version": "kubus-spatial-worker/1",
+            "version": "kubus-spatial-worker/2",
+            "cleanupProtocol": 1,
+            "workerInstanceId": WORKER_INSTANCE_ID,
             "detail": "A CUDA-capable NVIDIA GPU is required for local reconstruction",
         }
     return {
         "status": "ready",
         "gpu": gpu,
         "capabilities": ["spatial.reconstruct", "spatial.gaussianSplat"],
-        "version": "kubus-spatial-worker/1",
+        "version": "kubus-spatial-worker/2",
+        "cleanupProtocol": 1,
+        "workerInstanceId": WORKER_INSTANCE_ID,
     }
 
 
@@ -72,7 +89,7 @@ def decode_urlsafe(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
-def authorize_worker(token: str | None, request: ProcessRequest) -> None:
+def authorize_worker(token: str | None, request: JobRequest) -> None:
     if not token or "." not in token:
         raise HTTPException(status_code=401, detail="worker_authorization_required")
     try:
@@ -94,6 +111,31 @@ def authorize_worker(token: str | None, request: ProcessRequest) -> None:
 @app.post("/v1/process")
 def process(request: ProcessRequest, x_kubus_worker_authorization: str | None = Header(default=None)) -> dict[str, Any]:
     authorize_worker(x_kubus_worker_authorization, request)
+    if request.workerInstanceId != WORKER_INSTANCE_ID:
+        raise HTTPException(status_code=409, detail="worker_instance_changed")
+    try:
+        with control.job(request.jobId):
+            return process_owned(request)
+    except JobCancelled:
+        raise HTTPException(status_code=409, detail="job_cancelled")
+    except ValueError:
+        raise HTTPException(status_code=409, detail="job_identity_invalid_or_active")
+
+
+@app.post("/v1/jobs/cancel")
+async def cancel(request: JobRequest, x_kubus_worker_authorization: str | None = Header(default=None)):
+    authorize_worker(x_kubus_worker_authorization, request)
+    if request.workerInstanceId != WORKER_INSTANCE_ID:
+        raise HTTPException(status_code=409, detail="worker_instance_changed")
+    try:
+        return {**(await asyncio.to_thread(control.cancel, request.jobId)), "workerInstanceId": WORKER_INSTANCE_ID}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="job_identity_invalid")
+    except TimeoutError:
+        raise HTTPException(status_code=503, detail="worker_not_quiescent")
+
+
+def process_owned(request: ProcessRequest):
     if not torch.cuda.is_available():
         raise HTTPException(status_code=503, detail="gpu_unsupported")
     shared_root = pathlib.Path("/var/lib/kubus-node").resolve()
@@ -110,7 +152,7 @@ def process(request: ProcessRequest, x_kubus_worker_authorization: str | None = 
         "ns-train", "splatfacto", "--data", str(capture), "--output-dir", str(output / "training"),
         "--max-num-iterations", iterations, "--viewer.quit-on-train-completion", "True",
     ]
-    completed = subprocess.run(command, check=False, text=True, capture_output=True, timeout=24 * 60 * 60)
+    completed = control.run(request.jobId, command, timeout=24 * 60 * 60)
     if completed.returncode != 0:
         raise HTTPException(status_code=500, detail=(completed.stderr or completed.stdout)[-2000:])
     configs = sorted(glob.glob(str(output / "training" / "**" / "config.yml"), recursive=True))
@@ -118,9 +160,9 @@ def process(request: ProcessRequest, x_kubus_worker_authorization: str | None = 
         raise HTTPException(status_code=500, detail="training_config_not_found")
     export_dir = output / "export"
     export_dir.mkdir(exist_ok=True)
-    export = subprocess.run(
+    export = control.run(request.jobId,
         ["ns-export", "gaussian-splat", "--load-config", configs[-1], "--output-dir", str(export_dir)],
-        check=False, text=True, capture_output=True, timeout=2 * 60 * 60,
+        timeout=2 * 60 * 60,
     )
     if export.returncode != 0:
         raise HTTPException(status_code=500, detail=(export.stderr or export.stdout)[-2000:])
@@ -138,7 +180,7 @@ def process(request: ProcessRequest, x_kubus_worker_authorization: str | None = 
         "viewerDefaults": {"quality": "archive"},
         "processing": {
             "protocol": "kubus.spatial-job/1",
-            "workerVersion": "kubus-spatial-worker/1",
+            "workerVersion": "kubus-spatial-worker/2",
             "reconstruction": {
                 "engine": "nerfstudio",
                 "method": "splatfacto",

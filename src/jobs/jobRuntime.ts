@@ -11,6 +11,8 @@ import { validateSpatialManifest, type SpatialManifest, type SpatialVariant } fr
 import type { LocalStore } from '../state/localStore.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
 import type { WorkerAuthService } from '../spatial/workerAuth.js';
+import { resolveWorkerOutputFile } from './workerOutput.js';
+import { JobCleanup } from './jobCleanup.js';
 import type { CapabilityRegistry } from '../capabilities/registry.js';
 
 export type JobType = 'spatial.reconstruct' | 'spatial.optimize' | 'spatial.generate_preview';
@@ -66,6 +68,7 @@ function durationOf(job: LocalJob): number | undefined {
 export class JobRuntime {
   private running = new Map<string, AbortController>();
   private dispatching = false;
+  private readonly cleanup: JobCleanup;
   private readonly tasks = new Map<string, Promise<void>>();
   /** Tail of the in-flight reconstruction request per capture id. */
   private readonly captureLocks = new Map<string, Promise<void>>();
@@ -85,20 +88,31 @@ export class JobRuntime {
       /** Optional: local processing analytics. Absent in tests that do not care about it. */
       analytics?: AnalyticsStore;
     },
-  ) {}
+  ) { this.cleanup = new JobCleanup(deps.store, deps.dataRoot, deps.workerAuth, deps.workerUrl); }
 
   async start(): Promise<void> {
     await this.deps.store.update((state) => {
       for (const value of Object.values(state.jobs || {})) {
         const job = value as LocalJob;
-        if (job.state === 'running') {
-          job.state = 'queued';
-          job.updatedAt = new Date().toISOString();
-          job.logs.push({ at: job.updatedAt, level: 'warn', message: 'Recovered after node restart' });
+        if (job.state === 'running' || (job.state === 'queued' && state.jobCleanup?.[job.id])) {
+          job.state = 'failed'; job.stage = 'failed';
+          job.error = { code: 'interrupted_requires_retry', message: 'Processing interrupted; verify cleanup before starting a new attempt' };
+          job.completedAt = job.updatedAt = new Date().toISOString();
+          job.logs.push({ at: job.updatedAt, level: 'warn', message: 'Interrupted attempt retained for cleanup review' });
         }
       }
     });
+    await this.reconcileCleanup();
     this.schedule();
+  }
+
+  async reconcileCleanup(): Promise<void> {
+    for (const [id, record] of Object.entries(this.deps.store.snapshot().jobCleanup || {})) {
+      if (record.state === 'complete') continue;
+      await this.cleanup.reconcile(id).catch(() => {
+        this.deps.logger.warn({ jobId: id, code: 'cleanup_retry_required' }, 'spatial cleanup remains pending');
+      });
+    }
   }
 
   list(): LocalJob[] {
@@ -113,6 +127,9 @@ export class JobRuntime {
   }
 
   async create(type: JobType, input: Record<string, unknown>): Promise<LocalJob> {
+    if (Object.values(this.deps.store.snapshot().jobCleanup || {}).some(record => record.state === 'blocked')) {
+      throw localError(409, 'worker_cleanup_pending');
+    }
     // Network assignments retain participation authorization. A backend outage
     // must not revoke an owner's ability to process their own local capture.
     if (input.remoteComputeJobId) await this.deps.participationGate.assertUsefulOperation('remote_compute_execution');
@@ -224,8 +241,9 @@ export class JobRuntime {
     return this.get(id);
   }
 
-  health(): { configured: boolean; running: number; queued: number; concurrency: number } {
-    return { configured: Boolean(this.deps.workerUrl), running: this.running.size, queued: this.list().filter((job) => job.state === 'queued').length, concurrency: this.deps.concurrency };
+  health(): { configured: boolean; running: number; queued: number; concurrency: number; cleanupPending: number; cleanupBlocked: number } {
+    const records = Object.values(this.deps.store.snapshot().jobCleanup || {});
+    return { cleanupPending: records.filter(record => record.state !== 'complete').length, cleanupBlocked: records.filter(record => record.state === 'blocked').length, configured: Boolean(this.deps.workerUrl), running: this.running.size, queued: this.list().filter((job) => job.state === 'queued').length, concurrency: this.deps.concurrency };
   }
 
   private schedule(): void {
@@ -267,6 +285,13 @@ export class JobRuntime {
       const job = this.get(id);
       const capture = this.deps.captureStore.get(String(job.input.captureId));
       const outputDirectory = path.join(this.deps.dataRoot, 'private', 'jobs', id);
+      await this.cleanup.own(id, job.type);
+      const healthResponse = await fetch(`${this.deps.workerUrl}/health`, { signal: controller.signal });
+      const workerHealth = await healthResponse.json() as { cleanupProtocol?: number; workerInstanceId?: string };
+      if (!healthResponse.ok || workerHealth.cleanupProtocol !== 1 || !workerHealth.workerInstanceId) {
+        throw Object.assign(new Error('Worker cleanup protocol is required'), { code: 'worker_cleanup_protocol_required' });
+      }
+      if (controller.signal.aborted || this.get(id).state === 'cancelled') return;
       await fs.mkdir(outputDirectory, { recursive: true, mode: 0o700 });
       await this.patchJob(id, (current) => {
         current.state = 'running'; current.stage = 'preparing_dataset'; current.progress = 0.05;
@@ -305,9 +330,11 @@ export class JobRuntime {
       });
       const authorization = await this.deps.workerAuth.issue(id, job.type);
       if (controller.signal.aborted || this.get(id).state === 'cancelled') return;
+      await this.cleanup.markWorkerAttempt(id, workerHealth.workerInstanceId);
+      if (controller.signal.aborted || this.get(id).state === 'cancelled') return;
       const response = await fetch(`${this.deps.workerUrl}/v1/process`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Kubus-Worker-Authorization': authorization }, signal: controller.signal,
-        body: JSON.stringify({ jobId: id, type: job.type, captureDirectory: workerCaptureDirectory, outputDirectory, input: job.input }),
+        body: JSON.stringify({ jobId: id, type: job.type, workerInstanceId: workerHealth.workerInstanceId, captureDirectory: workerCaptureDirectory, outputDirectory, input: job.input }),
       });
       const body = await response.json().catch(() => ({})) as WorkerOutput & { error?: string };
       if (!response.ok) throw Object.assign(new Error(body.error || `worker_http_${response.status}`), { code: response.status === 503 ? 'worker_unsupported' : 'worker_failed' });
@@ -339,6 +366,10 @@ export class JobRuntime {
       });
       this.recordAnalytics(aborted ? 'cancelled' : 'failed', { durationMs: durationOf(this.get(id)) });
       this.deps.logger.warn({ jobId: id, code: (error as { code?: string }).code }, 'spatial job stopped');
+    } finally {
+      await this.cleanup.reconcile(id).catch(() => {
+        this.deps.logger.warn({ jobId: id, code: 'cleanup_retry_required' }, 'spatial cleanup remains pending');
+      });
     }
   }
 
@@ -359,10 +390,19 @@ export class JobRuntime {
 
   private async importOutputs(job: LocalJob, capture: ReturnType<CaptureStore['get']>, outputDirectory: string, output: WorkerOutput): Promise<Record<string, unknown>> {
     if (!Array.isArray(output.variants) || output.variants.length === 0) throw Object.assign(new Error('Worker returned no variants'), { code: 'worker_output_invalid' });
+    if (output.variants.length > 16) throw new Error('worker_output_variant_limit');
+    const validated = await Promise.all(output.variants.map(async item => {
+      if (!['spatial_preview', 'spatial_mobile', 'spatial_archive', 'model3d'].includes(item.role) ||
+          !['hot', 'warm', 'cold'].includes(item.storageClass) ||
+          typeof item.format !== 'string' || typeof item.mimeType !== 'string' ||
+          !/^(?:application|model)\/[a-z0-9.+-]+$/i.test(item.mimeType) ||
+          path.extname(item.path).slice(1).toLowerCase() !== item.format.toLowerCase()) {
+        throw new Error('worker_output_variant_invalid');
+      }
+      return { item, target: await resolveWorkerOutputFile(outputDirectory, item.path) };
+    }));
     const variants: SpatialVariant[] = [];
-    for (const item of output.variants) {
-      const target = path.resolve(outputDirectory, item.path);
-      if (!target.startsWith(`${path.resolve(outputDirectory)}${path.sep}`)) throw new Error('worker_output_path_invalid');
+    for (const { item, target } of validated) {
       // Streamed from disk: a Gaussian splat PLY can be hundreds of megabytes
       // and must never be held whole in Node's memory just to re-emit it as
       // multipart form data.

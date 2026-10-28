@@ -525,8 +525,17 @@ async function route(
     return jsonResponse(200, { jobs: list });
   }
 
+  if (method === 'POST' && path === '/local/v1/jobs/cleanup') {
+    if (!(await pairing.authorize(credential, 'jobs:create'))) throw localError(403, 'scope_required');
+    await jobs.reconcileCleanup();
+    return jsonResponse(200, { jobs: jobs.health() });
+  }
+
   const cancelMatch = path.match(/^\/local\/v1\/jobs\/([^/]+)\/cancel$/);
-  if (method === 'POST' && cancelMatch) return jsonResponse(200, await jobs.cancel(cancelMatch[1]!));
+  if (method === 'POST' && cancelMatch) {
+    if (!(await pairing.authorize(credential, 'jobs:create'))) throw localError(403, 'scope_required');
+    return jsonResponse(200, await jobs.cancel(cancelMatch[1]!));
+  }
 
   const jobMatch = path.match(/^\/local\/v1\/jobs\/([^/]+)$/);
   if (method === 'GET' && jobMatch) {
