@@ -63,10 +63,19 @@ it('treats equivalent v0/v1 identifiers as one pre-existing manual pin', async (
   await manager.acquire(cid, 'archive:record-A');
   await manager.release(v0, 'archive:record-A');
   expect(kubo.pinRm).not.toHaveBeenCalled();
+  expect(kubo.pinLs).toHaveBeenCalledWith(undefined, 'all');
   expect(store.snapshot().managedPins?.[cid]).toMatchObject({
     state: 'retained',
     ownership: 'preexisting',
   });
+});
+it('retains a pin that existed only as a direct manual reference', async () => {
+  const { manager, kubo, store } = await fixture();
+  kubo.pinLs.mockResolvedValueOnce({ Keys: { [v0]: { Type: 'direct' } } });
+  await manager.acquire(cid, 'archive:record-A');
+  await manager.release(cid, 'archive:record-A');
+  expect(kubo.pinRm).not.toHaveBeenCalled();
+  expect(store.snapshot().managedPins?.[cid]?.ownership).toBe('preexisting');
 });
 it('does not remove a pin whose initial ownership probe was unavailable', async () => {
   const { manager, kubo } = await fixture();

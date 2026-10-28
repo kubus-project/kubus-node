@@ -66,7 +66,9 @@ export class ManagedPins {
     cid: string,
   ): Promise<ManagedPinRecord['ownership']> {
     try {
-      const result = (await this.kubo.pinLs()) as {
+      // A manual direct or indirect reference also predates this owner. Do
+      // not mistake it for absence merely because it is not recursive.
+      const result = (await this.kubo.pinLs(undefined, 'all')) as {
         Keys?: Record<string, unknown>;
       };
       if (

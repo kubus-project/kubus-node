@@ -18,4 +18,9 @@ describe('KuboClient', () => {
     expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('pin')).toBe('false');
     expect(new URL(String(fetchMock.mock.calls[1]?.[0])).searchParams.get('pin')).toBe('true');
   });
+  it('can include direct and indirect pins when checking prior ownership', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{"Keys":{}}'));
+    await new KuboClient('http://kubo:5001').pinLs(undefined, 'all');
+    expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('type')).toBe('all');
+  });
 });

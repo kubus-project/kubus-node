@@ -102,8 +102,8 @@ export class KuboClient {
     }
   }
 
-  async pinLs(cid?: string): Promise<unknown> {
-    const params: Record<string, string> = { type: 'recursive' };
+  async pinLs(cid?: string, type: 'recursive' | 'direct' | 'indirect' | 'all' = 'recursive'): Promise<unknown> {
+    const params: Record<string, string> = { type };
     if (cid) params.arg = normalizeCid(cid);
     return this.post('pin/ls', params);
   }
