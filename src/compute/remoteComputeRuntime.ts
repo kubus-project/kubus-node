@@ -18,14 +18,8 @@ import type { ComputeIdentityService } from './computeIdentity.js';
 import { PrivatePayloadTransport, type ComputeKeyEnvelope } from './privatePayloadTransport.js';
 import { effectiveComputeProviderSettings, validateComputeProviderSettings, type ComputeProviderSettings } from './providerSettings.js';
 
-interface RemoteRuntimeRecord {
-  backendJobId: string;
-  localJobId?: string;
-  captureId?: string;
-  role: 'requester' | 'provider';
-  state: string;
-  updatedAt: string;
-}
+import { ProviderCleanup, type RemoteRuntimeRecord } from './providerCleanup.js';
+import { ManagedPins } from '../ipfs/managedPins.js';
 
 const POLL_INTERVAL_MS = 5000;
 const POLL_MAX_BACKOFF_MS = 60000;
@@ -34,6 +28,8 @@ const FAILURE_SUMMARY_INTERVAL_MS = 60000;
 
 export class RemoteComputeRuntime {
   private timer?: NodeJS.Timeout;
+  private cleanupTimer?: NodeJS.Timeout;
+  private readonly providerCleanup: ProviderCleanup;
   private polling = false;
   private stopped = true;
   private readonly backoff = new Backoff(POLL_INTERVAL_MS, POLL_MAX_BACKOFF_MS);
@@ -43,9 +39,16 @@ export class RemoteComputeRuntime {
   constructor(private readonly deps: {
     api: KubusApiClient; kubo: KuboClient; store: LocalStore; config: AppConfig; captures: CaptureStore; jobs: JobRuntime;
     gate: NetworkParticipationGate; identity: ComputeIdentityService; transport: PrivatePayloadTransport; logger: Logger;
-  }) {}
+  }) { this.providerCleanup = new ProviderCleanup(deps.store, deps.jobs, deps.config.localDataPath, async (cid, owner) => {
+    await new ManagedPins(deps.kubo, deps.store, { allowUnpin: deps.config.managedPinReleaseEnabled === true }).release(cid, owner);
+  }); }
 
   start(): void {
+    if (!this.cleanupTimer) {
+      void this.reconcileProviderCleanup().catch(() => this.deps.logger.warn({ code: 'provider_cleanup_retry_required' }, 'provider cleanup could not run'));
+      this.cleanupTimer = setInterval(() => void this.reconcileProviderCleanup().catch(() => this.deps.logger.warn({ code: 'provider_cleanup_retry_required' }, 'provider cleanup could not run')), POLL_INTERVAL_MS);
+      this.cleanupTimer.unref();
+    }
     if (!this.stopped) return;
     // A blocked verdict recorded against the credential still in use survives a
     // restart. Starting the loop anyway would re-learn the same 403 the hard
@@ -70,9 +73,38 @@ export class RemoteComputeRuntime {
   }
 
   stop(): void {
+    this.stopProviderPolling();
+    if (this.cleanupTimer) clearInterval(this.cleanupTimer);
+    this.cleanupTimer = undefined;
+  }
+
+  private stopProviderPolling(): void {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
+  }
+
+  cleanupDiagnostics(): { plaintextPending: number; plaintextBlocked: number; inputPinReleasesPending: number; managedInputUnpinsPending: number; requesterSubmissionsUnconfirmed: number; legacyReviewRequired: number } {
+    const state = this.deps.store.snapshot();
+    const records = (Object.values(state.remoteJobs || {}) as RemoteRuntimeRecord[]).filter(record => record.role === 'provider');
+    return { plaintextPending: records.filter(record => record.cleanup && record.cleanup.plaintext !== 'complete').length,
+      plaintextBlocked: records.filter(record => record.cleanup?.plaintext === 'blocked').length,
+      inputPinReleasesPending: records.filter(record => record.cleanup?.inputPinReleasePending).length,
+      managedInputUnpinsPending: Object.values(state.managedPins || {}).filter(record =>
+        ['release_pending', 'releasing', 'release_uncertain'].includes(record.state) && /^(provider-input|requester-input):/.test(record.lastReleasedOwner || '')).length,
+      requesterSubmissionsUnconfirmed: Object.values(state.privateComputeCids || {}).filter(record => record.submissionReconciliationRequired).length,
+      legacyReviewRequired: records.filter(record => !record.cleanup || (!record.cleanup.pinOwner && record.cleanup.inputPinReleasePending)).length };
+  }
+
+  async reconcileProviderCleanup(): Promise<ReturnType<RemoteComputeRuntime['cleanupDiagnostics']>> {
+    const managed = new ManagedPins(this.deps.kubo, this.deps.store, { allowUnpin: this.deps.config.managedPinReleaseEnabled === true });
+    // Retry old private-input releases without requiring backend access or a
+    // new canonical archive response. A pin RPC failure must not prevent
+    // removal of independently owned readable source directories.
+    await managed.reconcile({ ownerPrefix: 'provider-input:' }).catch(() => undefined);
+    await managed.reconcile({ ownerPrefix: 'requester-input:' }).catch(() => undefined);
+    await this.providerCleanup.reconcilePending();
+    return this.cleanupDiagnostics();
   }
 
   private scheduleNextPoll(delayMs: number): void {
@@ -144,7 +176,7 @@ export class RemoteComputeRuntime {
         credentialFingerprint: fingerprint,
       };
     });
-    this.stop();
+    this.stopProviderPolling();
   }
 
   /** Records that the credential worked, clearing any previous blocked verdict. */
@@ -209,11 +241,18 @@ export class RemoteComputeRuntime {
       }, input.authorization);
       await this.deps.store.update((state) => {
         (state.remoteJobs ??= {})[job.id] = { backendJobId: job.id, role: 'requester', state: job.state, updatedAt: new Date().toISOString() } satisfies RemoteRuntimeRecord;
-        const privateCid = state.privateComputeCids?.[encrypted.inputCid]; if (privateCid) privateCid.jobId = job.id;
+        const privateCid = state.privateComputeCids?.[encrypted.inputCid];
+        if (privateCid) { privateCid.jobId = job.id; privateCid.submissionState = 'submitted'; privateCid.submissionReconciliationRequired = false; }
       });
       return job;
     } catch (error) {
-      await this.deps.kubo.pinRm(encrypted.inputCid).catch(() => undefined);
+      // The backend may have committed the job before its response was lost.
+      // Retain the encrypted input for reconciliation rather than destroying
+      // an active provider's reference after an ambiguous submission failure.
+      await this.deps.store.update(state => {
+        const record = state.privateComputeCids?.[encrypted.inputCid];
+        if (record) { record.submissionState = 'unconfirmed'; record.submissionReconciliationRequired = true; }
+      }).catch(() => this.deps.logger.warn({ code: 'requester_submission_reconciliation_journal_failed' }, 'requester input remains retained for reconciliation'));
       throw error;
     }
   }
@@ -234,9 +273,11 @@ export class RemoteComputeRuntime {
     try { manifest = validateSpatialManifest(JSON.parse(Buffer.from(manifestBytes).toString('utf8'))); } catch { throw localError(422, 'remote_compute_manifest_invalid'); }
     const declared = new Set(job.outputCids);
     if (!declared.has(job.outputManifestCid) || manifest.variants.some((variant) => !declared.has(variant.cid))) throw localError(422, 'remote_compute_output_cid_mismatch');
-    for (const cid of job.outputCids) { await this.deps.kubo.catHead(cid, 1); await this.deps.kubo.pinAdd(cid); }
+    const pinOwner = `spatial:remote-${job.id}`;
+    const managed = new ManagedPins(this.deps.kubo, this.deps.store);
+    for (const cid of job.outputCids) { await this.deps.kubo.catHead(cid, 1); await managed.acquire(cid, pinOwner); }
     const id = manifest.id;
-    const record = { id, state: 'private_remote', manifestCid: job.outputManifestCid, manifest, createdAt: new Date().toISOString(), privateSourceCapture: true, remoteComputeJobId: job.id };
+    const record = { id, state: 'private_remote', manifestCid: job.outputManifestCid, manifest, createdAt: new Date().toISOString(), privateSourceCapture: true, remoteComputeJobId: job.id, pinOwner };
     await this.deps.store.update((state) => { (state.spatial ??= {})[id] = record; });
     return record;
   }
@@ -261,12 +302,16 @@ export class RemoteComputeRuntime {
   /** Returns the delay before the next poll: the normal interval on success, a growing backoff on failure. */
   private async pollProvider(): Promise<number> {
     const settings = this.settings();
-    if (this.polling || !settings.enabled || settings.paused) return POLL_INTERVAL_MS;
+    const ownedPending = Object.values(this.deps.store.snapshot().remoteJobs || {}).some(item => {
+      const record = item as RemoteRuntimeRecord;
+      return record.role === 'provider' && record.cleanup && record.cleanup.plaintext !== 'complete';
+    });
+    if (this.polling || ((!settings.enabled || settings.paused) && !ownedPending)) return POLL_INTERVAL_MS;
     const nodeId = this.deps.store.snapshot().nodeId;
     if (!nodeId) return POLL_INTERVAL_MS;
     this.polling = true;
     try {
-      const { jobs } = await this.deps.api.getProviderComputeJobs(nodeId, ['MATCHED', 'ACCEPTED', 'INPUT_READY', 'RUNNING', 'OUTPUT_READY']);
+      const { jobs } = await this.deps.api.getProviderComputeJobs(nodeId, ['MATCHED', 'ACCEPTED', 'INPUT_READY', 'RUNNING', 'OUTPUT_READY', 'CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED']);
       for (const job of jobs) await this.handleProviderJob(job).catch((error) => this.failProviderJob(job, error));
       this.onPollSucceeded();
       await this.recordAuthorized();
@@ -363,12 +408,39 @@ export class RemoteComputeRuntime {
 
   private async handleProviderJob(job: RemoteComputeJob): Promise<void> {
     const nodeId = this.deps.store.snapshot().nodeId!;
+    const existing = this.deps.store.snapshot().remoteJobs?.[job.id] as RemoteRuntimeRecord | undefined;
+    if (['CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED'].includes(job.state)) {
+      if (existing?.role === 'provider' && existing.cleanup) await this.providerCleanup.request(job.id);
+      return;
+    }
+    if (job.state === 'OUTPUT_READY' && existing?.cleanup) {
+      await this.providerCleanup.request(job.id);
+      await this.updateRecord(job.id, 'provider', 'OUTPUT_READY');
+      return;
+    }
+    const settingsAtDispatch = this.settings();
+    if ((!settingsAtDispatch.enabled || settingsAtDispatch.paused) && !existing?.localJobId) {
+      if (existing?.cleanup) await this.providerCleanup.request(job.id);
+      return;
+    }
+    if (existing?.cleanup?.requested) {
+      await this.providerCleanup.request(job.id);
+      if (['ACCEPTED', 'INPUT_READY', 'RUNNING'].includes(job.state)) {
+        await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'FAILED', metadata: { code: 'provider_input_released' } });
+        await this.updateRecord(job.id, 'provider', 'FAILED');
+      }
+      return;
+    }
     if (job.state === 'MATCHED') {
+      if (this.cleanupDiagnostics().plaintextBlocked > 0) {
+        await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'DECLINED', metadata: { code: 'provider_cleanup_pending' } });
+        return;
+      }
       await this.deps.gate.assertUsefulOperation('remote_compute_acceptance');
       const settings = this.settings();
       const active = Object.values(this.deps.store.snapshot().remoteJobs || {}).filter((item) => {
         const record = item as RemoteRuntimeRecord;
-        return record.role === 'provider' && ['ACCEPTED', 'INPUT_READY', 'RUNNING'].includes(record.state);
+        return record.role === 'provider' && ['PREPARING', 'ACCEPTED', 'INPUT_READY', 'RUNNING'].includes(record.state);
       }).length;
       if (Number(job.inputBytes || 0) > settings.maxAcceptedInputBytes) {
         await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'DECLINED', metadata: { code: 'provider_input_too_large' } });
@@ -382,20 +454,46 @@ export class RemoteComputeRuntime {
       job.state = 'ACCEPTED';
     }
     let record = this.deps.store.snapshot().remoteJobs?.[job.id] as RemoteRuntimeRecord | undefined;
-    if (job.state === 'ACCEPTED' || (job.state === 'INPUT_READY' && !record?.localJobId)) {
-      const captureId = `remote-${job.id}`;
-      const directory = path.join(this.deps.config.localDataPath, 'private', 'remote-jobs', job.id, 'capture');
-      await this.deps.kubo.pinAdd(job.inputCid);
-      const encrypted = await this.deps.kubo.cat(job.inputCid);
-      await this.deps.transport.decryptToDirectory(encrypted, job.inputKeyEnvelope as unknown as ComputeKeyEnvelope, directory, job.inputHash);
-      const capture = await this.readRemoteCapture(captureId, directory);
-      await this.deps.captures.registerRemote(capture);
+    // A crash after local insertion but before saving its ID must not create
+    // a second worker or orphan the first worker's readable input.
+    if (record?.cleanup && !record.localJobId) {
+      const child = (Object.values(this.deps.store.snapshot().jobs || {}) as LocalJob[])
+        .find(local => local.input?.remoteComputeJobId === job.id);
+      if (child) {
+        await this.deps.store.update(state => {
+          (state.remoteJobs![job.id] as RemoteRuntimeRecord).localJobId = child.id;
+        });
+        record = this.deps.store.snapshot().remoteJobs?.[job.id] as RemoteRuntimeRecord;
+      }
+    }
+    if ((job.state === 'ACCEPTED' || job.state === 'INPUT_READY') && !record?.localJobId) {
+      record = await this.providerCleanup.own(job);
+      await this.providerCleanup.runPreparation(job.id, async () => {
+        const captureId = `remote-${job.id}`;
+        const directory = path.join(this.deps.config.localDataPath, 'private', 'remote-jobs', job.id, 'capture');
+        const pinOwner = record!.cleanup?.pinOwner;
+        if (!pinOwner) throw localError(409, 'legacy_provider_pin_ownership_requires_review');
+        await new ManagedPins(this.deps.kubo, this.deps.store).acquire(job.inputCid, pinOwner);
+        this.providerCleanup.assertPreparing(job.id);
+        const encrypted = await this.deps.kubo.cat(job.inputCid);
+        this.providerCleanup.assertPreparing(job.id);
+        await this.deps.transport.decryptToDirectory(encrypted, job.inputKeyEnvelope as unknown as ComputeKeyEnvelope, directory, job.inputHash);
+        this.providerCleanup.assertPreparing(job.id);
+        const capture = await this.readRemoteCapture(captureId, directory);
+        await this.deps.captures.registerRemote(capture);
+        this.providerCleanup.assertPreparing(job.id);
+        const local = await this.deps.jobs.create(job.type as 'spatial.reconstruct', { captureId, artworkId: capture.artworkId, markerId: capture.markerId, remoteComputeJobId: job.id });
+        await this.deps.store.update(state => {
+          const current = state.remoteJobs![job.id] as RemoteRuntimeRecord;
+          current.localJobId = local.id; current.state = 'RUNNING'; current.updatedAt = new Date().toISOString();
+        });
+      });
+      record = this.deps.store.snapshot().remoteJobs?.[job.id] as RemoteRuntimeRecord;
+    }
+    if (record?.localJobId && ['ACCEPTED', 'INPUT_READY'].includes(job.state)) {
       if (job.state === 'ACCEPTED') await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'INPUT_READY' });
-      const local = await this.deps.jobs.create(job.type as 'spatial.reconstruct', { captureId, artworkId: capture.artworkId, markerId: capture.markerId, remoteComputeJobId: job.id });
-      await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'RUNNING', metadata: { localJobId: local.id } });
-      record = { backendJobId: job.id, localJobId: local.id, captureId, role: 'provider', state: 'RUNNING', updatedAt: new Date().toISOString() };
-      await this.deps.store.update((state) => { (state.remoteJobs ??= {})[job.id] = record!; });
-      return;
+      await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'RUNNING', metadata: { localJobId: record.localJobId } });
+      job.state = 'RUNNING';
     }
     if (job.state === 'RUNNING' && record?.localJobId) {
       const local = this.deps.jobs.get(record.localJobId);
@@ -426,14 +524,17 @@ export class RemoteComputeRuntime {
     this.deps.logger.warn({ jobId: job.id, code: (error as { code?: string }).code }, 'remote compute provider job failed');
   }
 
-  private async cleanupProvider(job: RemoteComputeJob, record: RemoteRuntimeRecord): Promise<void> {
-    if (record.captureId) await this.deps.captures.removeRemote(record.captureId).catch(() => undefined);
-    await fs.rm(path.join(this.deps.config.localDataPath, 'private', 'remote-jobs', job.id), { recursive: true, force: true });
-    await this.deps.kubo.pinRm(job.inputCid).catch(() => undefined);
+  private async cleanupProvider(job: RemoteComputeJob, _record: RemoteRuntimeRecord): Promise<void> {
+    await this.providerCleanup.request(job.id);
   }
 
   private async releaseRequesterInput(job: RemoteComputeJob): Promise<void> {
-    await this.deps.kubo.pinRm(job.inputCid).catch(() => undefined);
+    if (!['COMPLETED', 'DISPUTED', 'FAILED', 'CANCELLED', 'EXPIRED', 'DECLINED'].includes(job.state)) {
+      throw localError(409, 'remote_compute_not_terminal');
+    }
+    const owner = this.deps.store.snapshot().privateComputeCids?.[job.inputCid]?.pinOwner;
+    if (!owner) return; // Legacy/manual ownership requires a separate migration.
+    await new ManagedPins(this.deps.kubo, this.deps.store, { allowUnpin: this.deps.config.managedPinReleaseEnabled === true }).release(job.inputCid, owner);
     await this.deps.store.update((state) => { const item = state.privateComputeCids?.[job.inputCid]; if (item) item.releasedAt = new Date().toISOString(); });
   }
 

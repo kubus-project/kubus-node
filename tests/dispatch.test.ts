@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Buffer } from 'node:buffer';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -166,6 +166,18 @@ describe('dispatchLocalRequest', () => {
     expect(value.identityAlgorithm).toBe('ed25519');
     expect(value.publicKey).toBe(deps.identity.publicKeyBase64Url);
     expect(value.fingerprint).toBe(deps.identity.fingerprint);
+  });
+
+  it('read-only capture credentials cannot delete a capture', async () => {
+    vi.spyOn(deps.pairing, 'authorize').mockImplementation(async (_credential, scope) => scope === 'captures:read');
+    await expect(dispatchLocalRequest(request({ method: 'DELETE', path: '/local/v1/captures/synthetic', credential: token }), deps))
+      .rejects.toMatchObject({ code: 'scope_required' });
+  });
+
+  it.each(['/local/v1/jobs/job-1/cancel', '/local/v1/jobs/cleanup', '/local/v1/compute/cleanup'])('read-only credentials cannot mutate job lifecycle via %s', async route => {
+    vi.spyOn(deps.pairing, 'authorize').mockImplementation(async (_credential, scope) => scope === 'jobs:read');
+    await expect(dispatchLocalRequest(request({ method: 'POST', path: route, credential: token }), deps))
+      .rejects.toMatchObject({ code: 'scope_required' });
   });
 
   it('refuses a data-channel peer that has not proved the node identity', async () => {

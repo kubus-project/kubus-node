@@ -28,6 +28,8 @@ describe('parseEnv', () => {
     const config = parseEnv(baseEnv);
     expect(config.apiBaseUrl).toBe('http://localhost:3000');
     expect(config.cidClassFilters).toEqual(['hot', 'warm']);
+    expect(config.managedPinReleaseEnabled).toBe(false);
+    expect(parseEnv({ ...baseEnv, KUBUS_MANAGED_PIN_RELEASE_ENABLED: 'true' }).managedPinReleaseEnabled).toBe(true);
   });
 
   it('loads durable first-run configuration while explicit environment still wins', async () => {

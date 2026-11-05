@@ -14,6 +14,7 @@ import { syncPublicPinSet, reconcileDesiredPins, refreshCommitments } from '../o
 import { sendHeartbeat } from '../operator/heartbeat.js';
 import { refreshRewards } from '../operator/rewards.js';
 import { buildStatusSummary, refreshStatus } from '../operator/status.js';
+import { acquireRuntimeLease } from '../runtime/runtimeLease.js';
 import { ActionLock } from '../runtime/actionLock.js';
 import { Scheduler } from '../scheduler/loops.js';
 import { LocalStore } from '../state/localStore.js';
@@ -61,6 +62,18 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
   const logger = createLogger(config.logLevel);
+  if (command === 'status' || command === 'doctor') {
+    const readStore = new LocalStore(config.localStatePath);
+    await readStore.load({ readOnly: true });
+    const readApi = new KubusApiClient({ baseUrl: config.apiBaseUrl, auth: new BearerAuthProvider(config.operatorToken) });
+    const readKubo = new KuboClient(config.ipfsRpcUrl);
+    if (command === 'doctor') await doctor(readApi, readKubo, config, readStore);
+    else console.log(JSON.stringify(buildStatusSummary(config, readStore.snapshot(), await liveStatus(readApi, readKubo)), null, 2));
+    return;
+  }
+  const writerLease = await acquireRuntimeLease(config.localStatePath);
+  const longRunning = command === 'start' || command === 'gui';
+  try {
   const store = new LocalStore(config.localStatePath);
   await store.load();
   // Own file, own directory — never inside `state.json`. See identity/nodeIdentity.ts.
@@ -119,17 +132,6 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     onCredentialReplaced: () => { setTimeout(() => process.exit(75), 150).unref(); },
   });
   const localApi = { api, kubo, store, config, capabilities, pairing, captures, jobs, participationGate, remoteCompute, identity, permissionUpdate };
-
-  if (command === 'status') {
-    const live = await liveStatus(api, kubo);
-    console.log(JSON.stringify(buildStatusSummary(config, store.snapshot(), live), null, 2));
-    return;
-  }
-
-  if (command === 'doctor') {
-    await doctor(api, kubo, config, store);
-    return;
-  }
 
   if (command === 'gui') {
     participationGate.setSchedulerActive(false);
@@ -227,6 +229,11 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     await scheduler?.stop();
     await signaling?.stop();
   } }, gui, remoteCompute, null, logger);
+  } finally {
+    // Long-running processes retain the lease until they are proven dead on
+    // restart. Teardown has deadlines and may still have in-flight work.
+    if (!longRunning) await writerLease.release();
+  }
 }
 
 async function bootstrapOnce(api: KubusApiClient, kubo: KuboClient, store: LocalStore, config: ReturnType<typeof parseEnv>, capabilities: CapabilityRegistry, gate?: NetworkParticipationGate, identity?: ComputeIdentityService) {

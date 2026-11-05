@@ -9,6 +9,7 @@ import { validateSpatialManifest } from '../src/spatial/models.js';
 import { LocalStore } from '../src/state/localStore.js';
 import { MIN_VIEWS_FOR_RECONSTRUCTION } from '../src/spatial/nerfstudioAdapter.js';
 import { AnalyticsStore } from '../src/analytics/analyticsStore.js';
+import { syntheticCid } from './fixtures/contentIds.js';
 
 const dirs: string[] = [];
 
@@ -40,9 +41,9 @@ afterEach(async () => {
 const TERMINAL_STATES = new Set(['completed', 'failed', 'cancelled']);
 
 /** Waits for the job's async dispatch (including its state-file writes) to fully settle, rather than a fixed sleep that can race directory cleanup. */
-async function waitForTerminal(jobs: { get: (id: string) => { state: string } }, jobId: string, timeoutMs = 2000): Promise<void> {
+async function waitForTerminal(jobs: { get: (id: string) => { state: string }; health?: () => { running: number } }, jobId: string, timeoutMs = 2000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  while (!TERMINAL_STATES.has(jobs.get(jobId).state)) {
+  while (!TERMINAL_STATES.has(jobs.get(jobId).state) || (jobs.health?.().running ?? 0) > 0) {
     if (Date.now() > deadline) throw new Error(`job ${jobId} did not reach a terminal state within ${timeoutMs}ms`);
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
@@ -78,7 +79,7 @@ describe('private spatial runtime', () => {
     });
     await jobs.start();
     const job = await jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await waitForTerminal(jobs, job.id);
     expect(jobs.get(job.id).state).toBe('failed');
     expect(jobs.get(job.id).error?.code).toBe('worker_unavailable');
     await expect(jobs.create('spatial.reconstruct', { captureId: capture.id, remoteComputeJobId: 'network-assignment' }))
@@ -92,7 +93,7 @@ describe('private spatial runtime', () => {
     const captures = new CaptureStore(dir, store);
     const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: validCaptureFiles() });
 
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
       if (url.endsWith('/health')) return Promise.reject(new Error('connect ECONNREFUSED'));
       throw new Error(`unexpected fetch to ${url}`);
@@ -124,12 +125,16 @@ describe('private spatial runtime', () => {
     const captures = new CaptureStore(dir, store);
     const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: validCaptureFiles() });
 
-    vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
       if (url.endsWith('/health')) {
         return Promise.resolve(new Response(JSON.stringify({
-          status: 'ready', gpu: { available: true, name: 'RTX 3080 Ti' }, capabilities: ['spatial.reconstruct'],
+          status: 'ready', cleanupProtocol: 1, workerInstanceId: '44444444-4444-4444-8444-444444444444', gpu: { available: true, name: 'RTX 3080 Ti' }, capabilities: ['spatial.reconstruct'],
         }), { status: 200 }));
+      }
+      if (url.endsWith('/v1/jobs/cancel')) {
+        const request = JSON.parse(String(init?.body));
+        return new Response(JSON.stringify({ ...request, cleanupProtocol: 1, quiescent: true }));
       }
       if (url.endsWith('/v1/process')) {
         // A worker attempt was actually made — the eligibility check did not
@@ -168,7 +173,11 @@ describe('private spatial runtime', () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
       if (url.endsWith('/health')) {
-        return new Response(JSON.stringify({ status: 'ready', gpu: { available: true, name: 'RTX 3080 Ti' }, capabilities: ['spatial.reconstruct'] }), { status: 200 });
+        return new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, workerInstanceId: '44444444-4444-4444-8444-444444444444', gpu: { available: true, name: 'RTX 3080 Ti' }, capabilities: ['spatial.reconstruct'] }), { status: 200 });
+      }
+      if (url.endsWith('/v1/jobs/cancel')) {
+        const request = JSON.parse(String(init?.body));
+        return new Response(JSON.stringify({ ...request, cleanupProtocol: 1, quiescent: true }));
       }
       if (url.endsWith('/v1/process')) {
         const body = JSON.parse(String(init?.body ?? '{}'));
@@ -186,7 +195,7 @@ describe('private spatial runtime', () => {
 
     const jobs = new JobRuntime({
       store, captureStore: captures,
-      kubo: { addFileStreamed: async () => ({ Hash: 'bafyOutputCid' }), addBytes: async () => ({ Hash: 'bafyManifestCid' }) } as never,
+      kubo: { pinAdd: async () => undefined, pinLs: async () => ({ Keys: {} }), addFileStreamed: async () => ({ Hash: syntheticCid('output') }), addBytes: async () => ({ Hash: syntheticCid('manifest') }) } as never,
       logger: { warn: () => undefined } as never,
       dataRoot: dir, concurrency: 1, workerUrl: 'http://kubus-spatial-worker:8790',
       participationGate: { assertUsefulOperation: async () => { throw new Error('backend offline and participation lease expired'); } } as never,
@@ -221,13 +230,20 @@ describe('private spatial runtime', () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
       if (url.endsWith('/health')) {
-        return new Response(JSON.stringify({ status: 'ready', gpu: { available: true, name: 'RTX 3080 Ti' }, capabilities: ['spatial.reconstruct'] }), { status: 200 });
+        return new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, workerInstanceId: '44444444-4444-4444-8444-444444444444', gpu: { available: true, name: 'RTX 3080 Ti' }, capabilities: ['spatial.reconstruct'] }), { status: 200 });
+      }
+      if (url.endsWith('/v1/jobs/cancel')) {
+        const request = JSON.parse(String(init?.body));
+        return new Response(JSON.stringify({ ...request, cleanupProtocol: 1, quiescent: true }));
       }
       if (url.endsWith('/v1/process')) {
         // Never resolves on its own - only the cancellation's abort ends it,
         // simulating a real in-flight training run getting cancelled.
         return new Promise((_resolve, reject) => {
-          init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+          init?.signal?.addEventListener('abort', () => {
+            expect(store.snapshot().jobs?.[job.id]).toMatchObject({ state: 'cancelled' });
+            reject(new DOMException('aborted', 'AbortError'));
+          });
         });
       }
       throw new Error(`unexpected fetch to ${url}`);
@@ -236,7 +252,7 @@ describe('private spatial runtime', () => {
 
     const jobs = new JobRuntime({
       store, captureStore: captures,
-      kubo: { addFileStreamed: async () => ({ Hash: 'bafyOutputCid' }), addBytes: async () => ({ Hash: 'bafyManifestCid' }) } as never,
+      kubo: { pinAdd: async () => undefined, pinLs: async () => ({ Keys: {} }), addFileStreamed: async () => ({ Hash: syntheticCid('output') }), addBytes: async () => ({ Hash: syntheticCid('manifest') }) } as never,
       logger: { warn: () => undefined } as never,
       dataRoot: dir, concurrency: 1, workerUrl: 'http://kubus-spatial-worker:8790',
       participationGate: { assertUsefulOperation: async () => undefined } as never,
@@ -256,6 +272,8 @@ describe('private spatial runtime', () => {
     const cancelled = await jobs.cancel(job.id);
     expect(cancelled.state).toBe('cancelled');
     expect(cancelled.stage).toBe('cancelled');
+    expect(jobs.health().running).toBe(0);
+    await jobs.cancel(job.id);
 
     const buckets = analytics.query('24h');
     expect(buckets).toHaveLength(1);
@@ -263,6 +281,28 @@ describe('private spatial runtime', () => {
     expect(buckets[0]!.processing.cancelled).toBe(1);
     expect(buckets[0]!.processing.completed).toBe(0);
     await analytics.flush();
+  });
+
+  it('does not cancel an operation when its terminal state cannot be persisted; retry is safe', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-cancel-persist-')); dirs.push(dir);
+    const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
+    const captures = new CaptureStore(dir, store);
+    const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: {}, files: validCaptureFiles() });
+    const jobs = new JobRuntime({ store, captureStore: captures, kubo: {} as never,
+      logger: { warn: () => undefined } as never, dataRoot: dir, concurrency: 0,
+      participationGate: { assertUsefulOperation: async () => undefined } as never,
+      workerAuth: { issue: async () => 'synthetic' } as never });
+    const job = await jobs.create('spatial.reconstruct', { captureId: capture.id });
+    const fail = vi.spyOn(fs, 'rename').mockRejectedValueOnce(new Error('synthetic storage failure'));
+    await expect(jobs.cancel(job.id)).rejects.toThrow('synthetic storage failure');
+    expect(jobs.get(job.id).state).toBe('queued');
+    expect(jobs.get(job.id).logs.filter(log => log.message === 'Job cancelled')).toHaveLength(0);
+    fail.mockRestore();
+    await jobs.cancel(job.id);
+    const disk = new LocalStore(path.join(dir, 'state.json')); await disk.load();
+    expect(disk.snapshot().jobs?.[job.id]).toMatchObject({ state: 'cancelled' });
+    await jobs.cancel(job.id);
+    expect(jobs.get(job.id).logs.filter(log => log.message === 'Job cancelled')).toHaveLength(1);
   });
 
   it('validates the versioned renderer-neutral spatial manifest', () => {
@@ -286,8 +326,17 @@ describe('reconstruction preconditions', () => {
       participationGate: { assertUsefulOperation: async () => undefined } as never,
       workerAuth: { issue: async () => 'token' } as never,
     });
-    return { jobs, captures, capture };
+    return { jobs, captures, capture, store };
   }
+
+  it('refuses new processing until a blocked cleanup has been reviewed or retried', async () => {
+    const { jobs, capture, store } = await runtimeFor(validCaptureFiles(), 0);
+    await store.update(state => { state.jobCleanup = { old: { version: 1, jobId: 'old', type: 'spatial.reconstruct',
+      state: 'blocked', workerAttempted: true, updatedAt: new Date().toISOString() } }; });
+    await expect(jobs.create('spatial.reconstruct', { captureId: capture.id })).rejects.toMatchObject({ code: 'worker_cleanup_pending' });
+    expect(jobs.list()).toHaveLength(0);
+    expect(jobs.health()).toMatchObject({ cleanupPending: 1, cleanupBlocked: 1 });
+  });
 
   it('refuses to queue a reconstruction when the capture lost files after it was stored', async () => {
     const { jobs, capture } = await runtimeFor(validCaptureFiles());

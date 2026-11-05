@@ -24,6 +24,7 @@ services:
       IPFS_RPC_URL: http://kubo:5001
       IPFS_GATEWAY_URL: http://kubo:8080
       LOCAL_STATE_PATH: /var/lib/kubus-node/state.json
+      KUBUS_MANAGED_PIN_RELEASE_ENABLED: ${KUBUS_MANAGED_PIN_RELEASE_ENABLED:-false}
       LOCAL_DATA_PATH: /var/lib/kubus-node/data
       LOCAL_API_ENABLED: "true"
       LOCAL_API_HOST: "0.0.0.0"

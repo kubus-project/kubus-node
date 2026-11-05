@@ -1,6 +1,8 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import type { ManagedPinRecord } from '../ipfs/managedPins.js';
+import type { JobCleanupRecord } from '../jobs/jobCleanup.js';
 import type {
   AvailabilityCommitment,
   AvailabilityEpoch,
@@ -24,10 +26,12 @@ export interface LocalState {
   rewardableCids: RewardableCid[];
   desiredCids: PublicPinSetRecord[];
   pinnedCids: string[];
+  managedPins?: Record<string, ManagedPinRecord>;
   failedCids: Record<string, { error: string; at: string }>;
   publicPinSetTotal?: number;
   /** Authoritative completeness marker for the last canonical pin-set sync. */
   publicPinSetComplete?: boolean;
+  publicPinSetGeneration?: string;
   rewardableCidTotal?: number;
   latestPublicPinSetSyncAt?: string;
   latestPinReconcileAt?: string;
@@ -58,6 +62,7 @@ export interface LocalState {
     revokedAt?: string;
   }>;
   jobs?: Record<string, unknown>;
+  jobCleanup?: Record<string, JobCleanupRecord>;
   captures?: Record<string, unknown>;
   spatial?: Record<string, unknown>;
   participation?: {
@@ -84,7 +89,7 @@ export interface LocalState {
     maxAcceptedInputBytes: number;
     minimumFreeVramBytes: number;
   };
-  privateComputeCids?: Record<string, { jobId?: string; role: 'encrypted_input' | 'private_output'; createdAt: string; expiresAt?: string; releasedAt?: string }>;
+  privateComputeCids?: Record<string, { jobId?: string; role: 'encrypted_input' | 'private_output'; createdAt: string; expiresAt?: string; releasedAt?: string; pinOwner?: string; submissionState?: 'prepared' | 'submitted' | 'unconfirmed'; submissionReconciliationRequired?: boolean }>;
 
   /**
    * Why the optional remote-compute capabilities are or are not currently usable.
@@ -142,11 +147,13 @@ const emptyState = (): LocalState => ({
 export class LocalStore {
   private state: LocalState | null = null;
   private writeChain: Promise<void> = Promise.resolve();
+  private readOnly = false;
 
   constructor(private readonly filePath: string) {}
 
-  async load(): Promise<LocalState> {
-    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+  async load({ readOnly = false }: { readOnly?: boolean } = {}): Promise<LocalState> {
+    this.readOnly = readOnly;
+    if (!readOnly) await fs.mkdir(path.dirname(this.filePath), { recursive: true });
     try {
       const raw = await fs.readFile(this.filePath, 'utf8');
       const parsed = JSON.parse(raw) as LocalState;
@@ -157,6 +164,7 @@ export class LocalStore {
       if (code === 'ENOENT') {
         this.state = emptyState();
       } else {
+        if (readOnly) throw new Error('state_snapshot_unavailable');
         const backup = `${this.filePath}.corrupt-${Date.now()}`;
         try {
           await fs.rename(this.filePath, backup);
@@ -174,13 +182,25 @@ export class LocalStore {
   }
 
   async update(mutator: (state: LocalState) => void | Promise<void>): Promise<LocalState> {
-    if (!this.state) await this.load();
-    await mutator(this.state as LocalState);
-    (this.state as LocalState).updatedAt = new Date().toISOString();
-    const next = this.snapshot();
-    this.writeChain = this.writeChain.then(() => this.atomicWrite(next));
-    await this.writeChain;
-    return next;
+    if (this.readOnly) throw new Error('state_store_read_only');
+    // Serialize the mutation as well as the write. An async mutator must see
+    // the last committed state, and its candidate must remain invisible until
+    // persistence succeeds. Never leave a failed candidate in live memory.
+    const transaction = this.writeChain.then(async () => {
+      if (!this.state) await this.load();
+      const candidate = this.snapshot();
+      await mutator(candidate);
+      candidate.updatedAt = new Date().toISOString();
+      // Detach from references retained by a mutator before committing.
+      const next = JSON.parse(JSON.stringify(candidate)) as LocalState;
+      await this.atomicWrite(next);
+      this.state = next;
+      return this.snapshot();
+    });
+    // Recover only the scheduling tail: this caller still receives its own
+    // failure, while subsequent independent transactions can retry normally.
+    this.writeChain = transaction.then(() => undefined, () => undefined);
+    return transaction;
   }
 
   async getOrCreateNodeKey(provided?: string | null): Promise<string> {
@@ -202,8 +222,14 @@ export class LocalStore {
   private async atomicWrite(next: LocalState): Promise<void> {
     const dir = path.dirname(this.filePath);
     await fs.mkdir(dir, { recursive: true });
-    const tmp = path.join(dir, `.${path.basename(this.filePath)}.${process.pid}.${Date.now()}.tmp`);
-    await fs.writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
-    await fs.rename(tmp, this.filePath);
+    const tmp = path.join(dir, `.${path.basename(this.filePath)}.${process.pid}.${crypto.randomUUID()}.tmp`);
+    try {
+      await fs.writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+      await fs.rename(tmp, this.filePath);
+    } finally {
+      // Remove only this write's temporary file; never touch the committed
+      // state file when persistence fails. Preserve the original error.
+      await fs.rm(tmp, { force: true }).catch(() => undefined);
+    }
   }
 }

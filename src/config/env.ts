@@ -129,6 +129,7 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
     devSeedCid: env.KUBUS_DEV_SEED_CID?.trim() || undefined,
     devAllowEmptyCids: boolEnv(env, 'KUBUS_DEV_ALLOW_EMPTY_CIDS', false),
     skipPinning,
+    managedPinReleaseEnabled: boolEnv(env, 'KUBUS_MANAGED_PIN_RELEASE_ENABLED', false),
     verifierEndpointUrl: env.KUBUS_VERIFIER_ENDPOINT_URL?.trim() || undefined,
     isProduction,
     guiEnabled,

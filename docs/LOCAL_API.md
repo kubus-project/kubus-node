@@ -60,3 +60,17 @@ The same limits apply as the JSON path: 5000 files and 5 GiB per capture. Path t
 Set `metadata.localCaptureId` to a stable client-side id. Commit is idempotent on it: if the commit response is lost, the client cannot tell success from failure, and a retry that uploads a fresh draft would otherwise create a second durable capture and duplicate processing work. With the key present, a repeat commit returns the existing record and discards the redundant upload. Clients that omit it keep the previous behaviour, where every commit creates a new capture.
 
 Drafts are in-memory: a draft is a transfer in progress, not durable state. A node restart mid-upload abandons the draft and the client retries, the same as any other interrupted transfer. Committed captures are durable and private exactly as before.
+
+
+### Work-directory cleanup retry (candidate)
+
+`POST /local/v1/jobs/cleanup` requires a paired credential with `jobs:read` and `jobs:create` and a completed node-identity handshake. It retries only journaled terminal-job cleanup and returns aggregate job health, including `cleanupPending` and `cleanupBlocked`. It does not clear an unverified worker-instance change, delete captures or release IPFS pins. `POST /local/v1/jobs/:id/cancel` also requires `jobs:create`.
+
+`POST /local/v1/compute/cleanup` requires `jobs:read` plus `compute:manage` and retries requested/expired owned provider cleanup. `/local/v1/status` includes aggregate `computeCleanup` counts. `DELETE /local/v1/captures/:id` requires `captures:create` in addition to the capture read scope.
+
+
+### Managed input pins (candidate)
+
+Compute cleanup reports `inputPinReleasesPending` for provider owner-release work, `managedInputUnpinsPending` for relinquished private-input owners whose pin removal remains pending, `requesterSubmissionsUnconfirmed` for ambiguous submissions requiring reconciliation, and `legacyReviewRequired` for missing ownership evidence. Physical unpinning is disabled unless `KUBUS_MANAGED_PIN_RELEASE_ENABLED=true` has been explicitly activated following the documented ownership and migration review. Local status also reports aggregate `managedPins` release-enabled/pending/retained counts. These fields do not report erasure of blocks or independent copies. Existing route scopes and private source-cleanup checks remain in force.
+
+`managedPins.uncertainReleaseCount` counts unacknowledged or crash-interrupted removals. Those CIDs reject reacquisition and further removal until a separately reviewed recovery establishes that old requests cannot still execute. Restarting Node or clearing a flag does not establish that fact; no automatic recovery override is provided.

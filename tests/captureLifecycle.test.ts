@@ -464,7 +464,7 @@ describe('second-review findings', () => {
     await store.writeDraftFile(draft.id, 'frames.json', framesDocument([{ rgbPath: 'rgb/00000.jpg' }]), 'application/json');
     const file = pausedStream();
     // A connection that died without the server noticing: never released.
-    void store.writeDraftFileStream(draft.id, 'rgb/00000.jpg', file.chunks, 'image/jpeg').catch(() => undefined);
+    const writing = store.writeDraftFileStream(draft.id, 'rgb/00000.jpg', file.chunks, 'image/jpeg').catch(() => undefined);
     await file.started;
 
     const status = await Promise.race([
@@ -475,5 +475,6 @@ describe('second-review findings', () => {
     // Only completed files are reported, so the stuck one is resent.
     expect((status as { files: string[] }).files).toEqual(['frames.json']);
     file.release();
+    await writing;
   });
 });
