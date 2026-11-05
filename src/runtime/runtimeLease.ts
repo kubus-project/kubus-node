@@ -25,8 +25,14 @@ async function readOwner(file: string): Promise<Owner> {
 async function provenStopped(owner: Owner, current: Omit<Owner, 'version' | 'nonce'>): Promise<boolean> {
   // Another host/PID namespace is not observable from this process. Retain the
   // lease for explicit operator recovery rather than guessing it is dead.
-  if (owner.host !== current.host || owner.namespace !== current.namespace) return false;
+  if (owner.host !== current.host) return false;
+  // A different kernel boot id on the same host proves the recorded process died
+  // with the previous boot. This must precede the namespace comparison: after a
+  // host crash a restarted container always has a new PID namespace, which would
+  // otherwise keep the stale lease and fail every start until manual cleanup.
   if (owner.boot && current.boot && owner.boot !== current.boot) return true;
+  // Same boot, different PID namespace: the owner is not observable from here.
+  if (owner.namespace !== current.namespace) return false;
   try { process.kill(owner.pid, 0); } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'ESRCH';
   }

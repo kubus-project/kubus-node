@@ -43,6 +43,26 @@ it('does not replace an unverifiable host or malformed ownership record', async 
   expect(await fs.readFile(leaseFile, 'utf8')).toBe('{broken');
   await lease.release();
 });
+const linuxOnly = it.skipIf(process.platform !== 'linux');
+linuxOnly('reclaims a lease left by a previous boot even from another PID namespace', async () => {
+  const { file } = await fixture();
+  const lease = await acquireRuntimeLease(file);
+  const leaseFile = `${file}.runtime-lease`;
+  const owner = JSON.parse(await fs.readFile(leaseFile, 'utf8'));
+  await fs.writeFile(leaseFile, JSON.stringify({ ...owner, boot: 'previous-boot-id', namespace: 'pid:[4026539999]' }));
+  const recovered = await acquireRuntimeLease(file);
+  await recovered.release();
+  await lease.release();
+});
+linuxOnly('keeps a lease from another PID namespace on the same boot for operator review', async () => {
+  const { file } = await fixture();
+  const lease = await acquireRuntimeLease(file);
+  const leaseFile = `${file}.runtime-lease`;
+  const owner = JSON.parse(await fs.readFile(leaseFile, 'utf8'));
+  await fs.writeFile(leaseFile, JSON.stringify({ ...owner, namespace: 'pid:[4026539999]' }));
+  await expect(acquireRuntimeLease(file)).rejects.toThrow('runtime_writer_already_active_or_unverified');
+  await lease.release();
+});
 it('rejects a second process while its owner is alive and recovers after verified exit', async () => {
   const { file } = await fixture();
   const module = pathToFileURL(path.resolve('src/runtime/runtimeLease.ts')).href;

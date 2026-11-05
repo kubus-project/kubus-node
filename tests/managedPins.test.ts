@@ -268,3 +268,17 @@ it.each([
     expect(kubo.pinAdd).not.toHaveBeenCalled();
   },
 );
+it('re-probes a record left pending by a crash and never removes a pin it did not create', async () => {
+  const { store, kubo, pins, manager } = await fixture();
+  kubo.pinAdd.mockImplementationOnce(async () => {
+    throw new Error('crash before the pin was added');
+  });
+  await expect(manager.acquire(v0, 'archive:record-A')).rejects.toThrow();
+  expect(store.snapshot().managedPins?.[cid]?.ownership).toBe('created');
+  pins.add(v0); // an operator pins the same CID before the retry
+  await manager.acquire(v0, 'archive:record-A');
+  expect(store.snapshot().managedPins?.[cid]?.ownership).toBe('preexisting');
+  await manager.release(cid, 'archive:record-A');
+  expect(kubo.pinRm).not.toHaveBeenCalled();
+  expect(pins.has(v0)).toBe(true);
+});

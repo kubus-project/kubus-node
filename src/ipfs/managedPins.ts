@@ -86,7 +86,10 @@ export class ManagedPins {
         throw new Error('pin_release_outcome_requires_review');
       }
       const ownership =
-        !previous || previous.state === 'released'
+        // A record still 'pending' may predate a crash: another party could have pinned the
+        // CID since, so re-probe. A pin that was already ours then reads as preexisting, which
+        // errs toward retaining (never removing) it.
+        !previous || previous.state === 'released' || previous.state === 'pending'
           ? await this.probeOwnership(cid)
           : previous.ownership;
       await this.store.update((state) => {
