@@ -10,6 +10,14 @@ kubus node uses SemVer. Exact Git and container tags are immutable.
 
 An alpha or beta never updates `latest`. Every `v*` tag runs type checking, tests, the TypeScript build, dependency audit, node and worker image builds, release-bundle checksums, and SPDX SBOM generation before GitHub release assets are published. A failed workflow is a failed release, regardless of whether the Git tag exists.
 
+## v0.8.6 — Crash-safe runtime leases and pin reconciliation
+
+Stable release lined up with the kubus 0.8.6 family. Protocol (version 3), the local API and stored data are unchanged.
+
+- Runtime lease recovery: a lease left by a provable same-host, different-boot crash is reclaimed instead of blocking the restart.
+- Pending pin ownership is re-probed after a restart; archive and pin reconciliation use durable cleanup journals.
+- Managed destructive pin release stays **off by default** (`KUBUS_MANAGED_PIN_RELEASE_ENABLED=false`). Pins already in a `releasing` or `release_uncertain` state have no operator clearance command yet, so do not enable it.
+
 ## v0.8.2 — Dependency security and family branding
 
 This stable release includes the approved dependency lockfile security fixes
