@@ -790,9 +790,25 @@ export class CaptureStore {
     // The masking decision is part of the identity (the default, worker masking, adds nothing so earlier keys still match).
     const maskingKey = faceMasking.photos === 'worker' && (!video || faceMasking.video === 'worker') ? '' : `:masking=${faceMasking.photos}/${faceMasking.video ?? '-'}`;
     const localCaptureId = `photos-import:${setHash.digest('hex')}:${options.artworkId ?? ''}:${options.markerId ?? ''}${maskingKey}`;
+    // The import is idempotent on the files, so a retry converges on the capture that exists. A retry that states a
+    // different operator or capture time must not silently get the old record back: say so.
+    const stated = validIso(options.capturedAt);
+    const existing = (Object.values(this.store.snapshot().captures || {}) as CaptureRecord[]).find((record) => record.localCaptureId === localCaptureId);
+    if (existing) {
+      const differs: string[] = [];
+      if (options.capturedBy && options.capturedBy.slice(0, 200) !== existing.capturedBy) differs.push('capturedBy');
+      if (stated && stated !== (existing.mediaCapturedAt?.photos ?? existing.capturedAt)) differs.push('capturedAt');
+      if (differs.length) {
+        throw localError(409, 'capture_exists_with_different_provenance', {
+          message: `These files were already imported as capture ${existing.id} with a different ${differs.join(' and ')}; its provenance is not changed by a re-import. Import the files from a copy that differs in content, or process the existing capture as it is`,
+          captureId: existing.id,
+          differs,
+        });
+      }
+    }
 
     const earliest = new Date(Math.min(...photos.map((photo) => photo.mtimeMs))).toISOString();
-    const photosCapturedAt = validIso(options.capturedAt) ?? earliest;
+    const photosCapturedAt = stated ?? earliest;
     const videoCapturedAt = video ? validIso(options.videoCapturedAt) ?? video.mtime.toISOString() : undefined;
     const capturedAt = videoCapturedAt && videoCapturedAt < photosCapturedAt ? videoCapturedAt : photosCapturedAt;
     const draft = await this.beginDraft({
@@ -867,6 +883,9 @@ export class CaptureStore {
     });
     try {
       for (const relative of photos) {
+        if ((await fs.lstat(path.join(base.directory, relative))).isSymbolicLink()) {
+          throw localError(422, 'capture_photo_invalid', { message: 'A stored photo is a symbolic link; only regular files are accepted' });
+        }
         await this.writeDraftFileStream(
           draft.id, relative,
           createReadStream(path.join(base.directory, relative)) as unknown as AsyncIterable<Buffer>,

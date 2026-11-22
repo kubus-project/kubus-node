@@ -138,11 +138,32 @@ class Masking(unittest.TestCase):
             FakeMasker([]).mask_array(image, {"exclude": [{"box": [0.0, 0.0, 0.25, 0.35], "expectStrong": 1}]})
         audit = []
         masker.mask_array(image, {"exclude": [[0.0, 0.0, 0.25, 0.35]]}, audit=audit)
-        self.assertEqual(audit, [{"box": 0, "strongExcluded": 1, "expectStrong": 0, "ok": False}])
+        self.assertEqual(audit, [{"box": 0, "strongExcluded": 1, "expectStrong": 0, "weakExcluded": 0, "expectWeak": None, "ok": False}])
 
-    def test_a_weak_detection_inside_an_exclude_box_needs_no_expectation(self):
-        masked, count = FakeMasker([(20, 20, 60, 70, False)]).mask_array(noisy(), {"exclude": [[0.0, 0.0, 0.25, 0.35]]})
+    def test_a_weak_detection_inside_an_exclude_box_needs_no_expectation_but_is_reported_for_a_human_to_look_at(self):
+        review = {}
+        masked, count = FakeMasker([(20, 20, 60, 70, False)]).mask_array(noisy(), {"exclude": [[0.0, 0.0, 0.25, 0.35]]}, review=review)
         self.assertEqual(count, 0)
+        self.assertEqual(review["weakExcluded"], 1)
+
+    def test_a_reviewer_who_looked_can_pin_the_weak_count_and_a_different_count_stops_the_run(self):
+        image = noisy()
+        looked = {"box": [0.0, 0.0, 0.25, 0.35], "expectWeak": 1}
+        review = {}
+        FakeMasker([(20, 20, 60, 70, False)]).mask_array(image, {"exclude": [looked]}, review=review)
+        self.assertEqual(review["weakExcluded"], 0)  # acknowledged: not listed again
+        with self.assertRaises(fm.FaceMaskingError):  # a second, weak face turned up in the same box
+            FakeMasker([(20, 20, 60, 70, False), (60, 30, 90, 70, False)]).mask_array(image, {"exclude": [looked]})
+
+    def test_a_large_detection_that_was_not_near_certain_is_reported(self):
+        class Looks(FakeMasker):
+            def detect_detailed(self, rgb):
+                self.last_review = {"largeBelowCertain": 2}
+                return super().detect_detailed(rgb)
+
+        review = {}
+        Looks([]).mask_array(noisy(), review=review)
+        self.assertEqual(review, {"weakExcluded": 0, "largeBelowCertain": 2})
 
     def test_a_face_that_only_overlaps_an_exclude_box_is_still_masked(self):
         # Centre outside, or less than half of the face inside, so a person beside a painted head is not swallowed.
@@ -215,6 +236,48 @@ class Directory(unittest.TestCase):
             self.assertEqual([entry["regions"] for entry in written["images"]], [1, 2, 1])
             sheets = fm.contact_sheets(target, root / "sheets")
             self.assertEqual(len(sheets), 1)
+
+    def test_what_a_human_has_to_look_at_is_in_the_report_but_not_a_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            source, target = root / "in", root / "out"
+            source.mkdir()
+            Image.fromarray(noisy()).save(source / "a.jpg", "JPEG", quality=92)
+            Image.fromarray(noisy(seed=2)).save(source / "b.jpg", "JPEG", quality=92)
+            manual = {"a.jpg": {"exclude": [[0.0, 0.0, 0.25, 0.35]]}}
+            report = fm.mask_directory(source, target, manual, masker=FakeMasker([(20, 20, 60, 70, False)]))
+            self.assertEqual(report["review"], {"needsLook": [{"image": "a.jpg", "weakExcluded": 1}]})
+            self.assertEqual(report["images"][0]["needsLook"], {"weakExcluded": 1})
+            self.assertNotIn("needsLook", report["images"][1])
+            self.assertTrue(len(report["images"]) == 2 and (target / fm.REPORT_NAME).exists())
+
+    def test_a_multi_picture_jpeg_stays_a_jpeg_with_its_exif(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            source, target = root / "in", root / "out"
+            source.mkdir()
+            exif = Image.Exif()
+            exif[0x0110] = "Model"
+            first = Image.fromarray(noisy(200, 100))
+            first.save(source / "p.jpg", format="MPO", exif=exif.tobytes(), save_all=True, append_images=[Image.fromarray(noisy(100, 50, seed=3))])
+            with Image.open(source / "p.jpg") as probe:
+                self.assertEqual(probe.format, "MPO")
+            fm.mask_directory(source, target, masker=FakeMasker([]))
+            self.assertEqual(sorted(path.name for path in target.iterdir()), [fm.REPORT_NAME, "p.jpg"])
+            with Image.open(target / "p.jpg") as copy:
+                self.assertEqual(copy.format, "JPEG")
+                self.assertEqual(copy.getexif().get(0x0110), "Model")
+
+    def test_two_inputs_with_the_same_stem_are_refused_instead_of_overwriting_each_other(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            source, target = root / "in", root / "out"
+            source.mkdir()
+            Image.fromarray(noisy()).save(source / "a.jpg", "JPEG")
+            Image.fromarray(noisy()).save(source / "a.png", "PNG")
+            with self.assertRaises(fm.FaceMaskingError):
+                fm.mask_directory(source, target, masker=FakeMasker([]))
+            self.assertFalse((target / fm.REPORT_NAME).exists())
 
     def test_a_mismatched_exclude_box_stops_a_directory_run_before_any_report_exists(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -304,6 +367,39 @@ class JobPath(unittest.TestCase):
             self.assertEqual(counts, [1])
             with Image.open(root / "video_00000.jpg") as image:
                 self.assertEqual(image.size, (320, 240))
+
+    def test_a_face_missed_in_the_middle_of_three_frames_is_masked_there_too(self):
+        class Scripted(FakeMasker):
+            def __init__(self, per_frame):
+                super().__init__()
+                self.per_frame = list(per_frame)
+                self.calls = 0
+
+            def find_regions(self, rgb, manual=None, audit=None, review=None):
+                regions = self.per_frame[self.calls]
+                self.calls += 1
+                return list(regions)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            names = [f"video_{index:05d}.jpg" for index in range(4)]
+            for index, name in enumerate(names):
+                Image.fromarray(noisy(320, 240, seed=index)).save(root / name, "JPEG", quality=95)
+            face = (100, 60, 160, 130)
+            moved = (110, 62, 170, 132)
+            counts = fm.mask_frame_sequence(Scripted([[face], [], [moved], []]), root, names)
+            self.assertEqual(counts, [1, 2, 1, 0])  # frame 1 got both neighbours' regions, the edge frame 3 is not filled
+            with Image.open(root / names[1]) as image:
+                patch = np.asarray(image)[60:130, 100:160].reshape(-1, 3)
+                self.assertLess(len(np.unique(patch, axis=0)), 60 * 70 // 4)  # flat colour (JPEG noise aside), not the noise
+
+    def test_carry_over_needs_both_neighbours_and_an_empty_middle(self):
+        a, b = (10, 10, 60, 60), (200, 10, 250, 60)
+        self.assertEqual(fm.carry_over([[a], [], [a]]), [[], [a, a], []])
+        self.assertEqual(fm.carry_over([[a], [], []]), [[], [], []])  # only one neighbour has it
+        self.assertEqual(fm.carry_over([[a], [a], [a]]), [[], [], []])  # the middle frame found it itself
+        self.assertEqual(fm.carry_over([[a], [b], [a]]), [[], [a, a], []])  # a different face in the middle does not cover a
+        self.assertEqual(fm.carry_over([[a], []]), [[], []])
 
 
 if __name__ == "__main__":

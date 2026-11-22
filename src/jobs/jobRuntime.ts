@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { AnalyticsStore } from '../analytics/analyticsStore.js';
 import type { CaptureStore } from '../captures/captureStore.js';
-import { effectiveMasking, publicMaskingSummary } from '../captures/faceMasking.js';
+import { PINNED_WEIGHTS_SHA256, effectiveMasking, publicMaskingSummary } from '../captures/faceMasking.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import { localError } from '../localApi/pairingService.js';
 import type { Logger } from '../logging/logger.js';
@@ -114,10 +114,10 @@ export function faceMaskingProvenance(capture: { kind?: string; faceMasking?: un
   const out: Record<string, unknown> = {};
   if (kind !== 'video') {
     if (masking.photos === 'premasked' && masking.report) out.photos = cleanMaskingPart({ source: 'premasked', ...masking.report });
-    else if (masking.photos === 'worker') out.photos = cleanMaskingPart({ ...(reported?.photos as object | undefined), source: 'worker' });
+    else if (masking.photos === 'worker') out.photos = cleanMaskingPart({ ...(reported?.photos as object | undefined), source: 'worker', weightsPinned: pinned(reported?.photos) });
   }
   if (kind === 'video' || kind === 'mixed') {
-    if (masking.video === 'worker') out.video = cleanMaskingPart({ ...(reported?.video as object | undefined), source: 'worker' });
+    if (masking.video === 'worker') out.video = cleanMaskingPart({ ...(reported?.video as object | undefined), source: 'worker', weightsPinned: pinned(reported?.video) });
   }
   const ran = Boolean(out.photos || out.video);
   return ran ? { ran: true, ...out } : { ran: false };
@@ -130,11 +130,22 @@ export function faceMaskingProvenance(capture: { kind?: string; faceMasking?: un
  */
 export function publicDerivation(derivation: Record<string, unknown>): Record<string, unknown> {
   const masking = derivation.faceMasking as Record<string, unknown> | undefined;
-  if (!masking) return derivation;
-  return { ...derivation, faceMasking: publicMaskingSummary(masking) };
+  const out: Record<string, unknown> = masking ? { ...derivation, faceMasking: publicMaskingSummary(masking) } : { ...derivation };
+  // The operator's device models and how many photos each took are private (they identify the photographer's kit).
+  const photos = out.photos;
+  if (photos && typeof photos === 'object' && !Array.isArray(photos) && 'cameras' in photos) {
+    const { cameras: _private, ...rest } = photos as Record<string, unknown>;
+    out.photos = rest;
+  }
+  return out;
 }
 
-/** Parts the worker was asked to mask that its answer does not show as masked; empty when everything ran. */
+/** Does the worker's report of one part name the pinned detector weights? */
+function pinned(part: unknown): boolean {
+  return Boolean(part) && typeof part === 'object' && (part as Record<string, unknown>).weightsSha256 === PINNED_WEIGHTS_SHA256;
+}
+
+/** Parts the worker was asked to mask that its answer does not show as masked (or masked with other than the pinned weights); empty when everything ran. */
 export function missingMasking(requested: { photos?: boolean; video?: boolean } | undefined, worker: unknown): string[] {
   if (!requested) return [];
   const reported = (worker && typeof worker === 'object' ? (worker as Record<string, unknown>).faceMasking : undefined) as Record<string, unknown> | undefined;
@@ -142,9 +153,29 @@ export function missingMasking(requested: { photos?: boolean; video?: boolean } 
   for (const part of ['photos', 'video'] as const) {
     if (!requested[part]) continue;
     const summary = reported?.[part] as Record<string, unknown> | undefined;
-    if (!summary || summary.ran !== true || typeof summary.images !== 'number' || summary.images < 1 || typeof summary.weightsSha256 !== 'string') missing.push(part);
+    if (!summary || summary.ran !== true || typeof summary.images !== 'number' || summary.images < 1 || summary.weightsSha256 !== PINNED_WEIGHTS_SHA256) missing.push(part);
   }
   return missing;
+}
+
+/** Lower case with accents folded: a name with and without its diacritics compares equal. */
+function foldName(value: string): string {
+  return value.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+}
+
+/**
+ * Does a free-text note carry the capture operator's name? The note is published with the manifest, and the
+ * operator's name belongs in `capturedBy` and nowhere else. Compares the whole label and each word of it that is
+ * long enough to be a name (4 letters or more) as a whole word, accents and case ignored.
+ */
+export function noteNamesOperator(note: string, capturedBy: string | undefined): boolean {
+  if (!capturedBy) return false;
+  const haystack = foldName(note);
+  const label = foldName(capturedBy).trim();
+  if (label && haystack.includes(label)) return true;
+  const wordsOf = (text: string) => text.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  const noteWords = new Set(wordsOf(haystack));
+  return wordsOf(label).some((word) => word.length >= 4 && noteWords.has(word));
 }
 
 /** Keeps worker-reported provenance to bounded JSON primitives under known keys. */
@@ -337,11 +368,16 @@ export class JobRuntime {
       if (input.revisionNote.trim()) out.revisionNote = input.revisionNote.trim();
     }
     const capture = this.deps.captureStore.get(captureId);
-    const records = Object.values(this.deps.store.snapshot().spatial || {}) as Array<{ id: string; createdAt: string; manifest?: SpatialManifest }>;
+    if (out.revisionNote && noteNamesOperator(String(out.revisionNote), capture.capturedBy)) {
+      throw localError(422, 'job_revision_note_names_operator', { message: 'The revision note is published with the manifest and must not carry the operator name; describe the change instead' });
+    }
+    // A superseded record is history and its content is unpinned: nothing may link to it or be revised from it.
+    const records = (Object.values(this.deps.store.snapshot().spatial || {}) as Array<{ id: string; state?: string; createdAt: string; manifest?: SpatialManifest }>)
+      .filter((record) => record.state !== 'superseded');
     if (input.previousSpatialId !== undefined) {
       if (typeof input.previousSpatialId !== 'string' || !input.previousSpatialId) throw localError(400, 'job_previous_spatial_invalid');
       const previous = records.find((record) => record.id === input.previousSpatialId);
-      if (!previous?.manifest) throw localError(422, 'previous_spatial_not_found', { message: 'No local spatial record has that id' });
+      if (!previous?.manifest) throw localError(422, 'previous_spatial_not_found', { message: 'No current local spatial record has that id (a superseded record cannot be revised)' });
       if (previous.manifest.artworkId !== (capture.artworkId ?? '')) {
         throw localError(422, 'previous_spatial_artwork_mismatch', { message: 'A revision must belong to the same artwork as the record it revises' });
       }
@@ -625,15 +661,19 @@ export class JobRuntime {
     const previousCapture = previous.manifest.captureId;
     const previousMasked = ((previous.manifest.captureProvenance.derivation?.faceMasking ?? {}) as { ran?: boolean }).ran === true;
     const note = typeof job.input.revisionNote === 'string' && job.input.revisionNote ? { note: job.input.revisionNote.slice(0, 200) } : {};
-    const reason: SpatialRevision['reason'] = capture.derivedFrom?.captureId === previousCapture ? 'video_added' : masking?.ran === true && !previousMasked ? 'face_masking' : 'resolve';
+    // Decided first, whatever else this revision adds: a masked record must never name the unmasked record it
+    // replaces (its id, manifest CID and private capture id), because a manifest is pinned and can be published.
+    const fromUnmasked = masking?.ran === true && !previousMasked;
+    // `face_masking` when the earlier record was reconstructed from unmasked images and this one from masked ones
+    // (also when a video is added at the same time: `inputs` says so); otherwise `video_added` only when this
+    // capture was built from the capture the previous record came from.
+    const reason: SpatialRevision['reason'] = fromUnmasked ? 'face_masking' : capture.derivedFrom?.captureId === previousCapture ? 'video_added' : 'resolve';
     return {
       number: (previous.manifest.revision?.number ?? 1) + 1,
-      // `video_added` only when this capture was built from the capture the previous record came from;
-      // `face_masking` when the earlier record was reconstructed from unmasked images and this one from masked ones.
       reason,
-      ...note,
-      // No link back to the unmasked record for a face-masking revision (see `SpatialRevision`).
-      ...(reason === 'face_masking' ? {} : {
+      ...(note.note && noteNamesOperator(note.note, capture.capturedBy) ? {} : note),
+      // No link back to the unmasked record for a revision that masks what its predecessor did not (see `SpatialRevision`).
+      ...(fromUnmasked ? {} : {
         previousSpatialId: previous.id,
         ...(previous.manifestCid ? { previousManifestCid: previous.manifestCid } : {}),
         previousCaptureId: previousCapture,

@@ -325,10 +325,10 @@ def prepare_photo_dataset(
     if include_video:
         video_names, video_info, frame_stats = select_video_frames(runner, capture, work, progress, images, prefix="video")
         if mask_video:
-            from face_mask import mask_files
+            from face_mask import mask_frame_sequence
 
             progress("masking_faces", {"images": len(video_names)})
-            video_regions = mask_files(masker, images, video_names)
+            video_regions = mask_frame_sequence(masker, images, video_names)
         groups.append((video_names, True))
     submitted = len(names) + (len(groups[1][0]) if include_video else 0)
     progress("solving_poses", {"frames": frame_stats or {}, "photos": {"submitted": len(names)}})

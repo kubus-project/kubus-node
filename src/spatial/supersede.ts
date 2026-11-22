@@ -58,7 +58,14 @@ export async function supersedeSpatialRecord(
   if (old.manifest.artworkId !== replacement.manifest.artworkId) {
     throw localError(422, 'spatial_supersede_artwork_mismatch', { message: 'The replacing record belongs to a different artwork' });
   }
-  if (replacement.state !== 'local') throw localError(422, 'spatial_replacement_unavailable', { message: 'The replacing record is itself superseded or unavailable' });
+  // A record that was already offered to a backend cannot be retired from here: the publication would stay
+  // live while this Node stops serving its content. Withdraw it there first.
+  if (old.state === 'publication_requested') {
+    throw localError(409, 'spatial_publication_active', { message: 'The record was offered to a backend for publication; withdraw that publication first, then supersede it' });
+  }
+  if (replacement.state !== 'local' && replacement.state !== 'publication_requested') {
+    throw localError(422, 'spatial_replacement_unavailable', { message: 'The replacing record is itself superseded or unavailable' });
+  }
   if (old.supersededBy && old.supersededBy !== newId) throw localError(409, 'spatial_already_superseded', { message: 'The record was already superseded by another record' });
   if (replacement.createdAt <= old.createdAt) throw localError(422, 'spatial_replacement_not_newer', { message: 'The replacing record is not newer' });
 

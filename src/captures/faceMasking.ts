@@ -63,7 +63,7 @@ export interface CaptureFaceMasking {
 }
 
 export class FaceMaskingReportError extends Error {
-  constructor(readonly code: 'face_masking_report_invalid' | 'face_masking_report_mismatch', message: string) {
+  constructor(readonly code: 'face_masking_report_invalid' | 'face_masking_report_mismatch' | 'face_masking_report_unpinned', message: string) {
     super(message);
     this.name = 'FaceMaskingReportError';
   }
@@ -99,7 +99,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /**
  * Reads `<directory>/kubus-face-masking.json` when it exists and checks it against
  * the photos about to be imported (`photoHashes`: SHA-256 of each file). Returns
- * undefined when there is no report; throws when there is one that does not fit.
+ * undefined when there is no report; throws when there is one that does not fit or that names other than the pinned weights.
  */
 export async function readPremaskedReport(directory: string, photoHashes: string[]): Promise<FaceMaskingSummary | undefined> {
   const file = path.join(directory, FACE_MASKING_REPORT_NAME);
@@ -115,7 +115,13 @@ export async function readPremaskedReport(directory: string, photoHashes: string
   }
   let report: unknown;
   try { report = JSON.parse(raw.toString('utf8')); } catch { throw new FaceMaskingReportError('face_masking_report_invalid', 'The face-masking report is not valid JSON'); }
-  return summariseReport(report, photoHashes);
+  const summary = summariseReport(report, photoHashes);
+  // A report is the operator's statement; one that names any other detector weights than the pinned ones describes
+  // a run this Node cannot vouch for at all, so it is refused rather than recorded as masked.
+  if (!summary.weightsPinned) {
+    throw new FaceMaskingReportError('face_masking_report_unpinned', 'The face-masking report names detector weights other than the pinned ones; mask the photos again with face_mask.py from the worker image, or import without a report and let the worker mask them');
+  }
+  return summary;
 }
 
 export function summariseReport(report: unknown, photoHashes: string[]): FaceMaskingSummary {

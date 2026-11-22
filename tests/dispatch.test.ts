@@ -156,6 +156,18 @@ describe('dispatchLocalRequest', () => {
     }
   });
 
+  it('does not hand a superseded record to a paired client', async () => {
+    await deps.store.update((state) => {
+      state.spatial = {
+        old: { id: 'old', state: 'superseded', manifestCid: 'Qm1', manifest: { variants: [] } },
+        fresh: { id: 'fresh', state: 'local', manifestCid: 'Qm2', manifest: { variants: [] } },
+      } as never;
+    });
+    const get = (id: string) => dispatchLocalRequest(request({ method: 'GET', path: `/local/v1/spatial/${id}`, credential: token }), deps);
+    await expect(get('old')).rejects.toMatchObject({ statusCode: 410, code: 'spatial_record_superseded' });
+    await expect(get('fresh')).resolves.toMatchObject({ kind: 'json' });
+  });
+
   it('never publishes or revives a superseded spatial record', async () => {
     const publishExistingSpatial = vi.fn(async () => ({ requested: true }));
     deps.api = { publishExistingSpatial } as never;

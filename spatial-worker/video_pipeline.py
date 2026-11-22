@@ -44,7 +44,9 @@ def _float_env(name: str, default: float) -> float:
 MIN_DURATION_SECONDS = _float_env("KUBUS_VIDEO_MIN_SECONDS", 3.0)
 MAX_DURATION_SECONDS = _float_env("KUBUS_VIDEO_MAX_SECONDS", 20 * 60.0)
 # Fraction of submitted frames COLMAP must register for the run to proceed.
-MIN_REGISTRATION_RATIO = _float_env("KUBUS_VIDEO_MIN_REGISTRATION_RATIO", 0.6)
+# The default ratio. `gateLowered` compares against this constant, never against the env-tunable value.
+DEFAULT_MIN_REGISTRATION_RATIO = 0.6
+MIN_REGISTRATION_RATIO = _float_env("KUBUS_VIDEO_MIN_REGISTRATION_RATIO", DEFAULT_MIN_REGISTRATION_RATIO)
 # A frame is "blurry" when it scores below this fraction of the median score.
 BLUR_RATIO = _float_env("KUBUS_VIDEO_BLUR_RATIO", 0.5)
 # Median sharpness below this means the whole clip is soft, not just some frames.
@@ -283,7 +285,7 @@ def check_registration_gates(
     """
     details["minRegisteredViews"] = min_views
     details["minRegistrationRatio"] = min_ratio
-    details["gateLowered"] = min_views < MIN_VIEWS_FOR_RECONSTRUCTION or min_ratio < MIN_REGISTRATION_RATIO
+    details["gateLowered"] = min_views < MIN_VIEWS_FOR_RECONSTRUCTION or min_ratio < DEFAULT_MIN_REGISTRATION_RATIO
     ratio = registered / submitted if submitted else 0.0
     if registered < min_views:
         raise WorkerError(
@@ -370,14 +372,14 @@ def prepare_video_dataset(runner: Runner, capture: pathlib.Path, work: pathlib.P
     """
     regions: list | None = None
     if mask_video:
-        from face_mask import FaceMasker, mask_files
+        from face_mask import FaceMasker, mask_frame_sequence
 
         masker = masker or FaceMasker()  # raises FaceMaskingError when the pinned weights are missing or altered
 
         def mask_selected(directory: pathlib.Path, selected: list) -> None:
             nonlocal regions
             progress("masking_faces", {"images": len(selected)})
-            regions = mask_files(masker, directory, selected)
+            regions = mask_frame_sequence(masker, directory, selected)
 
         names, info, selection = select_video_frames(runner, capture, work, progress, after_selection=mask_selected)
     else:

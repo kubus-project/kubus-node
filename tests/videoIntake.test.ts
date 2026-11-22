@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CaptureStore } from '../src/captures/captureStore.js';
+import { PINNED_WEIGHTS_SHA256 } from '../src/captures/faceMasking.js';
 import { inspectCapturePackage } from '../src/captures/capturePackage.js';
 import { importRoots, resolveImportSource } from '../src/captures/importPaths.js';
 import { VIDEO_MAX_SECONDS, VIDEO_MIN_BYTES } from '../src/captures/videoPackage.js';
@@ -396,7 +397,7 @@ describe('video reconstruction job', () => {
       return new Response(JSON.stringify({
         variants: [{ role: 'spatial_archive', path: 'result.ply', mimeType: 'application/octet-stream', format: 'ply', storageClass: 'cold' }],
         processing: { protocol: 'kubus.spatial-job/1', workerVersion: 'kubus-spatial-worker/3', reconstruction: { engine: 'nerfstudio', method: 'splatfacto', iterations: 1000, outputFormat: 'ply' } },
-        provenance: { kind: 'video', faceMasking: { video: { ran: true, images: 75, regions: 4, imagesWithRegions: 3, regionsPerImage: Array.from({ length: 75 }, (_, index) => (index < 4 ? 1 : 0)), detector: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: 'a'.repeat(64) } }, frames: { selected: 75 }, sfm: { tool: 'colmap', submittedViews: 75, registeredViews: 70, registrationRatio: 0.933 }, splatCount: 123456, injected: 'ignored' },
+        provenance: { kind: 'video', faceMasking: { video: { ran: true, images: 75, regions: 4, imagesWithRegions: 3, regionsPerImage: Array.from({ length: 75 }, (_, index) => (index < 4 ? 1 : 0)), detector: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: PINNED_WEIGHTS_SHA256 } }, frames: { selected: 75 }, sfm: { tool: 'colmap', submittedViews: 75, registeredViews: 70, registrationRatio: 0.933 }, splatCount: 123456, injected: 'ignored' },
       }), { status: 200 });
     });
     jobsRef = jobs;

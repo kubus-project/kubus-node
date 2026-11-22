@@ -9,13 +9,13 @@ import { PHOTO_MIN_BYTES } from '../src/captures/photoPackage.js';
 import { VIDEO_MIN_BYTES } from '../src/captures/videoPackage.js';
 import { parseAddVideoArguments, parseImportPhotosArguments, parseImportVideoArguments, parseProcessArguments, parseSupersedeArguments } from '../src/cli/captureImport.js';
 import { CapabilityRegistry } from '../src/capabilities/registry.js';
-import { faceMaskingProvenance, JobRuntime, missingMasking, publicDerivation } from '../src/jobs/jobRuntime.js';
+import { faceMaskingProvenance, JobRuntime, missingMasking, noteNamesOperator, publicDerivation } from '../src/jobs/jobRuntime.js';
 import { ManagedPins, canonicalPinCid } from '../src/ipfs/managedPins.js';
 import { supersedeSpatialRecord } from '../src/spatial/supersede.js';
 import { findSupersededContent, purgeSupersededContent, warnAboutSupersededContent } from '../src/spatial/supersededBlocks.js';
 import { validateSpatialManifest } from '../src/spatial/models.js';
 import { serveSpatialVariant } from '../src/gui/spatialGuiApi.js';
-import { dropClientMaskingClaim } from '../src/localApi/dispatch.js';
+import { dropClientProvenanceClaims } from '../src/localApi/dispatch.js';
 import { LocalStore } from '../src/state/localStore.js';
 import { syntheticCid } from './fixtures/contentIds.js';
 
@@ -78,7 +78,7 @@ async function writePhotos(directory: string, count: number): Promise<Buffer[]> 
 function reportFor(files: Buffer[], regions: number[], overrides: Record<string, unknown> = {}) {
   return {
     schema: FACE_MASKING_REPORT_SCHEMA,
-    detector: { name: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: 'b'.repeat(64), scoreThreshold: 0.4, licence: 'MIT', opencv: '4.10.0' },
+    detector: { name: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: PINNED_WEIGHTS_SHA256, scoreThreshold: 0.4, licence: 'MIT', opencv: '4.10.0' },
     images: files.map((file, index) => ({ sha256: sha(file), regions: regions[index] ?? 0, manualAdded: 0, manualExcluded: index === 1 ? 1 : 0 })),
     ...overrides,
   };
@@ -111,7 +111,7 @@ describe('premasked photo report', () => {
 
   it('is bound to the files by checksum and yields counts per image in the capture order', () => {
     const summary = summariseReport(reportFor(files, [2, 0, 1]), files.map(sha));
-    expect(summary).toMatchObject({ detector: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: 'b'.repeat(64), images: 3, regions: 3, imagesWithRegions: 2, manualExcluded: 1, licence: 'MIT' });
+    expect(summary).toMatchObject({ detector: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: PINNED_WEIGHTS_SHA256, images: 3, regions: 3, imagesWithRegions: 2, manualExcluded: 1, licence: 'MIT' });
     expect(summary.regionsPerImage).toEqual([2, 0, 1]);
     // The counts follow the order the photos are imported in, not the order of the report.
     const reordered = summariseReport(reportFor(files, [2, 0, 1]), [sha(files[2]!), sha(files[0]!), sha(files[1]!)]);
@@ -206,11 +206,12 @@ describe('capture import records the masking decision', () => {
 
 describe('client claims about masking are ignored', () => {
   it('drops faceMasking from metadata a paired client uploads', () => {
-    const payload = { metadata: { kind: 'photos', faceMasking: { photos: 'none' }, frameCount: 3 } };
-    dropClientMaskingClaim(payload);
+    const payload = { metadata: { kind: 'photos', faceMasking: { photos: 'none' }, frameCount: 3, derivedFromCaptureId: 'cap-1', capturedBy: 'Someone', mediaCapturedAt: { photos: '2020-01-01T00:00:00Z' } } };
+    dropClientProvenanceClaims(payload);
+    // The masking decision, the capture a revision derives from, the operator label and the per-medium times are the Node's to write.
     expect(payload.metadata).toEqual({ kind: 'photos', frameCount: 3 });
-    expect(() => dropClientMaskingClaim({})).not.toThrow();
-    expect(() => dropClientMaskingClaim(undefined as never)).not.toThrow();
+    expect(() => dropClientProvenanceClaims({})).not.toThrow();
+    expect(() => dropClientProvenanceClaims(undefined as never)).not.toThrow();
   });
 });
 
@@ -235,7 +236,7 @@ describe('command lines', () => {
 describe('masking in the job and the record', () => {
   const WORKER_ID = '66666666-6666-4666-8666-666666666666';
   const processing = { protocol: 'kubus.spatial-job/1', workerVersion: 'kubus-spatial-worker/5', reconstruction: { engine: 'nerfstudio', method: 'splatfacto', iterations: 1000, outputFormat: 'ply' } };
-  const part = (images: number, regions = 3) => ({ ran: true, images, regions, imagesWithRegions: 2, regionsPerImage: Array.from({ length: images }, (_, index) => (index < regions ? 1 : 0)), detector: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: 'a'.repeat(64), scoreThreshold: 0.4, licence: 'MIT', opencv: '4.10.0' });
+  const part = (images: number, regions = 3) => ({ ran: true, images, regions, imagesWithRegions: 2, regionsPerImage: Array.from({ length: images }, (_, index) => (index < regions ? 1 : 0)), detector: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: PINNED_WEIGHTS_SHA256, scoreThreshold: 0.4, licence: 'MIT', opencv: '4.10.0' });
 
   async function setup(options: { faceMasking?: boolean; report?: (requested: any) => unknown } = {}) {
     const { dir, store, captures } = await newStore();
@@ -300,7 +301,7 @@ describe('masking in the job and the record', () => {
     // They are kept, privately, in the job record.
     expect((jobs.get(job.id).maskingDetail as any).photos.regionsPerImage).toHaveLength(9);
     // The record that can leave the Node says that masking ran and how many regions, never which image or where.
-    expect(record!.manifest.processing.faceMasking).toEqual({ ran: true, photos: { source: 'worker', detector: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: 'a'.repeat(64), scoreThreshold: 0.4, images: 9, regions: 3, imagesWithRegions: 2 } });
+    expect(record!.manifest.processing.faceMasking).toEqual({ ran: true, photos: { source: 'worker', detector: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: PINNED_WEIGHTS_SHA256, weightsPinned: true, scoreThreshold: 0.4, images: 9, regions: 3, imagesWithRegions: 2 } });
     expect(JSON.stringify(record!.manifest.processing)).not.toContain('regionsPerImage');
   });
 
@@ -313,7 +314,7 @@ describe('masking in the job and the record', () => {
     expect(jobs.get(job.id)).toMatchObject({ state: 'failed', error: { code: 'face_masking_failed' } });
     expect(records(store)).toHaveLength(0);
     // A report with no images, or one without the pinned checksum, is no better than none.
-    for (const report of [{ photos: { ran: true, images: 0, weightsSha256: 'a'.repeat(64) } }, { photos: { ran: true, images: 9 } }, { photos: { ran: false, images: 9, weightsSha256: 'a'.repeat(64) } }]) {
+    for (const report of [{ photos: { ran: true, images: 0, weightsSha256: PINNED_WEIGHTS_SHA256 } }, { photos: { ran: true, images: 9 } }, { photos: { ran: false, images: 9, weightsSha256: PINNED_WEIGHTS_SHA256 } }, { photos: { ran: true, images: 9, weightsSha256: 'a'.repeat(64) } }]) {
       expect(missingMasking({ photos: true }, { faceMasking: report })).toEqual(['photos']);
     }
     expect(missingMasking({ photos: true, video: true }, { faceMasking: { photos: part(9) } })).toEqual(['video']);
@@ -350,7 +351,7 @@ describe('masking in the job and the record', () => {
     expect(bodies[0].input).not.toHaveProperty('maskFaces');
     const [record] = records(store);
     const masking = record!.manifest.captureProvenance.derivation.faceMasking;
-    expect(masking).toMatchObject({ ran: true, photos: { source: 'premasked', attestation: 'operator_report', weightsPinned: false, detector: 'YuNet', weightsSha256: 'b'.repeat(64), images: 9, regions: 6, imagesWithRegions: 3 } });
+    expect(masking).toMatchObject({ ran: true, photos: { source: 'premasked', attestation: 'operator_report', weightsPinned: true, detector: 'YuNet', weightsSha256: PINNED_WEIGHTS_SHA256, images: 9, regions: 6, imagesWithRegions: 3 } });
     expect(JSON.stringify(record!.manifest)).not.toMatch(/regionsPerImage|manualAdded|manualExcluded/);
     // The per-image counts of the operator's report stay in the private capture record.
     expect((captures.get(capture.id).faceMasking?.report as any).regionsPerImage).toEqual([2, 0, 1, 0, 0, 3, 0, 0, 0]);
@@ -420,6 +421,92 @@ describe('masking in the job and the record', () => {
 
     await expect(jobs.create('spatial.reconstruct', { captureId: masked.id, revisionNote: 'x'.repeat(201) })).rejects.toMatchObject({ code: 'job_revision_note_invalid' });
     await expect(jobs.create('spatial.reconstruct', { captureId: masked.id, revisionNote: 5 })).rejects.toMatchObject({ code: 'job_revision_note_invalid' });
+  });
+
+  it('never links a masked revision to an unmasked record, even when a video is added in the same step', async () => {
+    const { dir, store, captures, jobs } = await setup();
+    await writePhotos(path.join(dir, 'a'), 9);
+    const legacy = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1', maskFaces: false });
+    const before = await jobs.create('spatial.reconstruct', { captureId: legacy.id });
+    await settle(jobs, before.id);
+    const [old] = records(store);
+    const video = path.join(dir, 'later.mp4');
+    await fs.writeFile(video, fakeMp4());
+    const mixed = await captures.addVideoToCapture(legacy.id, video, {});
+    const after = await jobs.create('spatial.reconstruct', { captureId: mixed.id });
+    await settle(jobs, after.id);
+    expect(jobs.get(after.id).state).toBe('completed');
+    const revision = records(store).find((record) => record.id !== old!.id)!;
+    expect(revision.manifest.revision).toEqual({ number: 2, reason: 'face_masking', inputs: { captureKind: 'mixed', photos: 9, video: true } });
+    const text = JSON.stringify(revision.manifest);
+    expect(text).not.toContain(old!.id);
+    expect(text).not.toContain(old!.manifestCid);
+    expect(text).not.toContain(legacy.id);
+  });
+
+  it('refuses a superseded record as the one to revise and never links a derived capture to it', async () => {
+    const { dir, store, captures, jobs } = await setup();
+    await writePhotos(path.join(dir, 'a'), 9);
+    const base = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1' });
+    const first = await jobs.create('spatial.reconstruct', { captureId: base.id });
+    await settle(jobs, first.id);
+    const [old] = records(store);
+    await store.update((state) => { (state.spatial as Record<string, { state: string }>)[old!.id]!.state = 'superseded'; });
+    await expect(jobs.create('spatial.reconstruct', { captureId: base.id, previousSpatialId: old!.id })).rejects.toMatchObject({ statusCode: 422, code: 'previous_spatial_not_found' });
+    const video = path.join(dir, 'later.mp4');
+    await fs.writeFile(video, fakeMp4());
+    const mixed = await captures.addVideoToCapture(base.id, video, {});
+    const derived = await jobs.create('spatial.reconstruct', { captureId: mixed.id });
+    expect(derived.input).not.toHaveProperty('previousSpatialId');
+    await settle(jobs, derived.id);
+  });
+
+  it('refuses a revision note that carries the operator name, accents and case ignored', async () => {
+    const { dir, captures, jobs } = await setup();
+    await writePhotos(path.join(dir, 'a'), 9);
+    const capture = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1', capturedBy: 'Ada Exampl\u00e9 (aexample)' });
+    for (const note of ['rerun for Ada Example', 'by EXAMPL\u00c9', 'handle aexample, provenance']) {
+      await expect(jobs.create('spatial.reconstruct', { captureId: capture.id, revisionNote: note })).rejects.toMatchObject({ statusCode: 422, code: 'job_revision_note_names_operator' });
+    }
+    const ok = await jobs.create('spatial.reconstruct', { captureId: capture.id, revisionNote: 'face masking and provenance corrected' });
+    expect(ok.input).toMatchObject({ revisionNote: 'face masking and provenance corrected' });
+    await settle(jobs, ok.id);
+    expect(noteNamesOperator('anything', undefined)).toBe(false);
+    expect(noteNamesOperator('a dam in the mural', 'Dam Jan')).toBe(false);
+  });
+
+  it('does not accept a premasked report that names other weights than the pinned ones', async () => {
+    const { dir, captures } = await setup();
+    const source = path.join(dir, 'masked');
+    const written = await writePhotos(source, 9);
+    const report = reportFor(written, [0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    report.detector.weightsSha256 = 'c'.repeat(64);
+    await fs.writeFile(path.join(source, FACE_MASKING_REPORT_NAME), JSON.stringify(report));
+    await expect(captures.importPhotoDirectory(source, { artworkId: 'art-1' })).rejects.toMatchObject({ statusCode: 422, code: 'face_masking_report_unpinned' });
+  });
+
+  it('keeps the camera models of the operator out of the public derivation', () => {
+    const open = publicDerivation({ photos: { count: 9, cameras: { 'Apple iPhone 16 Pro': 5 } }, splatCount: 5 }) as any;
+    expect(open.photos).toEqual({ count: 9 });
+    expect(open.splatCount).toBe(5);
+  });
+
+  it('records worker-masked parts as pinned and refuses a re-import that states different provenance', async () => {
+    const { dir, store, captures, jobs } = await setup();
+    await writePhotos(path.join(dir, 'a'), 9);
+    const first = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1', capturedBy: 'handle-one', capturedAt: '2026-08-17T03:59:31Z' });
+    const retry = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1', capturedBy: 'handle-one', capturedAt: '2026-08-17T03:59:31Z' });
+    expect(retry.id).toBe(first.id);
+    const quiet = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1' });
+    expect(quiet.id).toBe(first.id); // stating nothing is a plain retry
+    await expect(captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1', capturedBy: 'handle-two' }))
+      .rejects.toMatchObject({ statusCode: 409, code: 'capture_exists_with_different_provenance', details: { differs: ['capturedBy'] } });
+    await expect(captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1', capturedBy: 'handle-one', capturedAt: '2026-08-18T03:59:31Z' }))
+      .rejects.toMatchObject({ code: 'capture_exists_with_different_provenance', details: { differs: ['capturedAt'] } });
+    expect(captures.get(first.id).capturedBy).toBe('handle-one');
+    const job = await jobs.create('spatial.reconstruct', { captureId: first.id });
+    await settle(jobs, job.id);
+    expect(records(store)[0]!.manifest.captureProvenance.derivation.faceMasking.photos.weightsPinned).toBe(true);
   });
 });
 
@@ -581,6 +668,35 @@ describe('superseding a spatial record', () => {
     expect(warn).not.toHaveBeenCalled();
     await warnAboutSupersededContent({ store, kubo: { blockPresent: async () => { throw new Error('kubo down'); } }, logger: { warn } });
     expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses to retire a record that was offered to a backend, and accepts a replacement that was', async () => {
+    const { store, kubo } = await stateWithTwoRecords();
+    await store.update((state) => { (state.spatial as Record<string, { state: string }>).old!.state = 'publication_requested'; });
+    await expect(supersedeSpatialRecord({ store, kubo: kubo as never }, 'old', 'next')).rejects.toMatchObject({ statusCode: 409, code: 'spatial_publication_active' });
+    expect((store.snapshot().spatial as Record<string, { state: string }>).old!.state).toBe('publication_requested');
+    await store.update((state) => {
+      const spatial = state.spatial as Record<string, { state: string }>;
+      spatial.old!.state = 'local';
+      spatial.next!.state = 'publication_requested';
+    });
+    await expect(supersedeSpatialRecord({ store, kubo: kubo as never }, 'old', 'next')).resolves.toMatchObject({ state: 'superseded', supersededBy: 'next' });
+  });
+
+  it('does not call a record purged while a root is still in the store, and does not read a Kubo error as absent', async () => {
+    const { store, kubo, oldCids } = await stateWithTwoRecords();
+    await supersedeSpatialRecord({ store, kubo: kubo as never }, 'old', 'next');
+    const stubborn = {
+      blockPresent: async () => true,
+      refsLocal: async (cid: string) => [cid],
+      blockRm: async (cids: string[]) => cids.map((cid) => ({ cid })), // claims success, the block stays
+    };
+    const result = await purgeSupersededContent({ store, kubo: stubborn });
+    expect(result.records[0]).toMatchObject({ id: 'old', blocksKept: 2, keptReason: expect.stringContaining('still in the store') });
+    expect((store.snapshot().spatial as Record<string, { contentPurgedAt?: string }>).old!.contentPurgedAt).toBeUndefined();
+    expect(oldCids.manifest).toBeTruthy();
+    const broken = { ...stubborn, blockPresent: async () => { throw new Error('Kubo block/stat failed with HTTP 500: datastore is locked'); } };
+    await expect(purgeSupersededContent({ store, kubo: broken })).rejects.toThrow('datastore is locked');
   });
 
   it('is no longer served', async () => {

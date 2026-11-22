@@ -25,7 +25,7 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 WORKER_AUTH_KEY_PATH = os.environ.get("WORKER_AUTH_KEY_PATH", "/var/lib/kubus-node/worker-auth.key")
 
 
-WORKER_VERSION = "kubus-spatial-worker/6"
+WORKER_VERSION = "kubus-spatial-worker/7"
 WORKER_INSTANCE_ID = str(uuid.uuid4())
 control = JobControl("/var/lib/kubus-node/private/worker-control")
 

@@ -288,12 +288,18 @@ export async function dispatchLocalRequest(
  * cleartext LAN the attacker must already be on the network.
  */
 /**
- * A paired client cannot declare its own captures masked (or exempt from masking): the Node decides the
- * face-masking step from its own policy, so a claim carried in uploaded metadata is discarded.
+ * Metadata keys that only the Node's own importers may write into a capture: the face-masking decision (the Node
+ * decides it from its own policy), the capture a media capture was derived from (it picks which earlier spatial
+ * record a revision links to) and the operator and per-medium capture times (they end up in the manifest).
  */
-export function dropClientMaskingClaim(payload: { metadata?: unknown }): void {
+const NODE_OWNED_METADATA = ['faceMasking', 'derivedFromCaptureId', 'capturedBy', 'mediaCapturedAt'] as const;
+
+/** A paired client cannot declare these in uploaded metadata: a claim carried there is discarded. */
+export function dropClientProvenanceClaims(payload: { metadata?: unknown }): void {
   const metadata = payload?.metadata;
-  if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) delete (metadata as Record<string, unknown>).faceMasking;
+  if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) {
+    for (const key of NODE_OWNED_METADATA) delete (metadata as Record<string, unknown>)[key];
+  }
 }
 
 async function proveIdentity(request: LocalRequest, deps: LocalApiDeps): Promise<LocalResponse> {
@@ -467,14 +473,14 @@ async function route(
     // package can exceed 50 MiB on the wire. Keep the endpoint bounded while
     // allowing a useful mobile capture session.
     const payload = (await request.body.json(BODY_LIMITS.capturePackage)) as unknown as CapturePackagePayload;
-    dropClientMaskingClaim(payload);
+    dropClientProvenanceClaims(payload);
     return jsonResponse(201, await captures.create(payload));
   }
 
   if (method === 'POST' && path === '/local/v1/captures/drafts') {
     if (!(await pairing.authorize(credential, 'captures:create'))) throw localError(403, 'scope_required');
     const payload = (await request.body.json(BODY_LIMITS.captureDraftMetadata)) as unknown as CaptureDraftPayload;
-    dropClientMaskingClaim(payload);
+    dropClientProvenanceClaims(payload);
     return jsonResponse(201, await captures.beginDraft(payload));
   }
 
@@ -681,8 +687,11 @@ async function route(
 
   const spatialMatch = path.match(/^\/local\/v1\/spatial\/([^/]+)$/);
   if (method === 'GET' && spatialMatch) {
-    const value = store.snapshot().spatial?.[spatialMatch[1]!];
+    const value = store.snapshot().spatial?.[spatialMatch[1]!] as { state?: string } | undefined;
     if (!value) throw localError(404, 'spatial_not_found');
+    // A superseded record (for example one reconstructed from unmasked images) is history: its manifest and CIDs
+    // are not handed to a paired client, in line with the 410 of the GUI content route.
+    if (value.state === 'superseded') throw localError(410, 'spatial_record_superseded', { message: 'This record was replaced by a newer one and is no longer served' });
     return jsonResponse(200, value);
   }
 

@@ -4,6 +4,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CaptureStore } from '../src/captures/captureStore.js';
+import { PINNED_WEIGHTS_SHA256 } from '../src/captures/faceMasking.js';
 import { inspectCapturePackage } from '../src/captures/capturePackage.js';
 import { importRoots, resolveImportSource } from '../src/captures/importPaths.js';
 import { PHOTO_MAX_COUNT, PHOTO_MIN_BYTES, PHOTO_MIN_COUNT, inspectPhotoPackage, listPhotoSources } from '../src/captures/photoPackage.js';
@@ -268,7 +269,7 @@ describe('photo reconstruction job and spatial revisions', () => {
 
   /** What the worker reports for the parts it was asked to mask. */
   const maskingReport = (requested: { photos?: boolean; video?: boolean }) => {
-    const part = (images: number) => ({ ran: true, images, regions: 3, imagesWithRegions: 2, regionsPerImage: Array.from({ length: images }, (_, index) => (index < 3 ? 1 : 0)), detector: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: 'a'.repeat(64) });
+    const part = (images: number) => ({ ran: true, images, regions: 3, imagesWithRegions: 2, regionsPerImage: Array.from({ length: images }, (_, index) => (index < 3 ? 1 : 0)), detector: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: PINNED_WEIGHTS_SHA256 });
     return { ...(requested.photos ? { photos: part(12) } : {}), ...(requested.video ? { video: part(48) } : {}) };
   };
 

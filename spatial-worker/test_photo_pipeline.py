@@ -239,6 +239,20 @@ class PhotoDatasetTests(unittest.TestCase):
                 convert=fake_convert(first_n(19)))
         self.assertEqual(refused.exception.details["minRegisteredViews"], 20)  # the refusal says which floor it applied
 
+    def test_a_lowered_ratio_is_recorded_as_a_lowered_gate_whatever_the_env_default_is(self):
+        # The comparison is against the shipped default (0.6), not against the env-tunable value in force.
+        with mock.patch.object(vp, "MIN_REGISTRATION_RATIO", 0.2):
+            details: dict = {}
+            vp.check_registration_gates(30, 100, details, 24, 0.2)
+        self.assertEqual((details["minRegistrationRatio"], details["gateLowered"]), (0.2, True))
+        details = {}
+        vp.check_registration_gates(30, 40, details, 24, vp.DEFAULT_MIN_REGISTRATION_RATIO)
+        self.assertFalse(details["gateLowered"])
+        details = {}
+        vp.check_registration_gates(38, 40, details, 24, 0.9)  # a stricter gate is not a lowered one
+        self.assertFalse(details["gateLowered"])
+        self.assertEqual(vp.DEFAULT_MIN_REGISTRATION_RATIO, 0.6)
+
     def test_the_floor_is_the_video_floor_unless_tuned(self):
         self.assertEqual(pp.PHOTO_MIN_REGISTERED_VIEWS, vp.MIN_VIEWS_FOR_RECONSTRUCTION)
         self.assertEqual(pp.PHOTO_MIN_REGISTRATION_RATIO, vp.MIN_REGISTRATION_RATIO)

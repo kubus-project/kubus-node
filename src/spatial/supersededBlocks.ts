@@ -97,6 +97,13 @@ export async function purgeSupersededContent(deps: { store: LocalStore; kubo: Cl
         }
       }
     }
+    // Marked purged only when every root is really gone: a failed lookup throws (it is not "absent"), and a root
+    // that is still there after the removal is counted as kept.
+    if (kept === 0) {
+      for (const root of rootsOf(record)) {
+        if (await deps.kubo.blockPresent(root)) { kept += 1; keptReason ??= 'the block is still in the store after removal'; }
+      }
+    }
     if (kept === 0) {
       await deps.store.update((state) => {
         const current = (state.spatial as Record<string, SupersededRecord> | undefined)?.[record.id];

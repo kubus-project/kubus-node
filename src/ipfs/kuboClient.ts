@@ -130,7 +130,9 @@ export class KuboClient {
       return true;
     } catch (error) {
       const message = String((error as Error).message).toLowerCase();
-      if (message.includes('not found') || message.includes('offline') || message.includes('http 500')) return false;
+      // Only Kubo's own "not found" answer means the block is absent. Any other failure (an HTTP 500 for another
+      // reason, a datastore error) must not read as "absent": the caller would skip the block and report it purged.
+      if (message.includes('not found') || message.includes('could not find')) return false;
       throw error;
     }
   }
