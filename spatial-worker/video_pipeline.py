@@ -157,12 +157,25 @@ def plan_frames(duration: float) -> tuple:
     return target, extract
 
 
-def extract_frames(runner: Runner, video: pathlib.Path, destination: pathlib.Path, count: int, duration: float, source_fps: float = 0.0) -> list:
-    destination.mkdir(parents=True, exist_ok=True)
+def frame_sample_rate(count: int, duration: float, source_fps: float = 0.0) -> float:
+    """Frames per second the extraction samples at (never faster than the footage: the fps filter would repeat frames)."""
     rate = max(0.05, count / duration)
-    # Never sample faster than the footage: the fps filter would repeat frames.
     if source_fps > 0:
         rate = min(rate, source_fps)
+    return rate
+
+
+def frame_seconds(path: pathlib.Path, rate: float) -> float | None:
+    """Where in the footage an extracted frame (`00007.jpg`, numbered from 0 at `rate` per second) is; None when unnamed so."""
+    try:
+        return round(int(pathlib.Path(path).stem) / rate, 1)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def extract_frames(runner: Runner, video: pathlib.Path, destination: pathlib.Path, count: int, duration: float, source_fps: float = 0.0) -> list:
+    destination.mkdir(parents=True, exist_ok=True)
+    rate = frame_sample_rate(count, duration, source_fps)
     scale = (
         f"scale=w='if(gt(iw,ih),min(iw,{MAX_LONG_SIDE}),-2)':h='if(gt(iw,ih),-2,min(ih,{MAX_LONG_SIDE}))'"
     )
@@ -336,11 +349,13 @@ def select_video_frames(
     destination: pathlib.Path | None = None,
     prefix: str = "frame",
     after_selection: Callable[[pathlib.Path, list], None] | None = None,
+    seconds: list | None = None,
 ) -> tuple:
     """Probe the capture's video, extract, filter and select frames into `destination`.
 
     Returns (file names written, video facts, selection statistics). Shared by the
-    video intake and the mixed photo + video intake.
+    video intake and the mixed photo + video intake. A `seconds` list is filled with each selected frame's position
+    in the footage (seconds, in the order of the names).
     """
     video = find_source_video(capture)
     info = probe_video(runner, video)
@@ -348,6 +363,7 @@ def select_video_frames(
     raw = work / "raw_frames"
     progress("extracting_frames", {"video": info, "targetFrames": target, "extractFrames": extract_count})
     paths = extract_frames(runner, video, raw, extract_count, info["durationSeconds"], info["frameRate"])
+    rate = frame_sample_rate(extract_count, info["durationSeconds"], info["frameRate"])
     selected, selection = select_frames(score_frames(paths), target)
     chosen = destination if destination is not None else work / "selected_frames"
     if destination is None and chosen.exists():
@@ -358,6 +374,8 @@ def select_video_frames(
         name = f"{prefix}_{index:05d}.jpg"
         shutil.copyfile(item["path"], chosen / name)
         names.append(name)
+        if seconds is not None:
+            seconds.append(frame_seconds(item["path"], rate))
     shutil.rmtree(raw, ignore_errors=True)
     if after_selection is not None:
         after_selection(chosen, names)  # for example face masking, before anything reads the frames
@@ -372,6 +390,7 @@ def prepare_video_dataset(runner: Runner, capture: pathlib.Path, work: pathlib.P
     """
     regions: list | None = None
     review: list = []
+    seconds: list = []
     if mask_video:
         from face_mask import FaceMasker, mask_frame_sequence
 
@@ -382,7 +401,7 @@ def prepare_video_dataset(runner: Runner, capture: pathlib.Path, work: pathlib.P
             progress("masking_faces", {"images": len(selected)})
             regions = mask_frame_sequence(masker, directory, selected, review=review)
 
-        names, info, selection = select_video_frames(runner, capture, work, progress, after_selection=mask_selected)
+        names, info, selection = select_video_frames(runner, capture, work, progress, after_selection=mask_selected, seconds=seconds)
     else:
         names, info, selection = select_video_frames(runner, capture, work, progress)
     chosen = work / "selected_frames"
@@ -391,4 +410,4 @@ def prepare_video_dataset(runner: Runner, capture: pathlib.Path, work: pathlib.P
     sfm = run_structure_from_motion(runner, chosen, dataset, len(names))
     sfm["tool"] = "colmap"
     sfm["toolVersion"] = colmap_version(runner)
-    return {"dataset": dataset, "video": info, "frames": selection, "sfm": sfm, "masking": {"photos": None, "video": regions, "videoReview": review if regions is not None else None, "version": masker.version if mask_video else None}}
+    return {"dataset": dataset, "video": info, "frames": selection, "sfm": sfm, "masking": {"photos": None, "video": regions, "videoReview": review if regions is not None else None, "videoFiles": [f"selected_frames/{name}" for name in names] if regions is not None else None, "videoSeconds": seconds if regions is not None else None, "version": masker.version if mask_video else None}}

@@ -7,6 +7,7 @@ import { NEEDS_LOOK_LIST_LIMIT, PINNED_WEIGHTS_SHA256, effectiveMasking, publicM
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import { localError } from '../localApi/pairingService.js';
 import type { Logger } from '../logging/logger.js';
+import { WORKER_REVIEW_FILE, removeFaceReviewImages, storeFaceReview, type FaceReview, type ReviewSource } from '../spatial/faceReview.js';
 import { buildNerfstudioDataset } from '../spatial/nerfstudioAdapter.js';
 import { longWorkerFetch, workerFailure } from '../spatial/workerClient.js';
 import { validateSpatialManifest, type SpatialManifest, type SpatialRevision, type SpatialVariant } from '../spatial/models.js';
@@ -112,7 +113,10 @@ function cleanMaskingPart(value: unknown): Record<string, unknown> | undefined {
         if (typeof item.image !== 'number' || !Number.isInteger(item.image) || item.image < 1 || item.image > 100000) continue;
         const weak = count(item.weakExcluded);
         const large = count(item.largeBelowCertain);
-        items.push({ image: item.image, ...(weak ? { weakExcluded: weak } : {}), ...(large ? { largeBelowCertain: large } : {}) });
+        // Where the masked copy is (the worker's name, under the job's output directory) and where in the footage a frame is.
+        const file = typeof item.file === 'string' && WORKER_REVIEW_FILE.test(item.file) ? item.file : undefined;
+        const seconds = typeof item.seconds === 'number' && Number.isFinite(item.seconds) && item.seconds >= 0 && item.seconds <= 360000 ? item.seconds : undefined;
+        items.push({ image: item.image, ...(weak ? { weakExcluded: weak } : {}), ...(large ? { largeBelowCertain: large } : {}), ...(file ? { file } : {}), ...(seconds !== undefined ? { seconds } : {}) });
       }
       needs.items = items;
       if (raw.itemsTruncated === true || raw.items.length > NEEDS_LOOK_LIST_LIMIT) needs.itemsTruncated = true;
@@ -159,7 +163,8 @@ export function faceMaskingProvenance(capture: { kind?: string; faceMasking?: un
     if (masking.video === 'worker') out.video = cleanMaskingPart({ ...(reported?.video as object | undefined), source: 'worker', weightsPinned: pinned(reported?.video) });
   }
   const ran = Boolean(out.photos || out.video);
-  return ran ? { ran: true, ...out } : { ran: false };
+  // `--no-mask-faces` is the operator's explicit choice; say so, so "not masked" is not read as "not applicable".
+  return ran ? { ran: true, ...out } : { ran: false, ...(masking.optedOut ? { reason: 'operator_opted_out' } : {}) };
 }
 
 /**
@@ -335,7 +340,12 @@ export class JobRuntime {
     if (!['spatial.reconstruct', 'spatial.optimize', 'spatial.generate_preview'].includes(type)) throw localError(400, 'job_type_unsupported');
     const captureId = typeof input.captureId === 'string' ? input.captureId : '';
     if (!captureId) throw localError(400, 'job_capture_required');
-    this.deps.captureStore.get(captureId);
+    const target = this.deps.captureStore.get(captureId);
+    // Import refuses a record without an artwork, but only after training and export. An artwork-less capture is a
+    // normal thing to hold (private, not yet for an artwork), so the job must name one now, not burn a GPU run first.
+    if (!String(input.artworkId || target.artworkId || '')) {
+      throw localError(422, 'job_artwork_required', { message: 'This capture names no artwork and the job names none; a spatial record belongs to an artwork. Pass an artworkId, or import the capture with --artwork' });
+    }
 
     if (type !== 'spatial.reconstruct') return this.insert(type, input);
 
@@ -570,6 +580,10 @@ export class JobRuntime {
       if (maskRequest && (maskRequest.photos || maskRequest.video) && (workerHealth as { faceMasking?: unknown }).faceMasking !== true) {
         throw Object.assign(new Error('The spatial worker cannot mask faces; rebuild the worker image'), { code: 'worker_face_masking_unsupported' });
       }
+      // A worker that masks but cannot name the images it flagged leaves the operator nothing to look at.
+      if (maskRequest && (maskRequest.photos || maskRequest.video) && (workerHealth as { faceReviewImages?: unknown }).faceReviewImages !== true) {
+        throw Object.assign(new Error('The spatial worker does not report which images need a look; rebuild the worker image'), { code: 'worker_face_review_unsupported' });
+      }
       if (videoJob && !(Array.isArray(workerHealth.inputModes) && workerHealth.inputModes.includes(inputMode))) {
         throw Object.assign(new Error(`The spatial worker does not accept ${inputMode} input; rebuild the worker image`), { code: `worker_${inputMode}_unsupported` });
       }
@@ -754,39 +768,90 @@ export class JobRuntime {
     const variants: SpatialVariant[] = [];
     const id = crypto.randomUUID();
     const pinOwner = `spatial:${id}`;
-    const managed = new ManagedPins(this.deps.kubo, this.deps.store);
-    for (const { item, target } of validated) {
-      // Streamed from disk: a Gaussian splat PLY can be hundreds of megabytes
-      // and must never be held whole in Node's memory just to re-emit it as
-      // multipart form data.
-      const { size: sizeBytes } = await fs.stat(target);
-      const added = await this.deps.kubo.addFileStreamed(target, path.basename(target), undefined, { pin: false });
-      if (!added.Hash) throw new Error('kubo_add_missing_cid');
+    // Before anything is added to Kubo: the flagged masked images are kept for the operator's look, and a record
+    // whose review could not be done is never made.
+    const faceReview = await this.keepFaceReview(id, job, capture, outputDirectory, derivation?.faceMasking);
+    try {
+      const managed = new ManagedPins(this.deps.kubo, this.deps.store);
+      for (const { item, target } of validated) {
+        // Streamed from disk: a Gaussian splat PLY can be hundreds of megabytes
+        // and must never be held whole in Node's memory just to re-emit it as
+        // multipart form data.
+        const { size: sizeBytes } = await fs.stat(target);
+        const added = await this.deps.kubo.addFileStreamed(target, path.basename(target), undefined, { pin: false });
+        if (!added.Hash) throw new Error('kubo_add_missing_cid');
+        await managed.acquire(added.Hash, pinOwner);
+        variants.push({ role: item.role, cid: added.Hash, sizeBytes, mimeType: item.mimeType, format: item.format, storageClass: item.storageClass });
+      }
+      const maskingSummary = publicMaskingSummary(derivation?.faceMasking as Record<string, unknown> | undefined);
+      const manifest: SpatialManifest = {
+        schema: 'kubus.spatial/1', type: 'gaussianSplat', id,
+        artworkId: String(job.input.artworkId || capture.artworkId || ''), markerId: String(job.input.markerId || capture.markerId || '') || undefined,
+        captureId: capture.id, captureProvenance: { source: 'localCapture', captureId: capture.id, ...(derivation ? { derivation: publicDerivation(derivation) } : {}) }, capturedAt: capture.capturedAt,
+        capturedBy: typeof job.input.capturedBy === 'string' ? job.input.capturedBy : capture.capturedBy,
+        variants, transform: output.transform, viewerDefaults: output.viewerDefaults,
+        processing: { ...output.processing, ...(maskingSummary ? { faceMasking: maskingSummary } : {}) },
+        createdAt: new Date().toISOString(),
+        revision: this.revisionOf(job, capture, derivation?.faceMasking as { ran?: boolean } | undefined),
+      };
+      if (!manifest.artworkId) throw new Error('spatial_artwork_required');
+      validateSpatialManifest(manifest);
+      const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+      const added = await this.deps.kubo.addBytes(manifestBytes, `${id}.spatial.json`, { pin: false });
+      if (!added.Hash) throw new Error('kubo_add_manifest_missing_cid');
       await managed.acquire(added.Hash, pinOwner);
-      variants.push({ role: item.role, cid: added.Hash, sizeBytes, mimeType: item.mimeType, format: item.format, storageClass: item.storageClass });
+      // Private to the Node (not in the manifest): what a human still has to look at before this record is published.
+      const record = { id, state: 'local', manifestCid: added.Hash, manifest, createdAt: manifest.createdAt, privateSourceCapture: true, pinOwner, ...(faceReview ? { faceReview } : {}) };
+      await this.deps.store.update((state) => { (state.spatial ??= {})[id] = record; });
+      return record;
+    } catch (error) {
+      if (faceReview) await removeFaceReviewImages(this.deps.dataRoot, id);
+      throw error;
     }
-    const maskingSummary = publicMaskingSummary(derivation?.faceMasking as Record<string, unknown> | undefined);
-    const manifest: SpatialManifest = {
-      schema: 'kubus.spatial/1', type: 'gaussianSplat', id,
-      artworkId: String(job.input.artworkId || capture.artworkId || ''), markerId: String(job.input.markerId || capture.markerId || '') || undefined,
-      captureId: capture.id, captureProvenance: { source: 'localCapture', captureId: capture.id, ...(derivation ? { derivation: publicDerivation(derivation) } : {}) }, capturedAt: capture.capturedAt,
-      capturedBy: typeof job.input.capturedBy === 'string' ? job.input.capturedBy : capture.capturedBy,
-      variants, transform: output.transform, viewerDefaults: output.viewerDefaults,
-      processing: { ...output.processing, ...(maskingSummary ? { faceMasking: maskingSummary } : {}) },
-      createdAt: new Date().toISOString(),
-      revision: this.revisionOf(job, capture, derivation?.faceMasking as { ran?: boolean } | undefined),
-    };
-    if (!manifest.artworkId) throw new Error('spatial_artwork_required');
-    validateSpatialManifest(manifest);
-    const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
-    const added = await this.deps.kubo.addBytes(manifestBytes, `${id}.spatial.json`, { pin: false });
-    if (!added.Hash) throw new Error('kubo_add_manifest_missing_cid');
-    await managed.acquire(added.Hash, pinOwner);
-    // Private to the Node (not in the manifest): what a human still has to look at before this record is published.
-    const pendingLook = maskingNeedsLookCounts(derivation?.faceMasking).images;
-    const record = { id, state: 'local', manifestCid: added.Hash, manifest, createdAt: manifest.createdAt, privateSourceCapture: true, pinOwner, ...(pendingLook ? { faceReview: { pending: pendingLook, jobId: job.id } } : {}) };
-    await this.deps.store.update((state) => { (state.spatial ??= {})[id] = record; });
-    return record;
+  }
+
+  /**
+   * The review a record needs (see `spatial/faceReview.ts`): the images face masking flagged, copied (masked) out
+   * of the job's working directory, which is removed when the job ends. `undefined` when nothing is flagged.
+   */
+  private async keepFaceReview(id: string, job: LocalJob, capture: ReturnType<CaptureStore['get']>, outputDirectory: string, masking: unknown): Promise<FaceReview | undefined> {
+    const pending = maskingNeedsLookCounts(masking).images;
+    if (!pending) return undefined;
+    const sources: ReviewSource[] = [];
+    let truncated = false;
+    for (const part of ['photos', 'video'] as const) {
+      const record = (masking as Record<string, { source?: string; needsLook?: NeedsLook } | undefined>)[part];
+      const look = record?.needsLook;
+      if (!look || !look.images) continue;
+      if (look.itemsTruncated) truncated = true;
+      for (const item of look.items ?? []) {
+        let source: ReviewSource | undefined;
+        if (record?.source === 'premasked') {
+          // The photos were masked before import: the capture's own files are the masked images.
+          const relative = await this.capturePhotoOf(capture, item.image);
+          if (relative) source = { part, image: item.image, relative, root: capture.directory };
+        } else if (item.file) {
+          source = { part, image: item.image, relative: item.file, root: outputDirectory };
+        }
+        if (!source) throw Object.assign(new Error('A flagged image has no copy that can be kept for review; rebuild the worker image'), { code: 'face_review_images_unavailable' });
+        sources.push({ ...source, ...(item.weakExcluded ? { weakExcluded: item.weakExcluded } : {}), ...(item.largeBelowCertain ? { largeBelowCertain: item.largeBelowCertain } : {}), ...(item.seconds !== undefined ? { seconds: item.seconds } : {}) });
+      }
+      // Images flagged but not listed (only when a list was cut) are counted in `pending`.
+      if ((look.items?.length ?? 0) < look.images) truncated = true;
+    }
+    return storeFaceReview(this.deps.dataRoot, id, job.id, pending, sources, truncated);
+  }
+
+  /** `photos/NNNNN.<ext>` of a capture: the file of the photo with that 1-based number, when it exists. */
+  private async capturePhotoOf(capture: ReturnType<CaptureStore['get']>, image: number): Promise<string | undefined> {
+    const stem = String(image).padStart(5, '0');
+    try {
+      const entries = await fs.readdir(path.join(capture.directory, 'photos'));
+      const match = entries.find((entry) => path.parse(entry).name === stem && /\.(jpe?g|png)$/i.test(entry));
+      return match ? `photos/${match}` : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /**

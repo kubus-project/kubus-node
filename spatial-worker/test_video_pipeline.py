@@ -124,6 +124,21 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertEqual(len(regions), result["frames"]["selected"])
         self.assertTrue(all(count == 1 for count in regions))
         self.assertEqual(result["masking"]["version"]["name"], "YuNet")
+        # The masked frames are named under the job's directory for the operator's look, with their place in the footage.
+        files = result["masking"]["videoFiles"]
+        self.assertEqual(len(files), result["frames"]["selected"])
+        self.assertTrue(all(name.startswith("selected_frames/frame_") and (self.work / name).is_file() for name in files))
+        seconds = result["masking"]["videoSeconds"]
+        self.assertEqual(len(seconds), len(files))
+        self.assertEqual(seconds, sorted(seconds))
+        self.assertGreaterEqual(seconds[0], 0)
+
+    def test_frame_times_follow_the_sampling_rate_and_never_exceed_the_footage_rate(self):
+        self.assertEqual(vp.frame_sample_rate(120, 10.0, 30.0), 12.0)
+        self.assertEqual(vp.frame_sample_rate(900, 10.0, 30.0), 30.0)
+        self.assertEqual(vp.frame_sample_rate(1, 100.0, 0.0), 0.05)
+        self.assertEqual(vp.frame_seconds(pathlib.Path("00024.jpg"), 12.0), 2.0)
+        self.assertIsNone(vp.frame_seconds(pathlib.Path("clip.jpg"), 12.0))
 
     def test_without_the_mask_option_nothing_is_masked(self):
         result = self.run_pipeline(FakeTools())

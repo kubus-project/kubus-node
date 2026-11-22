@@ -12,6 +12,7 @@ import type { JobRuntime, JobType } from '../jobs/jobRuntime.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
 import type { RemoteComputeRuntime } from '../compute/remoteComputeRuntime.js';
 import { computeAuthorizationRequired } from '../compute/credentialFingerprint.js';
+import { withoutFaceReview } from '../spatial/faceReview.js';
 import type { LocalStore } from '../state/localStore.js';
 import { isValidCidLike, normalizeCid } from '../utils/cid.js';
 import { IdempotencyStore } from './idempotencyStore.js';
@@ -63,13 +64,17 @@ const SCOPE_BY_ROUTE: Array<[RegExp, LocalScope]> = [
 const pairingAttempts = new PairingAttemptLimiter();
 
 /**
- * A job as a paired client sees it. `maskingDetail` (per-image face-masking counts, which images need a look) is the
- * operator's, served by the GUI routes, not by the paired-client API.
+ * A job as a paired client sees it. `maskingDetail` (per-image face-masking counts, which images need a look) and the
+ * `faceReview` of the record in its output are the operator's, served by the GUI routes, not by the paired-client API.
  */
-function withoutMaskingDetail<T extends { maskingDetail?: unknown }>(job: T): T {
-  if (!('maskingDetail' in job)) return job;
-  const { maskingDetail: _private, ...rest } = job;
-  return rest as T;
+function withoutMaskingDetail<T extends { maskingDetail?: unknown; output?: unknown }>(job: T): T {
+  let out = job;
+  if ('maskingDetail' in out) {
+    const { maskingDetail: _private, ...rest } = out;
+    out = rest as T;
+  }
+  if (out.output && typeof out.output === 'object') out = { ...out, output: withoutFaceReview(out.output as object) };
+  return out;
 }
 
 /**
@@ -683,32 +688,45 @@ async function route(
     const authorization = typeof body.backendAuthorization === 'string' ? body.backendAuthorization : '';
     if (!authorization.startsWith('Bearer ')) throw localError(400, 'backend_authorization_required');
     // Face masking can leave images for a human to look at (see `faceReview` on the record). Publishing to IPFS is
-    // irreversible, so the record is not offered until the caller states that look was done; who and when go on the
-    // private record, never into the manifest.
+    // irreversible, so the record is not offered until the operator has looked at every listed image in the Node's
+    // own GUI (Spatial, the record, Face review): the Node checks that each was shown before it records the
+    // acknowledgement. There is no flag a paired client can send instead.
     const review = spatial.faceReview as { pending?: number; acknowledged?: unknown } | undefined;
-    const acknowledge = body.acknowledgeFaceReview === true;
-    if (review && typeof review.pending === 'number' && review.pending > 0 && !review.acknowledged && !acknowledge) {
+    if (review && typeof review.pending === 'number' && review.pending > 0 && !review.acknowledged) {
       throw localError(409, 'spatial_face_review_pending', {
-        message: `Face masking left ${review.pending} image(s) for a human to look at (the job record lists which). Look at them, then publish again with acknowledgeFaceReview: true`,
+        message: `Face masking left ${review.pending} image(s) for a human to look at. The operator looks at them in the Node's GUI (Spatial, open the record, Face review) and confirms; then publish again`,
         pending: review.pending,
       });
     }
-    const result = await api.publishExistingSpatial(
-      { spatial, artworkId: body.artworkId, markerId: body.markerId },
-      authorization,
-    );
+    // Claimed inside one state update, so a supersede cannot slip in between the check above and the backend call
+    // (`supersedeSpatialRecord` refuses a record with a publication in flight, checked in its own update).
     await store.update((state) => {
       const current = state.spatial?.[spatialId] as Record<string, unknown> | undefined;
-      // Re-checked inside the update: the record could have been superseded while the backend call ran, and
-      // `superseded` is terminal.
-      if (current && current.state !== 'superseded') {
-        current.state = 'publication_requested';
-        current.publication = result;
-        const pending = current.faceReview as { pending?: number; acknowledged?: unknown } | undefined;
-        if (pending && typeof pending.pending === 'number' && pending.pending > 0 && !pending.acknowledged) {
-          pending.acknowledged = { at: new Date().toISOString(), by: pairing.credentialIdFor(credential) ?? 'unknown' };
-        }
-      }
+      if (!current || (current.state !== 'local' && current.state !== 'publication_requested')) throw localError(409, 'spatial_not_publishable', { message: `A record in state ${String(current?.state)} cannot be published` });
+      current.publishInFlightAt = new Date().toISOString();
+    });
+    let result: Awaited<ReturnType<typeof api.publishExistingSpatial>>;
+    try {
+      // The backend gets the record without the Node's private review state.
+      result = await api.publishExistingSpatial(
+        { spatial: withoutFaceReview(spatial), artworkId: body.artworkId, markerId: body.markerId },
+        authorization,
+      );
+    } catch (error) {
+      await store.update((state) => {
+        const current = state.spatial?.[spatialId] as Record<string, unknown> | undefined;
+        if (current) delete current.publishInFlightAt;
+      }).catch(() => undefined);
+      throw error;
+    }
+    await store.update((state) => {
+      const current = state.spatial?.[spatialId] as Record<string, unknown> | undefined;
+      if (!current) return;
+      delete current.publishInFlightAt;
+      // The backend accepted the request: that is kept even on a record that was retired meanwhile (the claim above
+      // makes that impossible from this code, but never hide a live publication), and `superseded` stays terminal.
+      current.publication = result;
+      if (current.state !== 'superseded') current.state = 'publication_requested';
     });
     return jsonResponse(202, result);
   }
@@ -720,7 +738,8 @@ async function route(
     // A superseded record (for example one reconstructed from unmasked images) is history: its manifest and CIDs
     // are not handed to a paired client, in line with the 410 of the GUI content route.
     if (value.state === 'superseded') throw localError(410, 'spatial_record_superseded', { message: 'This record was replaced by a newer one and is no longer served' });
-    return jsonResponse(200, value);
+    // The Node's private review state (which images were flagged, who acknowledged) stays with the operator.
+    return jsonResponse(200, withoutFaceReview(value));
   }
 
   throw localError(404, 'local_route_not_found');

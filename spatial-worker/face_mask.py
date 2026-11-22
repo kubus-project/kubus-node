@@ -14,7 +14,7 @@ file is an error, never a silent "no faces".
 
 Tuned for recall. A missed face is worse than a patch over a flower:
 - a low score threshold (0.4; the detector's own default is 0.9), with a layout check on the weak band,
-- several passes: the whole image at two scales and overlapping native-resolution
+- several passes: the whole image at five scales and overlapping native-resolution
   tiles, so small and distant faces are seen at a size the network handles,
 - boxes from every pass are merged, then grown generously (forehead, hair line,
   ears, chin) before they are filled,
@@ -80,8 +80,12 @@ REPORT_NAME = "kubus-face-masking.json"
 
 # A detection at or above STRONG_SCORE is a face. Between SCORE_THRESHOLD and STRONG_SCORE it must also have a
 # face-shaped layout of eyes, nose and mouth (`plausible_layout`), which removes the texture of a rough wall.
-SCORE_THRESHOLD = float(os.environ.get("KUBUS_FACE_SCORE_THRESHOLD", "0.4"))
-STRONG_SCORE = float(os.environ.get("KUBUS_FACE_STRONG_SCORE", "0.7"))
+# The defaults are the recall-first values; an environment override may only make masking MORE eager (lower), never
+# less: a value above its default is refused when the masker is built (`check_thresholds`).
+DEFAULT_SCORE_THRESHOLD = 0.4
+DEFAULT_STRONG_SCORE = 0.7
+SCORE_THRESHOLD = float(os.environ.get("KUBUS_FACE_SCORE_THRESHOLD", str(DEFAULT_SCORE_THRESHOLD)))
+STRONG_SCORE = float(os.environ.get("KUBUS_FACE_STRONG_SCORE", str(DEFAULT_STRONG_SCORE)))
 # A weak detection must also be a believable size in the full photo: not a speck of texture (below WEAK_MIN_WIDTH
 # pixels, too small to identify anyone).
 WEAK_MIN_WIDTH = 28
@@ -267,10 +271,19 @@ def excludes_detection(exclude: tuple, box: tuple) -> bool:
     return area > 0 and max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0) / area >= EXCLUDE_CONTAINED
 
 
+def check_thresholds(score_threshold: float, strong_score: float) -> None:
+    """Refuses a detection threshold above the recall-first default: masking may be made more eager, never less."""
+    if not score_threshold > 0 or score_threshold > DEFAULT_SCORE_THRESHOLD:
+        raise FaceMaskingError(f"the face score threshold {score_threshold} is outside (0, {DEFAULT_SCORE_THRESHOLD}]; masking may not be made less eager")
+    if not strong_score > 0 or strong_score > DEFAULT_STRONG_SCORE:
+        raise FaceMaskingError(f"the strong face score {strong_score} is outside (0, {DEFAULT_STRONG_SCORE}]; masking may not be made less eager")
+
+
 class FaceMasker:
     """Loads the pinned detector once; `mask_array` masks one upright RGB image."""
 
     def __init__(self, score_threshold: float = SCORE_THRESHOLD):
+        check_thresholds(score_threshold, STRONG_SCORE)
         self.weights_sha256 = verify_weights()
         try:
             import cv2  # present in the worker image; imported lazily so the module imports anywhere
@@ -397,24 +410,31 @@ def fill_regions(rgb: Any, regions: list) -> Any:
     return out
 
 
-NEEDS_LOOK_LIST_LIMIT = 200
+NEEDS_LOOK_LIST_LIMIT = 1000
 
 
-def needs_look(reviews: list | None, positions: list | None = None) -> dict:
+def needs_look(reviews: list | None, positions: list | None = None, files: list | None = None, seconds: list | None = None) -> dict:
     """What a human has to look at after a run, from the per-image review counts.
 
     `images` is how many images carry a flag, `weakExcluded` and `largeBelowCertain` the detections, and `items`
     says which images: `{"image": n, ...flags}` with `n` the 1-based number of the image in its own sequence (the
     photo's number in the capture, `photos/00001.jpg` is 1; the frame's number among the selected video frames).
     `positions` gives that number per review entry when entries were dropped before (an unreadable photo), else it
-    is the entry's own position. The list is bounded (`itemsTruncated` says it was cut); the counts are not.
+    is the entry's own position. `files` (the image's path under the job's output directory, per review entry) lets
+    the Node keep a copy of the masked image for the operator to look at, `seconds` (video frames) says where in the
+    footage the frame is. The list is bounded (`itemsTruncated` says it was cut); the counts are not.
     """
     reviews = reviews or []
     items: list = []
     for index, item in enumerate(reviews):
         flags = {key: int(item.get(key, 0)) for key in ("weakExcluded", "largeBelowCertain") if item.get(key)}
         if flags:
-            items.append({"image": int(positions[index]) if positions is not None and index < len(positions) else index + 1, **flags})
+            entry = {"image": int(positions[index]) if positions is not None and index < len(positions) else index + 1, **flags}
+            if files is not None and index < len(files):
+                entry["file"] = str(files[index])
+            if seconds is not None and index < len(seconds) and seconds[index] is not None:
+                entry["seconds"] = round(float(seconds[index]), 1)
+            items.append(entry)
     out = {
         "images": len(items),
         "weakExcluded": sum(int(item.get("weakExcluded", 0)) for item in reviews),
@@ -458,9 +478,9 @@ def masking_provenance(masking: dict | None) -> dict | None:
     out: dict = {}
     photos, video = masking.get("photos"), masking.get("video")
     if photos is not None:
-        out["photos"] = summarise(photos, photo_images=len(photos), version=masking["version"], extra={"needsLook": needs_look(masking.get("photosReview"), masking.get("photosPositions"))})
+        out["photos"] = summarise(photos, photo_images=len(photos), version=masking["version"], extra={"needsLook": needs_look(masking.get("photosReview"), masking.get("photosPositions"), masking.get("photosFiles"))})
     if video is not None:
-        out["video"] = summarise(video, version=masking["version"], extra={"needsLook": needs_look(masking.get("videoReview"))})
+        out["video"] = summarise(video, version=masking["version"], extra={"needsLook": needs_look(masking.get("videoReview"), None, masking.get("videoFiles"), masking.get("videoSeconds"))})
     return out or None
 
 

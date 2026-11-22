@@ -41,6 +41,8 @@ let onboardingDismissed = false;
 let logState = { level: '', query: '', follow: true, lines: [] };
 let diagnostics = null;
 let library = { tab: 'captures', captures: null, spatial: null, loading: false, error: null, detail: null };
+/* Face review: the flagged images of one spatial record. images holds blob URLs of the ones already shown. */
+let faceReview = { id: null, data: null, loading: false, error: null, images: {}, busy: false };
 let processing = { jobs: null, loading: false, error: null, detailId: null };
 let analytics = { range: '24h', data: null, loading: false, error: null };
 
@@ -468,6 +470,7 @@ function renderSpatialGrid() {
       '<div class="card-thumb"><span class="card-thumb-fallback" aria-hidden="true">◈</span></div>' +
       '<div class="card-body">' +
       '<div class="row-between"><span class="t-body card-title">' + h(record.artworkId || 'Untitled') + '</span><span class="chip good">' + h(record.state) + '</span></div>' +
+      (record.faceReview && !record.faceReview.acknowledged ? '<div class="row"><span class="chip attention">Face review pending</span></div>' : '') +
       '<div class="t-meta">' + h(fmtWhen(record.createdAt)) + (archive ? ' · ' + h(fmtBytes(archive.sizeBytes)) + ' ' + h(archive.format) : '') + '</div>' +
       '</div></article>';
   }).join('') + '</div>';
@@ -525,7 +528,114 @@ function renderSpatialDetail(id) {
     '<details class="disclosure"><summary>Variants</summary><div class="stack-sm">' +
     record.variants.map((v) => detailRow(v.role, fmtBytes(v.sizeBytes) + ' · ' + v.format)).join('') +
     '</div></details>' +
+    '</section>' +
+    renderFaceReviewPanel(record);
+}
+
+/* --- Face review ---------------------------------------------------------- */
+
+function faceReviewItemLabel(item) {
+  const where = item.part === 'video'
+    ? 'Video frame ' + item.image + (typeof item.seconds === 'number' ? ' (about ' + item.seconds + ' s into the footage)' : '')
+    : 'Photo ' + item.image;
+  const why = [];
+  if (item.largeBelowCertain) why.push('a large face-like area was not patched (' + item.largeBelowCertain + ')');
+  if (item.weakExcluded) why.push('a weaker detection lies inside a box marked as painted (' + item.weakExcluded + ')');
+  return where + (why.length ? ' - ' + why.join('; ') : '');
+}
+
+function renderFaceReviewPanel(record) {
+  const summary = record.faceReview;
+  if (!summary) return '';
+  if (summary.acknowledged) {
+    return '<section class="panel"><h2 class="t-card">Face review</h2>' +
+      '<p class="t-body">Done: the flagged images were looked at and confirmed. This record can be published.</p></section>';
+  }
+  const intro = '<p class="t-body">Face masking is tuned to patch too much rather than too little, and it cannot prove that it found every face. ' +
+    h(summary.pending) + ' image(s) of this record were flagged because a large face-like area was not patched. ' +
+    'Look at each one: a real person who is still recognisable must not be published (a painted face that belongs to the artwork is fine). ' +
+    'This record cannot be published until you have looked at every listed image and confirmed it.</p>';
+  if (faceReview.id !== record.id || !faceReview.data) {
+    return '<section class="panel"><h2 class="t-card">Face review</h2>' + intro +
+      (faceReview.error ? '<p class="t-body">' + h(faceReview.error) + '</p>' : '') +
+      '<div class="row"><button class="button primary" data-face-review-open="' + h(record.id) + '"' + (faceReview.loading ? ' disabled' : '') + '>' +
+      (faceReview.loading ? 'Loading…' : 'Review flagged images') + '</button></div></section>';
+  }
+  const data = faceReview.data;
+  const unseen = data.items.filter((item) => !item.viewed).length;
+  return '<section class="panel" id="faceReviewPanel"><h2 class="t-card">Face review</h2>' + intro +
+    '<div class="row"><button class="button" data-face-review-all="1">Show all images</button>' +
+    '<span class="t-meta">' + h(data.items.length - unseen) + ' of ' + h(data.items.length) + ' shown</span></div>' +
+    (data.itemsTruncated ? '<p class="t-body">Only ' + h(data.items.length) + ' of ' + h(data.pending) + ' flagged images are listed. Confirming also states that the rest was looked at some other way.</p>' : '') +
+    '<div class="stack-sm">' + data.items.map((item) =>
+      '<div class="face-review-item">' +
+      '<div class="t-body">' + h(faceReviewItemLabel(item)) + '</div>' +
+      '<div class="face-review-image" data-face-review-mount="' + h(item.file) + '">' +
+      (faceReview.images[item.file] ? '<img alt="' + h(faceReviewItemLabel(item)) + '" src="' + h(faceReview.images[item.file]) + '">' : '<button class="button small subtle" data-face-review-show="' + h(item.file) + '">Show image</button>') +
+      '</div></div>').join('') + '</div>' +
+    (faceReview.error ? '<p class="t-body">' + h(faceReview.error) + '</p>' : '') +
+    '<div class="row"><button class="button primary" data-face-review-confirm="' + h(record.id) + '"' + (unseen > 0 || faceReview.busy ? ' disabled' : '') + '>' +
+    'I looked at every image; none shows a recognisable real face</button></div>' +
+    (unseen > 0 ? '<p class="t-meta">Show every listed image first (' + h(unseen) + ' left).</p>' : '') +
     '</section>';
+}
+
+function resetFaceReview() {
+  Object.keys(faceReview.images).forEach((file) => URL.revokeObjectURL(faceReview.images[file]));
+  faceReview = { id: null, data: null, loading: false, error: null, images: {}, busy: false };
+}
+
+async function openFaceReview(id) {
+  resetFaceReview();
+  faceReview.id = id;
+  faceReview.loading = true;
+  renderSection();
+  try {
+    faceReview.data = await request('/gui/api/spatial/' + encodeURIComponent(id) + '/face-review');
+  } catch (error) {
+    faceReview.error = error.message;
+  } finally {
+    faceReview.loading = false;
+    renderSection();
+  }
+}
+
+async function showFaceReviewImage(file) {
+  if (faceReview.images[file] || !faceReview.id) return;
+  const token = localStorage.getItem(TOKEN_KEY) || '';
+  const headers = { Accept: 'image/*' };
+  if (token) headers.Authorization = 'Bearer ' + token;
+  const response = await fetch('/gui/api/spatial/' + encodeURIComponent(faceReview.id) + '/face-review/image/' + encodeURIComponent(file), { headers: headers });
+  if (!response.ok) throw new Error('The image could not be loaded');
+  faceReview.images[file] = URL.createObjectURL(await response.blob());
+  const item = faceReview.data.items.find((entry) => entry.file === file);
+  if (item) item.viewed = true;
+}
+
+async function showFaceReviewImages(files) {
+  try {
+    for (const file of files) await showFaceReviewImage(file);
+    faceReview.error = null;
+  } catch (error) {
+    faceReview.error = error.message;
+  }
+  renderSection();
+}
+
+async function confirmFaceReview(id) {
+  faceReview.busy = true;
+  faceReview.error = null;
+  renderSection();
+  try {
+    const truncated = faceReview.data && faceReview.data.itemsTruncated;
+    await request('/gui/api/spatial/' + encodeURIComponent(id) + '/face-review/acknowledge', { method: 'POST', body: JSON.stringify({ confirm: true, allowTruncated: Boolean(truncated) }) });
+    resetFaceReview();
+    library.spatial = await request('/gui/api/spatial');
+  } catch (error) {
+    faceReview.busy = false;
+    faceReview.error = error.message;
+  }
+  renderSection();
 }
 
 function renderCompute() {
@@ -1270,7 +1380,22 @@ function bindSectionEvents() {
     });
   });
   $$('[data-lib-back]').forEach((button) => {
-    button.addEventListener('click', () => { library.detail = null; renderSection(); });
+    button.addEventListener('click', () => { library.detail = null; resetFaceReview(); renderSection(); });
+  });
+  $$('[data-face-review-open]').forEach((button) => {
+    button.addEventListener('click', () => { void openFaceReview(button.dataset.faceReviewOpen); });
+  });
+  $$('[data-face-review-show]').forEach((button) => {
+    button.addEventListener('click', () => { button.disabled = true; void showFaceReviewImages([button.dataset.faceReviewShow]); });
+  });
+  $$('[data-face-review-all]').forEach((button) => {
+    button.addEventListener('click', () => {
+      button.disabled = true;
+      void showFaceReviewImages(faceReview.data.items.map((item) => item.file));
+    });
+  });
+  $$('[data-face-review-confirm]').forEach((button) => {
+    button.addEventListener('click', () => { void confirmFaceReview(button.dataset.faceReviewConfirm); });
   });
   $$('[data-process-capture]').forEach((button) => {
     button.addEventListener('click', async () => {
@@ -1440,7 +1565,7 @@ async function refresh() {
     const firstLoad = model === null;
     model = next;
     if (firstLoad) render();
-    else if ($('#spatialPreviewMount iframe')) {
+    else if ($('#spatialPreviewMount iframe') || faceReview.id) {
       // An interactive Spatial preview is live: rebuilding the shell/section
       // would destroy its iframe (and the WebGL context inside it) out from
       // under the viewer every 10s, snapping the user back to "Open

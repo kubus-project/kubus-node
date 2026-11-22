@@ -302,7 +302,7 @@ describe('video reconstruction job', () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
       if (url.endsWith('/health')) {
-        return new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, workerInstanceId: WORKER_ID, gpu: { available: true, name: 'RTX 3080 Ti' }, capabilities: ['spatial.reconstruct'], faceMasking: true, ...workerHealth }), { status: 200 });
+        return new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, workerInstanceId: WORKER_ID, gpu: { available: true, name: 'RTX 3080 Ti' }, capabilities: ['spatial.reconstruct'], faceMasking: true, faceReviewImages: true, ...workerHealth }), { status: 200 });
       }
       if (url.endsWith('/v1/jobs/cancel')) {
         const request = JSON.parse(String(init?.body));

@@ -258,18 +258,23 @@ describe('masking in the job and the record', () => {
   const processing = { protocol: 'kubus.spatial-job/1', workerVersion: 'kubus-spatial-worker/5', reconstruction: { engine: 'nerfstudio', method: 'splatfacto', iterations: 1000, outputFormat: 'ply' } };
   const part = (images: number, regions = 3) => ({ ran: true, images, regions, imagesWithRegions: 2, regionsPerImage: Array.from({ length: images }, (_, index) => (index < regions ? 1 : 0)), detector: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: PINNED_WEIGHTS_SHA256, scoreThreshold: 0.4, licence: 'MIT', opencv: '4.10.0' });
 
-  async function setup(options: { faceMasking?: boolean; report?: (requested: any) => unknown } = {}) {
+  async function setup(options: { faceMasking?: boolean; faceReviewImages?: boolean; report?: (requested: any) => unknown; files?: string[] } = {}) {
     const { dir, store, captures } = await newStore();
     const bodies: any[] = [];
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-      if (url.endsWith('/health')) return new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, workerInstanceId: WORKER_ID, gpu: { available: true, name: 'RTX' }, capabilities: ['spatial.reconstruct'], inputModes: ['frames', 'video', 'photos', 'mixed'], ...(options.faceMasking === false ? {} : { faceMasking: true }) }), { status: 200 });
+      if (url.endsWith('/health')) return new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, workerInstanceId: WORKER_ID, gpu: { available: true, name: 'RTX' }, capabilities: ['spatial.reconstruct'], inputModes: ['frames', 'video', 'photos', 'mixed'], ...(options.faceMasking === false ? {} : { faceMasking: true, ...(options.faceReviewImages === false ? {} : { faceReviewImages: true }) }) }), { status: 200 });
       if (url.endsWith('/v1/jobs/cancel')) return new Response(JSON.stringify({ ...JSON.parse(String(init?.body)), cleanupProtocol: 1, quiescent: true }));
       if (url.endsWith('/v1/process')) {
         const body = JSON.parse(String(init?.body ?? '{}'));
         bodies.push(body);
         await fs.mkdir(body.outputDirectory, { recursive: true });
         await fs.writeFile(path.join(body.outputDirectory, 'result.ply'), Buffer.alloc(2048, 3));
+        // The masked images the worker flagged, as it leaves them in the job's working directory.
+        for (const file of options.files ?? []) {
+          await fs.mkdir(path.dirname(path.join(body.outputDirectory, file)), { recursive: true });
+          await fs.writeFile(path.join(body.outputDirectory, file), Buffer.from(`masked ${file}`));
+        }
         const requested = body.input.maskFaces;
         const faceMasking = options.report ? options.report(requested) : requested ? { ...(requested.photos ? { photos: part(9) } : {}), ...(requested.video ? { video: part(48) } : {}) } : undefined;
         return new Response(JSON.stringify({
@@ -423,7 +428,10 @@ describe('masking in the job and the record', () => {
   });
 
   it('warns in the job log when masking left images for a human, keeps it out of the pinned manifest', async () => {
-    const { dir, store, captures, jobs } = await setup({ report: () => ({ photos: { ...part(9), needsLook: { images: 2, weakExcluded: 1, largeBelowCertain: 3, items: [{ image: 2, largeBelowCertain: 2 }, { image: 5, weakExcluded: 1, largeBelowCertain: 1 }] } } }) });
+    const { dir, store, captures, jobs } = await setup({
+      files: ['dataset/images/photo_00001.jpg', 'dataset/images/photo_00004.jpg'],
+      report: () => ({ photos: { ...part(9), needsLook: { images: 2, weakExcluded: 1, largeBelowCertain: 3, items: [{ image: 2, largeBelowCertain: 2, file: 'dataset/images/photo_00001.jpg' }, { image: 5, weakExcluded: 1, largeBelowCertain: 1, file: 'dataset/images/photo_00004.jpg' }] } } }),
+    });
     await writePhotos(path.join(dir, 'a'), 9);
     const capture = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1' });
     const job = await jobs.create('spatial.reconstruct', { captureId: capture.id });
@@ -439,8 +447,74 @@ describe('masking in the job and the record', () => {
     // The private job record says which images.
     expect(finished.maskingDetail.photos.needsLook).toMatchObject({ images: 2, largeBelowCertain: 3, items: [{ image: 2, largeBelowCertain: 2 }, { image: 5, weakExcluded: 1, largeBelowCertain: 1 }] });
     expect(JSON.stringify(records(store)[0]!.manifest)).not.toMatch(/needsLook|largeBelowCertain|faceReview/);
-    // The private spatial record carries what the publish route checks.
-    expect((records(store)[0] as any).faceReview).toEqual({ pending: 2, jobId: job.id });
+    // The private spatial record carries what the publish route checks, and the masked copies the operator looks at.
+    const review = (records(store)[0] as any).faceReview;
+    expect(review).toEqual({
+      pending: 2, jobId: job.id, viewed: [],
+      items: [{ part: 'photos', image: 2, file: 'photos-00002.jpg', largeBelowCertain: 2 }, { part: 'photos', image: 5, file: 'photos-00005.jpg', weakExcluded: 1, largeBelowCertain: 1 }],
+    });
+    const kept = path.join(dir, 'private', 'face-review', (records(store)[0] as any).id);
+    expect((await fs.readFile(path.join(kept, 'photos-00002.jpg'))).toString()).toBe('masked dataset/images/photo_00001.jpg');
+    // The job's own working directory is gone; the copies are what is left.
+    await expect(fs.stat(path.join(dir, 'private', 'jobs', job.id))).rejects.toThrow();
+  });
+
+  it('keeps where the masked copy is and where in the footage a frame is, and drops anything that is not a worker image path', () => {
+    const kept = faceMaskingProvenance({ kind: 'mixed', artworkId: 'a', faceMasking: { photos: 'worker', video: 'worker' } }, { faceMasking: {
+      photos: { ...part(9), needsLook: { images: 3, largeBelowCertain: 3, items: [{ image: 1, largeBelowCertain: 1, file: 'dataset/images/photo_00000.jpg' }, { image: 2, largeBelowCertain: 1, file: '../../etc/passwd' }, { image: 3, largeBelowCertain: 1, file: 'C:/x/photo_00000.jpg' }] } },
+      video: { ...part(48), needsLook: { images: 1, largeBelowCertain: 1, items: [{ image: 12, largeBelowCertain: 1, file: 'selected_frames/frame_00011.jpg', seconds: 41.3 }, { image: 13, file: 'dataset/images/video_00012.jpg', seconds: -4 }, { image: 14, seconds: 'soon' }] } },
+    } }) as any;
+    expect(kept.photos.needsLook.items).toEqual([{ image: 1, largeBelowCertain: 1, file: 'dataset/images/photo_00000.jpg' }, { image: 2, largeBelowCertain: 1 }, { image: 3, largeBelowCertain: 1 }]);
+    expect(kept.video.needsLook.items).toEqual([{ image: 12, largeBelowCertain: 1, file: 'selected_frames/frame_00011.jpg', seconds: 41.3 }, { image: 13, file: 'dataset/images/video_00012.jpg' }, { image: 14 }]);
+  });
+
+  it('keeps the flagged masked copies of a video job (with where in the footage they are) and of premasked photos from the capture itself', async () => {
+    const { dir, store, captures, jobs } = await setup({
+      files: ['selected_frames/frame_00011.jpg'],
+      report: () => ({ video: { ...part(48), needsLook: { images: 1, largeBelowCertain: 1, items: [{ image: 12, largeBelowCertain: 1, file: 'selected_frames/frame_00011.jpg', seconds: 41.3 }] } } }),
+    });
+    await fs.writeFile(path.join(dir, 'clip.mp4'), fakeMp4());
+    const video = await captures.importVideoFile(path.join(dir, 'clip.mp4'), { artworkId: 'art-1' });
+    const videoJob = await jobs.create('spatial.reconstruct', { captureId: video.id });
+    await settle(jobs, videoJob.id);
+    expect(jobs.get(videoJob.id).error).toBeUndefined();
+    const record = records(store)[0] as any;
+    expect(record.faceReview).toEqual({ pending: 1, jobId: videoJob.id, viewed: [], items: [{ part: 'video', image: 12, file: 'video-00012.jpg', largeBelowCertain: 1, seconds: 41.3 }] });
+    expect((await fs.readFile(path.join(dir, 'private', 'face-review', record.id, 'video-00012.jpg'))).toString()).toBe('masked selected_frames/frame_00011.jpg');
+
+    // Photos masked before import: the capture's own files are the masked images.
+    const source = path.join(dir, 'premasked');
+    const written = await writePhotos(source, 9);
+    const flagged = reportFor(written, [1, 0, 0, 0, 0, 0, 0, 0, 0]);
+    (flagged.images[3] as Record<string, unknown>).needsLook = { largeBelowCertain: 2 };
+    await fs.writeFile(path.join(source, FACE_MASKING_REPORT_NAME), JSON.stringify(flagged));
+    const premasked = await captures.importPhotoDirectory(source, { artworkId: 'art-2' });
+    const photoJob = await jobs.create('spatial.reconstruct', { captureId: premasked.id });
+    await settle(jobs, photoJob.id);
+    expect(jobs.get(photoJob.id).error).toBeUndefined();
+    const second = records(store).find((entry) => entry.manifest.artworkId === 'art-2') as any;
+    expect(second.faceReview).toMatchObject({ pending: 1, items: [{ part: 'photos', image: 4, file: 'photos-00004.jpg', largeBelowCertain: 2 }] });
+    expect((await fs.readFile(path.join(dir, 'private', 'face-review', second.id, 'photos-00004.jpg')))).toEqual(written[3]);
+  });
+
+  it('fails the job, with no record and no kept copies, when a flagged image has no copy to keep, and refuses a worker that cannot name them', async () => {
+    const { dir, store, captures, jobs } = await setup({ report: () => ({ photos: { ...part(9), needsLook: { images: 1, largeBelowCertain: 1, items: [{ image: 2, largeBelowCertain: 1 }] } } }) });
+    await writePhotos(path.join(dir, 'a'), 9);
+    const capture = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1' });
+    const job = await jobs.create('spatial.reconstruct', { captureId: capture.id });
+    await settle(jobs, job.id);
+    expect(jobs.get(job.id)).toMatchObject({ state: 'failed', error: { code: 'face_review_images_unavailable' } });
+    expect(records(store)).toHaveLength(0);
+    expect(await fs.readdir(path.join(dir, 'private', 'face-review')).catch(() => [])).toEqual([]);
+
+    // A worker image from before the file names (it masks, but cannot say which image is which) is refused up front.
+    const old = await setup({ faceReviewImages: false });
+    await writePhotos(path.join(old.dir, 'a'), 9);
+    const oldCapture = await old.captures.importPhotoDirectory(path.join(old.dir, 'a'), { artworkId: 'art-1' });
+    const oldJob = await old.jobs.create('spatial.reconstruct', { captureId: oldCapture.id });
+    await settle(old.jobs, oldJob.id);
+    expect(old.jobs.get(oldJob.id)).toMatchObject({ state: 'failed', error: { code: 'worker_face_review_unsupported' } });
+    expect(old.bodies).toHaveLength(0);
   });
 
   it('only warns about the kind of detection that is non-zero', async () => {
@@ -462,10 +536,10 @@ describe('masking in the job and the record', () => {
     // The default of a private capture is not a choice: naming an artwork at job time would publish unmasked pixels under it.
     await expect(jobs.create('spatial.reconstruct', { captureId: unbound.id, artworkId: 'art-1' })).rejects.toMatchObject({ statusCode: 422, code: 'job_artwork_binds_unmasked_capture' });
     expect(Object.keys(store.snapshot().jobs ?? {})).toHaveLength(0);
-    // Without an artwork it is accepted as a job (a private capture), and a record needs an artwork anyway.
-    const privateJob = await jobs.create('spatial.reconstruct', { captureId: unbound.id });
-    await settle(jobs, privateJob.id);
-    expect(jobs.get(privateJob.id).error?.message).toBe('spatial_artwork_required');
+    // A record needs an artwork and import would refuse after the GPU run: the job is refused before it.
+    await expect(jobs.create('spatial.reconstruct', { captureId: unbound.id })).rejects.toMatchObject({ statusCode: 422, code: 'job_artwork_required' });
+    await expect(jobs.create('spatial.reconstruct', { captureId: unbound.id, artworkId: '' })).rejects.toMatchObject({ code: 'job_artwork_required' });
+    expect(Object.keys(store.snapshot().jobs ?? {})).toHaveLength(0);
   });
 
   it('refuses the same for video and for the video part of a mixed capture', async () => {
@@ -499,7 +573,7 @@ describe('masking in the job and the record', () => {
     expect(chosenJob.input.maskFaces).toBeUndefined();
     await settle(jobs, chosenJob.id);
     const done = Object.values(store.snapshot().spatial ?? {}) as Array<{ manifest: any }>;
-    expect(done.find((record) => record.manifest.artworkId === 'art-4')!.manifest.processing.faceMasking).toEqual({ ran: false });
+    expect(done.find((record) => record.manifest.artworkId === 'art-4')!.manifest.processing.faceMasking).toEqual({ ran: false, reason: 'operator_opted_out' });
   });
 
   it('does not warn when masking flagged nothing', async () => {
@@ -518,8 +592,8 @@ describe('masking in the job and the record', () => {
     const before = await jobs.create('spatial.reconstruct', { captureId: first.id });
     await settle(jobs, before.id);
     const [old] = records(store);
-    expect(old!.manifest.captureProvenance.derivation.faceMasking).toEqual({ ran: false });
-    expect(old!.manifest.processing.faceMasking).toEqual({ ran: false });
+    expect(old!.manifest.captureProvenance.derivation.faceMasking).toEqual({ ran: false, reason: 'operator_opted_out' });
+    expect(old!.manifest.processing.faceMasking).toEqual({ ran: false, reason: 'operator_opted_out' });
 
     const source = path.join(dir, 'masked');
     const written = await writePhotos(source, 9);

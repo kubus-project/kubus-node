@@ -1,5 +1,6 @@
 import { localError } from '../localApi/pairingService.js';
 import { ManagedPins } from '../ipfs/managedPins.js';
+import { removeFaceReviewImages } from './faceReview.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import type { LocalStore } from '../state/localStore.js';
 import type { SpatialManifest } from './models.js';
@@ -13,7 +14,19 @@ interface StoredSpatial {
   pinOwner?: string;
   supersededBy?: string;
   supersededAt?: string;
+  /** Set by the publish route while it waits for the backend; see `publishInFlight`. */
+  publishInFlightAt?: string;
 }
+
+/** A publish request older than this is a crashed one, not an in-flight one. */
+const PUBLISH_IN_FLIGHT_MS = 10 * 60 * 1000;
+
+function publishInFlight(record: StoredSpatial): boolean {
+  const at = record.publishInFlightAt ? Date.parse(record.publishInFlightAt) : NaN;
+  return Number.isFinite(at) && Date.now() - at < PUBLISH_IN_FLIGHT_MS;
+}
+
+const PUBLICATION_ACTIVE = { message: 'The record was offered to a backend for publication; withdraw that publication first, then supersede it' };
 
 export interface SupersedeResult {
   id: string;
@@ -57,7 +70,7 @@ function maskedManifest(manifest: SpatialManifest): boolean {
  * Idempotent: repeating it retries any pin whose release did not finish.
  */
 export async function supersedeSpatialRecord(
-  deps: { store: LocalStore; kubo: Pick<KuboClient, 'pinLs' | 'pinAdd' | 'pinRm'> & Partial<Pick<KuboClient, 'blockPresent'>> },
+  deps: { store: LocalStore; /** Where the Node keeps its private files; when given, the record's face-review images are removed. */ dataRoot?: string; kubo: Pick<KuboClient, 'pinLs' | 'pinAdd' | 'pinRm'> & Partial<Pick<KuboClient, 'blockPresent'>> },
   oldId: string,
   newId: string,
 ): Promise<SupersedeResult> {
@@ -72,8 +85,8 @@ export async function supersedeSpatialRecord(
   }
   // A record that was already offered to a backend cannot be retired from here: the publication would stay
   // live while this Node stops serving its content. Withdraw it there first.
-  if (old.state === 'publication_requested') {
-    throw localError(409, 'spatial_publication_active', { message: 'The record was offered to a backend for publication; withdraw that publication first, then supersede it' });
+  if (old.state === 'publication_requested' || publishInFlight(old)) {
+    throw localError(409, 'spatial_publication_active', PUBLICATION_ACTIVE);
   }
   if (replacement.state !== 'local' && replacement.state !== 'publication_requested') {
     throw localError(422, 'spatial_replacement_unavailable', { message: 'The replacing record is itself superseded or unavailable' });
@@ -84,11 +97,16 @@ export async function supersedeSpatialRecord(
   await deps.store.update((state) => {
     const current = (state.spatial as Record<string, StoredSpatial> | undefined)?.[oldId];
     if (!current) return;
+    // Checked again here, inside the update: the publish route claims the record in an update of its own, and a
+    // request that began after the read above must not be retired under the backend's feet.
+    if (current.state === 'publication_requested' || publishInFlight(current)) throw localError(409, 'spatial_publication_active', PUBLICATION_ACTIVE);
     current.state = 'superseded';
     current.supersededBy = newId;
     current.supersededAt ??= new Date().toISOString();
   });
 
+  // The flagged-image copies of a retired record are not kept (and are never served: the route refuses a superseded record).
+  if (deps.dataRoot) await removeFaceReviewImages(deps.dataRoot, oldId);
   const managed = new ManagedPins(deps.kubo, deps.store, { allowUnpin: true });
   const owner = old.pinOwner ?? `spatial:${oldId}`;
   const cids = [old.manifestCid, ...old.manifest.variants.map((variant) => variant.cid)];

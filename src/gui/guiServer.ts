@@ -26,6 +26,7 @@ import { spatialViewerBundle } from './public/vendor/spatialViewerBundle.js';
 import { handleLocalApi, type LocalApiDeps } from '../localApi/localApiRouter.js';
 import { localError } from '../localApi/pairingService.js';
 import { importRoots, resolveImportSource } from '../captures/importPaths.js';
+import { acknowledgeFaceReview, faceReviewView } from '../spatial/faceReview.js';
 import { supersedeSpatialRecord } from '../spatial/supersede.js';
 import { purgeSupersededContent } from '../spatial/supersededBlocks.js';
 import { buildViewModel } from './viewModel.js';
@@ -38,6 +39,7 @@ import {
   listJobSummaries,
   listSpatialSummaries,
   serveCaptureFile,
+  serveFaceReviewImage,
   serveSpatialVariant,
 } from './spatialGuiApi.js';
 
@@ -352,7 +354,25 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
   if (req.method === 'POST' && spatialSupersedeMatch) {
     const body = await readGuiJson(req);
     if (typeof body.by !== 'string' || !body.by) throw localError(400, 'spatial_replacement_required');
-    writeJson(res, 200, { success: true, data: await supersedeSpatialRecord({ store: deps.store, kubo: deps.kubo }, decodeURIComponent(spatialSupersedeMatch[1]!), body.by) });
+    writeJson(res, 200, { success: true, data: await supersedeSpatialRecord({ store: deps.store, kubo: deps.kubo, dataRoot: deps.config.localDataPath }, decodeURIComponent(spatialSupersedeMatch[1]!), body.by) });
+    return;
+  }
+  // Face review: the images face masking flagged, shown to the operator one by one, then acknowledged.
+  const faceReviewMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/face-review$/);
+  if (req.method === 'GET' && faceReviewMatch) {
+    writeJson(res, 200, { success: true, data: faceReviewView(deps.store, decodeURIComponent(faceReviewMatch[1]!)) });
+    return;
+  }
+  const faceReviewImageMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/face-review\/image\/([^/]+)$/);
+  if (req.method === 'GET' && faceReviewImageMatch) {
+    await serveFaceReviewImage(res, { store: deps.store, dataRoot: deps.config.localDataPath }, decodeURIComponent(faceReviewImageMatch[1]!), decodeURIComponent(faceReviewImageMatch[2]!));
+    return;
+  }
+  const faceReviewAcknowledgeMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/face-review\/acknowledge$/);
+  if (req.method === 'POST' && faceReviewAcknowledgeMatch) {
+    const body = await readGuiJson(req);
+    if (body.confirm !== true) throw localError(400, 'face_review_confirmation_required', { message: 'Confirm that you looked at every listed image and that none shows a recognisable face' });
+    writeJson(res, 200, { success: true, data: await acknowledgeFaceReview(deps.config.localDataPath, deps.store, decodeURIComponent(faceReviewAcknowledgeMatch[1]!), 'gui-operator', { allowTruncated: body.allowTruncated === true }) });
     return;
   }
   const spatialMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)$/);

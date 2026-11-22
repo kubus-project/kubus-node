@@ -333,8 +333,9 @@ def prepare_photo_dataset(
     frame_stats: dict | None = None
     video_regions: list | None = None
     video_review: list = []
+    video_seconds: list = []
     if include_video:
-        video_names, video_info, frame_stats = select_video_frames(runner, capture, work, progress, images, prefix="video")
+        video_names, video_info, frame_stats = select_video_frames(runner, capture, work, progress, images, prefix="video", seconds=video_seconds)
         if mask_video:
             from face_mask import mask_frame_sequence
 
@@ -355,6 +356,10 @@ def prepare_photo_dataset(
     masking = {
         "photos": photo_stats.get("maskedRegions") if mask_photos else None, "photosReview": photo_stats.get("maskedReview") if mask_photos else None,
         "photosPositions": photo_stats.get("maskedPositions") if mask_photos else None,
+        # Each flagged image's path under the job's output directory, for the operator's look (see `face_mask.needs_look`).
+        "photosFiles": [f"dataset/images/{name}" for name in names] if mask_photos else None,
+        "videoFiles": [f"dataset/images/{name}" for name in video_names] if video_regions is not None else None,
+        "videoSeconds": video_seconds if video_regions is not None else None,
         "video": video_regions, "videoReview": video_review if video_regions is not None else None,
         "version": masker.version if masker else None,
     }

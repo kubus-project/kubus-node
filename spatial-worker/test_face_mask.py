@@ -31,6 +31,28 @@ def noisy(width=400, height=300, seed=1):
     return np.random.default_rng(seed).integers(0, 256, (height, width, 3), dtype=np.uint8)
 
 
+class ThresholdsAreRecallFirst(unittest.TestCase):
+    def test_a_threshold_above_the_default_is_refused_and_a_lower_one_is_allowed(self):
+        fm.check_thresholds(fm.DEFAULT_SCORE_THRESHOLD, fm.DEFAULT_STRONG_SCORE)
+        fm.check_thresholds(0.2, 0.5)
+        for score, strong in ((0.41, 0.7), (0.9, 0.7), (0.4, 0.71), (0.4, 0.99), (0.0, 0.7), (0.4, 0.0)):
+            with self.subTest(score=score, strong=strong):
+                with self.assertRaises(fm.FaceMaskingError):
+                    fm.check_thresholds(score, strong)
+
+    def test_the_masker_refuses_a_raised_threshold_before_loading_anything(self):
+        with self.assertRaises(fm.FaceMaskingError):
+            fm.FaceMasker(score_threshold=0.9)
+        with mock.patch.object(fm, "STRONG_SCORE", 0.95):
+            with self.assertRaises(fm.FaceMaskingError):
+                fm.FaceMasker()
+
+    def test_the_documented_defaults_are_the_ones_in_force(self):
+        self.assertEqual((fm.DEFAULT_SCORE_THRESHOLD, fm.DEFAULT_STRONG_SCORE), (0.4, 0.7))
+        self.assertEqual(len(fm.WHOLE_IMAGE_SIDES), 5)
+        self.assertIn("five scales", fm.__doc__)
+
+
 class WeightsAreChecked(unittest.TestCase):
     def test_the_shipped_weights_match_the_pinned_checksum(self):
         self.assertEqual(fm.verify_weights(), fm.MODEL_SHA256)
@@ -194,6 +216,18 @@ class LargeFaces(unittest.TestCase):
         self.assertTrue(many["itemsTruncated"])
         self.assertEqual(many["images"], fm.NEEDS_LOOK_LIST_LIMIT + 5)  # the counts are not cut
         self.assertNotIn("itemsTruncated", looked)
+
+    def test_needs_look_names_the_masked_copy_and_where_in_the_footage_a_frame_is(self):
+        reviews = [{}, {"largeBelowCertain": 1}, {"weakExcluded": 2}]
+        looked = fm.needs_look(reviews, None, ["selected_frames/frame_00000.jpg", "selected_frames/frame_00001.jpg", "selected_frames/frame_00002.jpg"], [0.0, 12.34, None])
+        self.assertEqual(looked["items"], [
+            {"image": 2, "largeBelowCertain": 1, "file": "selected_frames/frame_00001.jpg", "seconds": 12.3},
+            {"image": 3, "weakExcluded": 2, "file": "selected_frames/frame_00002.jpg"},
+        ])
+        # Without names (older callers) the items are as before.
+        self.assertEqual(fm.needs_look(reviews)["items"][0], {"image": 2, "largeBelowCertain": 1})
+        # The list limit covers a full 400-photo set plus its video frames.
+        self.assertGreaterEqual(fm.NEEDS_LOOK_LIST_LIMIT, 400 + 300)
 
 
 class Masking(unittest.TestCase):

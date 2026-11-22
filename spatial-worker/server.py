@@ -25,7 +25,7 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 WORKER_AUTH_KEY_PATH = os.environ.get("WORKER_AUTH_KEY_PATH", "/var/lib/kubus-node/worker-auth.key")
 
 
-WORKER_VERSION = "kubus-spatial-worker/9"
+WORKER_VERSION = "kubus-spatial-worker/10"
 WORKER_INSTANCE_ID = str(uuid.uuid4())
 control = JobControl("/var/lib/kubus-node/private/worker-control")
 
@@ -81,6 +81,9 @@ def health() -> dict[str, Any]:
         "inputModes": ["frames", "video", "photos", "mixed"],
         # Face masking of photos and video frames before reconstruction (`input.maskFaces`); see face_mask.py.
         "faceMasking": True,
+        # The images face masking flags carry `file` (and a frame's `seconds`) in `needsLook.items`, so the Node can keep
+        # a masked copy for the operator to look at before the job's working directory is removed.
+        "faceReviewImages": True,
         "version": WORKER_VERSION,
         "cleanupProtocol": 1,
         "workerInstanceId": WORKER_INSTANCE_ID,

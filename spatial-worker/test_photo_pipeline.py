@@ -316,6 +316,14 @@ class PhotoDatasetTests(unittest.TestCase):
         self.assertIn("masking_faces", [stage for stage, _ in self.stages])
         self.assertEqual(result["masking"]["photos"], [1] * 20)
         self.assertEqual(result["masking"]["video"], [1] * result["frames"]["selected"])
+        # Where each masked image is under the job's directory (for the operator's look), and where a frame is in the footage.
+        work = self.root / "work"
+        files = result["masking"]["photosFiles"] + result["masking"]["videoFiles"]
+        self.assertEqual(result["masking"]["photosFiles"][:2], ["dataset/images/photo_00000.jpg", "dataset/images/photo_00001.jpg"])
+        self.assertEqual(len(result["masking"]["videoFiles"]), result["frames"]["selected"])
+        self.assertTrue(all((work / name).is_file() for name in files))
+        self.assertEqual(len(result["masking"]["videoSeconds"]), result["frames"]["selected"])
+        self.assertEqual(result["masking"]["videoSeconds"], sorted(result["masking"]["videoSeconds"]))
 
     def test_photos_only_masking_leaves_video_frames_alone(self):
         from test_face_mask import FakeMasker
@@ -327,8 +335,11 @@ class PhotoDatasetTests(unittest.TestCase):
         )
         self.assertEqual(result["masking"]["photos"], [1] * 30)
         self.assertIsNone(result["masking"]["video"])
+        self.assertIsNone(result["masking"]["videoFiles"])
+        self.assertEqual(len(result["masking"]["photosFiles"]), 30)
         unmasked = pp.prepare_photo_dataset(FakeColmap(), capture, self.root / "work2", self.progress, convert=fake_convert(first_n(10_000)))
         self.assertIsNone(unmasked["masking"]["photos"])
+        self.assertIsNone(unmasked["masking"]["photosFiles"])
 
     def test_a_missing_detector_fails_the_job_before_any_image_is_written(self):
         capture = make_photo_capture(self.root, count=12)

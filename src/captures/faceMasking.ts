@@ -62,9 +62,17 @@ export interface FaceMaskingSummary {
 }
 
 /** Which image a flag is on, and what: `image` is the 1-based number in the part's own order (`photos/00001.jpg` is 1). */
-export interface NeedsLookItem { image: number; weakExcluded?: number; largeBelowCertain?: number }
+export interface NeedsLookItem {
+  image: number;
+  weakExcluded?: number;
+  largeBelowCertain?: number;
+  /** The worker's path of the masked copy, relative to the job's output directory (worker-masked parts only). */
+  file?: string;
+  /** Where in the footage a video frame is. */
+  seconds?: number;
+}
 export interface NeedsLook { images: number; weakExcluded: number; largeBelowCertain: number; items?: NeedsLookItem[]; itemsTruncated?: boolean }
-export const NEEDS_LOOK_LIST_LIMIT = 200;
+export const NEEDS_LOOK_LIST_LIMIT = 1000;
 
 export interface CaptureFaceMasking {
   photos?: PhotoMasking;

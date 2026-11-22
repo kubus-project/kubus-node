@@ -193,32 +193,74 @@ describe('dispatchLocalRequest', () => {
     expect((deps.store.snapshot().spatial as Record<string, { state: string }>).fresh!.state).toBe('superseded');
   });
 
-  it('refuses to publish a record with images left to look at until the look is acknowledged, and records who and when', async () => {
+  it('refuses to publish a record with images left to look at until the operator acknowledged them in the GUI; no client flag can do it', async () => {
     const publishExistingSpatial = vi.fn(async () => ({ requested: true }));
     deps.api = { publishExistingSpatial } as never;
+    const review = { pending: 3, jobId: 'job-1', items: [{ part: 'photos', image: 2, file: 'photos-00002.jpg' }], viewed: ['photos-00002.jpg'] };
     await deps.store.update((state) => {
       state.spatial = {
-        flagged: { id: 'flagged', state: 'local', manifestCid: 'Qm1', manifest: {}, faceReview: { pending: 3, jobId: 'job-1' } },
+        flagged: { id: 'flagged', state: 'local', manifestCid: 'Qm1', manifest: {}, faceReview: review },
+        looked: { id: 'looked', state: 'local', manifestCid: 'Qm4', manifest: {}, faceReview: { ...review, acknowledged: { at: '2026-11-22T10:00:00.000Z', by: 'gui-operator' } } },
         clean: { id: 'clean', state: 'local', manifestCid: 'Qm2', manifest: {} },
         legacy: { id: 'legacy', state: 'local', manifestCid: 'Qm3', manifest: {}, faceReview: { pending: 0, jobId: 'job-0' } },
       } as never;
     });
     const publish = (id: string, extra: Record<string, unknown> = {}) => dispatchLocalRequest(request({ method: 'POST', path: `/local/v1/spatial/${id}/publish`, credential: token, body: jsonBody({ backendAuthorization: 'Bearer x', artworkId: 'a', ...extra }) }), deps);
-    const record = (id: string) => (deps.store.snapshot().spatial as Record<string, { state: string; faceReview?: { pending: number; acknowledged?: { at: string; by: string } } }>)[id]!;
+    const record = (id: string) => (deps.store.snapshot().spatial as Record<string, { state: string; publishInFlightAt?: string; publication?: unknown; faceReview?: { pending: number; acknowledged?: { at: string; by: string } } }>)[id]!;
     await expect(publish('flagged')).rejects.toMatchObject({ statusCode: 409, code: 'spatial_face_review_pending', details: { pending: 3 } });
-    await expect(publish('flagged', { acknowledgeFaceReview: 'yes' })).rejects.toMatchObject({ code: 'spatial_face_review_pending' });
+    // The old body flag does nothing: the look is the operator's, in the GUI, and the Node checks the images were shown.
+    await expect(publish('flagged', { acknowledgeFaceReview: true })).rejects.toMatchObject({ code: 'spatial_face_review_pending' });
     expect(publishExistingSpatial).not.toHaveBeenCalled();
     expect(record('flagged').state).toBe('local');
-    await expect(publish('flagged', { acknowledgeFaceReview: true })).resolves.toMatchObject({ kind: 'json' });
-    expect(publishExistingSpatial).toHaveBeenCalledTimes(1);
-    expect(record('flagged').state).toBe('publication_requested');
-    expect(record('flagged').faceReview?.acknowledged?.by).toBe(Object.keys(deps.store.snapshot().localCredentials ?? {})[0]);
-    expect(Date.parse(record('flagged').faceReview!.acknowledged!.at)).not.toBeNaN();
-    // Once acknowledged a repeat needs no flag, and records with nothing flagged never needed one.
-    await expect(publish('flagged')).resolves.toMatchObject({ kind: 'json' });
+    expect(record('flagged').faceReview?.acknowledged).toBeUndefined();
+    // After the operator's acknowledgement (recorded by the GUI route), and for records with nothing flagged, publishing works.
+    await expect(publish('looked')).resolves.toMatchObject({ kind: 'json' });
+    expect(record('looked').state).toBe('publication_requested');
+    expect(record('looked').publishInFlightAt).toBeUndefined();
+    // The backend never receives the Node's private review state.
+    const sent = publishExistingSpatial.mock.calls[0] as unknown as [{ spatial: Record<string, unknown> }];
+    expect(sent[0].spatial.faceReview).toBeUndefined();
+    expect(sent[0].spatial.id).toBe('looked');
     await expect(publish('clean')).resolves.toMatchObject({ kind: 'json' });
     await expect(publish('legacy')).resolves.toMatchObject({ kind: 'json' });
     expect(record('clean').faceReview).toBeUndefined();
+  });
+
+  it('claims the record while the backend call runs, so a supersede cannot retire it, and keeps a publication the backend accepted', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const publishExistingSpatial = vi.fn(async () => { await gate; return { requested: true }; });
+    deps.api = { publishExistingSpatial } as never;
+    await deps.store.update((state) => { state.spatial = { fresh: { id: 'fresh', state: 'local', manifestCid: 'Qm1', manifest: {} } } as never; });
+    const record = () => (deps.store.snapshot().spatial as Record<string, { state: string; publishInFlightAt?: string; publication?: unknown }>).fresh!;
+    const pending = dispatchLocalRequest(request({ method: 'POST', path: '/local/v1/spatial/fresh/publish', credential: token, body: jsonBody({ backendAuthorization: 'Bearer x', artworkId: 'a' }) }), deps);
+    while (!record().publishInFlightAt) await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(record().state).toBe('local');
+    release();
+    await expect(pending).resolves.toMatchObject({ kind: 'json' });
+    expect(record().publishInFlightAt).toBeUndefined();
+    expect(record().publication).toEqual({ requested: true });
+    // A failed backend call releases the claim.
+    await deps.store.update((state) => { state.spatial = { again: { id: 'again', state: 'local', manifestCid: 'Qm2', manifest: {} } } as never; });
+    publishExistingSpatial.mockImplementationOnce(async () => { throw new Error('backend down'); });
+    await expect(dispatchLocalRequest(request({ method: 'POST', path: '/local/v1/spatial/again/publish', credential: token, body: jsonBody({ backendAuthorization: 'Bearer x', artworkId: 'a' }) }), deps)).rejects.toThrow('backend down');
+    expect((deps.store.snapshot().spatial as Record<string, { publishInFlightAt?: string }>).again!.publishInFlightAt).toBeUndefined();
+  });
+
+  it('keeps the private face review of a record away from paired clients (record and job output)', async () => {
+    const review = { pending: 1, jobId: 'job-1', items: [{ part: 'photos', image: 4, file: 'photos-00004.jpg' }], viewed: [], acknowledged: { at: 'x', by: 'cred-1' } };
+    await deps.store.update((state) => { state.spatial = { r1: { id: 'r1', state: 'local', manifestCid: 'Qm1', manifest: { variants: [] }, faceReview: review } } as never; });
+    const response = await dispatchLocalRequest(request({ method: 'GET', path: '/local/v1/spatial/r1', credential: token }), deps) as { value: Record<string, unknown> };
+    expect(response.value.id).toBe('r1');
+    expect(JSON.stringify(response.value)).not.toMatch(/faceReview|photos-00004|cred-1/);
+    const job = { id: 'j1', state: 'completed', output: { id: 'r1', faceReview: review } };
+    deps.jobs = { get: () => job, list: () => [job], health: () => ({ running: 0, queued: 0 }) } as never;
+    for (const route of ['/local/v1/jobs/j1', '/local/v1/jobs']) {
+      const shown = await dispatchLocalRequest(request({ method: 'GET', path: route, credential: token }), deps) as { value: unknown };
+      expect(JSON.stringify(shown.value)).not.toMatch(/faceReview|cred-1/);
+      expect(JSON.stringify(shown.value)).toContain('r1');
+    }
+    expect(job.output.faceReview).toBeDefined();
   });
 
   it('keeps the private face-masking detail of a job away from paired clients', async () => {
