@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { AnalyticsStore } from '../analytics/analyticsStore.js';
 import type { CaptureStore } from '../captures/captureStore.js';
-import { PINNED_WEIGHTS_SHA256, effectiveMasking, publicMaskingSummary } from '../captures/faceMasking.js';
+import { NEEDS_LOOK_LIST_LIMIT, PINNED_WEIGHTS_SHA256, effectiveMasking, publicMaskingSummary, unmaskedForJobArtwork, type NeedsLook, type NeedsLookItem } from '../captures/faceMasking.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import { localError } from '../localApi/pairingService.js';
 import type { Logger } from '../logging/logger.js';
@@ -102,20 +102,41 @@ function cleanMaskingPart(value: unknown): Record<string, unknown> | undefined {
   if (look && typeof look === 'object' && !Array.isArray(look)) {
     const count = (value: unknown) => (typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 100000 ? value : 0);
     const raw = look as Record<string, unknown>;
-    out.needsLook = { images: count(raw.images), weakExcluded: count(raw.weakExcluded), largeBelowCertain: count(raw.largeBelowCertain) };
+    const needs: NeedsLook = { images: count(raw.images), weakExcluded: count(raw.weakExcluded), largeBelowCertain: count(raw.largeBelowCertain) };
+    // Which images: bounded numbers only. Kept in the private job record so the operator can find them.
+    if (Array.isArray(raw.items)) {
+      const items: NeedsLookItem[] = [];
+      for (const entry of raw.items.slice(0, NEEDS_LOOK_LIST_LIMIT)) {
+        if (!entry || typeof entry !== 'object') continue;
+        const item = entry as Record<string, unknown>;
+        if (typeof item.image !== 'number' || !Number.isInteger(item.image) || item.image < 1 || item.image > 100000) continue;
+        const weak = count(item.weakExcluded);
+        const large = count(item.largeBelowCertain);
+        items.push({ image: item.image, ...(weak ? { weakExcluded: weak } : {}), ...(large ? { largeBelowCertain: large } : {}) });
+      }
+      needs.items = items;
+      if (raw.itemsTruncated === true || raw.items.length > NEEDS_LOOK_LIST_LIMIT) needs.itemsTruncated = true;
+    }
+    out.needsLook = needs;
   }
   return Object.keys(out).length ? out : undefined;
 }
 
+/** What a face-masking record leaves for a human to look at, over its parts: images, and the two kinds of detection (all 0 when nothing is flagged). */
+export function maskingNeedsLookCounts(masking: unknown): { images: number; weakExcluded: number; largeBelowCertain: number } {
+  const total = { images: 0, weakExcluded: 0, largeBelowCertain: 0 };
+  if (!masking || typeof masking !== 'object') return total;
+  for (const part of ['photos', 'video'] as const) {
+    const look = ((masking as Record<string, unknown>)[part] as { needsLook?: Partial<Record<keyof typeof total, unknown>> } | undefined)?.needsLook;
+    if (!look) continue;
+    for (const key of Object.keys(total) as Array<keyof typeof total>) if (typeof look[key] === 'number') total[key] += look[key] as number;
+  }
+  return total;
+}
+
 /** How many images of a face-masking record a human still has to look at, over its parts (0 when nothing is flagged). */
 export function maskingNeedsLook(masking: unknown): number {
-  if (!masking || typeof masking !== 'object') return 0;
-  let images = 0;
-  for (const part of ['photos', 'video'] as const) {
-    const look = ((masking as Record<string, unknown>)[part] as { needsLook?: { images?: unknown } } | undefined)?.needsLook;
-    if (look && typeof look.images === 'number') images += look.images;
-  }
-  return images;
+  return maskingNeedsLookCounts(masking).images;
 }
 
 /**
@@ -347,7 +368,7 @@ export class JobRuntime {
       if (typeof input.mode === 'string' && input.mode !== mode) {
         throw localError(422, 'capture_input_mode_mismatch', { message: `The capture is a ${mode} capture, not ${input.mode}` });
       }
-      const prepared = { ...(mode === 'frames' ? input : { ...input, mode }), ...this.revisionInput(input, captureId), ...this.maskingInput(captureId, mode) };
+      const prepared = { ...(mode === 'frames' ? input : { ...input, mode }), ...this.revisionInput(input, captureId), ...this.maskingInput(captureId, mode, typeof input.artworkId === 'string' ? input.artworkId : undefined) };
       return this.insert(type, prepared, captureId);
     });
   }
@@ -356,9 +377,17 @@ export class JobRuntime {
    * Which parts of a capture the worker must mask before reconstruction (see `captures/faceMasking.ts`).
    * Photos masked before import need nothing here; posed frames are not masked by this step.
    */
-  private maskingInput(captureId: string, mode: string): Record<string, unknown> {
+  private maskingInput(captureId: string, mode: string, jobArtworkId: string | undefined): Record<string, unknown> {
     if (mode === 'frames') return {};
     const capture = this.deps.captureStore.get(captureId);
+    // The default (masking for an artwork) is decided at import from the capture's artwork. A job that names an
+    // artwork for a capture imported without one would bind a splat of unmasked images to that artwork.
+    const unmasked = unmaskedForJobArtwork(capture, mode, jobArtworkId);
+    if (unmasked.length) {
+      throw localError(422, 'job_artwork_binds_unmasked_capture', {
+        message: `This capture was imported without an artwork and without face masking (${unmasked.join(' and ')}); a job must not bind it to an artwork. Import it again with --artwork (faces are masked by default), or with --no-mask-faces to choose that explicitly`,
+      });
+    }
     const masking = effectiveMasking(capture);
     const photos = mode !== 'video' && masking.photos === 'worker';
     const video = (mode === 'video' || mode === 'mixed') && masking.video === 'worker';
@@ -753,7 +782,9 @@ export class JobRuntime {
     const added = await this.deps.kubo.addBytes(manifestBytes, `${id}.spatial.json`, { pin: false });
     if (!added.Hash) throw new Error('kubo_add_manifest_missing_cid');
     await managed.acquire(added.Hash, pinOwner);
-    const record = { id, state: 'local', manifestCid: added.Hash, manifest, createdAt: manifest.createdAt, privateSourceCapture: true, pinOwner };
+    // Private to the Node (not in the manifest): what a human still has to look at before this record is published.
+    const pendingLook = maskingNeedsLookCounts(derivation?.faceMasking).images;
+    const record = { id, state: 'local', manifestCid: added.Hash, manifest, createdAt: manifest.createdAt, privateSourceCapture: true, pinOwner, ...(pendingLook ? { faceReview: { pending: pendingLook, jobId: job.id } } : {}) };
     await this.deps.store.update((state) => { (state.spatial ??= {})[id] = record; });
     return record;
   }
@@ -815,13 +846,19 @@ export class JobRuntime {
     if (crop?.applied === true && typeof crop.splatsBefore === 'number' && typeof crop.splatsAfter === 'number') {
       parts.push(`floater crop kept ${crop.splatsAfter} of ${crop.splatsBefore} splats`);
     }
-    const toLook = maskingNeedsLook(derivation.faceMasking);
-    if (parts.length === 0 && toLook === 0) return;
+    const toLook = maskingNeedsLookCounts(derivation.faceMasking);
+    if (parts.length === 0 && toLook.images === 0) return;
     await this.patchJob(id, (current) => {
       const at = new Date().toISOString();
       if (parts.length) current.logs.push({ at, level: 'info', message: parts.join('; ') });
       // Face masking is tuned for recall but a run cannot decide everything; say so where the operator reads the job.
-      if (toLook) current.logs.push({ at, level: 'warn', message: `Face masking left ${toLook} image(s) a human has to look at (large detections it did not mask: a person close to the camera, or a painted head); look at them before this record is published` });
+      if (toLook.images) {
+        const kinds = [
+          toLook.largeBelowCertain ? `${toLook.largeBelowCertain} large detection(s) it did not mask (a person close to the camera, or a painted head)` : '',
+          toLook.weakExcluded ? `${toLook.weakExcluded} weaker detection(s) inside an exclude box (a real face next to a painted one)` : '',
+        ].filter(Boolean).join('; ');
+        current.logs.push({ at, level: 'warn', message: `Face masking left ${toLook.images} image(s) a human has to look at: ${kinds}. The job record lists which images; this record cannot be published until that look is acknowledged` });
+      }
     }).catch(() => undefined);
   }
 

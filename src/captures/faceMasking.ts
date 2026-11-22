@@ -58,14 +58,24 @@ export interface FaceMaskingSummary {
    * detection swallowed by an exclude box that the reviewer did not acknowledge with `expectWeak`, a large
    * detection that was not masked). `images` is how many images carry one. Zero means the report flagged nothing.
    */
-  needsLook: { images: number; weakExcluded: number; largeBelowCertain: number };
+  needsLook: NeedsLook;
 }
+
+/** Which image a flag is on, and what: `image` is the 1-based number in the part's own order (`photos/00001.jpg` is 1). */
+export interface NeedsLookItem { image: number; weakExcluded?: number; largeBelowCertain?: number }
+export interface NeedsLook { images: number; weakExcluded: number; largeBelowCertain: number; items?: NeedsLookItem[]; itemsTruncated?: boolean }
+export const NEEDS_LOOK_LIST_LIMIT = 200;
 
 export interface CaptureFaceMasking {
   photos?: PhotoMasking;
   video?: VideoMasking;
   /** Present for `premasked` photos: what the operator's report says, bound to the imported files by SHA-256. */
   report?: FaceMaskingSummary;
+  /**
+   * The operator passed `--no-mask-faces`. Without it a `none` on a capture that names no artwork is only the
+   * default for a private capture, and a job that binds such a capture to an artwork is refused (see `JobRuntime`).
+   */
+  optedOut?: boolean;
 }
 
 export class FaceMaskingReportError extends Error {
@@ -79,6 +89,30 @@ export interface MaskingChoice {
   /** `--mask-faces` (true) or `--no-mask-faces` (false); absent means the default for the capture. */
   maskFaces?: boolean;
   artworkId?: string;
+}
+
+/** Did the operator choose no masking (`--no-mask-faces`), as opposed to the default for a capture without an artwork? */
+export function choseNoMasking(choice: MaskingChoice): boolean {
+  return choice.maskFaces === false;
+}
+
+/**
+ * The parts of a capture a reconstruction in `mode` would use unmasked although the job binds it to a public
+ * artwork the capture was not imported for: the capture's own `none` is only the private-capture default (no
+ * artwork, no opt-out), and the job must not turn it into an artwork-bound splat. Empty when nothing is wrong.
+ */
+export function unmaskedForJobArtwork(
+  capture: { artworkId?: string; kind?: string; faceMasking?: CaptureFaceMasking },
+  mode: string,
+  jobArtworkId: string | undefined,
+): Array<'photos' | 'video'> {
+  if (!jobArtworkId || capture.artworkId) return [];
+  const masking = effectiveMasking(capture);
+  if (masking.optedOut) return [];
+  const out: Array<'photos' | 'video'> = [];
+  if (mode !== 'video' && masking.photos === 'none') out.push('photos');
+  if ((mode === 'video' || mode === 'mixed') && masking.video === 'none') out.push('video');
+  return out;
 }
 
 /** What the default is for a capture, and whether the caller changed it. */
@@ -160,8 +194,9 @@ export function summariseReport(report: unknown, photoHashes: string[]): FaceMas
   const regionsPerImage: number[] = [];
   let manualAdded = 0;
   let manualExcluded = 0;
-  const needsLook = { images: 0, weakExcluded: 0, largeBelowCertain: 0 };
-  for (const hash of photoHashes) {
+  const needsLook: NeedsLook = { images: 0, weakExcluded: 0, largeBelowCertain: 0 };
+  const items: NeedsLookItem[] = [];
+  for (const [position, hash] of photoHashes.entries()) {
     const entry = pool.get(hash)?.shift();
     if (!entry) throw new FaceMaskingReportError('face_masking_report_mismatch', 'A photo is not covered by the face-masking report (it was changed after masking, or never masked)');
     regionsPerImage.push(entry.regions);
@@ -169,8 +204,13 @@ export function summariseReport(report: unknown, photoHashes: string[]): FaceMas
     manualExcluded += entry.manualExcluded;
     needsLook.weakExcluded += entry.weakExcluded;
     needsLook.largeBelowCertain += entry.largeBelowCertain;
-    if (entry.weakExcluded || entry.largeBelowCertain) needsLook.images += 1;
+    if (entry.weakExcluded || entry.largeBelowCertain) {
+      needsLook.images += 1;
+      items.push({ image: position + 1, ...(entry.weakExcluded ? { weakExcluded: entry.weakExcluded } : {}), ...(entry.largeBelowCertain ? { largeBelowCertain: entry.largeBelowCertain } : {}) });
+    }
   }
+  needsLook.items = items.slice(0, NEEDS_LOOK_LIST_LIMIT);
+  if (items.length > NEEDS_LOOK_LIST_LIMIT) needsLook.itemsTruncated = true;
   const clip = (value: unknown, limit = 120) => (typeof value === 'string' ? value.slice(0, limit) : undefined);
   const threshold = typeof detector.scoreThreshold === 'number' && Number.isFinite(detector.scoreThreshold) ? detector.scoreThreshold : undefined;
   return {

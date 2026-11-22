@@ -7,7 +7,7 @@ import { createReadStream } from 'node:fs';
 import { declaredFrameCount, inspectCapturePackage, isPlainObject, type CapturePackageKind, type CapturePackageReport } from './capturePackage.js';
 import { VIDEO_EXTENSIONS, VIDEO_MAX_BYTES, VIDEO_MIN_BYTES, type VideoExtension } from './videoPackage.js';
 import { PHOTO_EXTENSIONS, PHOTO_MAX_BYTES, PHOTO_MAX_COUNT, PHOTO_MIN_COUNT, listPhotoSources, type PhotoFacts } from './photoPackage.js';
-import { FaceMaskingReportError, readPremaskedReport, resolveMasking, effectiveMasking, type CaptureFaceMasking } from './faceMasking.js';
+import { FaceMaskingReportError, readPremaskedReport, resolveMasking, effectiveMasking, choseNoMasking, type CaptureFaceMasking } from './faceMasking.js';
 
 export interface CaptureFilePayload { path: string; contentBase64: string; mimeType?: string }
 export interface CapturePackagePayload {
@@ -109,7 +109,7 @@ function mediaMetadata(metadata: Record<string, unknown> | undefined): Partial<C
     const photos = masking.photos === 'premasked' || masking.photos === 'worker' || masking.photos === 'none' ? masking.photos : undefined;
     const video = masking.video === 'worker' || masking.video === 'none' ? masking.video : undefined;
     if (photos || video) {
-      out.faceMasking = { ...(photos ? { photos } : {}), ...(video ? { video } : {}), ...(isPlainObject(masking.report) ? { report: masking.report as unknown as CaptureFaceMasking['report'] } : {}) };
+      out.faceMasking = { ...(photos ? { photos } : {}), ...(video ? { video } : {}), ...(masking.optedOut === true ? { optedOut: true } : {}), ...(isPlainObject(masking.report) ? { report: masking.report as unknown as CaptureFaceMasking['report'] } : {}) };
     }
   }
   const media = metadata?.mediaCapturedAt;
@@ -689,7 +689,8 @@ export class CaptureStore {
     const sha256 = hash.digest('hex');
     const videoMasking = resolveMasking({ maskFaces: options.maskFaces, artworkId: options.artworkId }) ? 'worker' : 'none';
     // The masking decision is part of the identity: the same footage imported with and without masking is two captures.
-    const localCaptureId = `video-import:${sha256}:${options.artworkId ?? ''}:${options.markerId ?? ''}${videoMasking === 'none' ? ':masking=none' : ''}`;
+    const optedOut = choseNoMasking({ maskFaces: options.maskFaces });
+    const localCaptureId = `video-import:${sha256}:${options.artworkId ?? ''}:${options.markerId ?? ''}${videoMasking === 'none' ? ':masking=none' : ''}${optedOut && !options.artworkId ? ':optout' : ''}`;
 
     const capturedAt = options.capturedAt && !Number.isNaN(Date.parse(options.capturedAt))
       ? new Date(options.capturedAt).toISOString()
@@ -703,7 +704,7 @@ export class CaptureStore {
       // a phone recording is still personal data nothing downstream needs.
       metadata: {
         kind: 'video', source: 'local_import', localCaptureId, sha256, sourceBytes: stat.size,
-        faceMasking: { video: videoMasking },
+        faceMasking: { video: videoMasking, ...(optedOut ? { optedOut: true } : {}) },
       },
     });
     try {
@@ -786,10 +787,13 @@ export class CaptureStore {
       photos: report ? 'premasked' : wantsMasking ? 'worker' : 'none',
       ...(video ? { video: wantsMasking ? 'worker' as const : 'none' as const } : {}),
       ...(report ? { report } : {}),
+      ...(choseNoMasking({ maskFaces: options.maskFaces }) ? { optedOut: true } : {}),
     };
     // The masking decision is part of the identity (the default, worker masking, adds nothing so earlier keys still match).
     const maskingKey = faceMasking.photos === 'worker' && (!video || faceMasking.video === 'worker') ? '' : `:masking=${faceMasking.photos}/${faceMasking.video ?? '-'}`;
-    const localCaptureId = `photos-import:${setHash.digest('hex')}:${options.artworkId ?? ''}:${options.markerId ?? ''}${maskingKey}`;
+    // An explicit opt-out is not the default of a capture without an artwork, so the two are different captures.
+    const optOutKey = faceMasking.optedOut && !options.artworkId ? ':optout' : '';
+    const localCaptureId = `photos-import:${setHash.digest('hex')}:${options.artworkId ?? ''}:${options.markerId ?? ''}${maskingKey}${optOutKey}`;
     // The import is idempotent on the files, so a retry converges on the capture that exists. A retry that states a
     // different operator or capture time must not silently get the old record back: say so.
     const stated = validIso(options.capturedAt);
@@ -862,7 +866,10 @@ export class CaptureStore {
     const photos = await listPhotoSources(base.directory);
     if (photos.length === 0) throw localError(422, 'capture_extension_invalid', { message: 'The photo capture no longer holds its photos' });
     const videoMasking = resolveMasking({ maskFaces: options.maskFaces, artworkId: base.artworkId }) ? 'worker' as const : 'none' as const;
-    const localCaptureId = `video-extension:${base.id}:${video.sha256}${videoMasking === 'none' ? ':masking=none' : ''}`;
+    // Opted out as a whole only when the base capture was, or the caller opted the video out while its photos are masked:
+    // photos that are unmasked by default (no artwork) stay unmasked by default.
+    const optedOut = base.faceMasking?.optedOut === true || (choseNoMasking({ maskFaces: options.maskFaces }) && (effectiveMasking(base).photos ?? 'none') !== 'none');
+    const localCaptureId = `video-extension:${base.id}:${video.sha256}${videoMasking === 'none' ? ':masking=none' : ''}${optedOut && !base.artworkId ? ':optout' : ''}`;
     const videoCapturedAt = validIso(options.capturedAt) ?? video.mtime.toISOString();
     const photosCapturedAt = base.mediaCapturedAt?.photos ?? base.capturedAt;
     const draft = await this.beginDraft({
@@ -877,6 +884,7 @@ export class CaptureStore {
         faceMasking: {
           photos: effectiveMasking(base).photos ?? 'none',
           video: videoMasking,
+          ...(optedOut ? { optedOut: true } : {}),
           ...(base.faceMasking?.report ? { report: base.faceMasking.report } : {}),
         },
         ...(base.capturedBy ? { capturedBy: base.capturedBy } : {}),

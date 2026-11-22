@@ -29,7 +29,7 @@ export async function resolveImportSource(requested: unknown, roots: string[]): 
   try {
     real = await fs.realpath(path.resolve(requested));
   } catch {
-    throw localError(404, 'capture_video_source_not_found', { importRoots: roots });
+    throw localError(404, 'capture_video_source_not_found', { message: 'No file at that path on the Node' });
   }
   for (const root of roots) {
     let realRoot: string;
@@ -40,5 +40,7 @@ export async function resolveImportSource(requested: unknown, roots: string[]): 
     }
     if (real === realRoot || real.startsWith(`${realRoot}${path.sep}`)) return real;
   }
-  throw localError(403, 'import_path_not_allowed', { importRoots: roots });
+  // The folders themselves are not named in the answer (a caller does not need the Node's disk layout); the operator
+  // finds them in docs/SPATIAL.md: `<data>/imports` and the folders listed in KUBUS_IMPORT_DIRS.
+  throw localError(403, 'import_path_not_allowed', { message: "The file is not inside one of the Node's import folders (the imports folder of its data directory, or a folder listed in KUBUS_IMPORT_DIRS)" });
 }

@@ -42,8 +42,8 @@ look at, never silently dropped: a detection that is not near-certain but lies i
 detection of any score from 0.4 that failed the near-certain test and so was not masked (`largeBelowCertain`:
 a close-up, hatted or sunglassed face scores lower, but so does a painted head or a wall). Both are counted per image, in the command line's report
 (`needsLook`, listed under `review` and printed to stderr) and, for the worker, in the job's `faceMasking`
-provenance (`needsLook`: the number of images and of detections), where a human looks before anything is
-published. An exclude entry may state `"expectWeak": n` once the reviewer has looked, and then the run fails
+provenance (`needsLook`: the number of images and of detections, and which images), where a human looks before anything is
+published (the Node refuses to publish a record with images left to look at until the operator acknowledges it). An exclude entry may state `"expectWeak": n` once the reviewer has looked, and then the run fails
 if the count differs. Video frames also get a neighbour check (`mask_frame_sequence`): a face region that the
 frame before and the frame after both have, and the frame between does not, is masked in the frame between.
 Its limits: it fills only a one-frame gap between two frames that both have the region (two misses in a row,
@@ -397,13 +397,33 @@ def fill_regions(rgb: Any, regions: list) -> Any:
     return out
 
 
-def needs_look(reviews: list | None) -> dict:
-    """What a human has to look at after a run, from the per-image review counts: images and detections."""
+NEEDS_LOOK_LIST_LIMIT = 200
+
+
+def needs_look(reviews: list | None, positions: list | None = None) -> dict:
+    """What a human has to look at after a run, from the per-image review counts.
+
+    `images` is how many images carry a flag, `weakExcluded` and `largeBelowCertain` the detections, and `items`
+    says which images: `{"image": n, ...flags}` with `n` the 1-based number of the image in its own sequence (the
+    photo's number in the capture, `photos/00001.jpg` is 1; the frame's number among the selected video frames).
+    `positions` gives that number per review entry when entries were dropped before (an unreadable photo), else it
+    is the entry's own position. The list is bounded (`itemsTruncated` says it was cut); the counts are not.
+    """
     reviews = reviews or []
-    return {
-        "images": sum(1 for item in reviews if any(item.get(key) for key in ("weakExcluded", "largeBelowCertain"))),
+    items: list = []
+    for index, item in enumerate(reviews):
+        flags = {key: int(item.get(key, 0)) for key in ("weakExcluded", "largeBelowCertain") if item.get(key)}
+        if flags:
+            items.append({"image": int(positions[index]) if positions is not None and index < len(positions) else index + 1, **flags})
+    out = {
+        "images": len(items),
+        "weakExcluded": sum(int(item.get("weakExcluded", 0)) for item in reviews),
         "largeBelowCertain": sum(int(item.get("largeBelowCertain", 0)) for item in reviews),
+        "items": items[:NEEDS_LOOK_LIST_LIMIT],
     }
+    if len(items) > NEEDS_LOOK_LIST_LIMIT:
+        out["itemsTruncated"] = True
+    return out
 
 
 def summarise(counts: list, photo_images: int = 0, extra: dict | None = None, version: dict | None = None) -> dict:
@@ -438,7 +458,7 @@ def masking_provenance(masking: dict | None) -> dict | None:
     out: dict = {}
     photos, video = masking.get("photos"), masking.get("video")
     if photos is not None:
-        out["photos"] = summarise(photos, photo_images=len(photos), version=masking["version"], extra={"needsLook": needs_look(masking.get("photosReview"))})
+        out["photos"] = summarise(photos, photo_images=len(photos), version=masking["version"], extra={"needsLook": needs_look(masking.get("photosReview"), masking.get("photosPositions"))})
     if video is not None:
         out["video"] = summarise(video, version=masking["version"], extra={"needsLook": needs_look(masking.get("videoReview"))})
     return out or None

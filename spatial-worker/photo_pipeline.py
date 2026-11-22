@@ -154,7 +154,8 @@ def prepare_photos(paths: list, destination: pathlib.Path, prefix: str = "photo"
     """Prepare every photo; returns (names written, statistics). Unreadable files are dropped and counted.
 
     With a `masker`, the statistics carry `maskedRegions` (the region count of each written photo, in order) and
-    `maskedReview` (what a human has to look at in each, see `face_mask.FaceMasker.find_regions`).
+    `maskedReview` (what a human has to look at in each, see `face_mask.FaceMasker.find_regions`) and
+    `maskedPositions` (each written photo's number among the submitted ones).
     """
     destination.mkdir(parents=True, exist_ok=True)
     names: list = []
@@ -163,7 +164,8 @@ def prepare_photos(paths: list, destination: pathlib.Path, prefix: str = "photo"
     unreadable = 0
     regions: list = []
     reviews: list = []
-    for path in paths:
+    positions: list = []
+    for position, path in enumerate(paths, start=1):
         name = f"{prefix}_{len(names):05d}.jpg"
         try:
             facts = prepare_photo(path, destination / name, masker=masker)
@@ -177,6 +179,7 @@ def prepare_photos(paths: list, destination: pathlib.Path, prefix: str = "photo"
         names.append(name)
         regions.append(facts["maskedRegions"])
         reviews.append(facts["maskReview"])
+        positions.append(position)  # the photo's number in the capture (photos/00001.jpg is 1), kept when others are dropped
         rotated += 1 if facts["orientationApplied"] else 0
         cameras[facts["camera"]] = cameras.get(facts["camera"], 0) + 1
     stats = {
@@ -186,6 +189,7 @@ def prepare_photos(paths: list, destination: pathlib.Path, prefix: str = "photo"
     if masker is not None:
         stats["maskedRegions"] = regions
         stats["maskedReview"] = reviews
+        stats["maskedPositions"] = positions
     return names, stats
 
 
@@ -350,6 +354,7 @@ def prepare_photo_dataset(
     sfm["sparsePointsInitialisation"] = has_points and (dataset / "sparse_pc.ply").is_file()
     masking = {
         "photos": photo_stats.get("maskedRegions") if mask_photos else None, "photosReview": photo_stats.get("maskedReview") if mask_photos else None,
+        "photosPositions": photo_stats.get("maskedPositions") if mask_photos else None,
         "video": video_regions, "videoReview": video_review if video_regions is not None else None,
         "version": masker.version if masker else None,
     }

@@ -248,6 +248,19 @@ describe('local photo import', () => {
     await expect(resolveImportSource(path.join(inside, '..', '..'), roots)).rejects.toMatchObject({ code: 'import_path_not_allowed' });
   });
 
+  it('does not name the Node filesystem in the refusal of an import path', async () => {
+    const dir = await tempDir();
+    const roots = importRoots(dir, {});
+    await fs.mkdir(roots[0]!, { recursive: true });
+    const refused = await resolveImportSource(dir, roots).catch((error) => error);
+    const missing = await resolveImportSource(path.join(dir, 'nowhere'), roots).catch((error) => error);
+    for (const error of [refused, missing]) {
+      expect(JSON.stringify({ message: error.message, details: error.details })).not.toContain(dir);
+      expect(error.details).not.toHaveProperty('importRoots');
+    }
+    expect(refused.details.message).toContain('KUBUS_IMPORT_DIRS');
+  });
+
   it('parses the command lines', () => {
     expect(parseImportPhotosArguments(['/p', '--artwork', 'a', '--marker', 'm', '--captured-at', '2026-08-17T06:00:00Z', '--captured-by', 'x', '--video', 'v.mp4', '--process', '--floater-crop']))
       .toEqual({ directory: '/p', artworkId: 'a', markerId: 'm', capturedAt: '2026-08-17T06:00:00Z', capturedBy: 'x', videoFile: 'v.mp4', process: true, floaterCrop: true });

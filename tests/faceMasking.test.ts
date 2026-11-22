@@ -120,11 +120,12 @@ describe('premasked photo report', () => {
 
   it('records what the report left for a human to look at, summed, and zero when it flagged nothing', () => {
     const hashes = files.map(sha);
-    expect(summariseReport(reportFor(files, [1, 0, 0]), hashes).needsLook).toEqual({ images: 0, weakExcluded: 0, largeBelowCertain: 0 });
+    expect(summariseReport(reportFor(files, [1, 0, 0]), hashes).needsLook).toEqual({ images: 0, weakExcluded: 0, largeBelowCertain: 0, items: [] });
     const flagged = reportFor(files, [1, 0, 0]);
     (flagged.images[0] as Record<string, unknown>).needsLook = { weakExcluded: 1 };
     (flagged.images[2] as Record<string, unknown>).needsLook = { weakExcluded: 2, largeBelowCertain: 1 };
-    expect(summariseReport(flagged, hashes).needsLook).toEqual({ images: 2, weakExcluded: 3, largeBelowCertain: 1 });
+    // Which images: their 1-based place in the capture's photo order (`photos/00001.jpg` is 1).
+    expect(summariseReport(flagged, hashes).needsLook).toEqual({ images: 2, weakExcluded: 3, largeBelowCertain: 1, items: [{ image: 1, weakExcluded: 1 }, { image: 3, weakExcluded: 2, largeBelowCertain: 1 }] });
   });
 
   it('refuses a report that is not for exactly these files', () => {
@@ -154,7 +155,7 @@ describe('capture import records the masking decision', () => {
     const unbound = await captures.importPhotoDirectory(path.join(dir, 'a'), {});
     expect(unbound.faceMasking).toEqual({ photos: 'none' });
     const optedOut = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1', maskFaces: false });
-    expect(optedOut.faceMasking).toEqual({ photos: 'none' });
+    expect(optedOut.faceMasking).toEqual({ photos: 'none', optedOut: true });
     const forced = await captures.importPhotoDirectory(path.join(dir, 'a'), { maskFaces: true });
     expect(forced.faceMasking).toEqual({ photos: 'worker' });
   });
@@ -192,7 +193,7 @@ describe('capture import records the masking decision', () => {
     await fs.writeFile(video, fakeMp4());
     const imported = await captures.importVideoFile(video, { artworkId: 'art-1' });
     expect(imported.faceMasking).toEqual({ video: 'worker' });
-    expect((await captures.importVideoFile(video, { artworkId: 'art-1', maskFaces: false })).faceMasking).toEqual({ video: 'none' });
+    expect((await captures.importVideoFile(video, { artworkId: 'art-1', maskFaces: false })).faceMasking).toEqual({ video: 'none', optedOut: true });
 
     const source = path.join(dir, 'masked');
     const written = await writePhotos(source, 9);
@@ -201,7 +202,17 @@ describe('capture import records the masking decision', () => {
     const mixed = await captures.addVideoToCapture(base.id, video, {});
     expect(mixed.faceMasking).toMatchObject({ photos: 'premasked', video: 'worker', report: { images: 9, regions: 1 } });
     const mixedOptOut = await captures.addVideoToCapture(base.id, video, { maskFaces: false });
-    expect(mixedOptOut.faceMasking).toMatchObject({ photos: 'premasked', video: 'none' });
+    expect(mixedOptOut.faceMasking).toMatchObject({ photos: 'premasked', video: 'none', optedOut: true });
+
+    // Photos that are unmasked only by default (no artwork) stay "by default" when a video is added with --no-mask-faces.
+    const plain = path.join(dir, 'plain');
+    await writePhotos(plain, 9);
+    const unbound = await captures.importPhotoDirectory(plain, {});
+    const unboundMixed = await captures.addVideoToCapture(unbound.id, video, { maskFaces: false });
+    expect(unboundMixed.faceMasking).toEqual({ photos: 'none', video: 'none' });
+    // An opt-out on the base capture carries over to the capture built from it.
+    const chosen = await captures.importPhotoDirectory(plain, { maskFaces: false });
+    expect((await captures.addVideoToCapture(chosen.id, video, {})).faceMasking).toEqual({ photos: 'none', video: 'none', optedOut: true });
   });
 
   it('survives a restart of the capture store', async () => {
@@ -400,6 +411,11 @@ describe('masking in the job and the record', () => {
     const look = { images: 2, largeBelowCertain: 3, coordinates: [[1, 2]] };
     const kept = faceMaskingProvenance({ kind: 'photos', faceMasking: { photos: 'worker' } }, { faceMasking: { photos: { ...part(9), needsLook: look } } }) as any;
     expect(kept.photos.needsLook).toEqual({ images: 2, weakExcluded: 0, largeBelowCertain: 3 });
+    // Which images are kept as bounded numbers; anything else a worker sends under it is dropped.
+    const listed = faceMaskingProvenance({ kind: 'photos', faceMasking: { photos: 'worker' } }, { faceMasking: { photos: { ...part(9), needsLook: { images: 2, largeBelowCertain: 3, items: [{ image: 2, largeBelowCertain: 1, box: [1, 2] }, { image: 0 }, { image: 'x' }, null, { image: 7, weakExcluded: 2 }], itemsTruncated: true } } } }) as any;
+    expect(listed.photos.needsLook.items).toEqual([{ image: 2, largeBelowCertain: 1 }, { image: 7, weakExcluded: 2 }]);
+    expect(listed.photos.needsLook.itemsTruncated).toBe(true);
+    expect(JSON.stringify(listed)).not.toContain('box');
     expect(maskingNeedsLook(kept)).toBe(2);
     expect(maskingNeedsLook({ ran: true, photos: { needsLook: { images: 1 } }, video: { needsLook: { images: 4 } } })).toBe(5);
     expect(maskingNeedsLook(undefined)).toBe(0);
@@ -407,16 +423,83 @@ describe('masking in the job and the record', () => {
   });
 
   it('warns in the job log when masking left images for a human, keeps it out of the pinned manifest', async () => {
-    const { dir, store, captures, jobs } = await setup({ report: () => ({ photos: { ...part(9), needsLook: { images: 2, largeBelowCertain: 3 } } }) });
+    const { dir, store, captures, jobs } = await setup({ report: () => ({ photos: { ...part(9), needsLook: { images: 2, weakExcluded: 1, largeBelowCertain: 3, items: [{ image: 2, largeBelowCertain: 2 }, { image: 5, weakExcluded: 1, largeBelowCertain: 1 }] } } }) });
     await writePhotos(path.join(dir, 'a'), 9);
     const capture = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1' });
     const job = await jobs.create('spatial.reconstruct', { captureId: capture.id });
     await settle(jobs, job.id);
     const finished = jobs.get(job.id) as any;
     expect(finished.state).toBe('completed');
-    expect(finished.logs.some((entry: { level: string; message: string }) => entry.level === 'warn' && /2 image\(s\) a human has to look at/.test(entry.message))).toBe(true);
-    expect(finished.maskingDetail.photos.needsLook).toMatchObject({ images: 2, largeBelowCertain: 3 });
-    expect(JSON.stringify(records(store)[0]!.manifest)).not.toMatch(/needsLook|largeBelowCertain/);
+    const warning = finished.logs.find((entry: { level: string; message: string }) => entry.level === 'warn');
+    expect(warning.message).toContain('2 image(s) a human has to look at');
+    // The line says which kinds are non-zero, and that publishing needs the acknowledgement.
+    expect(warning.message).toContain('3 large detection(s) it did not mask');
+    expect(warning.message).toContain('1 weaker detection(s) inside an exclude box');
+    expect(warning.message).toContain('cannot be published until that look is acknowledged');
+    // The private job record says which images.
+    expect(finished.maskingDetail.photos.needsLook).toMatchObject({ images: 2, largeBelowCertain: 3, items: [{ image: 2, largeBelowCertain: 2 }, { image: 5, weakExcluded: 1, largeBelowCertain: 1 }] });
+    expect(JSON.stringify(records(store)[0]!.manifest)).not.toMatch(/needsLook|largeBelowCertain|faceReview/);
+    // The private spatial record carries what the publish route checks.
+    expect((records(store)[0] as any).faceReview).toEqual({ pending: 2, jobId: job.id });
+  });
+
+  it('only warns about the kind of detection that is non-zero', async () => {
+    const { dir, captures, jobs } = await setup({ report: () => ({ photos: { ...part(9), needsLook: { images: 1, weakExcluded: 2, largeBelowCertain: 0 } } }) });
+    await writePhotos(path.join(dir, 'a'), 9);
+    const capture = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1' });
+    const job = await jobs.create('spatial.reconstruct', { captureId: capture.id });
+    await settle(jobs, job.id);
+    const warning = (jobs.get(job.id) as any).logs.find((entry: { level: string }) => entry.level === 'warn');
+    expect(warning.message).toContain('2 weaker detection(s) inside an exclude box');
+    expect(warning.message).not.toContain('large detection');
+  });
+
+  it('refuses a job that binds a capture imported without an artwork and without masking to an artwork', async () => {
+    const { dir, store, captures, jobs } = await setup();
+    await writePhotos(path.join(dir, 'a'), 9);
+    const unbound = await captures.importPhotoDirectory(path.join(dir, 'a'), {});
+    expect(unbound.faceMasking).toEqual({ photos: 'none' });
+    // The default of a private capture is not a choice: naming an artwork at job time would publish unmasked pixels under it.
+    await expect(jobs.create('spatial.reconstruct', { captureId: unbound.id, artworkId: 'art-1' })).rejects.toMatchObject({ statusCode: 422, code: 'job_artwork_binds_unmasked_capture' });
+    expect(Object.keys(store.snapshot().jobs ?? {})).toHaveLength(0);
+    // Without an artwork it is accepted as a job (a private capture), and a record needs an artwork anyway.
+    const privateJob = await jobs.create('spatial.reconstruct', { captureId: unbound.id });
+    await settle(jobs, privateJob.id);
+    expect(jobs.get(privateJob.id).error?.message).toBe('spatial_artwork_required');
+  });
+
+  it('refuses the same for video and for the video part of a mixed capture', async () => {
+    const { dir, captures, jobs } = await setup();
+    await fs.writeFile(path.join(dir, 'clip.mp4'), fakeMp4());
+    const video = await captures.importVideoFile(path.join(dir, 'clip.mp4'), {});
+    await expect(jobs.create('spatial.reconstruct', { captureId: video.id, artworkId: 'art-1' })).rejects.toMatchObject({ code: 'job_artwork_binds_unmasked_capture' });
+    await writePhotos(path.join(dir, 'a'), 9);
+    const mixed = await captures.importPhotoDirectory(path.join(dir, 'a'), { videoPath: path.join(dir, 'clip.mp4') });
+    expect(mixed.faceMasking).toMatchObject({ photos: 'none', video: 'none' });
+    await expect(jobs.create('spatial.reconstruct', { captureId: mixed.id, artworkId: 'art-1' })).rejects.toMatchObject({ code: 'job_artwork_binds_unmasked_capture' });
+  });
+
+  it('accepts an artwork at job time for a capture masked on request, one imported for an artwork, and an explicit opt-out', async () => {
+    const { dir, store, captures, jobs } = await setup();
+    await writePhotos(path.join(dir, 'a'), 9);
+    const forced = await captures.importPhotoDirectory(path.join(dir, 'a'), { maskFaces: true });
+    const forcedJob = await jobs.create('spatial.reconstruct', { captureId: forced.id, artworkId: 'art-1' });
+    expect(forcedJob.input).toMatchObject({ maskFaces: { photos: true } });
+    await settle(jobs, forcedJob.id);
+    // A capture imported for an artwork is masked whatever artwork the job names: nothing unmasked is bound.
+    const bound = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-2' });
+    const boundJob = await jobs.create('spatial.reconstruct', { captureId: bound.id, artworkId: 'art-3' });
+    expect(boundJob.input).toMatchObject({ maskFaces: { photos: true } });
+    await settle(jobs, boundJob.id);
+    // An explicit --no-mask-faces is stored as a choice and is a different capture from the default one.
+    const chosen = await captures.importPhotoDirectory(path.join(dir, 'a'), { maskFaces: false });
+    expect(chosen.faceMasking).toEqual({ photos: 'none', optedOut: true });
+    expect(chosen.id).not.toBe((await captures.importPhotoDirectory(path.join(dir, 'a'), {})).id);
+    const chosenJob = await jobs.create('spatial.reconstruct', { captureId: chosen.id, artworkId: 'art-4' });
+    expect(chosenJob.input.maskFaces).toBeUndefined();
+    await settle(jobs, chosenJob.id);
+    const done = Object.values(store.snapshot().spatial ?? {}) as Array<{ manifest: any }>;
+    expect(done.find((record) => record.manifest.artworkId === 'art-4')!.manifest.processing.faceMasking).toEqual({ ran: false });
   });
 
   it('does not warn when masking flagged nothing', async () => {

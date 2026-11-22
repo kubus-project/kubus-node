@@ -63,6 +63,16 @@ const SCOPE_BY_ROUTE: Array<[RegExp, LocalScope]> = [
 const pairingAttempts = new PairingAttemptLimiter();
 
 /**
+ * A job as a paired client sees it. `maskingDetail` (per-image face-masking counts, which images need a look) is the
+ * operator's, served by the GUI routes, not by the paired-client API.
+ */
+function withoutMaskingDetail<T extends { maskingDetail?: unknown }>(job: T): T {
+  if (!('maskingDetail' in job)) return job;
+  const { maskingDetail: _private, ...rest } = job;
+  return rest as T;
+}
+
+/**
  * The session id bound into every HTTP identity proof.
  *
  * WebRTC binds a real signalling session here. HTTP has none, so this constant
@@ -540,7 +550,10 @@ async function route(
 
   if (method === 'GET' && path === '/local/v1/jobs') {
     const gate = await participationGate.refresh();
-    const list = jobs.list().map((job) => (gate.leaseEligible || !job.output ? job : { ...job, output: undefined }));
+    const list = jobs.list().map((job) => {
+      const shown = withoutMaskingDetail(job);
+      return gate.leaseEligible || !shown.output ? shown : { ...shown, output: undefined };
+    });
     return jsonResponse(200, { jobs: list });
   }
 
@@ -559,7 +572,7 @@ async function route(
   const jobMatch = path.match(/^\/local\/v1\/jobs\/([^/]+)$/);
   if (method === 'GET' && jobMatch) {
     const job = jobs.get(jobMatch[1]!);
-    return jsonResponse(200, job);
+    return jsonResponse(200, withoutMaskingDetail(job));
   }
 
   if (method === 'POST' && path === '/local/v1/compute/candidates') {
@@ -669,6 +682,17 @@ async function route(
     const body = await request.body.json(BODY_LIMITS.json);
     const authorization = typeof body.backendAuthorization === 'string' ? body.backendAuthorization : '';
     if (!authorization.startsWith('Bearer ')) throw localError(400, 'backend_authorization_required');
+    // Face masking can leave images for a human to look at (see `faceReview` on the record). Publishing to IPFS is
+    // irreversible, so the record is not offered until the caller states that look was done; who and when go on the
+    // private record, never into the manifest.
+    const review = spatial.faceReview as { pending?: number; acknowledged?: unknown } | undefined;
+    const acknowledge = body.acknowledgeFaceReview === true;
+    if (review && typeof review.pending === 'number' && review.pending > 0 && !review.acknowledged && !acknowledge) {
+      throw localError(409, 'spatial_face_review_pending', {
+        message: `Face masking left ${review.pending} image(s) for a human to look at (the job record lists which). Look at them, then publish again with acknowledgeFaceReview: true`,
+        pending: review.pending,
+      });
+    }
     const result = await api.publishExistingSpatial(
       { spatial, artworkId: body.artworkId, markerId: body.markerId },
       authorization,
@@ -680,6 +704,10 @@ async function route(
       if (current && current.state !== 'superseded') {
         current.state = 'publication_requested';
         current.publication = result;
+        const pending = current.faceReview as { pending?: number; acknowledged?: unknown } | undefined;
+        if (pending && typeof pending.pending === 'number' && pending.pending > 0 && !pending.acknowledged) {
+          pending.acknowledged = { at: new Date().toISOString(), by: pairing.credentialIdFor(credential) ?? 'unknown' };
+        }
       }
     });
     return jsonResponse(202, result);

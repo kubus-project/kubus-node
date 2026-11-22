@@ -177,8 +177,23 @@ class LargeFaces(unittest.TestCase):
         self.assertEqual(count, 1)  # the near-certain one
         self.assertFalse(np.array_equal(masked, image))
         self.assertEqual(review["largeBelowCertain"], 1)  # the 0.8 one, left for a human
-        self.assertEqual(fm.needs_look([review, {}, {"largeBelowCertain": 2}]), {"images": 2, "largeBelowCertain": 3})
-        self.assertEqual(fm.needs_look(None), {"images": 0, "largeBelowCertain": 0})
+        self.assertEqual(
+            fm.needs_look([review, {}, {"largeBelowCertain": 2}]),
+            {"images": 2, "weakExcluded": 0, "largeBelowCertain": 3, "items": [{"image": 1, "largeBelowCertain": 1}, {"image": 3, "largeBelowCertain": 2}]},
+        )
+        self.assertEqual(fm.needs_look(None), {"images": 0, "weakExcluded": 0, "largeBelowCertain": 0, "items": []})
+
+    def test_needs_look_says_which_images_and_is_bounded(self):
+        looked = fm.needs_look([{}, {"weakExcluded": 1, "largeBelowCertain": 0}, {}, {"largeBelowCertain": 2}])
+        self.assertEqual(looked["items"], [{"image": 2, "weakExcluded": 1}, {"image": 4, "largeBelowCertain": 2}])
+        self.assertEqual((looked["images"], looked["weakExcluded"], looked["largeBelowCertain"]), (2, 1, 2))
+        # `positions` keeps the photo's own number when an unreadable one before it was dropped.
+        self.assertEqual(fm.needs_look([{}, {"largeBelowCertain": 1}], positions=[1, 3])["items"], [{"image": 3, "largeBelowCertain": 1}])
+        many = fm.needs_look([{"largeBelowCertain": 1}] * (fm.NEEDS_LOOK_LIST_LIMIT + 5))
+        self.assertEqual(len(many["items"]), fm.NEEDS_LOOK_LIST_LIMIT)
+        self.assertTrue(many["itemsTruncated"])
+        self.assertEqual(many["images"], fm.NEEDS_LOOK_LIST_LIMIT + 5)  # the counts are not cut
+        self.assertNotIn("itemsTruncated", looked)
 
 
 class Masking(unittest.TestCase):
@@ -439,11 +454,32 @@ class JobPath(unittest.TestCase):
         version = FakeMasker().version
         provenance = fm.masking_provenance({"photos": [0, 3], "video": None, "version": version})
         self.assertEqual(provenance["photos"]["regions"], 3)
-        self.assertEqual(provenance["photos"]["needsLook"], {"images": 0, "largeBelowCertain": 0})
+        self.assertEqual(provenance["photos"]["needsLook"], {"images": 0, "weakExcluded": 0, "largeBelowCertain": 0, "items": []})
         self.assertNotIn("video", provenance)
         flagged = fm.masking_provenance({"photos": [0, 3], "photosReview": [{}, {"largeBelowCertain": 2}], "video": [1], "videoReview": [{"largeBelowCertain": 1}], "version": version})
-        self.assertEqual(flagged["photos"]["needsLook"], {"images": 1, "largeBelowCertain": 2})
-        self.assertEqual(flagged["video"]["needsLook"], {"images": 1, "largeBelowCertain": 1})
+        self.assertEqual(flagged["photos"]["needsLook"], {"images": 1, "weakExcluded": 0, "largeBelowCertain": 2, "items": [{"image": 2, "largeBelowCertain": 2}]})
+        self.assertEqual(flagged["video"]["needsLook"], {"images": 1, "weakExcluded": 0, "largeBelowCertain": 1, "items": [{"image": 1, "largeBelowCertain": 1}]})
+        # A photo's number is its place in the capture even when an earlier one was unreadable and dropped.
+        numbered = fm.masking_provenance({"photos": [0, 3], "photosReview": [{}, {"largeBelowCertain": 2}], "photosPositions": [1, 3], "version": version})
+        self.assertEqual(numbered["photos"]["needsLook"]["items"], [{"image": 3, "largeBelowCertain": 2}])
+
+    def test_photo_numbers_survive_an_unreadable_photo_before_them(self):
+        class Flags(FakeMasker):
+            def find_regions(self, rgb, manual=None, audit=None, review=None):
+                if review is not None:
+                    review.update({"weakExcluded": 0, "largeBelowCertain": 1})
+                return []
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            Image.fromarray(noisy(seed=0)).save(root / "0.jpg", "JPEG")
+            (root / "1.jpg").write_bytes(b"not an image")
+            Image.fromarray(noisy(seed=2)).save(root / "2.jpg", "JPEG")
+            names, stats = pp.prepare_photos([root / "0.jpg", root / "1.jpg", root / "2.jpg"], root / "images", "photo", masker=Flags())
+            self.assertEqual(names, ["photo_00000.jpg", "photo_00001.jpg"])
+            self.assertEqual(stats["maskedPositions"], [1, 3])  # the third photo of the capture is the second one written
+            provenance = fm.masking_provenance({"photos": stats["maskedRegions"], "photosReview": stats["maskedReview"], "photosPositions": stats["maskedPositions"], "version": FakeMasker().version})
+            self.assertEqual([item["image"] for item in provenance["photos"]["needsLook"]["items"]], [1, 3])
 
     def test_the_worker_path_carries_the_review_of_every_photo_and_video_frame(self):
         class Flags(FakeMasker):
@@ -458,6 +494,7 @@ class JobPath(unittest.TestCase):
                 Image.fromarray(noisy(seed=index)).save(root / f"{index}.jpg", "JPEG")
             _, stats = pp.prepare_photos([root / "0.jpg", root / "1.jpg"], root / "images", "photo", masker=Flags())
             self.assertEqual(stats["maskedReview"], [{"weakExcluded": 0, "largeBelowCertain": 2}] * 2)
+            self.assertEqual(stats["maskedPositions"], [1, 2])
             names = ["video_00000.jpg", "video_00001.jpg"]
             for name in names:
                 Image.fromarray(noisy(320, 240)).save(root / name, "JPEG")

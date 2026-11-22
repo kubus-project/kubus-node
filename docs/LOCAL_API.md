@@ -66,6 +66,8 @@ Drafts are in-memory: a draft is a transfer in progress, not durable state. A no
 
 `POST /local/v1/jobs/cleanup` requires a paired credential with `jobs:read` and `jobs:create` and a completed node-identity handshake. It retries only journaled terminal-job cleanup and returns aggregate job health, including `cleanupPending` and `cleanupBlocked`. It does not clear an unverified worker-instance change, delete captures or release IPFS pins. `POST /local/v1/jobs/:id/cancel` also requires `jobs:create`.
 
+`POST /local/v1/spatial/:id/publish` takes `backendAuthorization` (a `Bearer` token) and optionally `artworkId` and `markerId`. A record whose face masking left images for a human to look at (private `faceReview.pending` above zero, see `docs/SPATIAL.md`) is refused with `409 spatial_face_review_pending` until the body also carries `acknowledgeFaceReview: true`; the acknowledgement (time and credential id) is recorded on the Node's private record, never in the manifest. A job whose capture was imported without an artwork and without face masking is refused with `422 job_artwork_binds_unmasked_capture` when its `input.artworkId` names an artwork. `GET /local/v1/jobs` and `GET /local/v1/jobs/:id` do not return `maskingDetail` (the per-image face-masking detail is the operator's, served by the GUI job routes).
+
 `POST /local/v1/compute/cleanup` requires `jobs:read` plus `compute:manage` and retries requested/expired owned provider cleanup. `/local/v1/status` includes aggregate `computeCleanup` counts. `DELETE /local/v1/captures/:id` requires `captures:create` in addition to the capture read scope.
 
 
