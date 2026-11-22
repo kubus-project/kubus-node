@@ -366,7 +366,7 @@ function fmtWhen(iso) {
 }
 
 function jobStageLabel(job) {
-  const stages = { queued: 'Queued', preparing_dataset: 'Preparing dataset', extracting_frames: 'Extracting frames', solving_poses: 'Solving camera poses', starting_worker: 'Starting worker', training: 'Training', importing: 'Importing', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled' };
+  const stages = { queued: 'Queued', preparing_dataset: 'Preparing dataset', preparing_photos: 'Preparing photos', extracting_frames: 'Extracting frames', solving_poses: 'Solving camera poses', starting_worker: 'Starting worker', training: 'Training', importing: 'Importing', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled' };
   if (job.stage) return stages[job.stage] || job.stage;
   // Jobs persisted before the stage field existed have state/progress only.
   // Fall back to state so they render a real label instead of "undefined".

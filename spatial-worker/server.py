@@ -16,13 +16,15 @@ from pydantic import BaseModel
 
 from gpu_tier import classify_vram_tier
 from job_control import JobControl, JobCancelled, hand_back_ownership
+from photo_pipeline import prepare_photo_dataset
+from scene_frame import analyse_dataset
 from video_pipeline import WorkerError, prepare_video_dataset
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 WORKER_AUTH_KEY_PATH = os.environ.get("WORKER_AUTH_KEY_PATH", "/var/lib/kubus-node/worker-auth.key")
 
 
-WORKER_VERSION = "kubus-spatial-worker/3"
+WORKER_VERSION = "kubus-spatial-worker/4"
 WORKER_INSTANCE_ID = str(uuid.uuid4())
 control = JobControl("/var/lib/kubus-node/private/worker-control")
 
@@ -74,8 +76,8 @@ def health() -> dict[str, Any]:
         "status": "ready",
         "gpu": gpu,
         "capabilities": ["spatial.reconstruct", "spatial.gaussianSplat"],
-        # Input modes `spatial.reconstruct` accepts: posed frames, or one video.
-        "inputModes": ["frames", "video"],
+        # Input modes `spatial.reconstruct` accepts: posed frames, one video, still photos, or photos plus one video.
+        "inputModes": ["frames", "video", "photos", "mixed"],
         "version": WORKER_VERSION,
         "cleanupProtocol": 1,
         "workerInstanceId": WORKER_INSTANCE_ID,
@@ -167,6 +169,14 @@ def ply_vertex_count(path: pathlib.Path) -> int | None:
     return None
 
 
+def wants_floater_crop(request: ProcessRequest) -> bool:
+    """Per-job `floaterCrop` wins; otherwise the worker's `KUBUS_SPATIAL_FLOATER_CROP` default (off)."""
+    requested = request.input.get("floaterCrop")
+    if isinstance(requested, bool):
+        return requested
+    return os.environ.get("KUBUS_SPATIAL_FLOATER_CROP", "0") == "1"
+
+
 def process_owned(request: ProcessRequest):
     try:
         return run_reconstruction(request)
@@ -184,36 +194,55 @@ def run_reconstruction(request: ProcessRequest):
     if request.type != "spatial.reconstruct":
         raise HTTPException(status_code=422, detail="job_type_not_supported_by_worker")
     mode = request.input.get("mode") or "frames"
-    if mode not in ("frames", "video"):
+    if mode not in ("frames", "video", "photos", "mixed"):
         raise HTTPException(status_code=422, detail="input_mode_not_supported_by_worker")
     output.mkdir(parents=True, exist_ok=True)
     provenance: dict[str, Any] = {}
+    timings: dict[str, float] = {}
+    started = time.monotonic()
+    runner = lambda command, timeout: control.run(request.jobId, command, timeout=timeout)
+    progress = lambda stage, detail: write_progress(output, stage, detail)
     if mode == "video":
-        prepared = prepare_video_dataset(
-            lambda command, timeout: control.run(request.jobId, command, timeout=timeout),
-            capture, output, lambda stage, detail: write_progress(output, stage, detail),
-        )
+        prepared = prepare_video_dataset(runner, capture, output, progress)
         dataset = prepared["dataset"]
         provenance = {"kind": "video", "video": prepared["video"], "frames": prepared["frames"], "sfm": prepared["sfm"]}
+    elif mode in ("photos", "mixed"):
+        prepared = prepare_photo_dataset(runner, capture, output, progress, include_video=(mode == "mixed"))
+        dataset = prepared["dataset"]
+        provenance = {"kind": mode, "photos": prepared["photos"], "sfm": prepared["sfm"]}
+        if prepared["video"]:
+            provenance["video"] = prepared["video"]
+            provenance["frames"] = prepared["frames"]
     else:
         dataset = capture
         if not (dataset / "transforms.json").is_file():
             raise HTTPException(status_code=422, detail="capture_requires_nerfstudio_transforms_json")
+    timings["intake"] = round(time.monotonic() - started, 1)
     iterations = str(max(1000, min(int(os.environ.get("KUBUS_SPATIAL_MAX_ITERATIONS", "15000")), 30000)))
     write_progress(output, "training", {"iterations": int(iterations)})
     command = [
         "ns-train", "splatfacto", "--data", str(dataset), "--output-dir", str(output / "training"),
         "--max-num-iterations", iterations, "--viewer.quit-on-train-completion", "True",
     ]
+    trained_at = time.monotonic()
     completed = control.run(request.jobId, command, timeout=24 * 60 * 60)
+    timings["training"] = round(time.monotonic() - trained_at, 1)
     if completed.returncode != 0:
         raise HTTPException(status_code=500, detail=(completed.stderr or completed.stdout)[-2000:])
     configs = sorted(glob.glob(str(output / "training" / "**" / "config.yml"), recursive=True))
     if not configs:
         raise HTTPException(status_code=500, detail="training_config_not_found")
+    # Orientation and the crop box come from the COLMAP solution, mapped into the frame the splat is written in.
+    analysis: dict[str, Any] | None = None
+    if mode != "frames":
+        try:
+            analysis = analyse_dataset(dataset / "transforms.json", dataset / "sparse_pc.ply", pathlib.Path(configs[-1]).parent / "dataparser_transforms.json")
+        except Exception as error:  # orientation is a convenience; it must never fail a finished training run
+            provenance["orientation"] = {"method": "unavailable", "error": type(error).__name__}
     write_progress(output, "exporting", {})
     export_dir = output / "export"
     export_dir.mkdir(exist_ok=True)
+    exported_at = time.monotonic()
     export = control.run(request.jobId,
         ["ns-export", "gaussian-splat", "--load-config", configs[-1], "--output-dir", str(export_dir)],
         timeout=2 * 60 * 60,
@@ -223,9 +252,39 @@ def run_reconstruction(request: ProcessRequest):
     candidates = sorted(export_dir.glob("*.ply"))
     if not candidates:
         raise HTTPException(status_code=500, detail="gaussian_export_not_found")
-    splats = ply_vertex_count(candidates[-1])
+    chosen = candidates[-1]
+    crop: dict[str, Any] | None = None
+    if wants_floater_crop(request):
+        crop = {"applied": False}
+        if analysis and analysis.get("box"):
+            box = analysis["box"]
+            centre = [(lo + hi) / 2.0 for lo, hi in zip(box["min"], box["max"])]
+            size = [hi - lo for lo, hi in zip(box["min"], box["max"])]
+            cropped = control.run(request.jobId, [
+                "ns-export", "gaussian-splat", "--load-config", configs[-1], "--output-dir", str(export_dir),
+                "--output-filename", "splat-cropped.ply",
+                "--obb-center", *[f"{value:.6f}" for value in centre],
+                "--obb-rotation", "0", "0", "0",
+                "--obb-scale", *[f"{value:.6f}" for value in size],
+            ], timeout=2 * 60 * 60)
+            before, after = ply_vertex_count(chosen), ply_vertex_count(export_dir / "splat-cropped.ply")
+            if cropped.returncode == 0 and after:
+                crop = {**box, "applied": True, "splatsBefore": before, "splatsAfter": after, "rotation": [0, 0, 0]}
+                chosen = export_dir / "splat-cropped.ply"
+            else:
+                crop = {"applied": False, "reason": "crop_export_failed", "splatsBefore": before}
+        else:
+            crop = {"applied": False, "reason": "no_subject_box"}
+    timings["export"] = round(time.monotonic() - exported_at, 1)
+    provenance["timings"] = timings
+    if analysis:
+        provenance["orientation"] = {key: value for key, value in analysis["orientation"].items() if not isinstance(value, list)}
+    if crop is not None:
+        provenance["crop"] = {key: value for key, value in crop.items() if not isinstance(value, (list, dict))}
+    splats = ply_vertex_count(chosen)
     if splats is not None:
         provenance["splatCount"] = splats
+    candidates = [chosen]
     result: dict[str, Any] = {
         "variants": [{
             "role": "spatial_archive",
@@ -246,6 +305,11 @@ def run_reconstruction(request: ProcessRequest):
             },
         },
     }
+    if analysis:
+        result["transform"] = {"matrix": analysis["matrix"], "matrixOrder": "column-major", "up": analysis["up"], "method": analysis["orientation"]["method"]}
+        result["processing"]["orientation"] = analysis["orientation"]
+    if crop is not None:
+        result["processing"]["floaterCrop"] = crop
     if provenance:
         result["provenance"] = provenance
     return result

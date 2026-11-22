@@ -246,7 +246,11 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     if (!captureId) throw localError(400, 'job_capture_required');
     const capture = local.captures.get(captureId);
     const type = typeof body.type === 'string' ? body.type : 'spatial.reconstruct';
-    const job = await local.jobs.create(type as never, { captureId, artworkId: capture.artworkId, markerId: capture.markerId });
+    // Operator options: only the two the runtime validates (a boolean crop switch, a record to revise).
+    const options: Record<string, unknown> = {};
+    if (body.floaterCrop !== undefined) options.floaterCrop = body.floaterCrop;
+    if (body.previousSpatialId !== undefined) options.previousSpatialId = body.previousSpatialId;
+    const job = await local.jobs.create(type as never, { captureId, artworkId: capture.artworkId, markerId: capture.markerId, ...options });
     writeJson(res, 201, { success: true, data: job });
     return;
   }
@@ -278,6 +282,32 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     const capture = await local.captures.importVideoFile(source, {
       artworkId: text(body.artworkId), markerId: text(body.markerId), capturedAt: text(body.capturedAt),
     });
+    writeJson(res, 201, { success: true, data: capture });
+    return;
+  }
+  if (req.method === 'POST' && parsed.pathname === '/gui/api/captures/import-photos') {
+    // Imports a directory of photographs (and optionally one video) already on
+    // this Node's disk. Both paths are confined to the import roots.
+    const local = requireLocalApi(deps);
+    const body = await readGuiJson(req);
+    const roots = importRoots(deps.config.localDataPath);
+    const directory = await resolveImportSource(body.path, roots);
+    const videoPath = body.videoPath === undefined || body.videoPath === null ? undefined : await resolveImportSource(body.videoPath, roots);
+    const text = (value: unknown) => (typeof value === 'string' && value.trim() ? value.trim().slice(0, 200) : undefined);
+    const capture = await local.captures.importPhotoDirectory(directory, {
+      artworkId: text(body.artworkId), markerId: text(body.markerId), capturedAt: text(body.capturedAt), capturedBy: text(body.capturedBy), videoPath,
+    });
+    writeJson(res, 201, { success: true, data: capture });
+    return;
+  }
+  if (req.method === 'POST' && parsed.pathname === '/gui/api/captures/add-video') {
+    // Builds a NEW mixed capture from a stored photo capture plus a video on this Node's disk.
+    const local = requireLocalApi(deps);
+    const body = await readGuiJson(req);
+    if (typeof body.captureId !== 'string' || !body.captureId) throw localError(400, 'capture_id_required');
+    const source = await resolveImportSource(body.path, importRoots(deps.config.localDataPath));
+    const capturedAt = typeof body.capturedAt === 'string' && body.capturedAt.trim() ? body.capturedAt.trim().slice(0, 40) : undefined;
+    const capture = await local.captures.addVideoToCapture(body.captureId, source, { capturedAt });
     writeJson(res, 201, { success: true, data: capture });
     return;
   }

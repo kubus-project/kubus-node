@@ -10,6 +10,26 @@ export interface SpatialVariant {
   storageClass: SpatialStorageClass;
 }
 
+/**
+ * Where a spatial record sits in the history of an artwork's reconstructions.
+ *
+ * Every record is immutable. A later reconstruction (for example, a video added
+ * to a photo capture) is a NEW record with its own `id`; `revision` links it to
+ * the one it revises, so a backend can bind a grant to (`id`, `revision.number`)
+ * and keep the earlier record published, suspended or withdrawn on its own terms.
+ */
+export interface SpatialRevision {
+  /** 1 for the first record of an artwork, previous number + 1 after that. */
+  number: number;
+  reason: 'initial' | 'video_added' | 'resolve';
+  previousSpatialId?: string;
+  /** CID of the previous record's manifest, so the link is content-addressed. */
+  previousManifestCid?: string;
+  previousCaptureId?: string;
+  /** What this record was reconstructed from. */
+  inputs: { captureKind: string; photos?: number; video?: boolean };
+}
+
 export interface SpatialManifest {
   schema: 'kubus.spatial/1';
   type: SpatialContentType;
@@ -26,7 +46,14 @@ export interface SpatialManifest {
   capturedAt: string;
   capturedBy?: string;
   variants: SpatialVariant[];
-  transform?: { matrix?: number[]; scale?: number; rotation?: number[]; position?: number[] };
+  /**
+   * Maps splat-file coordinates to viewer coordinates (right-handed, +Y up,
+   * subject centred near the origin, radius about 1, front facing +Z):
+   * `matrix` is 16 numbers in column-major order (three.js `Matrix4.fromArray`).
+   * `up` is the up direction in splat-file coordinates it was derived from.
+   */
+  transform?: { matrix?: number[]; matrixOrder?: 'column-major'; scale?: number; rotation?: number[]; position?: number[]; up?: number[]; method?: string };
+  revision?: SpatialRevision;
   viewerDefaults?: Record<string, unknown>;
   processing: {
     protocol: 'kubus.spatial-job/1';
@@ -37,6 +64,10 @@ export interface SpatialManifest {
       iterations: number;
       outputFormat: string;
     };
+    /** How the viewer transform was estimated (method, confidence, up vector). */
+    orientation?: Record<string, unknown>;
+    /** The optional floater crop applied at export: box, method, splat counts before and after. */
+    floaterCrop?: Record<string, unknown>;
   };
   createdAt: string;
 }
@@ -57,6 +88,16 @@ export function validateSpatialManifest(value: unknown): SpatialManifest {
     if (!variant.cid || !Number.isSafeInteger(variant.sizeBytes) || variant.sizeBytes < 0 || !variant.mimeType || !variant.format) {
       throw new Error('spatial_manifest_variant_invalid');
     }
+  }
+  const matrix = manifest.transform?.matrix;
+  if (matrix !== undefined && (!Array.isArray(matrix) || matrix.length !== 16 || !matrix.every((entry) => typeof entry === 'number' && Number.isFinite(entry)))) {
+    throw new Error('spatial_manifest_transform_invalid');
+  }
+  const revision = manifest.revision;
+  if (revision !== undefined && (!Number.isSafeInteger(revision.number) || revision.number < 1
+    || (revision.previousSpatialId !== undefined && typeof revision.previousSpatialId !== 'string')
+    || (revision.number > 1 && !revision.previousSpatialId))) {
+    throw new Error('spatial_manifest_revision_invalid');
   }
   return structuredClone(manifest as SpatialManifest);
 }

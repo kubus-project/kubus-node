@@ -73,11 +73,12 @@ export interface WorkerFailure {
   message: string;
 }
 
-/** Typed video-intake codes the worker may return; anything else is `worker_failed`. */
+/** Typed video- and photo-intake codes the worker may return; anything else is `worker_failed`. */
 export const WORKER_TYPED_ERROR_CODES = new Set([
   'video_unreadable',
   'video_too_short',
   'frames_too_blurry',
+  'photos_unreadable',
   'sfm_failed',
 ]);
 
@@ -107,7 +108,7 @@ export function workerFailure(body: unknown, status: number): WorkerFailure {
 function withCounts(message: string, details: unknown): string {
   if (!details || typeof details !== 'object') return message;
   const picked: string[] = [];
-  for (const key of ['durationSeconds', 'extracted', 'selected', 'blurDropped', 'duplicateDropped', 'submittedViews', 'registeredViews', 'registrationRatio']) {
+  for (const key of ['durationSeconds', 'extracted', 'selected', 'blurDropped', 'duplicateDropped', 'submittedViews', 'registeredViews', 'registrationRatio', 'submittedPhotos', 'usablePhotos']) {
     const value = (details as Record<string, unknown>)[key];
     if (typeof value === 'number' && Number.isFinite(value)) picked.push(`${key}=${value}`);
   }

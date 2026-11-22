@@ -268,6 +268,30 @@ def colmap_version(runner: Runner) -> str | None:
     return first[0].strip() if first else None
 
 
+def check_registration_gates(
+    registered: int,
+    submitted: int,
+    details: dict,
+    min_views: int = MIN_VIEWS_FOR_RECONSTRUCTION,
+    min_ratio: float = MIN_REGISTRATION_RATIO,
+    noun: str = "frames",
+) -> None:
+    """The registered-view floor and registration-ratio gate shared by every COLMAP-based intake."""
+    ratio = registered / submitted if submitted else 0.0
+    if registered < min_views:
+        raise WorkerError(
+            "sfm_failed",
+            f"COLMAP registered only {registered} of {submitted} {noun}; at least {min_views} are needed",
+            details=details,
+        )
+    if ratio < min_ratio:
+        raise WorkerError(
+            "sfm_failed",
+            f"COLMAP registered {registered} of {submitted} {noun} ({ratio:.0%}); at least {min_ratio:.0%} are needed",
+            details=details,
+        )
+
+
 def run_structure_from_motion(runner: Runner, frames_directory: pathlib.Path, dataset: pathlib.Path, submitted: int) -> dict:
     dataset.mkdir(parents=True, exist_ok=True)
     completed = runner([
@@ -286,18 +310,7 @@ def run_structure_from_motion(runner: Runner, frames_directory: pathlib.Path, da
     registered = count_registered_views(transforms)
     ratio = registered / submitted if submitted else 0.0
     details = {"submittedViews": submitted, "registeredViews": registered, "registrationRatio": round(ratio, 3)}
-    if registered < MIN_VIEWS_FOR_RECONSTRUCTION:
-        raise WorkerError(
-            "sfm_failed",
-            f"COLMAP registered only {registered} of {submitted} frames; at least {MIN_VIEWS_FOR_RECONSTRUCTION} are needed",
-            details=details,
-        )
-    if ratio < MIN_REGISTRATION_RATIO:
-        raise WorkerError(
-            "sfm_failed",
-            f"COLMAP registered {registered} of {submitted} frames ({ratio:.0%}); at least {MIN_REGISTRATION_RATIO:.0%} are needed",
-            details=details,
-        )
+    check_registration_gates(registered, submitted, details)
     try:
         has_points = bool(json.loads(transforms.read_text(encoding="utf-8")).get("ply_file_path"))
     except (OSError, json.JSONDecodeError):
@@ -306,8 +319,19 @@ def run_structure_from_motion(runner: Runner, frames_directory: pathlib.Path, da
     return details
 
 
-def prepare_video_dataset(runner: Runner, capture: pathlib.Path, work: pathlib.Path, progress: Progress) -> dict:
-    """Run the whole video-to-dataset stage. Returns the dataset directory and a statistics summary."""
+def select_video_frames(
+    runner: Runner,
+    capture: pathlib.Path,
+    work: pathlib.Path,
+    progress: Progress,
+    destination: pathlib.Path | None = None,
+    prefix: str = "frame",
+) -> tuple:
+    """Probe the capture's video, extract, filter and select frames into `destination`.
+
+    Returns (file names written, video facts, selection statistics). Shared by the
+    video intake and the mixed photo + video intake.
+    """
     video = find_source_video(capture)
     info = probe_video(runner, video)
     target, extract_count = plan_frames(info["durationSeconds"])
@@ -315,16 +339,26 @@ def prepare_video_dataset(runner: Runner, capture: pathlib.Path, work: pathlib.P
     progress("extracting_frames", {"video": info, "targetFrames": target, "extractFrames": extract_count})
     paths = extract_frames(runner, video, raw, extract_count, info["durationSeconds"], info["frameRate"])
     selected, selection = select_frames(score_frames(paths), target)
-    chosen = work / "selected_frames"
-    if chosen.exists():
+    chosen = destination if destination is not None else work / "selected_frames"
+    if destination is None and chosen.exists():
         shutil.rmtree(chosen)
-    chosen.mkdir(parents=True)
+    chosen.mkdir(parents=True, exist_ok=True)
+    names = []
     for index, item in enumerate(selected):
-        shutil.copyfile(item["path"], chosen / f"frame_{index:05d}.jpg")
+        name = f"{prefix}_{index:05d}.jpg"
+        shutil.copyfile(item["path"], chosen / name)
+        names.append(name)
     shutil.rmtree(raw, ignore_errors=True)
+    return names, info, selection
+
+
+def prepare_video_dataset(runner: Runner, capture: pathlib.Path, work: pathlib.Path, progress: Progress) -> dict:
+    """Run the whole video-to-dataset stage. Returns the dataset directory and a statistics summary."""
+    names, info, selection = select_video_frames(runner, capture, work, progress)
+    chosen = work / "selected_frames"
     progress("solving_poses", {"frames": selection})
     dataset = work / "dataset"
-    sfm = run_structure_from_motion(runner, chosen, dataset, len(selected))
+    sfm = run_structure_from_motion(runner, chosen, dataset, len(names))
     sfm["tool"] = "colmap"
     sfm["toolVersion"] = colmap_version(runner)
     return {"dataset": dataset, "video": info, "frames": selection, "sfm": sfm}

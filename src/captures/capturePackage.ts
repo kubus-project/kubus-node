@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { inspectPhotoPackage, listPhotoSources, type PhotoFacts, type PhotoProblem } from './photoPackage.js';
 import { inspectVideoPackage, listVideoSources, type VideoFacts, type VideoProblem } from './videoPackage.js';
 
 /**
@@ -19,10 +20,14 @@ export type CapturePackageProblem =
   | 'capture_frames_missing'
   | 'capture_frames_invalid'
   | 'capture_frame_file_missing'
-  | VideoProblem;
+  | VideoProblem
+  | PhotoProblem;
 
-/** What a capture package carries: posed frames, or one source video. */
-export type CapturePackageKind = 'frames' | 'video';
+/**
+ * What a capture package carries: posed frames, one source video, still photos
+ * (no poses; COLMAP solves them), or photos and one video together.
+ */
+export type CapturePackageKind = 'frames' | 'video' | 'photos' | 'mixed';
 
 export interface CapturePackageReport {
   ok: boolean;
@@ -39,8 +44,10 @@ export interface CapturePackageReport {
   frameCount: number;
   /** Which package shape was recognised, when one could be. */
   kind?: CapturePackageKind;
-  /** Facts about the source video, for a `video` package. */
+  /** Facts about the source video, for a `video` or `mixed` package. */
   video?: VideoFacts;
+  /** Facts about the photo set, for a `photos` or `mixed` package. */
+  photos?: PhotoFacts;
 }
 
 /** Enough for a phone to show and repair, bounded so an error stays small. */
@@ -135,9 +142,12 @@ export async function inspectCapturePackage(
   try {
     raw = await fs.readFile(path.join(directory, 'frames.json'), 'utf8');
   } catch {
-    // No frames.json: a capture that carries one source video instead is a
-    // `video` package. Anything else keeps the original answer.
-    if ((await listVideoSources(directory)).length > 0) return inspectVideo(directory);
+    // No frames.json: a capture that carries still photos and/or one source
+    // video instead is a `photos`, `video` or `mixed` package. Anything else
+    // keeps the original answer.
+    const hasPhotos = (await listPhotoSources(directory)).length > 0;
+    const hasVideo = (await listVideoSources(directory)).length > 0;
+    if (hasPhotos || hasVideo) return inspectMedia(directory, hasPhotos, hasVideo);
     return report('capture_frames_missing', 'The capture has no frames.json', ['frames.json']);
   }
 
@@ -213,12 +223,21 @@ export async function inspectCapturePackage(
   return { ok: true, missingPaths: [], missingCount: 0, frameCount: frames.length, kind: 'frames' };
 }
 
-async function inspectVideo(directory: string): Promise<CapturePackageReport> {
-  const result = await inspectVideoPackage(directory);
-  if (!result.ok) {
-    return { ...report(result.code!, result.message!, [], 0), kind: 'video', video: result.video };
+async function inspectMedia(directory: string, hasPhotos: boolean, hasVideo: boolean): Promise<CapturePackageReport> {
+  const kind: CapturePackageKind = hasPhotos && hasVideo ? 'mixed' : hasPhotos ? 'photos' : 'video';
+  let photos: PhotoFacts | undefined;
+  if (hasPhotos) {
+    const result = await inspectPhotoPackage(directory);
+    if (!result.ok) return { ...report(result.code!, result.message!, [], 0), kind };
+    photos = result.photos;
   }
-  return { ok: true, missingPaths: [], missingCount: 0, frameCount: 0, kind: 'video', video: result.video };
+  let video: VideoFacts | undefined;
+  if (hasVideo) {
+    const result = await inspectVideoPackage(directory);
+    if (!result.ok) return { ...report(result.code!, result.message!, [], 0), kind, video: result.video, ...(photos ? { photos } : {}) };
+    video = result.video;
+  }
+  return { ok: true, missingPaths: [], missingCount: 0, frameCount: 0, kind, ...(video ? { video } : {}), ...(photos ? { photos } : {}) };
 }
 
 /** `metadata.frameCount`, when the client stated a usable one. */

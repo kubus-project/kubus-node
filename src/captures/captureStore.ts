@@ -6,6 +6,7 @@ import { localError } from '../localApi/pairingService.js';
 import { createReadStream } from 'node:fs';
 import { declaredFrameCount, inspectCapturePackage, isPlainObject, type CapturePackageKind, type CapturePackageReport } from './capturePackage.js';
 import { VIDEO_EXTENSIONS, VIDEO_MAX_BYTES, VIDEO_MIN_BYTES, type VideoExtension } from './videoPackage.js';
+import { PHOTO_EXTENSIONS, PHOTO_MAX_BYTES, PHOTO_MAX_COUNT, PHOTO_MIN_COUNT, listPhotoSources, type PhotoFacts } from './photoPackage.js';
 
 export interface CaptureFilePayload { path: string; contentBase64: string; mimeType?: string }
 export interface CapturePackagePayload {
@@ -50,10 +51,22 @@ export interface CaptureRecord {
   fileCount: number;
   directory: string;
   retention?: { deleteAfter?: string };
-  /** `video` for a single-source-video package; absent or `frames` for posed frames. */
+  /** `video`, `photos` or `mixed` for a media package; absent or `frames` for posed frames. */
   kind?: CapturePackageKind;
-  /** Container facts of the source video, for a `video` capture. */
+  /** Container facts of the source video, for a `video` or `mixed` capture. */
   video?: { extension: string; sizeBytes: number; durationSeconds?: number };
+  /** Counts and sizes of the photo set, for a `photos` or `mixed` capture (never file names). */
+  photos?: PhotoFacts;
+  /**
+   * The capture this one was built from (a later video added to a photo
+   * capture). The earlier capture is kept untouched; a reconstruction of this
+   * one links its spatial revision to the earlier capture's record.
+   */
+  derivedFrom?: { captureId: string };
+  /** Free-text capture operator / photographer label, when the importer supplied one. */
+  capturedBy?: string;
+  /** When each medium was captured, for a mixed capture (`capturedAt` is the earliest). */
+  mediaCapturedAt?: { photos?: string; video?: string };
 
   /**
    * Client-supplied idempotency key from `metadata.localCaptureId`.
@@ -75,6 +88,35 @@ function localCaptureIdOf(payload: { metadata?: Record<string, unknown> }): stri
   if (typeof raw !== 'string') return undefined;
   const trimmed = raw.trim();
   return trimmed.length > 0 && trimmed.length <= 200 ? trimmed : undefined;
+}
+
+/** `derivedFrom`, `capturedBy` and per-medium times that an import wrote into a media capture's metadata. */
+function mediaMetadata(metadata: Record<string, unknown> | undefined): Partial<CaptureRecord> {
+  const out: Partial<CaptureRecord> = {};
+  const text = (value: unknown, limit = 200) => (typeof value === 'string' && value.trim() && value.length <= limit ? value.trim() : undefined);
+  const derivedFrom = text(metadata?.derivedFromCaptureId);
+  if (derivedFrom) out.derivedFrom = { captureId: derivedFrom };
+  const capturedBy = text(metadata?.capturedBy);
+  if (capturedBy) out.capturedBy = capturedBy;
+  const media = metadata?.mediaCapturedAt;
+  if (isPlainObject(media)) {
+    const photos = text(media.photos, 40);
+    const video = text(media.video, 40);
+    if (photos || video) out.mediaCapturedAt = { ...(photos ? { photos } : {}), ...(video ? { video } : {}) };
+  }
+  return out;
+}
+
+/** SHA-256 of a file, streamed. */
+async function sha256File(file: string): Promise<Buffer> {
+  const hash = crypto.createHash('sha256');
+  for await (const chunk of createReadStream(file)) hash.update(chunk as Buffer);
+  return hash.digest();
+}
+
+/** An ISO timestamp for a parseable date string, else undefined. */
+function validIso(value: string | undefined): string | undefined {
+  return value && !Number.isNaN(Date.parse(value)) ? new Date(value).toISOString() : undefined;
 }
 
 function safeRelativePath(raw: string): string {
@@ -543,11 +585,16 @@ export class CaptureStore {
         directory: draft.directory,
         retention: payload.retention,
         localCaptureId,
-        ...(inspection.kind === 'video' ? { kind: 'video' as const, video: inspection.video && {
-          extension: inspection.video.extension,
-          sizeBytes: inspection.video.sizeBytes,
-          durationSeconds: inspection.video.durationSeconds,
-        } } : {}),
+        ...(inspection.kind && inspection.kind !== 'frames' ? {
+          kind: inspection.kind,
+          ...(inspection.video ? { video: {
+            extension: inspection.video.extension,
+            sizeBytes: inspection.video.sizeBytes,
+            durationSeconds: inspection.video.durationSeconds,
+          } } : {}),
+          ...(inspection.photos ? { photos: inspection.photos } : {}),
+          ...mediaMetadata(payload.metadata),
+        } : {}),
       };
       await fs.writeFile(
         path.join(draft.directory, 'capture.json'),
@@ -653,6 +700,153 @@ export class CaptureStore {
       await this.discardDraft(draft.id).catch(() => undefined);
       throw error;
     }
+  }
+
+  /**
+   * Imports a directory of still photographs as a `photos` capture, optionally
+   * together with one video as a `mixed` capture.
+   *
+   * Photos carry no ARCore pose, so the worker solves cameras with COLMAP. The
+   * directory is read non-recursively; symbolic links are refused, files whose
+   * extension is not an image are skipped and counted, and every photo is
+   * streamed into a draft under a constant name (`photos/00001.jpg`) so no
+   * original file name (a phone's personal naming) is stored or ever reaches a
+   * path. The package then crosses the same integrity boundary as any capture.
+   * Idempotent: the key is the SHA-256 of every file (in name order), the
+   * optional video, and the artwork and marker.
+   */
+  async importPhotoDirectory(
+    sourceDirectory: string,
+    options: { artworkId?: string; markerId?: string; capturedAt?: string; capturedBy?: string; videoPath?: string; videoCapturedAt?: string } = {},
+  ): Promise<CaptureRecord & { skippedFiles: number }> {
+    let resolved: string;
+    try {
+      resolved = await fs.realpath(sourceDirectory);
+      if (!(await fs.stat(resolved)).isDirectory()) throw new Error('not a directory');
+    } catch {
+      throw localError(404, 'capture_photo_source_not_found');
+    }
+    const entries = await fs.readdir(resolved, { withFileTypes: true });
+    const photos: Array<{ absolute: string; extension: string; mtimeMs: number }> = [];
+    let skipped = 0;
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name, 'en', { numeric: true }))) {
+      const extension = path.extname(entry.name).slice(1).toLowerCase();
+      if (!(PHOTO_EXTENSIONS as readonly string[]).includes(extension)) { skipped += 1; continue; }
+      if (entry.isSymbolicLink()) throw localError(422, 'capture_photo_invalid', { message: 'A photo is a symbolic link; only regular files are accepted' });
+      if (!entry.isFile()) { skipped += 1; continue; }
+      const absolute = path.join(resolved, entry.name);
+      const stat = await fs.stat(absolute);
+      if (stat.size > PHOTO_MAX_BYTES) throw localError(422, 'capture_photo_size_invalid', { message: `A photo file exceeds the ${Math.round(PHOTO_MAX_BYTES / 2 ** 20)} MiB limit` });
+      photos.push({ absolute, extension: extension === 'jpeg' ? 'jpg' : extension, mtimeMs: stat.mtimeMs });
+    }
+    if (photos.length < PHOTO_MIN_COUNT) throw localError(422, 'capture_photos_too_few', { message: `A photo capture needs at least ${PHOTO_MIN_COUNT} photos; found ${photos.length}` });
+    if (photos.length > PHOTO_MAX_COUNT) throw localError(422, 'capture_photos_too_many', { message: `A photo capture holds at most ${PHOTO_MAX_COUNT} photos; found ${photos.length}` });
+
+    const video = options.videoPath ? await this.resolveVideoFile(options.videoPath) : undefined;
+    const setHash = crypto.createHash('sha256');
+    for (const photo of photos) setHash.update(await sha256File(photo.absolute));
+    if (video) setHash.update(video.sha256);
+    const localCaptureId = `photos-import:${setHash.digest('hex')}:${options.artworkId ?? ''}:${options.markerId ?? ''}`;
+
+    const earliest = new Date(Math.min(...photos.map((photo) => photo.mtimeMs))).toISOString();
+    const photosCapturedAt = validIso(options.capturedAt) ?? earliest;
+    const videoCapturedAt = video ? validIso(options.videoCapturedAt) ?? video.mtime.toISOString() : undefined;
+    const capturedAt = videoCapturedAt && videoCapturedAt < photosCapturedAt ? videoCapturedAt : photosCapturedAt;
+    const draft = await this.beginDraft({
+      schema: 'kubus.capture/1',
+      artworkId: options.artworkId,
+      markerId: options.markerId,
+      capturedAt,
+      metadata: {
+        kind: video ? 'mixed' : 'photos', source: 'local_import', localCaptureId,
+        photoCount: photos.length,
+        ...(options.capturedBy ? { capturedBy: options.capturedBy.slice(0, 200) } : {}),
+        ...(video ? { mediaCapturedAt: { photos: photosCapturedAt, video: videoCapturedAt } } : {}),
+      },
+    });
+    try {
+      for (const [index, photo] of photos.entries()) {
+        await this.writeDraftFileStream(
+          draft.id, `photos/${String(index + 1).padStart(5, '0')}.${photo.extension}`,
+          createReadStream(photo.absolute) as unknown as AsyncIterable<Buffer>,
+          photo.extension === 'png' ? 'image/png' : 'image/jpeg', PHOTO_MAX_BYTES,
+        );
+      }
+      if (video) {
+        await this.writeDraftFileStream(draft.id, `video/source.${video.extension}`, createReadStream(video.resolved) as unknown as AsyncIterable<Buffer>, VIDEO_MIME_TYPES[video.extension], VIDEO_MAX_BYTES);
+      }
+      return { ...(await this.commitDraft(draft.id)), skippedFiles: skipped };
+    } catch (error) {
+      await this.discardDraft(draft.id).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /**
+   * Adds a later video to an existing photo capture for the same artwork.
+   *
+   * Builds a NEW `mixed` capture holding the base capture's photos and the
+   * video; the base capture is not modified or removed. The new capture records
+   * `derivedFrom`, so a reconstruction of it produces a new spatial revision
+   * that links to the base capture's spatial record instead of replacing it.
+   */
+  async addVideoToCapture(
+    baseCaptureId: string,
+    videoPath: string,
+    options: { capturedAt?: string } = {},
+  ): Promise<CaptureRecord> {
+    const base = this.get(baseCaptureId);
+    if (base.kind !== 'photos') throw localError(422, 'capture_extension_invalid', { message: 'A video can only be added to a photo capture (kind photos)' });
+    const video = await this.resolveVideoFile(videoPath);
+    const photos = await listPhotoSources(base.directory);
+    if (photos.length === 0) throw localError(422, 'capture_extension_invalid', { message: 'The photo capture no longer holds its photos' });
+    const localCaptureId = `video-extension:${base.id}:${video.sha256}`;
+    const videoCapturedAt = validIso(options.capturedAt) ?? video.mtime.toISOString();
+    const photosCapturedAt = base.mediaCapturedAt?.photos ?? base.capturedAt;
+    const draft = await this.beginDraft({
+      schema: 'kubus.capture/1',
+      artworkId: base.artworkId,
+      markerId: base.markerId,
+      // The earliest time: the rights window starts at the first capture of the artwork.
+      capturedAt: videoCapturedAt < photosCapturedAt ? videoCapturedAt : photosCapturedAt,
+      metadata: {
+        kind: 'mixed', source: 'video_extension', localCaptureId, derivedFromCaptureId: base.id, photoCount: photos.length,
+        ...(base.capturedBy ? { capturedBy: base.capturedBy } : {}),
+        mediaCapturedAt: { photos: photosCapturedAt, video: videoCapturedAt },
+      },
+    });
+    try {
+      for (const relative of photos) {
+        await this.writeDraftFileStream(
+          draft.id, relative,
+          createReadStream(path.join(base.directory, relative)) as unknown as AsyncIterable<Buffer>,
+          relative.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg', PHOTO_MAX_BYTES,
+        );
+      }
+      await this.writeDraftFileStream(draft.id, `video/source.${video.extension}`, createReadStream(video.resolved) as unknown as AsyncIterable<Buffer>, VIDEO_MIME_TYPES[video.extension], VIDEO_MAX_BYTES);
+      return await this.commitDraft(draft.id);
+    } catch (error) {
+      await this.discardDraft(draft.id).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /** Real path, extension, size bounds, modification time and SHA-256 of a video file about to be imported. */
+  private async resolveVideoFile(sourcePath: string): Promise<{ resolved: string; extension: VideoExtension; sha256: string; mtime: Date }> {
+    let resolved: string;
+    let stat;
+    try {
+      resolved = await fs.realpath(sourcePath);
+      stat = await fs.stat(resolved);
+    } catch {
+      throw localError(404, 'capture_video_source_not_found');
+    }
+    if (!stat.isFile()) throw localError(400, 'capture_video_source_not_a_file');
+    const extension = path.extname(resolved).slice(1).toLowerCase() as VideoExtension;
+    if (!VIDEO_EXTENSIONS.includes(extension)) throw localError(415, 'capture_video_extension_unsupported', { allowed: [...VIDEO_EXTENSIONS] });
+    if (stat.size < VIDEO_MIN_BYTES) throw localError(422, 'capture_video_size_invalid', { message: 'The video file is too small to contain usable footage' });
+    if (stat.size > VIDEO_MAX_BYTES) throw localError(413, 'capture_video_size_invalid', { message: 'The video file exceeds the size limit' });
+    return { resolved, extension, sha256: (await sha256File(resolved)).toString('hex'), mtime: stat.mtime };
   }
 
   /** True while a queued or running job reads this capture. */

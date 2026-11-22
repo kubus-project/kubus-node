@@ -8,7 +8,7 @@ import { localError } from '../localApi/pairingService.js';
 import type { Logger } from '../logging/logger.js';
 import { buildNerfstudioDataset } from '../spatial/nerfstudioAdapter.js';
 import { longWorkerFetch, workerFailure } from '../spatial/workerClient.js';
-import { validateSpatialManifest, type SpatialManifest, type SpatialVariant } from '../spatial/models.js';
+import { validateSpatialManifest, type SpatialManifest, type SpatialRevision, type SpatialVariant } from '../spatial/models.js';
 import type { LocalStore } from '../state/localStore.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
 import type { WorkerAuthService } from '../spatial/workerAuth.js';
@@ -31,6 +31,7 @@ export type JobState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelle
 export type JobStage =
   | 'queued'
   | 'preparing_dataset'
+  | 'preparing_photos'
   | 'extracting_frames'
   | 'solving_poses'
   | 'starting_worker'
@@ -67,6 +68,7 @@ interface WorkerOutput {
 
 /** Worker-reported stages that map onto a job stage. `exporting` is a training-time step with no stage of its own. */
 const WORKER_STAGES: Record<string, { stage: JobStage; message: string } | undefined> = {
+  preparing_photos: { stage: 'preparing_photos', message: 'Preparing photos (orientation, size)' },
   extracting_frames: { stage: 'extracting_frames', message: 'Extracting and filtering frames from the video' },
   solving_poses: { stage: 'solving_poses', message: 'Solving camera poses (COLMAP)' },
   training: { stage: 'training', message: 'Training (this can take a while; progress is not reported mid-run by this worker version)' },
@@ -94,7 +96,7 @@ function sanitizeProvenance(value: unknown): Record<string, unknown> | undefined
     return undefined;
   };
   const picked: Record<string, unknown> = {};
-  for (const key of ['kind', 'video', 'frames', 'sfm', 'splatCount']) {
+  for (const key of ['kind', 'video', 'photos', 'frames', 'sfm', 'splatCount', 'orientation', 'crop', 'timings']) {
     const cleaned = clean((value as Record<string, unknown>)[key], 0);
     if (cleaned !== undefined) picked[key] = cleaned;
   }
@@ -221,12 +223,48 @@ export class JobRuntime {
       // A video capture runs the video intake path in the worker; a posed
       // frame capture runs the Nerfstudio adapter. The package decides, and a
       // caller that names a mode must agree with it.
-      const mode = inspection.kind === 'video' ? 'video' : 'frames';
+      const mode = inspection.kind === 'frames' || !inspection.kind ? 'frames' : inspection.kind;
       if (typeof input.mode === 'string' && input.mode !== mode) {
         throw localError(422, 'capture_input_mode_mismatch', { message: `The capture is a ${mode} capture, not ${input.mode}` });
       }
-      return this.insert(type, mode === 'video' ? { ...input, mode } : input, captureId);
+      const prepared = { ...(mode === 'frames' ? input : { ...input, mode }), ...this.revisionInput(input, captureId) };
+      return this.insert(type, prepared, captureId);
     });
+  }
+
+  /**
+   * Validates the caller's options and resolves which earlier spatial record a
+   * new one revises.
+   *
+   * `floaterCrop` must be a boolean. `previousSpatialId`, when given, must name
+   * an existing local record for the same artwork; without one, a capture that
+   * was derived from another (a video added to a photo capture) links to the
+   * newest record of the capture it came from. The earlier record is only
+   * referenced here, never changed.
+   */
+  private revisionInput(input: Record<string, unknown>, captureId: string): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    if (input.floaterCrop !== undefined) {
+      if (typeof input.floaterCrop !== 'boolean') throw localError(400, 'job_floater_crop_invalid');
+      out.floaterCrop = input.floaterCrop;
+    }
+    const capture = this.deps.captureStore.get(captureId);
+    const records = Object.values(this.deps.store.snapshot().spatial || {}) as Array<{ id: string; createdAt: string; manifest?: SpatialManifest }>;
+    if (input.previousSpatialId !== undefined) {
+      if (typeof input.previousSpatialId !== 'string' || !input.previousSpatialId) throw localError(400, 'job_previous_spatial_invalid');
+      const previous = records.find((record) => record.id === input.previousSpatialId);
+      if (!previous?.manifest) throw localError(422, 'previous_spatial_not_found', { message: 'No local spatial record has that id' });
+      if (previous.manifest.artworkId !== (capture.artworkId ?? '')) {
+        throw localError(422, 'previous_spatial_artwork_mismatch', { message: 'A revision must belong to the same artwork as the record it revises' });
+      }
+      out.previousSpatialId = previous.id;
+    } else if (capture.derivedFrom?.captureId) {
+      const sources = records
+        .filter((record) => record.manifest?.captureId === capture.derivedFrom!.captureId && record.manifest.artworkId === (capture.artworkId ?? ''))
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      if (sources[0]) out.previousSpatialId = sources[0].id;
+    }
+    return out;
   }
 
   /**
@@ -354,16 +392,18 @@ export class JobRuntime {
       if (!healthResponse.ok || workerHealth.cleanupProtocol !== 1 || !workerHealth.workerInstanceId) {
         throw Object.assign(new Error('Worker cleanup protocol is required'), { code: 'worker_cleanup_protocol_required' });
       }
-      const videoJob = job.type === 'spatial.reconstruct' && job.input.mode === 'video';
-      if (videoJob && !(Array.isArray(workerHealth.inputModes) && workerHealth.inputModes.includes('video'))) {
-        throw Object.assign(new Error('The spatial worker does not accept video input; rebuild the worker image'), { code: 'worker_video_unsupported' });
+      const inputMode = job.type === 'spatial.reconstruct' && typeof job.input.mode === 'string' ? job.input.mode : 'frames';
+      // Every mode that is not a posed-frame package is prepared inside the worker.
+      const videoJob = inputMode !== 'frames';
+      if (videoJob && !(Array.isArray(workerHealth.inputModes) && workerHealth.inputModes.includes(inputMode))) {
+        throw Object.assign(new Error(`The spatial worker does not accept ${inputMode} input; rebuild the worker image`), { code: `worker_${inputMode}_unsupported` });
       }
       if (controller.signal.aborted || this.get(id).state === 'cancelled') return;
       await fs.mkdir(outputDirectory, { recursive: true, mode: 0o700 });
       await this.patchJob(id, (current) => {
         current.state = 'running'; current.stage = 'preparing_dataset'; current.progress = 0.05;
         current.startedAt = current.updatedAt = new Date().toISOString();
-        current.logs.push({ at: current.updatedAt, level: 'info', message: videoJob ? 'Preparing video for the worker' : 'Preparing dataset from capture' });
+        current.logs.push({ at: current.updatedAt, level: 'info', message: videoJob ? `Preparing ${inputMode === 'video' ? 'video' : inputMode === 'photos' ? 'photos' : 'photos and video'} for the worker` : 'Preparing dataset from capture' });
       });
       this.recordAnalytics('started');
 
@@ -395,7 +435,7 @@ export class JobRuntime {
         // there is no real interim percentage to report - an indeterminate
         // stage is honest, a fabricated one is not. A video job begins with
         // frame extraction; the worker's progress file moves it on.
-        const first = videoJob ? WORKER_STAGES.extracting_frames! : WORKER_STAGES.training!;
+        const first = !videoJob ? WORKER_STAGES.training! : inputMode === 'video' ? WORKER_STAGES.extracting_frames! : WORKER_STAGES.preparing_photos!;
         current.stage = first.stage; current.progress = null; current.updatedAt = new Date().toISOString();
         current.logs.push({ at: current.updatedAt, level: 'info', message: first.message });
       });
@@ -474,6 +514,30 @@ export class JobRuntime {
     });
   }
 
+  /**
+   * The revision block of a new record: its number, what it revises and what it
+   * was built from. Always present, so a backend can bind a grant to
+   * (`id`, `revision.number`) for every record, including the first.
+   */
+  private revisionOf(job: LocalJob, capture: ReturnType<CaptureStore['get']>): SpatialRevision {
+    const previousId = typeof job.input.previousSpatialId === 'string' ? job.input.previousSpatialId : undefined;
+    const previous = previousId ? (this.deps.store.snapshot().spatial?.[previousId] as { id: string; manifestCid?: string; manifest?: SpatialManifest } | undefined) : undefined;
+    const inputs: SpatialRevision['inputs'] = { captureKind: capture.kind ?? 'frames' };
+    if (capture.photos) inputs.photos = capture.photos.count;
+    if (capture.video) inputs.video = true;
+    if (!previous?.manifest) return { number: 1, reason: 'initial', inputs };
+    const previousCapture = previous.manifest.captureId;
+    return {
+      number: (previous.manifest.revision?.number ?? 1) + 1,
+      // `video_added` only when this capture was built from the capture the previous record came from.
+      reason: capture.derivedFrom?.captureId === previousCapture ? 'video_added' : 'resolve',
+      previousSpatialId: previous.id,
+      ...(previous.manifestCid ? { previousManifestCid: previous.manifestCid } : {}),
+      previousCaptureId: previousCapture,
+      inputs,
+    };
+  }
+
   private async importOutputs(job: LocalJob, capture: ReturnType<CaptureStore['get']>, outputDirectory: string, output: WorkerOutput): Promise<Record<string, unknown>> {
     const derivation = sanitizeProvenance(output.provenance);
     if (!Array.isArray(output.variants) || output.variants.length === 0) throw Object.assign(new Error('Worker returned no variants'), { code: 'worker_output_invalid' });
@@ -506,8 +570,9 @@ export class JobRuntime {
       schema: 'kubus.spatial/1', type: 'gaussianSplat', id,
       artworkId: String(job.input.artworkId || capture.artworkId || ''), markerId: String(job.input.markerId || capture.markerId || '') || undefined,
       captureId: capture.id, captureProvenance: { source: 'localCapture', captureId: capture.id, ...(derivation ? { derivation } : {}) }, capturedAt: capture.capturedAt,
-      capturedBy: typeof job.input.capturedBy === 'string' ? job.input.capturedBy : undefined,
+      capturedBy: typeof job.input.capturedBy === 'string' ? job.input.capturedBy : capture.capturedBy,
       variants, transform: output.transform, viewerDefaults: output.viewerDefaults, processing: output.processing, createdAt: new Date().toISOString(),
+      revision: this.revisionOf(job, capture),
     };
     if (!manifest.artworkId) throw new Error('spatial_artwork_required');
     validateSpatialManifest(manifest);
@@ -571,6 +636,12 @@ export class JobRuntime {
       parts.push(`COLMAP registered ${sfm.registeredViews} of ${sfm.submittedViews} views`);
     }
     if (typeof derivation.splatCount === 'number') parts.push(`${derivation.splatCount} splats`);
+    const orientation = derivation.orientation as Record<string, unknown> | undefined;
+    if (orientation && typeof orientation.method === 'string') parts.push(`orientation by ${orientation.method}`);
+    const crop = derivation.crop as Record<string, unknown> | undefined;
+    if (crop?.applied === true && typeof crop.splatsBefore === 'number' && typeof crop.splatsAfter === 'number') {
+      parts.push(`floater crop kept ${crop.splatsAfter} of ${crop.splatsBefore} splats`);
+    }
     if (parts.length === 0) return;
     await this.patchJob(id, (current) => {
       current.logs.push({ at: new Date().toISOString(), level: 'info', message: parts.join('; ') });
@@ -604,6 +675,10 @@ function describeWorkerStage(stage: string, detail: Record<string, unknown>, fal
       number(frames.selected) !== undefined ? `${frames.selected} kept` : '',
     ].filter(Boolean);
     return `${fallback ?? stage}${counts.length ? `: ${counts.join(', ')}` : ''}`;
+  }
+  if (stage === 'preparing_photos') {
+    const photos = (detail.photos ?? {}) as Record<string, unknown>;
+    return `${fallback ?? stage}${number(photos.submitted) !== undefined ? `: ${photos.submitted} photos` : ''}`;
   }
   if (stage === 'exporting') return 'Exporting the Gaussian splat';
   return fallback ?? stage;

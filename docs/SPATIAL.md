@@ -47,13 +47,72 @@ A running Node performs the import (the file must sit in `<data>/imports` or a d
 
 The job reports the truthful stages `extracting_frames`, `solving_poses` and `training`; the worker publishes its current stage in `worker-progress.json` in the job's output directory, which the Node follows while its one request is open. Typed worker failures reach the operator as the job error code with a message and counts (never tool output). The manifest records how the scene was derived under `captureProvenance.derivation` (video facts, frame selection counts, COLMAP version and registration counts, splat count); that block is private provenance and is not part of the public manifest.
 
-Camera poses from COLMAP have arbitrary scale and orientation, which is fine for an object viewer; placing the splat in the world would need an alignment step that does not exist yet.
+Camera poses from COLMAP have arbitrary scale and orientation; the worker estimates an upright viewer transform and an optional floater crop from them (see "Viewer orientation and floater crop"). Placing the splat in the world would need a further alignment step that does not exist yet.
 
 The thresholds are environment variables of the worker: `KUBUS_VIDEO_MIN_SECONDS`, `KUBUS_VIDEO_MAX_SECONDS`, `KUBUS_VIDEO_MIN_REGISTRATION_RATIO`, `KUBUS_VIDEO_BLUR_RATIO`, `KUBUS_VIDEO_MIN_MEDIAN_SHARPNESS`, `KUBUS_VIDEO_DUPLICATE_DIFF`, `KUBUS_VIDEO_OVERSAMPLE`, `KUBUS_VIDEO_MAX_LONG_SIDE`, `KUBUS_VIDEO_FRAMES_PER_SECOND`, `KUBUS_VIDEO_MIN_TARGET_FRAMES`, `KUBUS_VIDEO_MAX_TARGET_FRAMES`. `docker-compose.yml` forwards each of them to the `kubus-spatial-worker` service with the worker default, so setting one in the shell or in `.env` next to the compose file is enough; an unparsable value falls back to the default.
 
 Two operational notes. The Node-to-worker request waits for the whole reconstruction, so it uses its own HTTP dispatcher without a headers timeout (Node's default is five minutes) and a 31 hour ceiling (the worker's own limits add up to 30 hours in the worst case: 1 hour frame extraction, 3 hours pose solving, 24 hours training, 2 hours export). The worker runs as root, so it gives the job's output tree back to the Node's user when it finishes; otherwise the Node's cleanup cannot delete it and every later job is refused as `worker_cleanup_pending`.
 
 `scripts/render_synthetic_orbit.py` (CC0) renders a synthetic orbit video of a procedural 3D flower for testing, and `scripts/smoke_video_intake.sh` runs the whole chain against a running stack.
+
+## Photo intake
+
+A capture of plain photographs has no camera poses: no ARCore tracking, no intrinsics. A **photo package** is a set of JPEG or PNG files directly under `photos/` and no `frames.json`; a **mixed package** also holds exactly one `video/source.<ext>`. The package kind (`photos`, `video`, `mixed`, or `frames`) is decided from the files, and `frames.json` wins if present.
+
+```sh
+# the photos sit in <data>/imports/<piece>/ (docker cp -r); the Node imports them and queues the job
+kubus-node capture import-photos /var/lib/kubus-node/data/imports/lala \
+  --artwork <artworkId> --marker <markerId> --captured-at 2026-08-17T06:00:00Z --process --floater-crop
+```
+
+Boundary checks (Node, `src/captures/photoPackage.ts`; headers only, never whole files): 8 to 400 photos, 16 KiB to 120 MiB each, a real JPEG or PNG signature that agrees with the extension, a readable size header (short side at least 480 px, long side at most 20,000 px, at most 200 megapixels), a complete tail (a JPEG ends with EOI, a PNG with IEND, which catches a truncated upload), and no symbolic links. Sub-directories and files that are not images are skipped and counted in the import answer (`skippedFiles`). Photos are streamed into the capture under constant names (`photos/00001.jpg`); the original file names, which a phone makes personal, are never stored and never reach a path. The same directory imported twice for the same artwork and marker returns the capture it already made. `--captured-at` is the capture time of the photos (default: the oldest file time; pass it explicitly, because it feeds the grant rule `validFrom <= capturedAt`); `--captured-by` records a free-text operator label and stays unset until the photographer is confirmed. A running Node needs the directory under `<data>/imports` or `KUBUS_IMPORT_DIRS`.
+
+The worker (`spatial-worker/photo_pipeline.py`) decodes every photo, bakes its EXIF orientation into the pixels (COLMAP and Nerfstudio ignore the tag), downscales to 2048 px on the long side, and writes a clean JPEG under a constant name that keeps only the lens facts COLMAP uses as a focal-length prior. It then runs COLMAP in stages (feature extraction, exhaustive matching, mapper). `ns-process-data images` assumes a single camera for the whole folder, and a photo set usually mixes devices, lenses and crops, so the stages are run directly (one camera per distinct size and lens, as COLMAP groups them) and Nerfstudio's own `colmap_to_json` writes `transforms.json` and `sparse_pc.ply`. The largest reconstructed model is used. The gates are the video path's, from one shared function: at least 24 registered views and at least 60 percent of the submitted photos registered, else `sfm_failed` with the counts; fewer than 8 decodable photos is `photos_unreadable`. Training and export are unchanged.
+
+Photo sets are small, so the floor and ratio can be tuned separately from the video gate: `KUBUS_PHOTO_MIN_REGISTERED_VIEWS` (24), `KUBUS_PHOTO_MIN_REGISTRATION_RATIO` (follows `KUBUS_VIDEO_MIN_REGISTRATION_RATIO`, 0.6), `KUBUS_PHOTO_MIN_COUNT` (8) and `KUBUS_PHOTO_MAX_LONG_SIDE` (2048); `docker-compose.yml` forwards them like the video thresholds. A set of fewer than 24 photos cannot pass the default floor; lowering it is an operator decision that belongs in the run record.
+
+## Mixed captures and spatial revisions
+
+A video that arrives after the photos does not change the photo capture or its spatial record:
+
+```sh
+kubus-node capture add-video <photoCaptureId> /var/lib/kubus-node/data/imports/later.mp4 \
+  --captured-at 2026-12-02T09:00:00Z --process
+```
+
+builds a NEW `mixed` capture holding the photo capture's photos and the video, with `derivedFrom: { captureId }`, and the photo capture stays exactly as it was. (`import-photos <dir> --video <file>` makes a mixed capture in one step.) The worker solves photos and video frames in one COLMAP run: photos keep their per-lens cameras, the video frames share one camera (a second `feature_extractor` pass with `single_camera 1` into the same database), and the gate counts every submitted image. `registeredPhotos` and `registeredVideoFrames` are reported separately.
+
+A reconstruction of the new capture produces a NEW spatial record; nothing is overwritten. The job links it to the record it revises: an explicit `previousSpatialId` (`capture process <captureId> --previous <spatialId>`) or, when the capture has `derivedFrom`, the newest record of that capture. The artwork must match (`previous_spatial_artwork_mismatch` otherwise; an unknown id is `previous_spatial_not_found`). The manifest always carries the revision block below, for the backend grant and revision model to bind to:
+
+| Field | Meaning |
+| --- | --- |
+| `id` | The spatial record id, unique per revision. A grant or publication binds to this. |
+| `artworkId`, `markerId` | The artwork the record belongs to; a revision must match its predecessor's artwork. |
+| `captureId` | The private capture this record was reconstructed from (dropped from a public manifest). |
+| `capturedAt` | The earliest capture time of any input (a mixed capture takes the earlier of photos and video), so a `validFrom <= capturedAt` rule is conservative. The per-medium times are on the capture record (`mediaCapturedAt`). |
+| `capturedBy` | Optional operator label from the capture (opt-in at publication). |
+| `revision.number` | 1 for the first record of an artwork, previous number + 1 after that. |
+| `revision.reason` | `initial`, `video_added` (the capture was derived from the previous record's capture) or `resolve`. |
+| `revision.previousSpatialId` | The record this one revises. Absent for revision 1. |
+| `revision.previousManifestCid` | CID of the previous record's manifest: the link is content-addressed. |
+| `revision.previousCaptureId` | The capture of the previous record. |
+| `revision.inputs` | `{ captureKind, photos?, video? }`: what this record was reconstructed from. |
+
+Suggested backend binding: a grant authorises (artwork, methods, territory, window); a publication of revision N is checked against the grant in force at publication time, using the `capturedAt` of that revision, and records `id` and `revision.number`. Withdrawing or suspending the revision-1 record does not touch revision 2 and vice versa, and the previous record stays reachable through `previousSpatialId`. `captureProvenance.derivation` (private) records the inputs, COLMAP counts and timings; a public manifest must drop `captureProvenance` as before.
+
+## Viewer orientation and floater crop
+
+COLMAP output has an arbitrary orientation, centre and scale. For every COLMAP-derived scene (video, photos, mixed) the worker estimates, in the coordinate frame the splat file is written in (cameras and sparse points are first mapped through `dataparser_transforms.json`; `spatial-worker/scene_frame.py`):
+
+- **up**: the mean of the cameras' up axes; when they disagree (mean resultant length below 0.6, for example rolled photos), the normal of the dominant plane of the sparse points, signed by the cameras; else +Z is assumed. The method and a 0 to 1 confidence are recorded.
+- **front**: the horizontal direction from the subject towards the cameras, when the cameras cover one side (resultant length at least 0.4); a full orbit has no front and keeps its yaw.
+- **subject box**: the 2nd to 98th percentile box of the sparse points, grown by 35 percent (never by less than 15 percent of the largest side, so a flat mural is not cut to a sliver).
+
+`manifest.transform.matrix` is 16 numbers in **column-major** order (three.js `Matrix4.fromArray`) mapping splat-file coordinates to viewer coordinates: right-handed, +Y up, the subject centred on the origin, its largest dimension two units across, its front facing +Z (the viewer camera starts at +Z). `transform.up` is the up vector in splat coordinates and `transform.method` how it was found; `processing.orientation` holds method, confidence, front, centre and counts. The Node GUI viewer reads the manifest and passes `transform` to `window.loadSpatial(url, transform)`; the vendored bundle carries one local patch for that (see its header comment; re-apply it when the bundle is replaced by a fresh build of the app viewer). A record without a transform opens as before. The app and web viewers must apply the same `matrix`; until they do they show the file's own orientation.
+
+The **floater crop** is optional (per job `floaterCrop: true`, `--floater-crop` on the CLI, or `KUBUS_SPATIAL_FLOATER_CROP=1` as the worker default). It re-exports the trained splat with `ns-export gaussian-splat --obb-center/--obb-rotation/--obb-scale` set to the subject box (axis-aligned in the splat frame) and uses that file as the archive variant. `processing.floaterCrop` records `applied`, the box (`min`, `max`, `method: sparse_point_percentile`, `percentiles`, `margin`, `frame: splat`) and the splat counts before and after. The uncropped export stays in the job's output directory only until the job is cleaned up; if the full-scene archive matters, run without the crop. A crop that cannot be applied is recorded as `applied: false` with a reason, never silently skipped.
+
+Orientation is a convenience: if it cannot be computed the run still completes, with `provenance.orientation.method = "unavailable"` and no transform.
 
 ## Future delivery gate
 
