@@ -19,7 +19,7 @@ async function fixture({owned = true, attempted = true, jobState = 'running'} = 
  const target = path.join(root, 'private', 'jobs', id); await fs.mkdir(target, { recursive: true }); await fs.writeFile(path.join(target, 'synthetic-readable'), 'private-fixture');
  const recovered = new LocalStore(file); await recovered.load();
  const jobs = new JobRuntime({store: recovered, captureStore: {} as never, kubo: {} as never,
-   workerAuth: auth, logger: {warn: () => undefined} as never, dataRoot: root, workerUrl: 'http://worker.invalid',
+   workerAuth: auth, logger: {warn: () => undefined, info: () => undefined} as never, dataRoot: root, workerUrl: 'http://worker.invalid',
    participationGate: {} as never, concurrency: 1 });
  return {root, target, recovered, jobs};
 }
@@ -49,4 +49,10 @@ it('legacy directories without ownership evidence remain untouched after interru
  const {jobs, target} = await fixture({owned: false}); const fetch = vi.spyOn(globalThis, 'fetch');
  await jobs.start(); expect(jobs.get(id).state).toBe('failed'); expect(fetch).not.toHaveBeenCalled();
  expect((await fs.stat(target)).isDirectory()).toBe(true);
+});
+it('start removes face-review copies that no record needs (a crash between the copy and the record)', async () => {
+ const {jobs, root} = await fixture({owned: false, jobState: 'completed'});
+ const orphan = path.join(root, 'private', 'face-review', instance); await fs.mkdir(orphan, {recursive: true}); await fs.writeFile(path.join(orphan, 'photos-00001.jpg'), 'masked');
+ await jobs.start();
+ await expect(fs.stat(orphan)).rejects.toMatchObject({code: 'ENOENT'});
 });

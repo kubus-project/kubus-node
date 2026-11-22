@@ -22,9 +22,11 @@ job's cancellation machinery (`JobControl.run`) owns the processes, and so tests
 can substitute fakes. Nothing here imports torch or FastAPI.
 """
 import json
+import math
 import os
 import pathlib
 import shutil
+import sys
 from typing import Any, Callable
 
 # The same floor the Node adapter enforces for pose captures
@@ -35,10 +37,24 @@ VIDEO_EXTENSIONS = ("mp4", "mov", "m4v", "webm", "mkv")
 
 
 def _float_env(name: str, default: float) -> float:
+    """A float knob from the environment; unparsable and non-finite values (`nan`, `inf`) fall back to the default."""
     try:
-        return float(os.environ.get(name, default))
+        value = float(os.environ.get(name, default))
     except ValueError:
         return default
+    if not math.isfinite(value):
+        print(f"{name}={os.environ.get(name)!r} is not a finite number; using the default {default}", file=sys.stderr)
+        return default
+    return value
+
+
+def _bounded_env(name: str, default: float, low: float, high: float) -> float:
+    """`_float_env` for a gate knob: a value outside [low, high] falls back to the default instead of disabling the gate."""
+    value = _float_env(name, default)
+    if not low <= value <= high:
+        print(f"{name}={value} is outside [{low}, {high}]; using the default {default}", file=sys.stderr)
+        return default
+    return value
 
 
 MIN_DURATION_SECONDS = _float_env("KUBUS_VIDEO_MIN_SECONDS", 3.0)
@@ -46,7 +62,7 @@ MAX_DURATION_SECONDS = _float_env("KUBUS_VIDEO_MAX_SECONDS", 20 * 60.0)
 # Fraction of submitted frames COLMAP must register for the run to proceed.
 # The default ratio. `gateLowered` compares against this constant, never against the env-tunable value.
 DEFAULT_MIN_REGISTRATION_RATIO = 0.6
-MIN_REGISTRATION_RATIO = _float_env("KUBUS_VIDEO_MIN_REGISTRATION_RATIO", DEFAULT_MIN_REGISTRATION_RATIO)
+MIN_REGISTRATION_RATIO = _bounded_env("KUBUS_VIDEO_MIN_REGISTRATION_RATIO", DEFAULT_MIN_REGISTRATION_RATIO, 0.0, 1.0)
 # A frame is "blurry" when it scores below this fraction of the median score.
 BLUR_RATIO = _float_env("KUBUS_VIDEO_BLUR_RATIO", 0.5)
 # Median sharpness below this means the whole clip is soft, not just some frames.
@@ -296,6 +312,14 @@ def check_registration_gates(
     The thresholds in force are written into `details` (the `sfm` provenance, and the typed error's details),
     so a run that passed under a lowered floor is distinguishable from one that passed the default gate.
     """
+    if not (math.isfinite(min_ratio) and 0.0 <= min_ratio <= 1.0):
+        # Fail closed: a NaN would compare false against every ratio and silently disable the gate. The value is
+        # kept out of `details` because the response is JSON and JSON has no NaN.
+        raise WorkerError(
+            "sfm_failed",
+            f"the registration ratio gate {min_ratio!r} is not a number between 0 and 1; the run is refused",
+            details=details,
+        )
     details["minRegisteredViews"] = min_views
     details["minRegistrationRatio"] = min_ratio
     details["gateLowered"] = min_views < MIN_VIEWS_FOR_RECONSTRUCTION or min_ratio < DEFAULT_MIN_REGISTRATION_RATIO
@@ -341,6 +365,26 @@ def run_structure_from_motion(runner: Runner, frames_directory: pathlib.Path, da
     return details
 
 
+def remove_raw_frames(raw: pathlib.Path) -> bool:
+    """Removes the unmasked extraction directory before face masking runs on the selected copies.
+
+    Returns whether it is gone. A frame that cannot be removed (a locked file) is reported on stderr instead of being
+    ignored: the files are private and are deleted with the job's directory by the cleanup journal, but they are
+    unmasked, so they are never left without a trace.
+    """
+    reason = ""
+    try:
+        shutil.rmtree(raw)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        reason = f" ({type(error).__name__}: {error})"
+    if raw.exists():
+        print(f"raw video frames could not be removed from {raw}{reason}; they stay until the job directory is cleaned up", file=sys.stderr)
+        return False
+    return True
+
+
 def select_video_frames(
     runner: Runner,
     capture: pathlib.Path,
@@ -376,7 +420,7 @@ def select_video_frames(
         names.append(name)
         if seconds is not None:
             seconds.append(frame_seconds(item["path"], rate))
-    shutil.rmtree(raw, ignore_errors=True)
+    remove_raw_frames(raw)
     if after_selection is not None:
         after_selection(chosen, names)  # for example face masking, before anything reads the frames
     return names, info, selection

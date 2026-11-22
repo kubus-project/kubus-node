@@ -303,6 +303,14 @@ class Masking(unittest.TestCase):
         masker.mask_array(image, {"exclude": [[0.0, 0.0, 0.25, 0.35]]}, audit=audit)
         self.assertEqual(audit, [{"box": 0, "strongExcluded": 1, "expectStrong": 0, "weakExcluded": 0, "expectWeak": None, "ok": False}])
 
+    def test_a_boolean_is_not_an_expected_count(self):
+        # `true` is an int in Python and would have counted as 1: it must mean "no expectation", the same as absent.
+        image = noisy()
+        self.assertEqual(fm.parse_excludes([{"box": [0.0, 0.0, 0.25, 0.35], "expectStrong": True}], 160, 120)[0]["expect"], 0)
+        self.assertEqual(fm.parse_excludes([{"box": [0.0, 0.0, 0.25, 0.35], "expectStrong": 1}], 160, 120)[0]["expect"], 1)
+        with self.assertRaises(fm.FaceMaskingError):  # a near-certain face in the box and the entry only says `true`
+            FakeMasker([(20, 20, 60, 70, True)]).mask_array(image, {"exclude": [{"box": [0.0, 0.0, 0.25, 0.35], "expectStrong": True}]})
+
     def test_a_weak_detection_inside_an_exclude_box_needs_no_expectation_but_is_reported_for_a_human_to_look_at(self):
         review = {}
         masked, count = FakeMasker([(20, 20, 60, 70, False)]).mask_array(noisy(), {"exclude": [[0.0, 0.0, 0.25, 0.35]]}, review=review)

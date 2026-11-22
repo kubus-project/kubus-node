@@ -256,7 +256,7 @@ def parse_excludes(raw: Any, width: int, height: int) -> list:
         expect = spec.get("expectStrong", 0)
         expect_weak = spec.get("expectWeak")
         out.append({
-            "pixels": pixels, "expect": expect if isinstance(expect, int) and expect >= 0 else 0, "seen": 0, "weak": 0,
+            "pixels": pixels, "expect": expect if isinstance(expect, int) and not isinstance(expect, bool) and expect >= 0 else 0, "seen": 0, "weak": 0,
             "expect_weak": expect_weak if isinstance(expect_weak, int) and not isinstance(expect_weak, bool) and expect_weak >= 0 else None,
         })
     return out

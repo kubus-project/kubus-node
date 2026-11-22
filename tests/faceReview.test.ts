@@ -8,7 +8,7 @@ import { startGuiServer } from '../src/gui/guiServer.js';
 import { listSpatialSummaries, serveFaceReviewImage } from '../src/gui/spatialGuiApi.js';
 import { LocalStore } from '../src/state/localStore.js';
 import {
-  WORKER_REVIEW_FILE, acknowledgeFaceReview, faceReviewDirectory, faceReviewView, openFaceReviewImage, removeFaceReviewImages, storeFaceReview, withoutFaceReview,
+  WORKER_REVIEW_FILE, acknowledgeFaceReview, faceReviewDirectory, faceReviewView, openFaceReviewImage, removeFaceReviewImages, storeFaceReview, sweepOrphanFaceReviews, withoutFaceReview,
 } from '../src/spatial/faceReview.js';
 import { supersedeSpatialRecord } from '../src/spatial/supersede.js';
 import { syntheticCid } from './fixtures/contentIds.js';
@@ -240,6 +240,37 @@ describe('face review of a record', () => {
     expect(recordOf(store).state).toBe('superseded');
     await expect(fs.stat(faceReviewDirectory(dir, SPATIAL_ID))).rejects.toThrow();
     await removeFaceReviewImages(dir, SPATIAL_ID);
+  });
+});
+
+describe('start-up sweep of review copies', () => {
+  const COPY = (dir: string, id: string) => path.join(dir, 'private', 'face-review', id);
+
+  it('removes copies of a record that was never written, was superseded or was acknowledged, and keeps the ones in use', async () => {
+    const { dir, store } = await setup();
+    // A crash between the copy and the record: a directory no record has (and a name that is no record id at all).
+    await fs.mkdir(COPY(dir, OTHER_ID), { recursive: true });
+    await fs.writeFile(path.join(COPY(dir, OTHER_ID), 'photos-00001.jpg'), 'orphan');
+    await fs.mkdir(COPY(dir, 'not-an-id'), { recursive: true });
+    expect((await sweepOrphanFaceReviews(dir, store)).sort()).toEqual([OTHER_ID, 'not-an-id'].sort());
+    await expect(fs.stat(COPY(dir, OTHER_ID))).rejects.toThrow();
+    await expect(fs.stat(COPY(dir, 'not-an-id'))).rejects.toThrow();
+    // The pending review of a live record keeps its images.
+    expect((await fs.stat(COPY(dir, SPATIAL_ID))).isDirectory()).toBe(true);
+    expect(await sweepOrphanFaceReviews(dir, store)).toEqual([]);
+    expect((await fs.readdir(COPY(dir, SPATIAL_ID))).length).toBeGreaterThan(0);
+    // Superseded: no longer needed (the supersede flow removes them too; this is the leftover of an interrupted one).
+    await store.update((state) => { (state.spatial![SPATIAL_ID] as { state: string }).state = 'superseded'; });
+    expect(await sweepOrphanFaceReviews(dir, store)).toEqual([SPATIAL_ID]);
+    await expect(fs.stat(COPY(dir, SPATIAL_ID))).rejects.toThrow();
+  });
+
+  it('removes the copies of an acknowledged record and is a no-op without a review folder', async () => {
+    const { dir, store } = await setup();
+    await store.update((state) => { (state.spatial![SPATIAL_ID] as { faceReview: { acknowledged?: unknown } }).faceReview.acknowledged = { at: 'x', by: 'op' }; });
+    expect(await sweepOrphanFaceReviews(dir, store)).toEqual([SPATIAL_ID]);
+    await fs.rm(path.join(dir, 'private', 'face-review'), { recursive: true, force: true });
+    expect(await sweepOrphanFaceReviews(dir, store)).toEqual([]);
   });
 });
 

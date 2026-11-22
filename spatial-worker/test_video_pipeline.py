@@ -264,6 +264,19 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertGreater(extract, target)
         self.assertLessEqual(extract, vp.MAX_EXTRACTED_FRAMES)
 
+    def test_raw_frames_that_cannot_be_removed_are_reported_not_ignored(self):
+        raw = self.work / "raw_frames"
+        raw.mkdir()
+        write_frame(raw / "frame_00001.jpg", 1)
+        self.assertTrue(vp.remove_raw_frames(self.work / "never_made"))  # already gone is fine
+        with unittest.mock.patch("shutil.rmtree", side_effect=PermissionError("locked")),                 unittest.mock.patch("sys.stderr") as stderr:
+            self.assertFalse(vp.remove_raw_frames(raw))
+        written = "".join(call.args[0] for call in stderr.write.call_args_list)
+        self.assertIn("could not be removed", written)
+        self.assertIn("locked", written)
+        self.assertTrue(vp.remove_raw_frames(raw))  # the real removal works again
+        self.assertFalse(raw.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

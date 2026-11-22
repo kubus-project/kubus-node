@@ -253,6 +253,22 @@ class PhotoDatasetTests(unittest.TestCase):
         self.assertFalse(details["gateLowered"])
         self.assertEqual(vp.DEFAULT_MIN_REGISTRATION_RATIO, 0.6)
 
+    def test_a_non_finite_or_out_of_range_gate_knob_never_disables_the_gate(self):
+        for raw in ("nan", "inf", "-inf", "-0.1", "1.5", "abc"):
+            with mock.patch.dict("os.environ", {"KUBUS_VIDEO_MIN_REGISTRATION_RATIO": raw}):
+                self.assertEqual(vp._bounded_env("KUBUS_VIDEO_MIN_REGISTRATION_RATIO", 0.6, 0.0, 1.0), 0.6, raw)
+        with mock.patch.dict("os.environ", {"KUBUS_VIDEO_MIN_REGISTRATION_RATIO": "0.3", "KUBUS_PHOTO_MIN_REGISTERED_VIEWS": "-5"}):
+            self.assertEqual(vp._bounded_env("KUBUS_VIDEO_MIN_REGISTRATION_RATIO", 0.6, 0.0, 1.0), 0.3)  # a lowered, valid value still works
+            self.assertEqual(vp._bounded_env("KUBUS_PHOTO_MIN_REGISTERED_VIEWS", 24, 3, 100_000), 24)
+        with mock.patch.dict("os.environ", {"KUBUS_VIDEO_BLUR_RATIO": "nan"}):
+            self.assertEqual(vp._float_env("KUBUS_VIDEO_BLUR_RATIO", 0.5), 0.5)
+        # The check itself fails closed on a NaN or out-of-range ratio handed in directly.
+        for bad in (float("nan"), float("inf"), -0.5, 1.5):
+            details: dict = {}
+            with self.assertRaises(vp.WorkerError) as refused:
+                vp.check_registration_gates(30, 100, details, 24, bad)
+            self.assertEqual(refused.exception.code, "sfm_failed")
+
     def test_the_floor_is_the_video_floor_unless_tuned(self):
         self.assertEqual(pp.PHOTO_MIN_REGISTERED_VIEWS, vp.MIN_VIEWS_FOR_RECONSTRUCTION)
         self.assertEqual(pp.PHOTO_MIN_REGISTRATION_RATIO, vp.MIN_REGISTRATION_RATIO)

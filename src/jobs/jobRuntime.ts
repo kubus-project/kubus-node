@@ -7,7 +7,7 @@ import { NEEDS_LOOK_LIST_LIMIT, PINNED_WEIGHTS_SHA256, effectiveMasking, publicM
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import { localError } from '../localApi/pairingService.js';
 import type { Logger } from '../logging/logger.js';
-import { WORKER_REVIEW_FILE, removeFaceReviewImages, storeFaceReview, type FaceReview, type ReviewSource } from '../spatial/faceReview.js';
+import { WORKER_REVIEW_FILE, removeFaceReviewImages, storeFaceReview, sweepOrphanFaceReviews, type FaceReview, type ReviewSource } from '../spatial/faceReview.js';
 import { buildNerfstudioDataset } from '../spatial/nerfstudioAdapter.js';
 import { longWorkerFetch, workerFailure } from '../spatial/workerClient.js';
 import { validateSpatialManifest, type SpatialManifest, type SpatialRevision, type SpatialVariant } from '../spatial/models.js';
@@ -295,6 +295,9 @@ export class JobRuntime {
       }
     });
     await this.reconcileCleanup();
+    // Review copies of a record that was never written (a crash between the copy and the record) or no longer needs them.
+    const swept = await sweepOrphanFaceReviews(this.deps.dataRoot, this.deps.store);
+    if (swept.length) this.deps.logger.info({ removed: swept.length }, 'removed orphaned face-review copies');
     this.schedule();
   }
 
@@ -378,7 +381,10 @@ export class JobRuntime {
       if (typeof input.mode === 'string' && input.mode !== mode) {
         throw localError(422, 'capture_input_mode_mismatch', { message: `The capture is a ${mode} capture, not ${input.mode}` });
       }
-      const prepared = { ...(mode === 'frames' ? input : { ...input, mode }), ...this.revisionInput(input, captureId), ...this.maskingInput(captureId, mode, typeof input.artworkId === 'string' ? input.artworkId : undefined) };
+      // `maskFaces` is the Node's decision from the capture (below), never the caller's: a value sent by a paired client
+      // for a capture that needs no masking would otherwise reach the worker.
+      const { maskFaces: _callerMasking, ...callerInput } = input;
+      const prepared = { ...(mode === 'frames' ? callerInput : { ...callerInput, mode }), ...this.revisionInput(input, captureId), ...this.maskingInput(captureId, mode, typeof input.artworkId === 'string' ? input.artworkId : undefined) };
       return this.insert(type, prepared, captureId);
     });
   }

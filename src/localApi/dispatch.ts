@@ -66,14 +66,25 @@ const pairingAttempts = new PairingAttemptLimiter();
 /**
  * A job as a paired client sees it. `maskingDetail` (per-image face-masking counts, which images need a look) and the
  * `faceReview` of the record in its output are the operator's, served by the GUI routes, not by the paired-client API.
+ * The output of a job whose spatial record was superseded is history too: it carries the retired record's manifest and
+ * CIDs, which the 410 of the record route and `purge-superseded` exist to take out of circulation, so it is dropped.
  */
-function withoutMaskingDetail<T extends { maskingDetail?: unknown; output?: unknown }>(job: T): T {
+function withoutMaskingDetail<T extends { maskingDetail?: unknown; output?: unknown }>(job: T, spatial?: Record<string, unknown> | null): T {
   let out = job;
   if ('maskingDetail' in out) {
     const { maskingDetail: _private, ...rest } = out;
     out = rest as T;
   }
-  if (out.output && typeof out.output === 'object') out = { ...out, output: withoutFaceReview(out.output as object) };
+  if (out.output && typeof out.output === 'object') {
+    const id = (out.output as { id?: unknown }).id;
+    const record = typeof id === 'string' ? (spatial?.[id] as { state?: unknown } | undefined) : undefined;
+    if (record?.state === 'superseded') {
+      const { output: _retired, ...rest } = out;
+      out = rest as T;
+    } else {
+      out = { ...out, output: withoutFaceReview(out.output as object) };
+    }
+  }
   return out;
 }
 
@@ -555,8 +566,9 @@ async function route(
 
   if (method === 'GET' && path === '/local/v1/jobs') {
     const gate = await participationGate.refresh();
+    const spatialRecords = store.snapshot().spatial as Record<string, unknown> | undefined;
     const list = jobs.list().map((job) => {
-      const shown = withoutMaskingDetail(job);
+      const shown = withoutMaskingDetail(job, spatialRecords);
       return gate.leaseEligible || !shown.output ? shown : { ...shown, output: undefined };
     });
     return jsonResponse(200, { jobs: list });
@@ -577,7 +589,7 @@ async function route(
   const jobMatch = path.match(/^\/local\/v1\/jobs\/([^/]+)$/);
   if (method === 'GET' && jobMatch) {
     const job = jobs.get(jobMatch[1]!);
-    return jsonResponse(200, withoutMaskingDetail(job));
+    return jsonResponse(200, withoutMaskingDetail(job, store.snapshot().spatial as Record<string, unknown> | undefined));
   }
 
   if (method === 'POST' && path === '/local/v1/compute/candidates') {

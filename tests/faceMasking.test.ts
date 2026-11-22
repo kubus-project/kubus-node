@@ -361,6 +361,14 @@ describe('masking in the job and the record', () => {
     expect(plain.input).not.toHaveProperty('maskFaces');
     await settle(jobs, plain.id);
     expect(jobs.get(plain.id).state).toBe('completed');
+    // The decision is the Node's: what a caller sends for `maskFaces` is dropped, whichever way it points.
+    const forced = await jobs.create('spatial.reconstruct', { captureId: optedOut.id, maskFaces: { photos: true, video: true } });
+    expect(forced.input).not.toHaveProperty('maskFaces');
+    await settle(jobs, forced.id);
+    const masked = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1' });
+    const lowered = await jobs.create('spatial.reconstruct', { captureId: masked.id, maskFaces: { photos: false, video: false } });
+    expect(lowered.input).toMatchObject({ maskFaces: { photos: true, video: false } });
+    await settle(jobs, lowered.id);
   });
 
   it('does not ask for masking of premasked photos and carries the operator report into the record', async () => {

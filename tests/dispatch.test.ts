@@ -168,6 +168,27 @@ describe('dispatchLocalRequest', () => {
     await expect(get('fresh')).resolves.toMatchObject({ kind: 'json' });
   });
 
+  it('does not hand the manifest or CIDs of a superseded record to a paired client through the job record', async () => {
+    await deps.store.update((state) => {
+      state.spatial = {
+        old: { id: 'old', state: 'superseded', manifestCid: 'QmOLD', manifest: { variants: [{ cid: 'QmOLDVARIANT' }] } },
+        fresh: { id: 'fresh', state: 'local', manifestCid: 'QmFRESH', manifest: { variants: [] } },
+      } as never;
+    });
+    const retired = { id: 'j-old', state: 'completed', output: { id: 'old', manifestCid: 'QmOLD', manifest: { variants: [{ cid: 'QmOLDVARIANT' }] } } };
+    const current = { id: 'j-new', state: 'completed', output: { id: 'fresh', manifestCid: 'QmFRESH', manifest: { variants: [] } } };
+    deps.jobs = { get: (id: string) => (id === 'j-old' ? retired : current), list: () => [retired, current], health: () => ({ running: 0, queued: 0 }) } as never;
+    const read = async (route: string) => (await dispatchLocalRequest(request({ method: 'GET', path: route, credential: token }), deps) as { value: any }).value;
+    const single = await read('/local/v1/jobs/j-old');
+    expect(single.id).toBe('j-old');
+    expect(JSON.stringify(single)).not.toMatch(/QmOLD|manifest/);
+    const listed = (await read('/local/v1/jobs')).jobs as Array<Record<string, any>>;
+    expect(JSON.stringify(listed.find((job) => job.id === 'j-old'))).not.toMatch(/QmOLD|manifest/);
+    expect(listed.find((job) => job.id === 'j-new')!.output.manifestCid).toBe('QmFRESH');
+    // The job object itself (what the operator's own tools read) is not changed.
+    expect(retired.output.manifestCid).toBe('QmOLD');
+  });
+
   it('never publishes or revives a superseded spatial record', async () => {
     const publishExistingSpatial = vi.fn(async () => ({ requested: true }));
     deps.api = { publishExistingSpatial } as never;

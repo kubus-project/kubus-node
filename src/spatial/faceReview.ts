@@ -128,6 +128,37 @@ export async function removeFaceReviewImages(dataRoot: string, spatialId: string
   }
 }
 
+/**
+ * Start-up sweep: removes review copies that nothing needs. `keepFaceReview` copies the flagged images before the
+ * record is written, so a process killed in between leaves a directory for an id no record has; a record that was
+ * superseded or acknowledged needs none either. Only called before any job runs (a record being made right now
+ * would look like an orphan). Returns the directory names it removed. Best effort: what cannot be removed now is
+ * retried at the next start.
+ */
+export async function sweepOrphanFaceReviews(dataRoot: string, store: LocalStore): Promise<string[]> {
+  const root = path.join(dataRoot, 'private', 'face-review');
+  let names: string[];
+  try {
+    names = await fs.readdir(root);
+  } catch {
+    return [];
+  }
+  const removed: string[] = [];
+  for (const name of names) {
+    const record = RECORD_ID.test(name) ? (store.snapshot().spatial?.[name] as StoredWithReview | undefined) : undefined;
+    const needed = Boolean(record && record.state !== 'superseded' && record.faceReview && !record.faceReview.acknowledged);
+    if (needed) continue;
+    try {
+      // `rm` removes a link itself and never follows it.
+      await fs.rm(path.join(root, name), { recursive: true, force: true });
+      removed.push(name);
+    } catch {
+      // retried at the next start
+    }
+  }
+  return removed;
+}
+
 /** `items` and `viewed` are optional on disk: a state file written before the review kept its images has neither. */
 interface StoredWithReview { state?: string; faceReview?: FaceReview }
 

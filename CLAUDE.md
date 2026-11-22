@@ -127,6 +127,7 @@ Authored: `src/`, `tests/`, `installer/`, `spatial-worker/`, `docs/`.
 npm run lint
 npm run typecheck
 npm test
+bash scripts/test_worker_python.sh   # worker Python suites (face masking, intake), in the worker image
 npm run build
 npm run smoke            # where the change touches runtime startup
 ```

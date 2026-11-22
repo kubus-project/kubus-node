@@ -44,6 +44,8 @@ jobs:
         run: |
           docker compose config
           docker compose build kubus-node-agent kubus-spatial-worker
+      - name: Run the spatial worker's Python tests in the worker image
+        run: bash scripts/test_worker_python.sh
       - name: Boot the unconfigured runtime and assert local-only setup
         shell: bash
         run: |

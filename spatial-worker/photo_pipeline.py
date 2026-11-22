@@ -40,6 +40,7 @@ from video_pipeline import (
     colmap_version,
     count_registered_views,
     select_video_frames,
+    _bounded_env,
     _float_env,
     _tail,
 )
@@ -51,8 +52,8 @@ MAX_PHOTOS = 400
 MAX_PHOTO_PIXELS = 200_000_000
 PHOTO_MAX_LONG_SIDE = int(_float_env("KUBUS_PHOTO_MAX_LONG_SIDE", 2048))
 # The photo gate defaults to the video gate; photo sets are small, so an operator may tune it separately.
-PHOTO_MIN_REGISTERED_VIEWS = int(_float_env("KUBUS_PHOTO_MIN_REGISTERED_VIEWS", MIN_VIEWS_FOR_RECONSTRUCTION))
-PHOTO_MIN_REGISTRATION_RATIO = _float_env("KUBUS_PHOTO_MIN_REGISTRATION_RATIO", MIN_REGISTRATION_RATIO)
+PHOTO_MIN_REGISTERED_VIEWS = int(_bounded_env("KUBUS_PHOTO_MIN_REGISTERED_VIEWS", MIN_VIEWS_FOR_RECONSTRUCTION, 3, 100_000))
+PHOTO_MIN_REGISTRATION_RATIO = _bounded_env("KUBUS_PHOTO_MIN_REGISTRATION_RATIO", MIN_REGISTRATION_RATIO, 0.0, 1.0)
 
 # Pose solving as a whole is budgeted at 3 h by the Node (workerClient.WORKER_TOOL_TIMEOUTS_MS):
 # 30 min + 45 min + 60 min = 2 h 15 min.
