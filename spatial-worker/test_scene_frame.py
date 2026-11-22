@@ -108,6 +108,26 @@ class OrientationTests(unittest.TestCase):
         self.assertEqual(estimate["method"], "plane_normal")
         self.assertAlmostEqual(abs(float(estimate["up"][2])), 1.0, places=2)
 
+    def test_a_wall_seen_face_on_is_not_given_a_sideways_up_by_the_plane_fallback(self):
+        # A mural: sparse points on the wall x = 0 (its normal is horizontal), cameras facing it from x = 3
+        # with their roll spread over three angles (0, 120 and 240 degrees), so the camera ups cancel out.
+        rng = np.random.default_rng(5)
+        wall = np.column_stack([rng.normal(size=600) * 0.01, rng.normal(size=600), rng.normal(size=600)])
+        poses = []
+        for index in range(24):
+            offset = rng.normal(size=2) * 0.3
+            pose = camera((3.0, offset[0], offset[1]), (0.0, 0.0, 0.0), (0, 0, 1))
+            pose[:3, :3] = pose[:3, :3] @ rotation_about([0, 0, 1], (index % 3) * 2 * math.pi / 3)
+            poses.append(pose)
+        poses = np.stack(poses)
+        self.assertLess(np.linalg.norm(poses[:, :3, 1].mean(axis=0)), sf.MIN_UP_CONFIDENCE)
+        plane, flatness = sf.plane_normal(wall)
+        self.assertGreater(abs(float(plane[0])), 0.99)  # the dominant plane is the wall, normal along x
+        self.assertGreater(flatness, 0.9)
+        estimate = sf.estimate_up(poses, wall)
+        self.assertNotEqual(estimate["method"], "plane_normal")
+        self.assertLess(estimate["confidence"], sf.MIN_UP_CONFIDENCE)  # never reported as a trusted answer
+
     def test_with_nothing_to_go_on_up_is_assumed(self):
         poses = np.stack([np.eye(4), np.eye(4)])
         poses[1][:3, :3] = np.diag([1, -1, -1])

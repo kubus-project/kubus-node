@@ -276,7 +276,14 @@ def check_registration_gates(
     min_ratio: float = MIN_REGISTRATION_RATIO,
     noun: str = "frames",
 ) -> None:
-    """The registered-view floor and registration-ratio gate shared by every COLMAP-based intake."""
+    """The registered-view floor and registration-ratio gate shared by every COLMAP-based intake.
+
+    The thresholds in force are written into `details` (the `sfm` provenance, and the typed error's details),
+    so a run that passed under a lowered floor is distinguishable from one that passed the default gate.
+    """
+    details["minRegisteredViews"] = min_views
+    details["minRegistrationRatio"] = min_ratio
+    details["gateLowered"] = min_views < MIN_VIEWS_FOR_RECONSTRUCTION or min_ratio < MIN_REGISTRATION_RATIO
     ratio = registered / submitted if submitted else 0.0
     if registered < min_views:
         raise WorkerError(

@@ -34,6 +34,9 @@ import numpy as np
 # Below this mean-resultant length the cameras' "up" axes do not agree
 # (rotated or mixed-orientation photos), so the plane fallback is used.
 MIN_UP_CONFIDENCE = 0.6
+# The plane fallback is only trusted when the cameras look at the plane obliquely: above this mean
+# |cos| between their viewing directions and the plane normal they are face-on (a wall or a top-down floor).
+MAX_PLANE_FACE_ON = 0.8
 # Below this the cameras surround the subject (a full orbit), so no front exists.
 MIN_FRONT_CONFIDENCE = 0.4
 # Subject box from this percentile range of the sparse points, per axis.
@@ -136,10 +139,17 @@ def estimate_up(poses: np.ndarray, points: np.ndarray | None = None) -> dict:
         return {"method": "camera_up", "up": _unit(mean), "confidence": confidence}
     if points is not None and len(points) >= 20:
         normal, flatness = plane_normal(points)
-        if np.dot(normal, mean) < 0:
-            normal = -normal
-        # A weak camera consensus still fixes the sign; flatness says how much to trust the plane.
-        return {"method": "plane_normal", "up": _unit(normal), "confidence": flatness}
+        # Cameras looking face-on at the plane cannot tell a floor seen from above from a wall (a mural, the
+        # subject class of this lane): for a wall the plane normal is horizontal, so "up" would be sideways.
+        # Only oblique views, where the cameras stand off to the side of the plane, vouch for a floor.
+        views = -poses[:, :3, 2]
+        views = views / np.maximum(np.linalg.norm(views, axis=1, keepdims=True), 1e-12)
+        face_on = float(np.abs(views @ normal).mean())
+        if face_on < MAX_PLANE_FACE_ON:
+            if np.dot(normal, mean) < 0:
+                normal = -normal
+            # A weak camera consensus still fixes the sign; flatness says how much to trust the plane.
+            return {"method": "plane_normal", "up": _unit(normal), "confidence": flatness}
     if confidence > 1e-6:
         return {"method": "camera_up_weak", "up": _unit(mean), "confidence": confidence}
     return {"method": "assumed", "up": np.array([0.0, 0.0, 1.0]), "confidence": 0.0}

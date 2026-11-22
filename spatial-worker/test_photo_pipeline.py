@@ -4,6 +4,7 @@ import pathlib
 import struct
 import tempfile
 import unittest
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -118,6 +119,24 @@ class PreparePhotoTests(unittest.TestCase):
         self.assertEqual((facts["width"], facts["height"]), (1000, 750))
         self.assertEqual((facts["sourceWidth"], facts["sourceHeight"]), (4000, 3000))
 
+    def test_the_pixel_limit_is_a_refusal_checked_before_decoding(self):
+        write_jpeg(self.root / "a.jpg", size=(640, 480))
+        decoded = []
+        original_load = Image.Image.load
+
+        def spying_load(image, *args, **kwargs):
+            decoded.append(True)
+            return original_load(image, *args, **kwargs)
+
+        with mock.patch.object(pp, "MAX_PHOTO_PIXELS", 640 * 480 - 1), mock.patch.object(Image.Image, "load", spying_load):
+            with self.assertRaises(ValueError):
+                pp.prepare_photo(self.root / "a.jpg", self.root / "o.jpg")
+        self.assertEqual(decoded, [])
+        self.assertFalse((self.root / "o.jpg").exists())
+        with mock.patch.object(pp, "MAX_PHOTO_PIXELS", 640 * 480):
+            pp.prepare_photo(self.root / "a.jpg", self.root / "o.jpg")  # exactly at the limit is allowed
+        self.assertIsNone(Image.MAX_IMAGE_PIXELS)  # Pillow's own bound would only warn up to 2x
+
     def test_unreadable_files_are_dropped_and_counted_and_names_become_constant(self):
         photos = []
         for index in range(3):
@@ -199,6 +218,25 @@ class PhotoDatasetTests(unittest.TestCase):
         with self.assertRaises(vp.WorkerError) as ratio:
             pp.prepare_photo_dataset(FakeColmap(registered=26), big, self.root / "work2", self.progress, convert=fake_convert(first_n(26)))
         self.assertIn("43%", ratio.exception.message)
+
+    def test_the_gate_in_force_is_recorded_and_a_lowered_floor_is_visible(self):
+        capture = make_photo_capture(self.root, count=30)
+        default = self.run_photos(capture, FakeColmap())["sfm"]
+        self.assertEqual(default["minRegisteredViews"], vp.MIN_VIEWS_FOR_RECONSTRUCTION)
+        self.assertEqual(default["minRegistrationRatio"], vp.MIN_REGISTRATION_RATIO)
+        self.assertFalse(default["gateLowered"])
+        small = make_photo_capture(self.root / "small", count=23)
+        with mock.patch.object(pp, "PHOTO_MIN_REGISTERED_VIEWS", 20):
+            lowered = pp.prepare_photo_dataset(
+                FakeColmap(registered=22), small, self.root / "work3", self.progress, convert=fake_convert(first_n(22)))["sfm"]
+        self.assertEqual((lowered["registeredViews"], lowered["submittedViews"]), (22, 23))
+        self.assertEqual(lowered["minRegisteredViews"], 20)
+        self.assertTrue(lowered["gateLowered"])
+        with mock.patch.object(pp, "PHOTO_MIN_REGISTERED_VIEWS", 20), self.assertRaises(vp.WorkerError) as refused:
+            pp.prepare_photo_dataset(
+                FakeColmap(registered=19), make_photo_capture(self.root / "tiny", count=23), self.root / "work4", self.progress,
+                convert=fake_convert(first_n(19)))
+        self.assertEqual(refused.exception.details["minRegisteredViews"], 20)  # the refusal says which floor it applied
 
     def test_the_floor_is_the_video_floor_unless_tuned(self):
         self.assertEqual(pp.PHOTO_MIN_REGISTERED_VIEWS, vp.MIN_VIEWS_FOR_RECONSTRUCTION)

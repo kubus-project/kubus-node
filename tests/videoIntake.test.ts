@@ -262,11 +262,12 @@ describe('long worker request (N3)', () => {
 });
 
 describe('worker request ceiling', () => {
-  it('sits above the sum of the worker tool timeouts for a video job (30 h)', () => {
+  it('sits above the sum of the worker tool timeouts for a video job with a crop export (32 h)', () => {
     const sum = Object.values(WORKER_TOOL_TIMEOUTS_MS).reduce((total, ms) => total + ms, 0);
-    expect(sum).toBe(30 * 60 * 60 * 1000);
+    expect(WORKER_TOOL_TIMEOUTS_MS.cropExport).toBe(2 * 60 * 60 * 1000);
+    expect(sum).toBe(32 * 60 * 60 * 1000);
     expect(WORKER_REQUEST_CEILING_MS).toBeGreaterThan(sum);
-    expect(WORKER_REQUEST_CEILING_MS).toBe(31 * 60 * 60 * 1000);
+    expect(WORKER_REQUEST_CEILING_MS).toBe(33 * 60 * 60 * 1000);
   });
 });
 

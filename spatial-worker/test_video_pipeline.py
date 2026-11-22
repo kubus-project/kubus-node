@@ -182,6 +182,15 @@ class VideoPipelineTests(unittest.TestCase):
         error = self.assertCode("sfm_failed", FakeTools(sfm_registered=registered))
         self.assertLess(error.details["registrationRatio"], vp.MIN_REGISTRATION_RATIO)
 
+    def test_the_gate_in_force_is_recorded_in_the_sfm_details(self):
+        selected = vp.plan_frames(20.0)[0]
+        result = self.run_pipeline(FakeTools(sfm_registered=selected))
+        self.assertEqual(result["sfm"]["minRegisteredViews"], vp.MIN_VIEWS_FOR_RECONSTRUCTION)
+        self.assertEqual(result["sfm"]["minRegistrationRatio"], vp.MIN_REGISTRATION_RATIO)
+        self.assertFalse(result["sfm"]["gateLowered"])
+        error = self.assertCode("sfm_failed", FakeTools(sfm_registered=vp.MIN_VIEWS_FOR_RECONSTRUCTION - 1))
+        self.assertEqual(error.details["minRegisteredViews"], vp.MIN_VIEWS_FOR_RECONSTRUCTION)
+
     def test_exactly_enough_registration_passes(self):
         selected = vp.plan_frames(20.0)[0]
         registered = int(selected * vp.MIN_REGISTRATION_RATIO) + 1

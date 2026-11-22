@@ -95,8 +95,10 @@ def prepare_photo(source: pathlib.Path, target: pathlib.Path, max_long_side: int
     """Decode `source`, bake its EXIF orientation, downscale, and write a clean JPEG to `target`."""
     from PIL import Image, ImageOps  # present in the worker image; imported lazily so the module imports anywhere
 
-    Image.MAX_IMAGE_PIXELS = MAX_PHOTO_PIXELS
+    Image.MAX_IMAGE_PIXELS = None  # Pillow only warns up to 2x its limit; the bound is enforced explicitly below
     with Image.open(source) as opened:
+        if opened.size[0] * opened.size[1] > MAX_PHOTO_PIXELS:  # the header is read, nothing is decoded yet
+            raise ValueError("photo exceeds the pixel limit")
         opened.load()  # a truncated or corrupt file fails here, not in COLMAP
         exif = opened.getexif()
         orientation = int(exif.get(TAG_ORIENTATION, 1) or 1)
