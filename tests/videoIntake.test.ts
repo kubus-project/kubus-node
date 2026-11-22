@@ -11,7 +11,7 @@ import { VIDEO_MAX_SECONDS, VIDEO_MIN_BYTES } from '../src/captures/videoPackage
 import { parseImportVideoArguments } from '../src/cli/captureImport.js';
 import { JobRuntime } from '../src/jobs/jobRuntime.js';
 import { CapabilityRegistry } from '../src/capabilities/registry.js';
-import { createWorkerAgent, longWorkerFetch, workerFailure } from '../src/spatial/workerClient.js';
+import { WORKER_REQUEST_CEILING_MS, WORKER_TOOL_TIMEOUTS_MS, createWorkerAgent, longWorkerFetch, workerFailure } from '../src/spatial/workerClient.js';
 import { LocalStore } from '../src/state/localStore.js';
 import { syntheticCid } from './fixtures/contentIds.js';
 
@@ -261,16 +261,41 @@ describe('long worker request (N3)', () => {
   });
 });
 
+describe('worker request ceiling', () => {
+  it('sits above the sum of the worker tool timeouts for a video job (30 h)', () => {
+    const sum = Object.values(WORKER_TOOL_TIMEOUTS_MS).reduce((total, ms) => total + ms, 0);
+    expect(sum).toBe(30 * 60 * 60 * 1000);
+    expect(WORKER_REQUEST_CEILING_MS).toBeGreaterThan(sum);
+    expect(WORKER_REQUEST_CEILING_MS).toBe(31 * 60 * 60 * 1000);
+  });
+});
+
 describe('video reconstruction job', () => {
   const WORKER_ID = '44444444-4444-4444-8444-444444444444';
 
-  async function runtime(workerHealth: Record<string, unknown>, onProcess: (body: any, init?: RequestInit) => Promise<Response>) {
+  async function runtime(workerHealth: Record<string, unknown>, onProcess: (body: any, init?: RequestInit) => Promise<Response>, options: { framesCapture?: boolean } = {}) {
     const dir = await tempDir();
     const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
     const captures = new CaptureStore(dir, store);
-    const source = path.join(dir, 'clip.mp4');
-    await fs.writeFile(source, fakeMp4({ durationSeconds: 25 }));
-    const capture = await captures.importVideoFile(source, { artworkId: 'art-1', markerId: 'marker-1' });
+    let capture;
+    if (options.framesCapture) {
+      const frames = Array.from({ length: 24 }, (_, index) => ({
+        index, rgbPath: `rgb/${String(index).padStart(5, '0')}.jpg`, poseTranslation: [index * 0.1, 0, 0], poseRotation: [0, 0, 0, 1],
+        intrinsics: { width: 1920, height: 1080, fx: 1400.5, fy: 1400.5, cx: 960, cy: 540 }, timestampNanos: 1000 + index, depthAvailable: false,
+      }));
+      const jpg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString('base64');
+      capture = await captures.create({
+        schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true },
+        files: [
+          ...frames.map((frame) => ({ path: frame.rgbPath, contentBase64: jpg })),
+          { path: 'frames.json', contentBase64: Buffer.from(JSON.stringify({ schema: 'kubus.capture.frames/1', frames })).toString('base64') },
+        ],
+      });
+    } else {
+      const source = path.join(dir, 'clip.mp4');
+      await fs.writeFile(source, fakeMp4({ durationSeconds: 25 }));
+      capture = await captures.importVideoFile(source, { artworkId: 'art-1', markerId: 'marker-1' });
+    }
     const processBodies: any[] = [];
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
@@ -388,5 +413,20 @@ describe('video reconstruction job', () => {
     const record = Object.values(store.snapshot().spatial ?? {})[0] as { manifest: { captureProvenance: Record<string, any> } };
     expect(record.manifest.captureProvenance.derivation).toMatchObject({ kind: 'video', splatCount: 123456, sfm: { registeredViews: 70 } });
     expect(record.manifest.captureProvenance.derivation.injected).toBeUndefined();
+  }, 20000);
+
+  it('logs the training stage once for a posed-frame job even when the worker reports it too', async () => {
+    const { jobs, capture } = await runtime({ inputModes: ['frames'] }, async (body) => {
+      const output = body.outputDirectory as string;
+      await fs.mkdir(output, { recursive: true });
+      await fs.writeFile(path.join(output, 'worker-progress.json'), JSON.stringify({ stage: 'training', detail: { iterations: 1000 } }));
+      // One watcher poll (2 s) elapses while the request is open.
+      await new Promise((resolve) => setTimeout(resolve, 2300));
+      return new Response(JSON.stringify({ detail: { code: 'sfm_failed', message: 'stop here' } }), { status: 422 });
+    }, { framesCapture: true });
+    const job = await jobs.create('spatial.reconstruct', { captureId: capture.id, artworkId: 'art-1' });
+    await settle(jobs, job.id);
+    const training = jobs.get(job.id).logs.filter((entry) => entry.message.startsWith('Training'));
+    expect(training).toHaveLength(1);
   }, 20000);
 });

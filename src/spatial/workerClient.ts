@@ -15,8 +15,18 @@ import { Agent } from 'undici';
  * headers) keeps a bounded inactivity timeout.
  */
 export const WORKER_BODY_TIMEOUT_MS = 10 * 60 * 1000;
-/** Training allows 24 h and export 2 h; the request may take both plus slack. */
-export const WORKER_REQUEST_CEILING_MS = 27 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+/**
+ * The worker's own per-tool timeouts for one job, worst case: ffmpeg frame
+ * extraction 1 h and `ns-process-data` 3 h (video jobs only), training 24 h,
+ * export 2 h. The request ceiling must sit above their sum, otherwise the Node
+ * aborts with a non-cancel timeout while the worker is still legitimately
+ * running. Keep these in step with `spatial-worker/server.py` and
+ * `spatial-worker/video_pipeline.py`.
+ */
+export const WORKER_TOOL_TIMEOUTS_MS = { extraction: 1 * HOUR_MS, poseSolving: 3 * HOUR_MS, training: 24 * HOUR_MS, export: 2 * HOUR_MS } as const;
+/** Sum of the worker's tool timeouts plus one hour of slack (31 h). */
+export const WORKER_REQUEST_CEILING_MS = Object.values(WORKER_TOOL_TIMEOUTS_MS).reduce((sum, ms) => sum + ms, 0) + HOUR_MS;
 
 export interface WorkerAgentOptions {
   /** 0 disables the headers timeout. */

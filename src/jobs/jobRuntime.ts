@@ -405,7 +405,7 @@ export class JobRuntime {
       if (controller.signal.aborted || this.get(id).state === 'cancelled') return;
       // The worker answers when reconstruction is finished, which is far longer
       // than Node's default five-minute headers timeout allows.
-      const stopWatching = this.watchWorkerProgress(id, outputDirectory);
+      const stopWatching = this.watchWorkerProgress(id, outputDirectory, videoJob ? '' : 'training');
       let response: Response;
       let body: WorkerOutput & { detail?: unknown; error?: string };
       try {
@@ -529,9 +529,13 @@ export class JobRuntime {
    * without inventing percentages. Best effort: an unreadable file is simply
    * not a stage change. Returns a function that stops watching and waits for
    * any in-flight update, so nothing patches the job after the request ends.
+   *
+   * `alreadyLogged` is the stage the caller has already announced, so the first
+   * poll does not repeat it (a frames job is announced as `training` before the
+   * request; a video job keeps the worker's richer first line).
    */
-  private watchWorkerProgress(id: string, outputDirectory: string): () => Promise<void> {
-    let last = '';
+  private watchWorkerProgress(id: string, outputDirectory: string, alreadyLogged = ''): () => Promise<void> {
+    let last = alreadyLogged;
     let pending: Promise<void> = Promise.resolve();
     const poll = async (): Promise<void> => {
       let parsed: { stage?: unknown; detail?: unknown };
