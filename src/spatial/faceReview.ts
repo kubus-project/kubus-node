@@ -128,15 +128,21 @@ export async function removeFaceReviewImages(dataRoot: string, spatialId: string
   }
 }
 
+/** A review folder touched more recently than this is left alone by the sweep: another process may be writing it. */
+export const SWEEP_GRACE_MS = 10 * 60 * 1000;
+
 /**
  * Start-up sweep: removes review copies that nothing needs. `keepFaceReview` copies the flagged images before the
  * record is written, so a process killed in between leaves a directory for an id no record has; a record that was
- * superseded or acknowledged needs none either. Only called before any job runs (a record being made right now
- * would look like an orphan). Returns the directory names it removed. Best effort: what cannot be removed now is
- * retried at the next start.
+ * superseded or acknowledged needs none either. `start` and `gui` are separate processes on one data directory, so
+ * the sweep cannot assume it is the only writer: a folder modified within `graceMs` (default ten minutes) could be
+ * a record being made right now by the other process and is left for the next start. Returns the directory names
+ * it removed. Best effort: what cannot be removed now is retried at the next start.
  */
-export async function sweepOrphanFaceReviews(dataRoot: string, store: LocalStore): Promise<string[]> {
+export async function sweepOrphanFaceReviews(dataRoot: string, store: LocalStore, options: { graceMs?: number; now?: number } = {}): Promise<string[]> {
   const root = path.join(dataRoot, 'private', 'face-review');
+  const graceMs = options.graceMs ?? SWEEP_GRACE_MS;
+  const now = options.now ?? Date.now();
   let names: string[];
   try {
     names = await fs.readdir(root);
@@ -148,6 +154,12 @@ export async function sweepOrphanFaceReviews(dataRoot: string, store: LocalStore
     const record = RECORD_ID.test(name) ? (store.snapshot().spatial?.[name] as StoredWithReview | undefined) : undefined;
     const needed = Boolean(record && record.state !== 'superseded' && record.faceReview && !record.faceReview.acknowledged);
     if (needed) continue;
+    try {
+      const touched = (await fs.lstat(path.join(root, name))).mtimeMs;
+      if (now - touched < graceMs) continue;
+    } catch {
+      continue;
+    }
     try {
       // `rm` removes a link itself and never follows it.
       await fs.rm(path.join(root, name), { recursive: true, force: true });

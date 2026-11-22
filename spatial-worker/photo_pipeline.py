@@ -41,16 +41,15 @@ from video_pipeline import (
     count_registered_views,
     select_video_frames,
     _bounded_env,
-    _float_env,
     _tail,
 )
 
 PHOTO_EXTENSIONS = ("jpg", "jpeg", "png")
 # The Node refuses fewer than 8 at import; the worker repeats the bound for packages that skipped the Node.
-MIN_PHOTOS = int(_float_env("KUBUS_PHOTO_MIN_COUNT", 8))
+MIN_PHOTOS = int(_bounded_env("KUBUS_PHOTO_MIN_COUNT", 8, 3, 400))
 MAX_PHOTOS = 400
 MAX_PHOTO_PIXELS = 200_000_000
-PHOTO_MAX_LONG_SIDE = int(_float_env("KUBUS_PHOTO_MAX_LONG_SIDE", 2048))
+PHOTO_MAX_LONG_SIDE = int(_bounded_env("KUBUS_PHOTO_MAX_LONG_SIDE", 2048, 256, 8192))
 # The photo gate defaults to the video gate; photo sets are small, so an operator may tune it separately.
 PHOTO_MIN_REGISTERED_VIEWS = int(_bounded_env("KUBUS_PHOTO_MIN_REGISTERED_VIEWS", MIN_VIEWS_FOR_RECONSTRUCTION, 3, 100_000))
 PHOTO_MIN_REGISTRATION_RATIO = _bounded_env("KUBUS_PHOTO_MIN_REGISTRATION_RATIO", MIN_REGISTRATION_RATIO, 0.0, 1.0)

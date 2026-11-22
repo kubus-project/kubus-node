@@ -245,6 +245,8 @@ describe('face review of a record', () => {
 
 describe('start-up sweep of review copies', () => {
   const COPY = (dir: string, id: string) => path.join(dir, 'private', 'face-review', id);
+  // The sweep spares anything touched in the last ten minutes; these tests look at it from an hour later.
+  const NOW = { now: Date.now() + 60 * 60 * 1000 };
 
   it('removes copies of a record that was never written, was superseded or was acknowledged, and keeps the ones in use', async () => {
     const { dir, store } = await setup();
@@ -252,25 +254,38 @@ describe('start-up sweep of review copies', () => {
     await fs.mkdir(COPY(dir, OTHER_ID), { recursive: true });
     await fs.writeFile(path.join(COPY(dir, OTHER_ID), 'photos-00001.jpg'), 'orphan');
     await fs.mkdir(COPY(dir, 'not-an-id'), { recursive: true });
-    expect((await sweepOrphanFaceReviews(dir, store)).sort()).toEqual([OTHER_ID, 'not-an-id'].sort());
+    expect((await sweepOrphanFaceReviews(dir, store, NOW)).sort()).toEqual([OTHER_ID, 'not-an-id'].sort());
     await expect(fs.stat(COPY(dir, OTHER_ID))).rejects.toThrow();
     await expect(fs.stat(COPY(dir, 'not-an-id'))).rejects.toThrow();
     // The pending review of a live record keeps its images.
     expect((await fs.stat(COPY(dir, SPATIAL_ID))).isDirectory()).toBe(true);
-    expect(await sweepOrphanFaceReviews(dir, store)).toEqual([]);
+    expect(await sweepOrphanFaceReviews(dir, store, NOW)).toEqual([]);
     expect((await fs.readdir(COPY(dir, SPATIAL_ID))).length).toBeGreaterThan(0);
     // Superseded: no longer needed (the supersede flow removes them too; this is the leftover of an interrupted one).
     await store.update((state) => { (state.spatial![SPATIAL_ID] as { state: string }).state = 'superseded'; });
-    expect(await sweepOrphanFaceReviews(dir, store)).toEqual([SPATIAL_ID]);
+    expect(await sweepOrphanFaceReviews(dir, store, NOW)).toEqual([SPATIAL_ID]);
     await expect(fs.stat(COPY(dir, SPATIAL_ID))).rejects.toThrow();
   });
 
   it('removes the copies of an acknowledged record and is a no-op without a review folder', async () => {
     const { dir, store } = await setup();
     await store.update((state) => { (state.spatial![SPATIAL_ID] as { faceReview: { acknowledged?: unknown } }).faceReview.acknowledged = { at: 'x', by: 'op' }; });
-    expect(await sweepOrphanFaceReviews(dir, store)).toEqual([SPATIAL_ID]);
+    expect(await sweepOrphanFaceReviews(dir, store, NOW)).toEqual([SPATIAL_ID]);
     await fs.rm(path.join(dir, 'private', 'face-review'), { recursive: true, force: true });
+    expect(await sweepOrphanFaceReviews(dir, store, NOW)).toEqual([]);
+  });
+});
+
+describe('start-up sweep of review copies, grace period', () => {
+  it('spares a recently written folder (another process may be making that record) and takes it once it is old', async () => {
+    const { dir, store } = await setup();
+    const fresh = path.join(dir, 'private', 'face-review', OTHER_ID);
+    await fs.mkdir(fresh, { recursive: true });
+    await fs.writeFile(path.join(fresh, 'photos-00001.jpg'), 'being written');
     expect(await sweepOrphanFaceReviews(dir, store)).toEqual([]);
+    expect((await fs.stat(fresh)).isDirectory()).toBe(true);
+    expect(await sweepOrphanFaceReviews(dir, store, { now: Date.now() + 11 * 60 * 1000 })).toEqual([OTHER_ID]);
+    await expect(fs.stat(fresh)).rejects.toThrow();
   });
 });
 
@@ -312,6 +327,7 @@ describe('face review in the GUI routes', () => {
       expect(image.status).toBe(200);
       expect(image.headers.get('content-type')).toBe('image/jpeg');
       expect(image.headers.get('cache-control')).toBe('private, no-store');
+      expect(image.headers.get('x-content-type-options')).toBe('nosniff');
       expect(await image.text()).toBe('masked 0');
       expect((await fetch(url('/face-review/image/..%2Fstate.json'), { headers })).status).toBe(404);
       expect((await fetch(url('/face-review/image/photos-00099.jpg'), { headers })).status).toBe(404);

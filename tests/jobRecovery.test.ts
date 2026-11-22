@@ -53,6 +53,14 @@ it('legacy directories without ownership evidence remain untouched after interru
 it('start removes face-review copies that no record needs (a crash between the copy and the record)', async () => {
  const {jobs, root} = await fixture({owned: false, jobState: 'completed'});
  const orphan = path.join(root, 'private', 'face-review', instance); await fs.mkdir(orphan, {recursive: true}); await fs.writeFile(path.join(orphan, 'photos-00001.jpg'), 'masked');
+ // Left by a process that died long ago (a folder touched in the last minutes may be another process's work in progress).
+ const longAgo = new Date(Date.now() - 20 * 60 * 1000); await fs.utimes(orphan, longAgo, longAgo);
  await jobs.start();
  await expect(fs.stat(orphan)).rejects.toMatchObject({code: 'ENOENT'});
+});
+it('start leaves a recently written face-review folder alone (the other process may be making that record)', async () => {
+ const {jobs, root} = await fixture({owned: false, jobState: 'completed'});
+ const fresh = path.join(root, 'private', 'face-review', instance); await fs.mkdir(fresh, {recursive: true}); await fs.writeFile(path.join(fresh, 'photos-00001.jpg'), 'masked');
+ await jobs.start();
+ expect((await fs.stat(fresh)).isDirectory()).toBe(true);
 });

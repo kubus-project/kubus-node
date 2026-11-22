@@ -253,6 +253,25 @@ class PhotoDatasetTests(unittest.TestCase):
         self.assertFalse(details["gateLowered"])
         self.assertEqual(vp.DEFAULT_MIN_REGISTRATION_RATIO, 0.6)
 
+    def test_intake_knobs_are_bounded_so_zero_or_negative_values_fall_back_to_the_defaults(self):
+        import json as _json
+        import os
+        import subprocess
+        import sys
+
+        knobs = {
+            "KUBUS_PHOTO_MIN_COUNT": "0", "KUBUS_VIDEO_MIN_SECONDS": "-3", "KUBUS_VIDEO_MIN_MEDIAN_SHARPNESS": "0",
+            "KUBUS_VIDEO_MAX_LONG_SIDE": "0", "KUBUS_PHOTO_MAX_LONG_SIDE": "-1", "KUBUS_VIDEO_MIN_TARGET_FRAMES": "0",
+            "KUBUS_VIDEO_MAX_TARGET_FRAMES": "-4", "KUBUS_VIDEO_OVERSAMPLE": "0", "KUBUS_VIDEO_FRAMES_PER_SECOND": "0",
+        }
+        code = "import json, photo_pipeline as p, video_pipeline as v; print(json.dumps([p.MIN_PHOTOS, v.MIN_DURATION_SECONDS, v.MIN_MEDIAN_SHARPNESS, v.MAX_LONG_SIDE, p.PHOTO_MAX_LONG_SIDE, v.MIN_TARGET_FRAMES, v.MAX_TARGET_FRAMES, v.OVERSAMPLE_FACTOR, v.FRAMES_PER_SECOND_TARGET]))"
+        here = os.path.dirname(os.path.abspath(__file__))
+        done = subprocess.run([sys.executable, "-c", code], cwd=here, env={**os.environ, **knobs}, capture_output=True, text=True, check=True)
+        self.assertEqual(_json.loads(done.stdout), [8, 3.0, 3.0, 1920, 2048, 48, 240, 2.5, 3.0])
+        self.assertIn("is outside", done.stderr)
+        lowered = subprocess.run([sys.executable, "-c", code], cwd=here, env={**os.environ, "KUBUS_PHOTO_MIN_COUNT": "5", "KUBUS_VIDEO_MIN_SECONDS": "1"}, capture_output=True, text=True, check=True)
+        self.assertEqual(_json.loads(lowered.stdout)[:2], [5, 1.0])  # a valid lowered value still works
+
     def test_a_non_finite_or_out_of_range_gate_knob_never_disables_the_gate(self):
         for raw in ("nan", "inf", "-inf", "-0.1", "1.5", "abc"):
             with mock.patch.dict("os.environ", {"KUBUS_VIDEO_MIN_REGISTRATION_RATIO": raw}):

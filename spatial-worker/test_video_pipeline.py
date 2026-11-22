@@ -133,6 +133,23 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertEqual(seconds, sorted(seconds))
         self.assertGreaterEqual(seconds[0], 0)
 
+    def test_masked_job_stops_when_the_unmasked_raw_frames_cannot_be_removed(self):
+        from test_face_mask import FakeMasker
+
+        masker = FakeMasker([(40, 30, 90, 80)])
+        order = []
+        with unittest.mock.patch.object(vp, "remove_raw_frames", return_value=False), unittest.mock.patch.object(masker, "detect_detailed", side_effect=lambda *a, **k: (order.append("masked"), [])[1]):
+            with self.assertRaises(vp.WorkerError) as raised:
+                vp.prepare_video_dataset(FakeTools(), self.capture, self.work, lambda stage, detail: self.stages.append((stage, detail)), mask_video=True, masker=masker)
+        self.assertEqual(raised.exception.code, "raw_frames_not_removed")
+        self.assertEqual(order, [], "nothing runs on the frames once the unmasked copies could not be removed")
+        self.assertNotIn("solving_poses", [stage for stage, _ in self.stages])
+
+    def test_unmasked_job_carries_on_when_raw_frames_cannot_be_removed(self):
+        with unittest.mock.patch.object(vp, "remove_raw_frames", return_value=False):
+            result = self.run_pipeline(FakeTools())
+        self.assertIsNone(result["masking"]["video"])
+
     def test_frame_times_follow_the_sampling_rate_and_never_exceed_the_footage_rate(self):
         self.assertEqual(vp.frame_sample_rate(120, 10.0, 30.0), 12.0)
         self.assertEqual(vp.frame_sample_rate(900, 10.0, 30.0), 30.0)

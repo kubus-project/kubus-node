@@ -1010,6 +1010,10 @@ export class CaptureStore {
     onError?: (error: unknown) => void;
   } = {}): { stop(): void } {
     const timer = setInterval(() => {
+      // A tick that finds a sweep still running skips: `reclaimOrphanedDirectories` would join it and hand every
+      // overlapping tick the same count, so one reclaimed directory was reported once per tick (a flake at a 10 ms
+      // interval, double reporting otherwise). The next tick sweeps again.
+      if (this.sweeping) return;
       this.reclaimOrphanedDirectories().then(
         (count) => { if (count > 0) options.onReclaimed?.(count); },
         (error: unknown) => options.onError?.(error),

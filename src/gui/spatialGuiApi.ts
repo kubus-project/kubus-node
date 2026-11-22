@@ -217,7 +217,7 @@ export async function serveFaceReviewImage(
   file: string,
 ): Promise<void> {
   const image = await openFaceReviewImage(deps.dataRoot, deps.store, spatialId, file);
-  res.writeHead(200, { 'Content-Type': image.mimeType, 'Content-Length': String(image.size), 'Cache-Control': 'private, no-store' });
+  res.writeHead(200, { 'Content-Type': image.mimeType, 'Content-Length': String(image.size), 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' });
   // The handle was opened before the record was updated; a read error now only ends this response, never the process.
   pipeline(image.handle.createReadStream(), res, () => undefined);
 }

@@ -69,7 +69,7 @@ const pairingAttempts = new PairingAttemptLimiter();
  * The output of a job whose spatial record was superseded is history too: it carries the retired record's manifest and
  * CIDs, which the 410 of the record route and `purge-superseded` exist to take out of circulation, so it is dropped.
  */
-function withoutMaskingDetail<T extends { maskingDetail?: unknown; output?: unknown }>(job: T, spatial?: Record<string, unknown> | null): T {
+function publicJob<T extends { maskingDetail?: unknown; output?: unknown }>(job: T, spatial?: Record<string, unknown> | null): T {
   let out = job;
   if ('maskingDetail' in out) {
     const { maskingDetail: _private, ...rest } = out;
@@ -557,9 +557,12 @@ async function route(
     const body = await request.body.json(BODY_LIMITS.json);
     return jsonResponse(
       201,
-      await jobs.create(
-        String(body.type || '') as JobType,
-        (body.input && typeof body.input === 'object' ? body.input : {}) as Record<string, unknown>,
+      publicJob(
+        await jobs.create(
+          String(body.type || '') as JobType,
+          (body.input && typeof body.input === 'object' ? body.input : {}) as Record<string, unknown>,
+        ),
+        store.snapshot().spatial as Record<string, unknown> | undefined,
       ),
     );
   }
@@ -568,7 +571,7 @@ async function route(
     const gate = await participationGate.refresh();
     const spatialRecords = store.snapshot().spatial as Record<string, unknown> | undefined;
     const list = jobs.list().map((job) => {
-      const shown = withoutMaskingDetail(job, spatialRecords);
+      const shown = publicJob(job, spatialRecords);
       return gate.leaseEligible || !shown.output ? shown : { ...shown, output: undefined };
     });
     return jsonResponse(200, { jobs: list });
@@ -583,13 +586,14 @@ async function route(
   const cancelMatch = path.match(/^\/local\/v1\/jobs\/([^/]+)\/cancel$/);
   if (method === 'POST' && cancelMatch) {
     if (!(await pairing.authorize(credential, 'jobs:create'))) throw localError(403, 'scope_required');
-    return jsonResponse(200, await jobs.cancel(cancelMatch[1]!));
+    // The cancel of a job that already finished returns that job as stored, so it goes through the same filter as the reads.
+    return jsonResponse(200, publicJob(await jobs.cancel(cancelMatch[1]!), store.snapshot().spatial as Record<string, unknown> | undefined));
   }
 
   const jobMatch = path.match(/^\/local\/v1\/jobs\/([^/]+)$/);
   if (method === 'GET' && jobMatch) {
     const job = jobs.get(jobMatch[1]!);
-    return jsonResponse(200, withoutMaskingDetail(job, store.snapshot().spatial as Record<string, unknown> | undefined));
+    return jsonResponse(200, publicJob(job, store.snapshot().spatial as Record<string, unknown> | undefined));
   }
 
   if (method === 'POST' && path === '/local/v1/compute/candidates') {

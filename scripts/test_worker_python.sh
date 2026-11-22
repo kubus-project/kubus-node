@@ -5,6 +5,9 @@
 #
 #   scripts/test_worker_python.sh [worker-image]   # default: the image `docker build spatial-worker` makes
 #
+# CI passes the image its `docker compose -p kubus-worker-ci build` step just made (kubus-worker-ci-kubus-spatial-worker),
+# so the large nerfstudio-based image is built once per workflow, not twice.
+#
 # The test files are deliberately not copied into the image: the source (modules, weights and tests) is mounted
 # read-only and copied inside, so the run tests the checked-out source on the image's Python and libraries.
 set -euo pipefail
@@ -13,6 +16,10 @@ src="$(cd "$here/../spatial-worker" && pwd)"
 image="${1:-}"
 if [ -z "$image" ]; then
   image="$(docker build --quiet "$src")"
+elif ! docker image inspect "$image" >/dev/null 2>&1; then
+  # Never let `docker run` try to pull a name that was meant to be a local build.
+  echo "worker image '$image' does not exist locally; build it first (docker compose -p kubus-worker-ci build kubus-spatial-worker)" >&2
+  exit 1
 fi
 # MSYS_NO_PATHCONV keeps Git Bash on Windows from rewriting the container paths.
 MSYS_NO_PATHCONV=1 docker run --rm --network none --entrypoint sh -v "$src:/src:ro" "$image" -c '

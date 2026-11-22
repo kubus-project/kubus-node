@@ -57,24 +57,24 @@ def _bounded_env(name: str, default: float, low: float, high: float) -> float:
     return value
 
 
-MIN_DURATION_SECONDS = _float_env("KUBUS_VIDEO_MIN_SECONDS", 3.0)
-MAX_DURATION_SECONDS = _float_env("KUBUS_VIDEO_MAX_SECONDS", 20 * 60.0)
+MIN_DURATION_SECONDS = _bounded_env("KUBUS_VIDEO_MIN_SECONDS", 3.0, 0.5, 3600.0)
+MAX_DURATION_SECONDS = _bounded_env("KUBUS_VIDEO_MAX_SECONDS", 20 * 60.0, 1.0, 24 * 3600.0)
 # Fraction of submitted frames COLMAP must register for the run to proceed.
 # The default ratio. `gateLowered` compares against this constant, never against the env-tunable value.
 DEFAULT_MIN_REGISTRATION_RATIO = 0.6
 MIN_REGISTRATION_RATIO = _bounded_env("KUBUS_VIDEO_MIN_REGISTRATION_RATIO", DEFAULT_MIN_REGISTRATION_RATIO, 0.0, 1.0)
 # A frame is "blurry" when it scores below this fraction of the median score.
-BLUR_RATIO = _float_env("KUBUS_VIDEO_BLUR_RATIO", 0.5)
+BLUR_RATIO = _bounded_env("KUBUS_VIDEO_BLUR_RATIO", 0.5, 0.0, 1.0)
 # Median sharpness below this means the whole clip is soft, not just some frames.
-MIN_MEDIAN_SHARPNESS = _float_env("KUBUS_VIDEO_MIN_MEDIAN_SHARPNESS", 3.0)
+MIN_MEDIAN_SHARPNESS = _bounded_env("KUBUS_VIDEO_MIN_MEDIAN_SHARPNESS", 3.0, 0.1, 1_000_000.0)
 # Mean absolute difference (0-255) between 32x32 thumbnails below which two
 # consecutive frames are the same view.
-DUPLICATE_DIFF = _float_env("KUBUS_VIDEO_DUPLICATE_DIFF", 1.5)
-OVERSAMPLE_FACTOR = _float_env("KUBUS_VIDEO_OVERSAMPLE", 2.5)
-MAX_LONG_SIDE = int(_float_env("KUBUS_VIDEO_MAX_LONG_SIDE", 1920))
-FRAMES_PER_SECOND_TARGET = _float_env("KUBUS_VIDEO_FRAMES_PER_SECOND", 3.0)
-MIN_TARGET_FRAMES = int(_float_env("KUBUS_VIDEO_MIN_TARGET_FRAMES", 48))
-MAX_TARGET_FRAMES = int(_float_env("KUBUS_VIDEO_MAX_TARGET_FRAMES", 240))
+DUPLICATE_DIFF = _bounded_env("KUBUS_VIDEO_DUPLICATE_DIFF", 1.5, 0.0, 255.0)
+OVERSAMPLE_FACTOR = _bounded_env("KUBUS_VIDEO_OVERSAMPLE", 2.5, 1.0, 10.0)
+MAX_LONG_SIDE = int(_bounded_env("KUBUS_VIDEO_MAX_LONG_SIDE", 1920, 256, 8192))
+FRAMES_PER_SECOND_TARGET = _bounded_env("KUBUS_VIDEO_FRAMES_PER_SECOND", 3.0, 0.1, 30.0)
+MIN_TARGET_FRAMES = int(_bounded_env("KUBUS_VIDEO_MIN_TARGET_FRAMES", 48, 8, 800))
+MAX_TARGET_FRAMES = int(_bounded_env("KUBUS_VIDEO_MAX_TARGET_FRAMES", 240, 8, 800))
 MAX_EXTRACTED_FRAMES = 800
 
 Runner = Callable[[list, float], Any]
@@ -420,7 +420,10 @@ def select_video_frames(
         names.append(name)
         if seconds is not None:
             seconds.append(frame_seconds(item["path"], rate))
-    remove_raw_frames(raw)
+    if not remove_raw_frames(raw) and after_selection is not None:
+        # Face masking was asked for, so unmasked extractions that cannot be removed are not left beside the masked copies:
+        # the job stops here and its directory is removed by the cleanup journal.
+        raise WorkerError("raw_frames_not_removed", "The unmasked extracted video frames could not be removed, so the job was stopped")
     if after_selection is not None:
         after_selection(chosen, names)  # for example face masking, before anything reads the frames
     return names, info, selection

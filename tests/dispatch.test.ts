@@ -189,6 +189,37 @@ describe('dispatchLocalRequest', () => {
     expect(retired.output.manifestCid).toBe('QmOLD');
   });
 
+  it('applies the same job filter to the cancel and create responses as to the reads', async () => {
+    const review = { pending: 2, jobId: 'j-old', items: [{ part: 'photos', image: 1, file: 'photos-00001.jpg' }], viewed: [] };
+    await deps.store.update((state) => {
+      state.spatial = {
+        old: { id: 'old', state: 'superseded', manifestCid: 'QmOLD', manifest: { variants: [{ cid: 'QmOLDVARIANT' }] } },
+        pending: { id: 'pending', state: 'local', manifestCid: 'QmPEND', manifest: { variants: [] }, faceReview: review },
+      } as never;
+    });
+    const retired = { id: 'j-old', state: 'completed', maskingDetail: { photos: { needsLook: { images: 2 } } }, output: { id: 'old', manifestCid: 'QmOLD', faceReview: review, manifest: { variants: [{ cid: 'QmOLDVARIANT' }] } } };
+    const reviewing = { id: 'j-pend', state: 'completed', maskingDetail: { photos: { needsLook: { images: 2 } } }, output: { id: 'pending', manifestCid: 'QmPEND', faceReview: review, manifest: { variants: [] } } };
+    deps.jobs = {
+      get: () => retired,
+      list: () => [retired, reviewing],
+      cancel: async (id: string) => (id === 'j-old' ? retired : reviewing),
+      create: async () => reviewing,
+      health: () => ({ running: 0, queued: 0 }),
+    } as never;
+    const post = async (route: string, body: unknown = {}) =>
+      (await dispatchLocalRequest(request({ method: 'POST', path: route, credential: token, body: jsonBody(body) }), deps) as { value: Record<string, any> }).value;
+    const cancelledRetired = await post('/local/v1/jobs/j-old/cancel');
+    expect(cancelledRetired.id).toBe('j-old');
+    expect(JSON.stringify(cancelledRetired)).not.toMatch(/QmOLD|faceReview|maskingDetail|needsLook|manifest/);
+    for (const shown of [await post('/local/v1/jobs/j-pend/cancel'), await post('/local/v1/jobs', { type: 'spatial.reconstruct', input: {} })]) {
+      expect(JSON.stringify(shown)).not.toMatch(/faceReview|maskingDetail|needsLook|photos-00001/);
+      expect(shown.output.manifestCid).toBe('QmPEND');
+    }
+    // The job objects themselves (what the operator's own tools read) are not changed.
+    expect(retired.output.faceReview).toBeDefined();
+    expect(reviewing.maskingDetail).toBeDefined();
+  });
+
   it('never publishes or revives a superseded spatial record', async () => {
     const publishExistingSpatial = vi.fn(async () => ({ requested: true }));
     deps.api = { publishExistingSpatial } as never;
