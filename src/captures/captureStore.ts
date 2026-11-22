@@ -796,7 +796,9 @@ export class CaptureStore {
     const existing = (Object.values(this.store.snapshot().captures || {}) as CaptureRecord[]).find((record) => record.localCaptureId === localCaptureId);
     if (existing) {
       const differs: string[] = [];
-      if (options.capturedBy && options.capturedBy.slice(0, 200) !== existing.capturedBy) differs.push('capturedBy');
+      // Compared the way the value was stored: trimmed, and a label over 200 characters is dropped (stores nothing), not cut.
+      const statedBy = typeof options.capturedBy === 'string' && options.capturedBy.trim() && options.capturedBy.length <= 200 ? options.capturedBy.trim() : undefined;
+      if (statedBy && statedBy !== existing.capturedBy) differs.push('capturedBy');
       if (stated && stated !== (existing.mediaCapturedAt?.photos ?? existing.capturedAt)) differs.push('capturedAt');
       if (differs.length) {
         throw localError(409, 'capture_exists_with_different_provenance', {

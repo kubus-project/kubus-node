@@ -97,7 +97,25 @@ function cleanMaskingPart(value: unknown): Record<string, unknown> | undefined {
   }
   const counts = input.regionsPerImage;
   if (Array.isArray(counts) && counts.length <= 512 && counts.every((entry) => Number.isInteger(entry) && entry >= 0 && entry <= 2000)) out.regionsPerImage = counts;
+  // What a human still has to look at (see `FaceMaskingSummary.needsLook`): counts only.
+  const look = input.needsLook;
+  if (look && typeof look === 'object' && !Array.isArray(look)) {
+    const count = (value: unknown) => (typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 100000 ? value : 0);
+    const raw = look as Record<string, unknown>;
+    out.needsLook = { images: count(raw.images), weakExcluded: count(raw.weakExcluded), largeBelowCertain: count(raw.largeBelowCertain) };
+  }
   return Object.keys(out).length ? out : undefined;
+}
+
+/** How many images of a face-masking record a human still has to look at, over its parts (0 when nothing is flagged). */
+export function maskingNeedsLook(masking: unknown): number {
+  if (!masking || typeof masking !== 'object') return 0;
+  let images = 0;
+  for (const part of ['photos', 'video'] as const) {
+    const look = ((masking as Record<string, unknown>)[part] as { needsLook?: { images?: unknown } } | undefined)?.needsLook;
+    if (look && typeof look.images === 'number') images += look.images;
+  }
+  return images;
 }
 
 /**
@@ -797,9 +815,13 @@ export class JobRuntime {
     if (crop?.applied === true && typeof crop.splatsBefore === 'number' && typeof crop.splatsAfter === 'number') {
       parts.push(`floater crop kept ${crop.splatsAfter} of ${crop.splatsBefore} splats`);
     }
-    if (parts.length === 0) return;
+    const toLook = maskingNeedsLook(derivation.faceMasking);
+    if (parts.length === 0 && toLook === 0) return;
     await this.patchJob(id, (current) => {
-      current.logs.push({ at: new Date().toISOString(), level: 'info', message: parts.join('; ') });
+      const at = new Date().toISOString();
+      if (parts.length) current.logs.push({ at, level: 'info', message: parts.join('; ') });
+      // Face masking is tuned for recall but a run cannot decide everything; say so where the operator reads the job.
+      if (toLook) current.logs.push({ at, level: 'warn', message: `Face masking left ${toLook} image(s) a human has to look at (large detections it did not mask: a person close to the camera, or a painted head); look at them before this record is published` });
     }).catch(() => undefined);
   }
 

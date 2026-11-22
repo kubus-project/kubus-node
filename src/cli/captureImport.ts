@@ -325,6 +325,9 @@ export async function runSpatialCommand(args: string[], config: AppConfig): Prom
   if (answer === 'unreachable') throw new Error('No running Node answered; start it and try again');
   if (answer.status !== 200 || !answer.envelope.data) fail(answer.envelope, answer.status);
   console.log(JSON.stringify(answer.envelope.data, null, 2));
+  if (Array.isArray((answer.envelope.data as { warnings?: unknown }).warnings) && ((answer.envelope.data as { warnings: unknown[] }).warnings).includes('replacement_not_face_masked')) {
+    console.error('Warning: the replacing record does not record face masking; check that it is not another record that shows faces.');
+  }
 }
 
 export async function runCaptureCommand(args: string[], config: AppConfig, logger: Logger): Promise<void> {

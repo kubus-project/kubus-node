@@ -26,6 +26,18 @@ export interface SupersedeResult {
    * `kubus-node spatial purge-superseded` to remove exactly these blocks. Absent when the store could not be asked.
    */
   blocksStillStored?: number;
+  /**
+   * Things the operator should know about the replacement. `replacement_not_face_masked`: the replacing record does
+   * not say that faces were masked (`processing.faceMasking.ran`), so retiring a record for its faces may have
+   * replaced it with another that shows them. Superseding stays the operator's decision; this only says so.
+   */
+  warnings?: string[];
+}
+
+/** Does the manifest's derivation record that face masking ran? */
+function maskedManifest(manifest: SpatialManifest): boolean {
+  const derivation = (manifest as { captureProvenance?: { derivation?: { faceMasking?: { ran?: unknown } } } }).captureProvenance?.derivation;
+  return derivation?.faceMasking?.ran === true;
 }
 
 /**
@@ -94,5 +106,10 @@ export async function supersedeSpatialRecord(
       blocksStillStored = undefined;
     }
   }
-  return { id: oldId, state: 'superseded', supersededBy: newId, released, ...(blocksStillStored !== undefined ? { blocksStillStored } : {}) };
+  const warnings = maskedManifest(replacement.manifest) ? [] : ['replacement_not_face_masked'];
+  return {
+    id: oldId, state: 'superseded', supersededBy: newId, released,
+    ...(blocksStillStored !== undefined ? { blocksStillStored } : {}),
+    ...(warnings.length ? { warnings } : {}),
+  };
 }

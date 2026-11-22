@@ -53,6 +53,12 @@ export interface FaceMaskingSummary {
   regionsPerImage: number[];
   manualAdded: number;
   manualExcluded: number;
+  /**
+   * What the masking run left for a human to look at, summed from the report's per-image `needsLook` (a weaker
+   * detection swallowed by an exclude box that the reviewer did not acknowledge with `expectWeak`, a large
+   * detection that was not masked). `images` is how many images carry one. Zero means the report flagged nothing.
+   */
+  needsLook: { images: number; weakExcluded: number; largeBelowCertain: number };
 }
 
 export interface CaptureFaceMasking {
@@ -132,7 +138,8 @@ export function summariseReport(report: unknown, photoHashes: string[]): FaceMas
   }
   if (!Array.isArray(report.images)) throw new FaceMaskingReportError('face_masking_report_invalid', 'The face-masking report lists no images');
   // Each imported file must be one the report lists, once per occurrence (identical files may repeat).
-  const pool = new Map<string, Array<{ regions: number; manualAdded: number; manualExcluded: number }>>();
+  type Entry = { regions: number; manualAdded: number; manualExcluded: number; weakExcluded: number; largeBelowCertain: number };
+  const pool = new Map<string, Entry[]>();
   for (const item of report.images) {
     if (!isRecord(item) || typeof item.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(item.sha256)) {
       throw new FaceMaskingReportError('face_masking_report_invalid', 'A face-masking report entry has no SHA-256');
@@ -143,7 +150,8 @@ export function summariseReport(report: unknown, photoHashes: string[]): FaceMas
     }
     const count = (value: unknown) => (typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= MAX_REGIONS_PER_IMAGE ? value : 0);
     const list = pool.get(item.sha256) ?? [];
-    list.push({ regions, manualAdded: count(item.manualAdded), manualExcluded: count(item.manualExcluded) });
+    const look = isRecord(item.needsLook) ? item.needsLook : {};
+    list.push({ regions, manualAdded: count(item.manualAdded), manualExcluded: count(item.manualExcluded), weakExcluded: count(look.weakExcluded), largeBelowCertain: count(look.largeBelowCertain) });
     pool.set(item.sha256, list);
   }
   if (report.images.length !== photoHashes.length) {
@@ -152,12 +160,16 @@ export function summariseReport(report: unknown, photoHashes: string[]): FaceMas
   const regionsPerImage: number[] = [];
   let manualAdded = 0;
   let manualExcluded = 0;
+  const needsLook = { images: 0, weakExcluded: 0, largeBelowCertain: 0 };
   for (const hash of photoHashes) {
     const entry = pool.get(hash)?.shift();
     if (!entry) throw new FaceMaskingReportError('face_masking_report_mismatch', 'A photo is not covered by the face-masking report (it was changed after masking, or never masked)');
     regionsPerImage.push(entry.regions);
     manualAdded += entry.manualAdded;
     manualExcluded += entry.manualExcluded;
+    needsLook.weakExcluded += entry.weakExcluded;
+    needsLook.largeBelowCertain += entry.largeBelowCertain;
+    if (entry.weakExcluded || entry.largeBelowCertain) needsLook.images += 1;
   }
   const clip = (value: unknown, limit = 120) => (typeof value === 'string' ? value.slice(0, limit) : undefined);
   const threshold = typeof detector.scoreThreshold === 'number' && Number.isFinite(detector.scoreThreshold) ? detector.scoreThreshold : undefined;
@@ -176,6 +188,7 @@ export function summariseReport(report: unknown, photoHashes: string[]): FaceMas
     regionsPerImage,
     manualAdded,
     manualExcluded,
+    needsLook,
   };
 }
 

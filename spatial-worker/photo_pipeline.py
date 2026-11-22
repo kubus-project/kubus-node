@@ -114,11 +114,12 @@ def prepare_photo(source: pathlib.Path, target: pathlib.Path, max_long_side: int
         icc = opened.info.get("icc_profile")
         image, _ = to_srgb(upright.convert("RGB"), icc)  # a Display P3 photo is read as sRGB by everything downstream
     regions = 0
+    review: dict = {}
     if masker is not None:
         import numpy as np
 
         try:
-            masked, regions = masker.mask_array(np.asarray(image))
+            masked, regions = masker.mask_array(np.asarray(image), review=review)
         except Exception as error:
             raise FaceMaskingError("face masking failed on an image") from error
         image = Image.fromarray(masked)
@@ -144,6 +145,7 @@ def prepare_photo(source: pathlib.Path, target: pathlib.Path, max_long_side: int
         "sourceWidth": width, "sourceHeight": height,
         "orientationApplied": orientation != 1,
         "maskedRegions": regions,
+        "maskReview": review,
         "camera": " ".join(part for part in (make, model) if part) or "unknown",
     }
 
@@ -151,7 +153,8 @@ def prepare_photo(source: pathlib.Path, target: pathlib.Path, max_long_side: int
 def prepare_photos(paths: list, destination: pathlib.Path, prefix: str = "photo", masker: FaceMasker | None = None) -> tuple:
     """Prepare every photo; returns (names written, statistics). Unreadable files are dropped and counted.
 
-    With a `masker`, the statistics carry `maskedRegions`: the region count of each written photo, in order.
+    With a `masker`, the statistics carry `maskedRegions` (the region count of each written photo, in order) and
+    `maskedReview` (what a human has to look at in each, see `face_mask.FaceMasker.find_regions`).
     """
     destination.mkdir(parents=True, exist_ok=True)
     names: list = []
@@ -159,6 +162,7 @@ def prepare_photos(paths: list, destination: pathlib.Path, prefix: str = "photo"
     rotated = 0
     unreadable = 0
     regions: list = []
+    reviews: list = []
     for path in paths:
         name = f"{prefix}_{len(names):05d}.jpg"
         try:
@@ -172,6 +176,7 @@ def prepare_photos(paths: list, destination: pathlib.Path, prefix: str = "photo"
             continue
         names.append(name)
         regions.append(facts["maskedRegions"])
+        reviews.append(facts["maskReview"])
         rotated += 1 if facts["orientationApplied"] else 0
         cameras[facts["camera"]] = cameras.get(facts["camera"], 0) + 1
     stats = {
@@ -180,6 +185,7 @@ def prepare_photos(paths: list, destination: pathlib.Path, prefix: str = "photo"
     }
     if masker is not None:
         stats["maskedRegions"] = regions
+        stats["maskedReview"] = reviews
     return names, stats
 
 
@@ -322,13 +328,14 @@ def prepare_photo_dataset(
     video_info: dict | None = None
     frame_stats: dict | None = None
     video_regions: list | None = None
+    video_review: list = []
     if include_video:
         video_names, video_info, frame_stats = select_video_frames(runner, capture, work, progress, images, prefix="video")
         if mask_video:
             from face_mask import mask_frame_sequence
 
             progress("masking_faces", {"images": len(video_names)})
-            video_regions = mask_frame_sequence(masker, images, video_names)
+            video_regions = mask_frame_sequence(masker, images, video_names, review=video_review)
         groups.append((video_names, True))
     submitted = len(names) + (len(groups[1][0]) if include_video else 0)
     progress("solving_poses", {"frames": frame_stats or {}, "photos": {"submitted": len(names)}})
@@ -341,5 +348,9 @@ def prepare_photo_dataset(
     except (OSError, ValueError):
         has_points = False
     sfm["sparsePointsInitialisation"] = has_points and (dataset / "sparse_pc.ply").is_file()
-    masking = {"photos": photo_stats.get("maskedRegions") if mask_photos else None, "video": video_regions, "version": masker.version if masker else None}
+    masking = {
+        "photos": photo_stats.get("maskedRegions") if mask_photos else None, "photosReview": photo_stats.get("maskedReview") if mask_photos else None,
+        "video": video_regions, "videoReview": video_review if video_regions is not None else None,
+        "version": masker.version if masker else None,
+    }
     return {"dataset": dataset, "photos": photo_stats, "video": video_info, "frames": frame_stats, "sfm": sfm, "masking": masking}

@@ -9,7 +9,7 @@ import { PHOTO_MIN_BYTES } from '../src/captures/photoPackage.js';
 import { VIDEO_MIN_BYTES } from '../src/captures/videoPackage.js';
 import { parseAddVideoArguments, parseImportPhotosArguments, parseImportVideoArguments, parseProcessArguments, parseSupersedeArguments } from '../src/cli/captureImport.js';
 import { CapabilityRegistry } from '../src/capabilities/registry.js';
-import { faceMaskingProvenance, JobRuntime, missingMasking, noteNamesOperator, publicDerivation } from '../src/jobs/jobRuntime.js';
+import { faceMaskingProvenance, JobRuntime, maskingNeedsLook, missingMasking, noteNamesOperator, publicDerivation } from '../src/jobs/jobRuntime.js';
 import { ManagedPins, canonicalPinCid } from '../src/ipfs/managedPins.js';
 import { supersedeSpatialRecord } from '../src/spatial/supersede.js';
 import { findSupersededContent, purgeSupersededContent, warnAboutSupersededContent } from '../src/spatial/supersededBlocks.js';
@@ -116,6 +116,15 @@ describe('premasked photo report', () => {
     // The counts follow the order the photos are imported in, not the order of the report.
     const reordered = summariseReport(reportFor(files, [2, 0, 1]), [sha(files[2]!), sha(files[0]!), sha(files[1]!)]);
     expect(reordered.regionsPerImage).toEqual([1, 2, 0]);
+  });
+
+  it('records what the report left for a human to look at, summed, and zero when it flagged nothing', () => {
+    const hashes = files.map(sha);
+    expect(summariseReport(reportFor(files, [1, 0, 0]), hashes).needsLook).toEqual({ images: 0, weakExcluded: 0, largeBelowCertain: 0 });
+    const flagged = reportFor(files, [1, 0, 0]);
+    (flagged.images[0] as Record<string, unknown>).needsLook = { weakExcluded: 1 };
+    (flagged.images[2] as Record<string, unknown>).needsLook = { weakExcluded: 2, largeBelowCertain: 1 };
+    expect(summariseReport(flagged, hashes).needsLook).toEqual({ images: 2, weakExcluded: 3, largeBelowCertain: 1 });
   });
 
   it('refuses a report that is not for exactly these files', () => {
@@ -387,6 +396,38 @@ describe('masking in the job and the record', () => {
     expect(clean.photos.source).toBe('worker');
   });
 
+  it('keeps what a worker part says a human should look at, as counts only', () => {
+    const look = { images: 2, largeBelowCertain: 3, coordinates: [[1, 2]] };
+    const kept = faceMaskingProvenance({ kind: 'photos', faceMasking: { photos: 'worker' } }, { faceMasking: { photos: { ...part(9), needsLook: look } } }) as any;
+    expect(kept.photos.needsLook).toEqual({ images: 2, weakExcluded: 0, largeBelowCertain: 3 });
+    expect(maskingNeedsLook(kept)).toBe(2);
+    expect(maskingNeedsLook({ ran: true, photos: { needsLook: { images: 1 } }, video: { needsLook: { images: 4 } } })).toBe(5);
+    expect(maskingNeedsLook(undefined)).toBe(0);
+    expect(maskingNeedsLook({ ran: true, photos: { images: 9 } })).toBe(0);
+  });
+
+  it('warns in the job log when masking left images for a human, keeps it out of the pinned manifest', async () => {
+    const { dir, store, captures, jobs } = await setup({ report: () => ({ photos: { ...part(9), needsLook: { images: 2, largeBelowCertain: 3 } } }) });
+    await writePhotos(path.join(dir, 'a'), 9);
+    const capture = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1' });
+    const job = await jobs.create('spatial.reconstruct', { captureId: capture.id });
+    await settle(jobs, job.id);
+    const finished = jobs.get(job.id) as any;
+    expect(finished.state).toBe('completed');
+    expect(finished.logs.some((entry: { level: string; message: string }) => entry.level === 'warn' && /2 image\(s\) a human has to look at/.test(entry.message))).toBe(true);
+    expect(finished.maskingDetail.photos.needsLook).toMatchObject({ images: 2, largeBelowCertain: 3 });
+    expect(JSON.stringify(records(store)[0]!.manifest)).not.toMatch(/needsLook|largeBelowCertain/);
+  });
+
+  it('does not warn when masking flagged nothing', async () => {
+    const { dir, captures, jobs } = await setup({ report: () => ({ photos: { ...part(9), needsLook: { images: 0, largeBelowCertain: 0 } } }) });
+    await writePhotos(path.join(dir, 'a'), 9);
+    const capture = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1' });
+    const job = await jobs.create('spatial.reconstruct', { captureId: capture.id });
+    await settle(jobs, job.id);
+    expect((jobs.get(job.id) as any).logs.some((entry: { level: string }) => entry.level === 'warn')).toBe(false);
+  });
+
   it('numbers a masked re-run as a face_masking revision of the unmasked record, with the operator note', async () => {
     const { dir, store, captures, jobs } = await setup();
     await writePhotos(path.join(dir, 'a'), 9);
@@ -504,6 +545,12 @@ describe('masking in the job and the record', () => {
     await expect(captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1', capturedBy: 'handle-one', capturedAt: '2026-08-18T03:59:31Z' }))
       .rejects.toMatchObject({ code: 'capture_exists_with_different_provenance', details: { differs: ['capturedAt'] } });
     expect(captures.get(first.id).capturedBy).toBe('handle-one');
+    // The label is compared the way it was stored: padding around it is not a different operator.
+    const padded = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1', capturedBy: '  handle-one 	' });
+    expect(padded.id).toBe(first.id);
+    // A label over 200 characters is dropped on import (it stores nothing), so stating one cannot differ from it.
+    const overlong = await captures.importPhotoDirectory(path.join(dir, 'a'), { artworkId: 'art-1', capturedBy: 'x'.repeat(201) });
+    expect(overlong.id).toBe(first.id);
     const job = await jobs.create('spatial.reconstruct', { captureId: first.id });
     await settle(jobs, job.id);
     expect(records(store)[0]!.manifest.captureProvenance.derivation.faceMasking.photos.weightsPinned).toBe(true);
@@ -587,6 +634,19 @@ describe('superseding a spatial record', () => {
     expect(spatial.next!.state).toBe('local');
     expect(store.snapshot().managedPins![canonicalPinCid(oldCids.splat)]).toMatchObject({ state: 'released' });
     expect(store.snapshot().managedPins![canonicalPinCid(newCids.splat)]).toMatchObject({ state: 'pinned' });
+  });
+
+  it('says so when the replacement does not record face masking, and stays quiet when it does', async () => {
+    const { store, kubo } = await stateWithTwoRecords();
+    const unmasked = await supersedeSpatialRecord({ store, kubo: kubo as never }, 'old', 'next');
+    expect(unmasked.warnings).toEqual(['replacement_not_face_masked']);
+    const again = await stateWithTwoRecords();
+    await again.store.update((state) => {
+      const next = (state.spatial as Record<string, { manifest: { captureProvenance: Record<string, unknown> } }>).next!;
+      next.manifest.captureProvenance.derivation = { faceMasking: { ran: true } };
+    });
+    const masked = await supersedeSpatialRecord({ store: again.store, kubo: again.kubo as never }, 'old', 'next');
+    expect(masked).not.toHaveProperty('warnings');
   });
 
   it('is idempotent and refuses unsuitable replacements', async () => {

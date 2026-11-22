@@ -32,15 +32,23 @@ sets after looking at the image. A box covering more than a third of the image n
 `"allowLarge": true`. Nothing about a face is stored except the number of regions per
 image.
 
-Two things a run cannot decide are reported for a human to look at, never silently dropped:
-a detection that is not near-certain but lies inside an exclude box (`weakExcluded`: a real,
-turned or occluded face next to a painted one would stay unmasked), and a large detection that
-failed the near-certain test and so was not masked (`largeBelowCertain`: a close-up, hatted or
-sunglassed face scores below 0.9). Both are counted per image in the report (`needsLook`), listed
-under `review` and printed by the command line. An exclude entry may state `"expectWeak": n` once
-the reviewer has looked, and then the run fails if the count differs. Video frames also get a
-neighbour check (`mask_frame_sequence`): a face region that the frame before and the frame after
-both have, and the frame between does not, is masked in the frame between.
+A large face (wider than 12 percent of the short side) is masked only when near-certain (score 0.9 or more
+with a face-shaped layout): the coarse passes that see large faces also score walls, and above all the painted
+heads of the artwork itself, at 0.7 to 0.9, and a patch over a painted head destroys what is being captured
+(measured on the six Head of Flowers sets: masking large detections from 0.7 patched whole painted heads and
+added 46 regions in four of the six). Two things a run cannot decide are therefore reported for a human to
+look at, never silently dropped: a detection that is not near-certain but lies inside an exclude box
+(`weakExcluded`: a real, turned or occluded face next to a painted one would stay unmasked), and a large
+detection of any score from 0.4 that failed the near-certain test and so was not masked (`largeBelowCertain`:
+a close-up, hatted or sunglassed face scores lower, but so does a painted head or a wall). Both are counted per image, in the command line's report
+(`needsLook`, listed under `review` and printed to stderr) and, for the worker, in the job's `faceMasking`
+provenance (`needsLook`: the number of images and of detections), where a human looks before anything is
+published. An exclude entry may state `"expectWeak": n` once the reviewer has looked, and then the run fails
+if the count differs. Video frames also get a neighbour check (`mask_frame_sequence`): a face region that the
+frame before and the frame after both have, and the frame between does not, is masked in the frame between.
+Its limits: it fills only a one-frame gap between two frames that both have the region (two misses in a row,
+a miss at the first or the last frame, and a face seen in one frame only are not covered), and it relies on
+the selected frames being temporal neighbours.
 
 Command line (also used from the Node's operator documentation):
 
@@ -77,8 +85,9 @@ STRONG_SCORE = float(os.environ.get("KUBUS_FACE_STRONG_SCORE", "0.7"))
 # A weak detection must also be a believable size in the full photo: not a speck of texture (below WEAK_MIN_WIDTH
 # pixels, too small to identify anyone).
 WEAK_MIN_WIDTH = 28
-# A face wider than LARGE_FRACTION of the photo's short side is found only by the coarsest passes, where a
-# plain wall can score 0.8; there it must be near-certain and have a face-shaped layout.
+# A face wider than LARGE_FRACTION of the photo's short side is found only by the coarsest passes, where a plain
+# wall, or a painted head, can score 0.8; there it must be near-certain (LARGE_MIN_SCORE and a face-shaped layout)
+# to be masked. A large detection that is not is counted for a human to look at (`largeBelowCertain`).
 LARGE_FRACTION = 0.12
 LARGE_MIN_SCORE = 0.9
 # An exclude box drops a detection only when its centre lies inside and at least this share of the detection's
@@ -290,11 +299,11 @@ class FaceMasker:
                 if max(w, h) > MAX_INPUT_FACE:
                     continue
                 native = w / scale
-                if native > LARGE_FRACTION * short_side and not (score >= LARGE_MIN_SCORE and plausible_layout(row)):
-                    if skipped is not None and score >= STRONG_SCORE:
+                layout = plausible_layout(row)
+                if native > LARGE_FRACTION * short_side and not (score >= LARGE_MIN_SCORE and layout):
+                    if skipped is not None:  # any score the detector returned (from the 0.4 threshold)
                         skipped.append((offset_x + x / scale, offset_y + y / scale, offset_x + (x + w) / scale, offset_y + (y + h) / scale, score))
                     continue
-                layout = plausible_layout(row)
                 if score < STRONG_SCORE and not (layout and native >= WEAK_MIN_WIDTH):
                     continue
                 boxes.append((offset_x + x / scale, offset_y + y / scale, offset_x + (x + w) / scale, offset_y + (y + h) / scale, score, bool(score >= LARGE_MIN_SCORE and layout)))
@@ -324,7 +333,7 @@ class FaceMasker:
                 tile = bgr[top:min(height, top + TILE_SIZE), left:min(width, left + TILE_SIZE)]
                 boxes += self._faces(tile, 1.0, left, top, min(width, height))
         merged = merge_detections(boxes)
-        # Large, convincing-but-not-certain detections that were not masked, once per face and not where a mask already is.
+        # Large detections that were not masked (not near-certain), once per face and not where a mask already is.
         unmasked = [box for box, _ in merge_detections(self._large_skipped)
                     if not any(_iou(box, kept) >= MERGE_IOU or _overlap_of_smaller(box, kept) >= MERGE_CONTAINED for kept, _ in merged)]
         self.last_review = {"largeBelowCertain": len(unmasked)}
@@ -339,7 +348,7 @@ class FaceMasker:
         not raised but appended there as {"box", "strongExcluded", "expectStrong", "weakExcluded", "expectWeak", "ok"}
         for every box, so a reviewer can see what each one swallowed. `review`, when given, receives the counts a human
         should look at: `weakExcluded` (weaker detections swallowed by an exclude box that did not state `expectWeak`)
-        and `largeBelowCertain` (large detections that were not masked because they were not near-certain).
+        and `largeBelowCertain` (large detections of score 0.4 or more that were not masked because they were not near-certain).
         """
         height, width = rgb.shape[:2]
         manual = manual or {}
@@ -388,6 +397,15 @@ def fill_regions(rgb: Any, regions: list) -> Any:
     return out
 
 
+def needs_look(reviews: list | None) -> dict:
+    """What a human has to look at after a run, from the per-image review counts: images and detections."""
+    reviews = reviews or []
+    return {
+        "images": sum(1 for item in reviews if any(item.get(key) for key in ("weakExcluded", "largeBelowCertain"))),
+        "largeBelowCertain": sum(int(item.get("largeBelowCertain", 0)) for item in reviews),
+    }
+
+
 def summarise(counts: list, photo_images: int = 0, extra: dict | None = None, version: dict | None = None) -> dict:
     """The record of a masking run for provenance: no coordinates, just counts."""
     histogram: dict = {}
@@ -420,9 +438,9 @@ def masking_provenance(masking: dict | None) -> dict | None:
     out: dict = {}
     photos, video = masking.get("photos"), masking.get("video")
     if photos is not None:
-        out["photos"] = summarise(photos, photo_images=len(photos), version=masking["version"])
+        out["photos"] = summarise(photos, photo_images=len(photos), version=masking["version"], extra={"needsLook": needs_look(masking.get("photosReview"))})
     if video is not None:
-        out["video"] = summarise(video, version=masking["version"])
+        out["video"] = summarise(video, version=masking["version"], extra={"needsLook": needs_look(masking.get("videoReview"))})
     return out or None
 
 
@@ -473,13 +491,15 @@ def carry_over(regions_per_frame: list) -> list:
     return added
 
 
-def mask_frame_sequence(masker: "FaceMasker", directory: pathlib.Path, names: list, progress: Callable[[int, int], None] | None = None) -> list:
+def mask_frame_sequence(masker: "FaceMasker", directory: pathlib.Path, names: list, progress: Callable[[int, int], None] | None = None, review: list | None = None) -> list:
     """Masks the frames of a video, in order, with a neighbour check; returns the region count of each frame.
 
-    Every frame is analysed on its own (nothing is written yet), then each frame is filled with its own regions plus
-    those `carry_over` adds, so a face the detector missed in one frame of a run of frames that have it is still
-    masked. The files are rewritten only after every frame was analysed, and a failure leaves none of them half done
-    for the caller to use (the job stops).
+    Every frame is analysed on its own (nothing is written yet; an analysis failure leaves every file as it was),
+    then each frame is filled with its own regions plus those `carry_over` adds, so a face the detector missed in
+    one frame of a run of frames that have it is still masked. The write phase rewrites the files one by one: a
+    failure in it (disk full, an encode error) can leave some frames masked and some not in `directory`, and the
+    error is raised so the job stops and nothing in it is used. `carry_over` has limits, see the module docstring.
+    With `review` (a list) each frame's `find_regions` review counts are appended to it, in order.
     """
     import numpy as np
     from PIL import Image
@@ -488,7 +508,10 @@ def mask_frame_sequence(masker: "FaceMasker", directory: pathlib.Path, names: li
     for index, name in enumerate(names):
         with Image.open(directory / name) as opened:
             image = opened.convert("RGB")
-        found.append(masker.find_regions(np.asarray(image)))
+        frame_review: dict = {}
+        found.append(masker.find_regions(np.asarray(image), review=frame_review))
+        if review is not None:
+            review.append(frame_review)
         if progress:
             progress(index + 1, len(names) * 2)
     extra = carry_over(found)

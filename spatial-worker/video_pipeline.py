@@ -371,6 +371,7 @@ def prepare_video_dataset(runner: Runner, capture: pathlib.Path, work: pathlib.P
     holds the region count of each frame and the detector's version.
     """
     regions: list | None = None
+    review: list = []
     if mask_video:
         from face_mask import FaceMasker, mask_frame_sequence
 
@@ -379,7 +380,7 @@ def prepare_video_dataset(runner: Runner, capture: pathlib.Path, work: pathlib.P
         def mask_selected(directory: pathlib.Path, selected: list) -> None:
             nonlocal regions
             progress("masking_faces", {"images": len(selected)})
-            regions = mask_frame_sequence(masker, directory, selected)
+            regions = mask_frame_sequence(masker, directory, selected, review=review)
 
         names, info, selection = select_video_frames(runner, capture, work, progress, after_selection=mask_selected)
     else:
@@ -390,4 +391,4 @@ def prepare_video_dataset(runner: Runner, capture: pathlib.Path, work: pathlib.P
     sfm = run_structure_from_motion(runner, chosen, dataset, len(names))
     sfm["tool"] = "colmap"
     sfm["toolVersion"] = colmap_version(runner)
-    return {"dataset": dataset, "video": info, "frames": selection, "sfm": sfm, "masking": {"photos": None, "video": regions, "version": masker.version if mask_video else None}}
+    return {"dataset": dataset, "video": info, "frames": selection, "sfm": sfm, "masking": {"photos": None, "video": regions, "videoReview": review if regions is not None else None, "version": masker.version if mask_video else None}}

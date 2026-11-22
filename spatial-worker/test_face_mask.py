@@ -98,6 +98,89 @@ class Geometry(unittest.TestCase):
         self.assertLessEqual(fm.grow_box((10, 10, 24, 24), 25, 25)[2], 25)
 
 
+class StubDetector:
+    """Stands in for cv2.FaceDetectorYN: returns the rows it was given for every input."""
+
+    def __init__(self, rows):
+        self.rows = np.array(rows, dtype=np.float32).reshape(-1, 15)
+
+    def setInputSize(self, size):
+        pass
+
+    def detect(self, bgr):
+        return 1, self.rows
+
+
+class LargeFaces(unittest.TestCase):
+    """A large face (over 12 percent of the short side) is found by the coarse passes only, where walls and painted
+    heads also score 0.8. It is masked only when near-certain (0.9 with a face-shaped layout); every other large
+    detection from the 0.4 threshold is counted for a human, never dropped silently."""
+
+    def masker(self, rows):
+        masker = FakeMasker()
+        masker._detector = StubDetector(rows)
+        masker._large_skipped = []
+        return masker
+
+    def run_faces(self, masker, width=400, height=300):
+        bgr = np.zeros((height, width, 3), dtype=np.uint8)
+        return masker._faces(bgr, 1.0, 0, 0, min(width, height))
+
+    @staticmethod
+    def face(score, layout=True, at=(0, 0)):
+        row = Geometry().row()
+        if not layout:
+            row = [0, 0, 100, 100, 10, 90, 20, 10, 80, 20, 90, 90, 15, 50, 0.5]
+        row[0], row[1], row[14] = at[0], at[1], score
+        return row
+
+    def test_a_large_detection_of_score_0_95_with_a_layout_is_masked_and_near_certain(self):
+        masker = self.masker([self.face(0.95)])
+        boxes = self.run_faces(masker)
+        self.assertEqual(len(boxes), 1)
+        self.assertTrue(boxes[0][5])
+        self.assertEqual(masker._large_skipped, [])
+
+    def test_a_large_detection_of_score_0_8_is_not_masked_but_counted(self):
+        # A painted head or a wall at the coarse passes: masking it would patch the artwork.
+        for layout in (True, False):
+            masker = self.masker([self.face(0.8, layout=layout)])
+            self.assertEqual(self.run_faces(masker), [])
+            self.assertEqual(len(masker._large_skipped), 1)
+
+    def test_the_whole_band_from_the_threshold_is_counted(self):
+        masker = self.masker([self.face(0.42, layout=False), self.face(0.55), self.face(0.65, at=(200, 100))])
+        self.assertEqual(self.run_faces(masker), [])
+        self.assertEqual(len(masker._large_skipped), 3)
+
+    def test_a_small_weak_detection_without_a_layout_is_dropped_without_counting(self):
+        # Not large: wall texture at the native scale is not something a human is asked to look at.
+        row = self.face(0.5, layout=False)
+        row[2] = row[3] = 20
+        masker = self.masker([row])
+        self.assertEqual(self.run_faces(masker, 1200, 900), [])
+        self.assertEqual(masker._large_skipped, [])
+
+    def test_the_worker_path_counts_what_it_does_not_mask(self):
+        # The path prepare_photo and mask_frame_sequence use: no manual list, a review dict that reaches the summary.
+        class Rows(fm.FaceMasker):
+            def __init__(self, rows):
+                self.version = FakeMasker().version
+                self._detector = StubDetector(rows)
+                self._cv2 = __import__("cv2")
+
+        image = noisy(400, 300)
+        masker = Rows([LargeFaces.face(0.95), LargeFaces.face(0.8, layout=False, at=(250, 150))])
+        review = {}
+        with mock.patch.object(fm, "WHOLE_IMAGE_SIDES", (400,)):  # one whole-image pass and one tile: same rows, merged
+            masked, count = masker.mask_array(image, review=review)
+        self.assertEqual(count, 1)  # the near-certain one
+        self.assertFalse(np.array_equal(masked, image))
+        self.assertEqual(review["largeBelowCertain"], 1)  # the 0.8 one, left for a human
+        self.assertEqual(fm.needs_look([review, {}, {"largeBelowCertain": 2}]), {"images": 2, "largeBelowCertain": 3})
+        self.assertEqual(fm.needs_look(None), {"images": 0, "largeBelowCertain": 0})
+
+
 class Masking(unittest.TestCase):
     def test_a_detected_face_becomes_one_flat_colour_and_the_rest_is_untouched(self):
         image = noisy()
@@ -321,9 +404,9 @@ class JobPath(unittest.TestCase):
             seen = {}
 
             class Spy(FakeMasker):
-                def mask_array(self, rgb, manual=None):
+                def mask_array(self, rgb, manual=None, audit=None, review=None):
                     seen["shape"] = rgb.shape
-                    return super().mask_array(rgb, manual)
+                    return super().mask_array(rgb, manual, audit, review)
 
             facts = pp.prepare_photo(root / "a.jpg", root / "out.jpg", max_long_side=600, masker=Spy([(500, 300, 600, 420)]))
             self.assertEqual(seen["shape"], (900, 1200, 3))  # full resolution
@@ -332,7 +415,7 @@ class JobPath(unittest.TestCase):
 
     def test_a_masking_failure_stops_the_set_and_leaves_no_unmasked_file(self):
         class Broken(FakeMasker):
-            def mask_array(self, rgb, manual=None):
+            def mask_array(self, rgb, manual=None, audit=None, review=None):
                 raise RuntimeError("boom")
 
         with tempfile.TemporaryDirectory() as temp:
@@ -356,7 +439,31 @@ class JobPath(unittest.TestCase):
         version = FakeMasker().version
         provenance = fm.masking_provenance({"photos": [0, 3], "video": None, "version": version})
         self.assertEqual(provenance["photos"]["regions"], 3)
+        self.assertEqual(provenance["photos"]["needsLook"], {"images": 0, "largeBelowCertain": 0})
         self.assertNotIn("video", provenance)
+        flagged = fm.masking_provenance({"photos": [0, 3], "photosReview": [{}, {"largeBelowCertain": 2}], "video": [1], "videoReview": [{"largeBelowCertain": 1}], "version": version})
+        self.assertEqual(flagged["photos"]["needsLook"], {"images": 1, "largeBelowCertain": 2})
+        self.assertEqual(flagged["video"]["needsLook"], {"images": 1, "largeBelowCertain": 1})
+
+    def test_the_worker_path_carries_the_review_of_every_photo_and_video_frame(self):
+        class Flags(FakeMasker):
+            def find_regions(self, rgb, manual=None, audit=None, review=None):
+                if review is not None:
+                    review.update({"weakExcluded": 0, "largeBelowCertain": 2})
+                return []
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            for index in range(2):
+                Image.fromarray(noisy(seed=index)).save(root / f"{index}.jpg", "JPEG")
+            _, stats = pp.prepare_photos([root / "0.jpg", root / "1.jpg"], root / "images", "photo", masker=Flags())
+            self.assertEqual(stats["maskedReview"], [{"weakExcluded": 0, "largeBelowCertain": 2}] * 2)
+            names = ["video_00000.jpg", "video_00001.jpg"]
+            for name in names:
+                Image.fromarray(noisy(320, 240)).save(root / name, "JPEG")
+            review = []
+            fm.mask_frame_sequence(Flags(), root, names, review=review)
+            self.assertEqual(review, [{"weakExcluded": 0, "largeBelowCertain": 2}] * 2)
         self.assertIsNone(fm.masking_provenance({"photos": None, "video": None, "version": None}))
 
     def test_mask_files_masks_in_place_and_keeps_the_dataset_dimensions(self):
