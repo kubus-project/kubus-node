@@ -32,6 +32,8 @@ import { startSetupServer } from '../gui/setupServer.js';
 import { PermissionUpdateService } from '../setup/permissionUpdate.js';
 import { AnalyticsStore } from '../analytics/analyticsStore.js';
 import { recoverNetworkStartup } from '../runtime/networkStartup.js';
+import { runCaptureCommand } from './captureImport.js';
+import { ensureImportDirectory } from '../captures/importPaths.js';
 
 /**
  * Whether a command may sweep orphaned capture directories.
@@ -71,6 +73,12 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     else console.log(JSON.stringify(buildStatusSummary(config, readStore.snapshot(), await liveStatus(readApi, readKubo)), null, 2));
     return;
   }
+  // `capture ...` reaches a running Node over its local API, or imports offline
+  // under its own lease; it must not take the writer lease first.
+  if (command === 'capture') {
+    await runCaptureCommand(argv.slice(1), config, logger);
+    return;
+  }
   const writerLease = await acquireRuntimeLease(config.localStatePath);
   const longRunning = command === 'start' || command === 'gui';
   try {
@@ -89,6 +97,8 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   await computeIdentity.initialize();
   const pairing = new PairingService(store, config, identity);
   const captures = new CaptureStore(config.localDataPath, store);
+  // The place an operator puts a video to import (`kubus-node capture import-video`).
+  if (reclaimsOrphanedCaptures(command)) await ensureImportDirectory(config.localDataPath).catch(() => undefined);
   // Streaming-upload drafts are in-memory, so a restart mid-transfer leaves a
   // capture directory with no owner. Reclaim those before serving, or every
   // interrupted upload permanently consumes disk.

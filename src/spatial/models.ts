@@ -17,7 +17,12 @@ export interface SpatialManifest {
   artworkId: string;
   markerId?: string;
   captureId: string;
-  captureProvenance: { source: 'localCapture'; captureId: string };
+  captureProvenance: {
+    source: 'localCapture';
+    captureId: string;
+    /** How the scene was derived when not from posed frames: video intake, frame selection, SfM and splat counts. */
+    derivation?: Record<string, unknown>;
+  };
   capturedAt: string;
   capturedBy?: string;
   variants: SpatialVariant[];

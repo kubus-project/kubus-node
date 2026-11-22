@@ -7,6 +7,7 @@ import type { KuboClient } from '../ipfs/kuboClient.js';
 import { localError } from '../localApi/pairingService.js';
 import type { Logger } from '../logging/logger.js';
 import { buildNerfstudioDataset } from '../spatial/nerfstudioAdapter.js';
+import { longWorkerFetch, workerFailure } from '../spatial/workerClient.js';
 import { validateSpatialManifest, type SpatialManifest, type SpatialVariant } from '../spatial/models.js';
 import type { LocalStore } from '../state/localStore.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
@@ -23,11 +24,15 @@ export type JobState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelle
  * bounded steps; it is `null` during `training`, the one stage whose real
  * duration and completion fraction this worker version does not report -
  * showing a fabricated percentage there would be worse than an indeterminate
- * spinner labelled with the real stage name.
+ * spinner labelled with the real stage name. `extracting_frames` and
+ * `solving_poses` are the two video-intake stages the worker reports through
+ * its progress file; they are indeterminate for the same reason.
  */
 export type JobStage =
   | 'queued'
   | 'preparing_dataset'
+  | 'extracting_frames'
+  | 'solving_poses'
   | 'starting_worker'
   | 'training'
   | 'importing'
@@ -56,6 +61,44 @@ interface WorkerOutput {
   transform?: SpatialManifest['transform'];
   viewerDefaults?: Record<string, unknown>;
   processing: SpatialManifest['processing'];
+  /** What the worker derived the scene from (video intake): frame selection, SfM counts, splat count. */
+  provenance?: unknown;
+}
+
+/** Worker-reported stages that map onto a job stage. `exporting` is a training-time step with no stage of its own. */
+const WORKER_STAGES: Record<string, { stage: JobStage; message: string } | undefined> = {
+  extracting_frames: { stage: 'extracting_frames', message: 'Extracting and filtering frames from the video' },
+  solving_poses: { stage: 'solving_poses', message: 'Solving camera poses (COLMAP)' },
+  training: { stage: 'training', message: 'Training (this can take a while; progress is not reported mid-run by this worker version)' },
+};
+const PROGRESS_POLL_MS = 2000;
+const PROVENANCE_MAX_BYTES = 8 * 1024;
+
+/** Keeps worker-reported provenance to bounded JSON primitives under known keys. */
+function sanitizeProvenance(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const clean = (input: unknown, depth: number): unknown => {
+    if (typeof input === 'string') return input.slice(0, 200);
+    if (typeof input === 'number') return Number.isFinite(input) ? input : null;
+    if (typeof input === 'boolean' || input === null) return input;
+    if (depth > 3) return undefined;
+    if (Array.isArray(input)) return undefined;
+    if (typeof input === 'object') {
+      const out: Record<string, unknown> = {};
+      for (const [key, item] of Object.entries(input as Record<string, unknown>).slice(0, 32)) {
+        const cleaned = clean(item, depth + 1);
+        if (cleaned !== undefined) out[key.slice(0, 64)] = cleaned;
+      }
+      return out;
+    }
+    return undefined;
+  };
+  const picked: Record<string, unknown> = {};
+  for (const key of ['kind', 'video', 'frames', 'sfm', 'splatCount']) {
+    const cleaned = clean((value as Record<string, unknown>)[key], 0);
+    if (cleaned !== undefined) picked[key] = cleaned;
+  }
+  return Buffer.byteLength(JSON.stringify(picked)) <= PROVENANCE_MAX_BYTES ? picked : undefined;
 }
 
 const capabilityFor = (type: JobType) => type === 'spatial.reconstruct' ? 'spatial.reconstruction' : 'spatial.optimization';
@@ -175,7 +218,14 @@ export class JobRuntime {
           missingCount: inspection.missingCount,
         });
       }
-      return this.insert(type, input, captureId);
+      // A video capture runs the video intake path in the worker; a posed
+      // frame capture runs the Nerfstudio adapter. The package decides, and a
+      // caller that names a mode must agree with it.
+      const mode = inspection.kind === 'video' ? 'video' : 'frames';
+      if (typeof input.mode === 'string' && input.mode !== mode) {
+        throw localError(422, 'capture_input_mode_mismatch', { message: `The capture is a ${mode} capture, not ${input.mode}` });
+      }
+      return this.insert(type, mode === 'video' ? { ...input, mode } : input, captureId);
     });
   }
 
@@ -300,16 +350,20 @@ export class JobRuntime {
       const outputDirectory = path.join(this.deps.dataRoot, 'private', 'jobs', id);
       await this.cleanup.own(id, job.type);
       const healthResponse = await fetch(`${this.deps.workerUrl}/health`, { signal: controller.signal });
-      const workerHealth = await healthResponse.json() as { cleanupProtocol?: number; workerInstanceId?: string };
+      const workerHealth = await healthResponse.json() as { cleanupProtocol?: number; workerInstanceId?: string; inputModes?: unknown };
       if (!healthResponse.ok || workerHealth.cleanupProtocol !== 1 || !workerHealth.workerInstanceId) {
         throw Object.assign(new Error('Worker cleanup protocol is required'), { code: 'worker_cleanup_protocol_required' });
+      }
+      const videoJob = job.type === 'spatial.reconstruct' && job.input.mode === 'video';
+      if (videoJob && !(Array.isArray(workerHealth.inputModes) && workerHealth.inputModes.includes('video'))) {
+        throw Object.assign(new Error('The spatial worker does not accept video input; rebuild the worker image'), { code: 'worker_video_unsupported' });
       }
       if (controller.signal.aborted || this.get(id).state === 'cancelled') return;
       await fs.mkdir(outputDirectory, { recursive: true, mode: 0o700 });
       await this.patchJob(id, (current) => {
         current.state = 'running'; current.stage = 'preparing_dataset'; current.progress = 0.05;
         current.startedAt = current.updatedAt = new Date().toISOString();
-        current.logs.push({ at: current.updatedAt, level: 'info', message: 'Preparing dataset from capture' });
+        current.logs.push({ at: current.updatedAt, level: 'info', message: videoJob ? 'Preparing video for the worker' : 'Preparing dataset from capture' });
       });
       this.recordAnalytics('started');
 
@@ -317,7 +371,9 @@ export class JobRuntime {
       // (optimize, generate_preview) operate on already-processed spatial
       // data and skip the kubus.capture/1 -> Nerfstudio translation.
       let workerCaptureDirectory = capture.directory;
-      if (job.type === 'spatial.reconstruct') {
+      // A video capture is handed to the worker as is: frame extraction and
+      // pose solving happen there, where ffmpeg and COLMAP live.
+      if (job.type === 'spatial.reconstruct' && !videoJob) {
         const datasetDirectory = path.join(outputDirectory, 'dataset');
         const dataset = await buildNerfstudioDataset(capture.directory, datasetDirectory);
         workerCaptureDirectory = dataset.datasetDirectory;
@@ -337,25 +393,42 @@ export class JobRuntime {
       await this.patchJob(id, (current) => {
         // Training runs as a single blocking call in this worker version, so
         // there is no real interim percentage to report - an indeterminate
-        // stage is honest, a fabricated one is not.
-        current.stage = 'training'; current.progress = null; current.updatedAt = new Date().toISOString();
-        current.logs.push({ at: current.updatedAt, level: 'info', message: 'Training (this can take a while; progress is not reported mid-run by this worker version)' });
+        // stage is honest, a fabricated one is not. A video job begins with
+        // frame extraction; the worker's progress file moves it on.
+        const first = videoJob ? WORKER_STAGES.extracting_frames! : WORKER_STAGES.training!;
+        current.stage = first.stage; current.progress = null; current.updatedAt = new Date().toISOString();
+        current.logs.push({ at: current.updatedAt, level: 'info', message: first.message });
       });
       const authorization = await this.deps.workerAuth.issue(id, job.type);
       if (controller.signal.aborted || this.get(id).state === 'cancelled') return;
       await this.cleanup.markWorkerAttempt(id, workerHealth.workerInstanceId);
       if (controller.signal.aborted || this.get(id).state === 'cancelled') return;
-      const response = await fetch(`${this.deps.workerUrl}/v1/process`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Kubus-Worker-Authorization': authorization }, signal: controller.signal,
-        body: JSON.stringify({ jobId: id, type: job.type, workerInstanceId: workerHealth.workerInstanceId, captureDirectory: workerCaptureDirectory, outputDirectory, input: job.input }),
-      });
-      const body = await response.json().catch(() => ({})) as WorkerOutput & { error?: string };
-      if (!response.ok) throw Object.assign(new Error(body.error || `worker_http_${response.status}`), { code: response.status === 503 ? 'worker_unsupported' : 'worker_failed' });
+      // The worker answers when reconstruction is finished, which is far longer
+      // than Node's default five-minute headers timeout allows.
+      const stopWatching = this.watchWorkerProgress(id, outputDirectory);
+      let response: Response;
+      let body: WorkerOutput & { detail?: unknown; error?: string };
+      try {
+        response = await longWorkerFetch(`${this.deps.workerUrl}/v1/process`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Kubus-Worker-Authorization': authorization }, signal: controller.signal,
+          body: JSON.stringify({ jobId: id, type: job.type, workerInstanceId: workerHealth.workerInstanceId, captureDirectory: workerCaptureDirectory, outputDirectory, input: job.input }),
+        });
+        body = await response.json().catch(() => ({})) as WorkerOutput & { detail?: unknown; error?: string };
+      } finally {
+        await stopWatching();
+      }
+      if (!response.ok) {
+        // FastAPI reports the reason under `detail`, as a string or as a typed object.
+        const failure = workerFailure(body, response.status);
+        throw Object.assign(new Error(failure.message), { code: failure.code });
+      }
       await this.patchJob(id, (current) => {
         current.stage = 'importing'; current.progress = 0.9; current.updatedAt = new Date().toISOString();
         current.logs.push({ at: current.updatedAt, level: 'info', message: 'Importing spatial output into local Kubo' });
       });
       const spatial = await this.importOutputs(job, capture, outputDirectory, body);
+      const derivation = sanitizeProvenance(body.provenance);
+      if (derivation) await this.logDerivation(id, derivation);
       await this.patchJob(id, (current) => {
         current.state = 'completed'; current.stage = 'completed'; current.progress = 1; current.output = spatial;
         current.completedAt = current.updatedAt = new Date().toISOString();
@@ -402,6 +475,7 @@ export class JobRuntime {
   }
 
   private async importOutputs(job: LocalJob, capture: ReturnType<CaptureStore['get']>, outputDirectory: string, output: WorkerOutput): Promise<Record<string, unknown>> {
+    const derivation = sanitizeProvenance(output.provenance);
     if (!Array.isArray(output.variants) || output.variants.length === 0) throw Object.assign(new Error('Worker returned no variants'), { code: 'worker_output_invalid' });
     if (output.variants.length > 16) throw new Error('worker_output_variant_limit');
     const validated = await Promise.all(output.variants.map(async item => {
@@ -431,7 +505,7 @@ export class JobRuntime {
     const manifest: SpatialManifest = {
       schema: 'kubus.spatial/1', type: 'gaussianSplat', id,
       artworkId: String(job.input.artworkId || capture.artworkId || ''), markerId: String(job.input.markerId || capture.markerId || '') || undefined,
-      captureId: capture.id, captureProvenance: { source: 'localCapture', captureId: capture.id }, capturedAt: capture.capturedAt,
+      captureId: capture.id, captureProvenance: { source: 'localCapture', captureId: capture.id, ...(derivation ? { derivation } : {}) }, capturedAt: capture.capturedAt,
       capturedBy: typeof job.input.capturedBy === 'string' ? job.input.capturedBy : undefined,
       variants, transform: output.transform, viewerDefaults: output.viewerDefaults, processing: output.processing, createdAt: new Date().toISOString(),
     };
@@ -446,6 +520,59 @@ export class JobRuntime {
     return record;
   }
 
+  /**
+   * Follows the stage the worker publishes while its single request is open.
+   *
+   * The worker writes `worker-progress.json` into the job's output directory,
+   * which both containers share. Reading it keeps the job's stage truthful
+   * (frame extraction, pose solving, training) without a second protocol and
+   * without inventing percentages. Best effort: an unreadable file is simply
+   * not a stage change. Returns a function that stops watching and waits for
+   * any in-flight update, so nothing patches the job after the request ends.
+   */
+  private watchWorkerProgress(id: string, outputDirectory: string): () => Promise<void> {
+    let last = '';
+    let pending: Promise<void> = Promise.resolve();
+    const poll = async (): Promise<void> => {
+      let parsed: { stage?: unknown; detail?: unknown };
+      try {
+        parsed = JSON.parse(await fs.readFile(path.join(outputDirectory, 'worker-progress.json'), 'utf8'));
+      } catch {
+        return;
+      }
+      const stage = typeof parsed.stage === 'string' ? parsed.stage : '';
+      if (!stage || stage === last) return;
+      last = stage;
+      const detail = (parsed.detail && typeof parsed.detail === 'object' ? parsed.detail : {}) as Record<string, unknown>;
+      const mapped = WORKER_STAGES[stage];
+      await this.patchJob(id, (current) => {
+        const at = new Date().toISOString();
+        if (mapped) { current.stage = mapped.stage; current.progress = null; current.updatedAt = at; }
+        current.logs.push({ at, level: 'info', message: describeWorkerStage(stage, detail, mapped?.message) });
+      }).catch(() => undefined);
+    };
+    const timer = setInterval(() => { pending = pending.then(poll); }, PROGRESS_POLL_MS);
+    timer.unref?.();
+    return async () => {
+      clearInterval(timer);
+      await pending;
+      await poll();
+    };
+  }
+
+  private async logDerivation(id: string, derivation: Record<string, unknown>): Promise<void> {
+    const sfm = derivation.sfm as Record<string, unknown> | undefined;
+    const parts: string[] = [];
+    if (sfm && typeof sfm.registeredViews === 'number' && typeof sfm.submittedViews === 'number') {
+      parts.push(`COLMAP registered ${sfm.registeredViews} of ${sfm.submittedViews} views`);
+    }
+    if (typeof derivation.splatCount === 'number') parts.push(`${derivation.splatCount} splats`);
+    if (parts.length === 0) return;
+    await this.patchJob(id, (current) => {
+      current.logs.push({ at: new Date().toISOString(), level: 'info', message: parts.join('; ') });
+    }).catch(() => undefined);
+  }
+
   private async patchJob(id: string, mutate: (job: LocalJob) => void): Promise<void> {
     await this.deps.store.update((state) => {
       const job = state.jobs?.[id] as LocalJob | undefined;
@@ -454,4 +581,26 @@ export class JobRuntime {
       mutate(job);
     });
   }
+}
+
+function describeWorkerStage(stage: string, detail: Record<string, unknown>, fallback?: string): string {
+  const number = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? value : undefined);
+  if (stage === 'extracting_frames') {
+    const video = (detail.video ?? {}) as Record<string, unknown>;
+    const seconds = number(video.durationSeconds);
+    const size = number(video.width) && number(video.height) ? `${video.width}x${video.height}` : undefined;
+    return `${fallback ?? stage}${seconds !== undefined ? ` (${seconds.toFixed(1)} s${size ? `, ${size}` : ''})` : ''}`;
+  }
+  if (stage === 'solving_poses') {
+    const frames = (detail.frames ?? {}) as Record<string, unknown>;
+    const counts = [
+      number(frames.extracted) !== undefined ? `${frames.extracted} extracted` : '',
+      number(frames.blurDropped) !== undefined ? `${frames.blurDropped} blurry dropped` : '',
+      number(frames.duplicateDropped) !== undefined ? `${frames.duplicateDropped} near-duplicate dropped` : '',
+      number(frames.selected) !== undefined ? `${frames.selected} kept` : '',
+    ].filter(Boolean);
+    return `${fallback ?? stage}${counts.length ? `: ${counts.join(', ')}` : ''}`;
+  }
+  if (stage === 'exporting') return 'Exporting the Gaussian splat';
+  return fallback ?? stage;
 }

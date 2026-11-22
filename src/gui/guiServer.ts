@@ -25,6 +25,7 @@ import { spatialViewerBootstrapJs, spatialViewerHtml } from './templates/spatial
 import { spatialViewerBundle } from './public/vendor/spatialViewerBundle.js';
 import { handleLocalApi, type LocalApiDeps } from '../localApi/localApiRouter.js';
 import { localError } from '../localApi/pairingService.js';
+import { importRoots, resolveImportSource } from '../captures/importPaths.js';
 import { buildViewModel } from './viewModel.js';
 import { renderQrSvg } from './qr.js';
 import {
@@ -265,6 +266,19 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
   if (req.method === 'GET' && parsed.pathname === '/gui/api/captures') {
     const local = requireLocalApi(deps);
     writeJson(res, 200, { success: true, data: listCaptureSummaries(local.captures) });
+    return;
+  }
+  if (req.method === 'POST' && parsed.pathname === '/gui/api/captures/import-video') {
+    // Imports a video already on this Node's disk, bypassing the 128 MiB
+    // streaming-upload request cap. The path is confined to the import roots.
+    const local = requireLocalApi(deps);
+    const body = await readGuiJson(req);
+    const source = await resolveImportSource(body.path, importRoots(deps.config.localDataPath));
+    const text = (value: unknown) => (typeof value === 'string' && value.trim() ? value.trim().slice(0, 200) : undefined);
+    const capture = await local.captures.importVideoFile(source, {
+      artworkId: text(body.artworkId), markerId: text(body.markerId), capturedAt: text(body.capturedAt),
+    });
+    writeJson(res, 201, { success: true, data: capture });
     return;
   }
   const captureMatch = parsed.pathname.match(/^\/gui\/api\/captures\/([^/]+)$/);

@@ -3,7 +3,9 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { LocalStore } from '../state/localStore.js';
 import { localError } from '../localApi/pairingService.js';
-import { declaredFrameCount, inspectCapturePackage, isPlainObject, type CapturePackageReport } from './capturePackage.js';
+import { createReadStream } from 'node:fs';
+import { declaredFrameCount, inspectCapturePackage, isPlainObject, type CapturePackageKind, type CapturePackageReport } from './capturePackage.js';
+import { VIDEO_EXTENSIONS, VIDEO_MAX_BYTES, VIDEO_MIN_BYTES, type VideoExtension } from './videoPackage.js';
 
 export interface CaptureFilePayload { path: string; contentBase64: string; mimeType?: string }
 export interface CapturePackagePayload {
@@ -48,6 +50,10 @@ export interface CaptureRecord {
   fileCount: number;
   directory: string;
   retention?: { deleteAfter?: string };
+  /** `video` for a single-source-video package; absent or `frames` for posed frames. */
+  kind?: CapturePackageKind;
+  /** Container facts of the source video, for a `video` capture. */
+  video?: { extension: string; sizeBytes: number; durationSeconds?: number };
 
   /**
    * Client-supplied idempotency key from `metadata.localCaptureId`.
@@ -102,6 +108,14 @@ async function draftMarkerAgeMs(directory: string): Promise<number | null> {
     return null;
   }
 }
+
+const VIDEO_MIME_TYPES: Record<VideoExtension, string> = {
+  mp4: 'video/mp4',
+  mov: 'video/quicktime',
+  m4v: 'video/x-m4v',
+  webm: 'video/webm',
+  mkv: 'video/x-matroska',
+};
 
 const MAX_CAPTURE_BYTES = 5 * 1024 * 1024 * 1024;
 const MAX_CAPTURE_FILES = 5000;
@@ -529,6 +543,11 @@ export class CaptureStore {
         directory: draft.directory,
         retention: payload.retention,
         localCaptureId,
+        ...(inspection.kind === 'video' ? { kind: 'video' as const, video: inspection.video && {
+          extension: inspection.video.extension,
+          sizeBytes: inspection.video.sizeBytes,
+          durationSeconds: inspection.video.durationSeconds,
+        } } : {}),
       };
       await fs.writeFile(
         path.join(draft.directory, 'capture.json'),
@@ -568,6 +587,70 @@ export class CaptureStore {
       // Otherwise the draft stays exactly as it was: every uploaded file is
       // still there, the replaced record is untouched, and the commit can be
       // repeated. An abandoned draft is reclaimed by the orphan sweep.
+      throw error;
+    }
+  }
+
+  /**
+   * Imports one video file from the local disk as a `video` capture.
+   *
+   * The streaming upload route caps a request at 128 MiB, which a phone video
+   * exceeds. A file already on the Node's own disk needs no request at all: it
+   * is streamed straight into a draft and committed through the same integrity
+   * boundary every other capture crosses, so a truncated or unreadable video is
+   * refused here and never reaches a GPU.
+   *
+   * Idempotent: the key is the file's SHA-256 plus the artwork and marker, so
+   * importing the same footage twice returns the capture it already made.
+   */
+  async importVideoFile(
+    sourcePath: string,
+    options: { artworkId?: string; markerId?: string; capturedAt?: string } = {},
+  ): Promise<CaptureRecord> {
+    let resolved: string;
+    let stat;
+    try {
+      resolved = await fs.realpath(sourcePath);
+      stat = await fs.stat(resolved);
+    } catch {
+      throw localError(404, 'capture_video_source_not_found');
+    }
+    if (!stat.isFile()) throw localError(400, 'capture_video_source_not_a_file');
+    const extension = path.extname(resolved).slice(1).toLowerCase() as VideoExtension;
+    if (!VIDEO_EXTENSIONS.includes(extension)) {
+      throw localError(415, 'capture_video_extension_unsupported', { allowed: [...VIDEO_EXTENSIONS] });
+    }
+    if (stat.size < VIDEO_MIN_BYTES) throw localError(422, 'capture_video_size_invalid', { message: 'The video file is too small to contain usable footage' });
+    if (stat.size > VIDEO_MAX_BYTES) throw localError(413, 'capture_video_size_invalid', { message: 'The video file exceeds the size limit' });
+
+    const hash = crypto.createHash('sha256');
+    for await (const chunk of createReadStream(resolved)) hash.update(chunk as Buffer);
+    const sha256 = hash.digest('hex');
+    const localCaptureId = `video-import:${sha256}:${options.artworkId ?? ''}:${options.markerId ?? ''}`;
+
+    const capturedAt = options.capturedAt && !Number.isNaN(Date.parse(options.capturedAt))
+      ? new Date(options.capturedAt).toISOString()
+      : stat.mtime.toISOString();
+    const draft = await this.beginDraft({
+      schema: 'kubus.capture/1',
+      artworkId: options.artworkId,
+      markerId: options.markerId,
+      capturedAt,
+      // No original file name or path: the capture is private, but the name of
+      // a phone recording is still personal data nothing downstream needs.
+      metadata: { kind: 'video', source: 'local_import', localCaptureId, sha256, sourceBytes: stat.size },
+    });
+    try {
+      await this.writeDraftFileStream(
+        draft.id,
+        `video/source.${extension}`,
+        createReadStream(resolved) as unknown as AsyncIterable<Buffer>,
+        VIDEO_MIME_TYPES[extension],
+        VIDEO_MAX_BYTES,
+      );
+      return await this.commitDraft(draft.id);
+    } catch (error) {
+      await this.discardDraft(draft.id).catch(() => undefined);
       throw error;
     }
   }
