@@ -71,6 +71,34 @@ The worker (`spatial-worker/photo_pipeline.py`) decodes every photo, bakes its E
 
 Photo sets are small, so the floor and ratio can be tuned separately from the video gate: `KUBUS_PHOTO_MIN_REGISTERED_VIEWS` (24), `KUBUS_PHOTO_MIN_REGISTRATION_RATIO` (follows `KUBUS_VIDEO_MIN_REGISTRATION_RATIO`, 0.6), `KUBUS_PHOTO_MIN_COUNT` (8) and `KUBUS_PHOTO_MAX_LONG_SIDE` (2048); `docker-compose.yml` forwards them like the video thresholds. A set of fewer than 24 photos cannot pass the default floor; lowering it is an operator decision, and the run record carries it: the `sfm` provenance holds `minRegisteredViews`, `minRegistrationRatio` and `gateLowered` (true when either is below the default), so a below-gate record is visible as one.
 
+## Face masking
+
+People who happen to stand in front of a mural must not end up in a splat. Photos and video frames are masked before pose solving and training, with a detector whose weights are pinned and checksummed in the worker image.
+
+- **Detector** (`spatial-worker/face_mask.py`): YuNet, `face_detection_yunet_2023mar.onnx` from OpenCV Zoo commit `48b10fa5`, run through OpenCV's `cv2.FaceDetectorYN`. Code and weights are MIT, the network was trained with BSD-3-Clause libfacedetection.train (`spatial-worker/models/`, `docs/THIRD_PARTY_LICENSES.md`). The weights file is vendored, verified against its SHA-256 when the image is built and again before every use; a missing or altered file is `face_masking_failed`, never a silent "no faces".
+- **Tuned for recall.** A missed face is worse than a patch over a flower. Detection runs at five whole-image scales plus overlapping native-resolution tiles (a face 20 px wide in a 5000 px photo is seen at that size), with a score threshold of 0.4 (the detector's default is 0.9). Detections between 0.4 and 0.7 must also have a face-shaped landmark layout in the frame of the eye line (so a tilted or sideways head passes and rough-wall texture does not), and a wide detection (above 12 percent of the photo's short side) is only believed at 0.9 with that layout. Boxes of the same face found by several passes are kept once, never united. Each region is grown generously (45 percent each side, 70 percent up, 40 percent down) and filled with **one flat colour** (the region's median), which cannot be undone.
+- **A reviewed manual list refines it.** `add` boxes are masked as given; `exclude` boxes drop detections whose centre lies inside them (a painted face that is part of the artwork, which is not masked). Both are fractions of the upright image, so a list survives resizing. The list is private and per image.
+- **Provenance records counts, never coordinates:** `captureProvenance.derivation.faceMasking` holds, per part (`photos`, `video`), the source (`worker` or `premasked`), detector, model, weights SHA-256, score threshold, image count, total regions, images with regions, and the region count of each image. `processing.faceMasking` (the part of the record that can leave the Node) keeps everything except the per-image array. A capture that is not masked records `{ ran: false }`.
+
+Where masking happens is decided at import and stored on the capture (`faceMasking`):
+
+| Mode | When | What happens |
+| --- | --- | --- |
+| `premasked` | The photo directory holds a `kubus-face-masking.json` report written by `python face_mask.py mask <in> <out>` | The report names every masked file by SHA-256 (a report for other files is refused: `face_masking_report_mismatch`), the unmasked originals never enter the capture store, and the record carries the operator report. |
+| `worker` | Default for a capture bound to an artwork (public art); `--mask-faces` for one without | The job asks the worker (`input.maskFaces: { photos, video }`) to mask every photo and video frame as the first step. The unmasked source files stay in the private capture store. The Node refuses a worker that does not advertise `faceMasking`, and fails the job (`face_masking_failed`, nothing imported) if the worker's answer does not report masking for every part it was asked to mask. |
+| `none` | `--no-mask-faces`, or no artwork and no flag | Recorded as `ran: false`. |
+
+Paired clients cannot declare their own captures masked; `faceMasking` in uploaded metadata is discarded. Masked copies of a directory, with a report and contact sheets for a human to check, come from the worker image:
+
+```sh
+docker run --rm --entrypoint python -v <in>:/in:ro -v <out>:/out kubus-node-kubus-spatial-worker:latest \
+  /worker/face_mask.py mask /in /out/<piece> [--manual /out/_manual/<piece>.json] [--contact /out/_contact/<piece>]
+```
+
+Detection is not perfect: look at the contact sheets before training, and fix a miss with a `--manual` list. Masking covers faces; other personal data in a photo (number plates, a name on a wall, a body) is not detected.
+
+An earlier record that was reconstructed from unmasked images is retired with `kubus-node spatial supersede <oldId> --by <newId>`: the record is marked `superseded` (kept as history), the Node releases the pins it created for its manifest and splat, and the local gateway no longer serves it. It never runs garbage collection, never removes a pin the Node did not create, and refuses a replacement that belongs to another artwork or is not newer. The stored photos of the superseded capture are not deleted by this command.
+
 ## Mixed captures and spatial revisions
 
 A video that arrives after the photos does not change the photo capture or its spatial record:
@@ -92,7 +120,8 @@ A reconstruction of the new capture produces a NEW spatial record; nothing is ov
 | `capturedAt` | The earliest capture time of any input (a mixed capture takes the earlier of photos and video), so a `validFrom <= capturedAt` rule is conservative. The per-medium times are on the capture record (`mediaCapturedAt`). |
 | `capturedBy` | Optional operator label from the capture (opt-in at publication). |
 | `revision.number` | 1 for the first record of an artwork, previous number + 1 after that. |
-| `revision.reason` | `initial`, `video_added` (the capture was derived from the previous record's capture) or `resolve`. |
+| `revision.reason` | `initial`, `video_added` (the capture was derived from the previous record's capture), `face_masking` (the previous record was reconstructed from unmasked images and this one from masked ones) or `resolve`. |
+| `revision.note` | Optional free text from `capture process --revision-note` (for example the provenance corrections made with the revision). |
 | `revision.previousSpatialId` | The record this one revises. Absent for revision 1. |
 | `revision.previousManifestCid` | CID of the previous record's manifest: the link is content-addressed. |
 | `revision.previousCaptureId` | The capture of the previous record. |
@@ -104,7 +133,7 @@ Suggested backend binding: a grant authorises (artwork, methods, territory, wind
 
 COLMAP output has an arbitrary orientation, centre and scale. For every COLMAP-derived scene (video, photos, mixed) the worker estimates, in the coordinate frame the splat file is written in (cameras and sparse points are first mapped through `dataparser_transforms.json`; `spatial-worker/scene_frame.py`):
 
-- **up**: the mean of the cameras' up axes; when they disagree (mean resultant length below 0.6, for example rolled photos), the normal of the dominant plane of the sparse points, signed by the cameras, but only when the cameras look at that plane obliquely (a floor seen from the side). Cameras looking face-on at the plane cannot tell a floor from a wall, and a wall's normal is horizontal, so that case is not trusted: the weak mean camera up is kept at its own low confidence (`camera_up_weak`); else +Z is assumed. The method and a 0 to 1 confidence are recorded.
+- **up**: the mean of the cameras' up axes; when they disagree (mean resultant length below 0.6, for example rolled photos), the normal of the dominant plane of the sparse points, signed by the cameras, but only when the cameras look at that plane obliquely. **That fallback is a heuristic.** It assumes the dominant plane is horizontal (a floor or table). View geometry cannot prove that: a wall mural photographed obliquely with rolled cameras gives the same picture, and then the plane normal is horizontal, so "up" would be sideways. The fallback is therefore never reported as a trusted answer: its confidence is capped at 0.5, below the 0.6 trusted level, and `processing.orientation.trusted` is `false` for it (and for `camera_up_weak` and `assumed`); only a consensus of the cameras' own up axes is `trusted: true`. Cameras looking face-on at the plane keep the weak mean camera up (`camera_up_weak`); else +Z is assumed. The method, a 0 to 1 confidence and `trusted` are recorded; check the viewer image of any record whose orientation is not trusted.
 - **front**: the horizontal direction from the subject towards the cameras, when the cameras cover one side (resultant length at least 0.4); a full orbit has no front and keeps its yaw.
 - **subject box**: the 2nd to 98th percentile box of the sparse points, grown by 35 percent (never by less than 15 percent of the largest side, so a flat mural is not cut to a sliver).
 

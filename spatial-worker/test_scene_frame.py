@@ -107,6 +107,10 @@ class OrientationTests(unittest.TestCase):
         self.assertLess(np.linalg.norm(poses[:, :3, 1].mean(axis=0)), sf.MIN_UP_CONFIDENCE)
         self.assertEqual(estimate["method"], "plane_normal")
         self.assertAlmostEqual(abs(float(estimate["up"][2])), 1.0, places=2)
+        # A heuristic answer: usable, but never reported as trusted.
+        self.assertLess(estimate["confidence"], sf.MIN_UP_CONFIDENCE)
+        analysis = sf.analyse_scene(poses, flat)
+        self.assertFalse(analysis["orientation"]["trusted"])
 
     def test_a_wall_seen_face_on_is_not_given_a_sideways_up_by_the_plane_fallback(self):
         # A mural: sparse points on the wall x = 0 (its normal is horizontal), cameras facing it from x = 3
@@ -127,6 +131,34 @@ class OrientationTests(unittest.TestCase):
         estimate = sf.estimate_up(poses, wall)
         self.assertNotEqual(estimate["method"], "plane_normal")
         self.assertLess(estimate["confidence"], sf.MIN_UP_CONFIDENCE)  # never reported as a trusted answer
+
+    def test_an_obliquely_photographed_wall_is_never_a_trusted_plane_answer(self):
+        # The review-2 case: a wall mural (points on x = 0) shot from a spread of azimuths up to 70 degrees either
+        # side with random roll. Those cameras are no longer face-on, so the plane fallback applies, and its
+        # "up" is the wall normal (sideways). View geometry cannot tell this from a floor, so the answer must
+        # be reported as a low-confidence heuristic, not as a trusted one.
+        rng = np.random.default_rng(11)
+        wall = np.column_stack([rng.normal(size=800) * 0.005, rng.normal(size=800), rng.normal(size=800)])
+        for spread in (30.0, 50.0, 70.0):
+            poses = []
+            for _ in range(30):
+                azimuth = math.radians(rng.uniform(-spread, spread))
+                position = (3.0 * math.cos(azimuth), 3.0 * math.sin(azimuth), rng.normal() * 0.2)
+                pose = camera(position, (0.0, 0.0, 0.0), (0, 0, 1))
+                pose[:3, :3] = pose[:3, :3] @ rotation_about([0, 0, 1], rng.uniform(0.0, 2 * math.pi))
+                poses.append(pose)
+            poses = np.stack(poses)
+            estimate = sf.estimate_up(poses, wall)
+            self.assertLess(estimate["confidence"], sf.MIN_UP_CONFIDENCE, f"spread {spread}")
+            analysis = sf.analyse_scene(poses, wall)
+            self.assertFalse(analysis["orientation"]["trusted"], f"spread {spread}")
+            self.assertLess(analysis["orientation"]["confidence"], sf.MIN_UP_CONFIDENCE)
+
+    def test_a_consensus_of_camera_ups_is_trusted(self):
+        poses = orbit(count=24)
+        analysis = sf.analyse_scene(poses, np.random.default_rng(2).normal(size=(300, 3)))
+        self.assertEqual(analysis["orientation"]["method"], "camera_up")
+        self.assertTrue(analysis["orientation"]["trusted"])
 
     def test_with_nothing_to_go_on_up_is_assumed(self):
         poses = np.stack([np.eye(4), np.eye(4)])

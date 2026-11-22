@@ -80,6 +80,7 @@ export const WORKER_TYPED_ERROR_CODES = new Set([
   'frames_too_blurry',
   'photos_unreadable',
   'sfm_failed',
+  'face_masking_failed',
 ]);
 
 /**

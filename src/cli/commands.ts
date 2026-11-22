@@ -32,7 +32,7 @@ import { startSetupServer } from '../gui/setupServer.js';
 import { PermissionUpdateService } from '../setup/permissionUpdate.js';
 import { AnalyticsStore } from '../analytics/analyticsStore.js';
 import { recoverNetworkStartup } from '../runtime/networkStartup.js';
-import { runCaptureCommand } from './captureImport.js';
+import { runCaptureCommand, runSpatialCommand } from './captureImport.js';
 import { ensureImportDirectory } from '../captures/importPaths.js';
 
 /**
@@ -77,6 +77,10 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   // under its own lease; it must not take the writer lease first.
   if (command === 'capture') {
     await runCaptureCommand(argv.slice(1), config, logger);
+    return;
+  }
+  if (command === 'spatial') {
+    await runSpatialCommand(argv.slice(1), config);
     return;
   }
   const writerLease = await acquireRuntimeLease(config.localStatePath);

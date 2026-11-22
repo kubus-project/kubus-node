@@ -7,10 +7,11 @@ import type { AppConfig } from '../config/schema.js';
 import type { Logger } from '../logging/logger.js';
 
 const USAGE = `Usage:
-  kubus-node capture import-video <path> [--artwork <id>] [--marker <id>] [--captured-at <ISO time>] [--process] [--floater-crop]
-  kubus-node capture import-photos <directory> [--video <file>] [--artwork <id>] [--marker <id>] [--captured-at <ISO time>] [--captured-by <label>] [--process] [--floater-crop]
-  kubus-node capture add-video <captureId> <path> [--captured-at <ISO time>] [--process] [--floater-crop]
-  kubus-node capture process <captureId> [--previous <spatialId>] [--floater-crop]
+  kubus-node capture import-video <path> [--artwork <id>] [--marker <id>] [--captured-at <ISO time>] [--mask-faces | --no-mask-faces] [--process] [--floater-crop]
+  kubus-node capture import-photos <directory> [--video <file>] [--artwork <id>] [--marker <id>] [--captured-at <ISO time>] [--captured-by <label>] [--mask-faces | --no-mask-faces] [--process] [--floater-crop]
+  kubus-node capture add-video <captureId> <path> [--captured-at <ISO time>] [--mask-faces | --no-mask-faces] [--process] [--floater-crop]
+  kubus-node capture process <captureId> [--previous <spatialId>] [--revision-note <text>] [--floater-crop]
+  kubus-node spatial supersede <spatialId> --by <spatialId>
 
 import-video imports one video file as a private capture, without the 128 MiB upload limit.
 import-photos imports a directory of still photographs (JPEG or PNG, at least 8; no camera
@@ -23,7 +24,15 @@ With a running Node the path must be readable by that Node and sit in an import 
 <data>/imports (inside the container: /var/lib/kubus-node/data/imports) or a directory listed in
 KUBUS_IMPORT_DIRS. With no running Node the path is imported directly from wherever it is.
 --process queues a reconstruction job for the new capture (running Node only).
---floater-crop asks the worker to crop stray Gaussians outside the subject at export.`;
+--floater-crop asks the worker to crop stray Gaussians outside the subject at export.
+Faces: people in the images are masked before reconstruction. A capture bound to an artwork (public
+art) is masked by default; --no-mask-faces opts out (recorded), --mask-faces turns it on for a capture
+without an artwork. A photo directory that holds a kubus-face-masking.json report written by the
+worker's face_mask.py (masked copies, bound to the files by SHA-256) is recorded as premasked; the
+unmasked originals then never enter the capture store. Otherwise the worker masks photos and video
+frames as the first step of the job and the unmasked source files stay in the private capture store.
+spatial supersede marks a record as replaced by a newer one for the same artwork and releases the Node's
+own pins on its content, so it is no longer served; it does not run garbage collection.`;
 
 export interface ImportVideoArguments {
   file: string;
@@ -32,6 +41,7 @@ export interface ImportVideoArguments {
   capturedAt?: string;
   process: boolean;
   floaterCrop?: boolean;
+  maskFaces?: boolean;
 }
 
 export interface ImportPhotosArguments {
@@ -43,6 +53,7 @@ export interface ImportPhotosArguments {
   capturedBy?: string;
   process: boolean;
   floaterCrop?: boolean;
+  maskFaces?: boolean;
 }
 
 export interface AddVideoArguments {
@@ -51,12 +62,27 @@ export interface AddVideoArguments {
   capturedAt?: string;
   process: boolean;
   floaterCrop?: boolean;
+  maskFaces?: boolean;
 }
 
 export interface ProcessArguments {
   captureId: string;
   previousSpatialId?: string;
+  revisionNote?: string;
   floaterCrop?: boolean;
+}
+
+export interface SupersedeArguments {
+  spatialId: string;
+  byId: string;
+}
+
+/** `--mask-faces` / `--no-mask-faces`: true, false, or undefined for the default. Both together is an error. */
+function maskChoice(options: Record<string, string | true>): { maskFaces?: boolean } {
+  if (options['--mask-faces'] === true && options['--no-mask-faces'] === true) throw new Error('--mask-faces and --no-mask-faces cannot be combined');
+  if (options['--mask-faces'] === true) return { maskFaces: true };
+  if (options['--no-mask-faces'] === true) return { maskFaces: false };
+  return {};
 }
 
 /** Splits `args` into options (name -> value, or `true` for flags) and positionals; an unknown option is an error. */
@@ -96,6 +122,8 @@ export function parseImportVideoArguments(args: string[]): ImportVideoArguments 
     else if (arg === '--captured-at') out.capturedAt = value();
     else if (arg === '--process') out.process = true;
     else if (arg === '--floater-crop') out.floaterCrop = true;
+    else if (arg === '--mask-faces') { if (out.maskFaces === false) throw new Error('--mask-faces and --no-mask-faces cannot be combined'); out.maskFaces = true; }
+    else if (arg === '--no-mask-faces') { if (out.maskFaces === true) throw new Error('--mask-faces and --no-mask-faces cannot be combined'); out.maskFaces = false; }
     else if (arg.startsWith('--')) throw new Error(`Unknown option ${arg}`);
     else if (!out.file) out.file = arg;
     else throw new Error('Only one video can be imported per capture');
@@ -105,7 +133,7 @@ export function parseImportVideoArguments(args: string[]): ImportVideoArguments 
 }
 
 export function parseImportPhotosArguments(args: string[]): ImportPhotosArguments {
-  const { options, positionals } = parseOptions(args, ['--video', '--artwork', '--marker', '--captured-at', '--captured-by'], ['--process', '--floater-crop']);
+  const { options, positionals } = parseOptions(args, ['--video', '--artwork', '--marker', '--captured-at', '--captured-by'], ['--process', '--floater-crop', '--mask-faces', '--no-mask-faces']);
   if (positionals.length === 0) throw new Error('A photo directory path is required');
   if (positionals.length > 1) throw new Error('Only one photo directory can be imported per capture');
   return {
@@ -117,11 +145,12 @@ export function parseImportPhotosArguments(args: string[]): ImportPhotosArgument
     capturedBy: options['--captured-by'] as string | undefined,
     process: options['--process'] === true,
     ...(options['--floater-crop'] === true ? { floaterCrop: true } : {}),
+    ...maskChoice(options),
   };
 }
 
 export function parseAddVideoArguments(args: string[]): AddVideoArguments {
-  const { options, positionals } = parseOptions(args, ['--captured-at'], ['--process', '--floater-crop']);
+  const { options, positionals } = parseOptions(args, ['--captured-at'], ['--process', '--floater-crop', '--mask-faces', '--no-mask-faces']);
   if (positionals.length < 2) throw new Error('A photo capture id and a video file path are required');
   if (positionals.length > 2) throw new Error('Only one video can be added');
   return {
@@ -130,15 +159,24 @@ export function parseAddVideoArguments(args: string[]): AddVideoArguments {
     capturedAt: options['--captured-at'] as string | undefined,
     process: options['--process'] === true,
     ...(options['--floater-crop'] === true ? { floaterCrop: true } : {}),
+    ...maskChoice(options),
   };
 }
 
+export function parseSupersedeArguments(args: string[]): SupersedeArguments {
+  const { options, positionals } = parseOptions(args, ['--by'], []);
+  if (positionals.length !== 1) throw new Error('Exactly one spatial record id is required');
+  if (typeof options['--by'] !== 'string') throw new Error('--by <spatialId> names the record that replaces it');
+  return { spatialId: positionals[0]!, byId: options['--by'] };
+}
+
 export function parseProcessArguments(args: string[]): ProcessArguments {
-  const { options, positionals } = parseOptions(args, ['--previous'], ['--floater-crop']);
+  const { options, positionals } = parseOptions(args, ['--previous', '--revision-note'], ['--floater-crop']);
   if (positionals.length !== 1) throw new Error('Exactly one capture id is required');
   return {
     captureId: positionals[0]!,
     previousSpatialId: options['--previous'] as string | undefined,
+    ...(typeof options['--revision-note'] === 'string' ? { revisionNote: options['--revision-note'] } : {}),
     ...(options['--floater-crop'] === true ? { floaterCrop: true } : {}),
   };
 }
@@ -171,11 +209,12 @@ function fail(envelope: Envelope, status: number): never {
 }
 
 /** The job body for `/gui/api/jobs`: the capture plus the options an operator may set. */
-function queueInput(captureId: unknown, extra: { floaterCrop?: boolean; previousSpatialId?: string }): Record<string, unknown> {
+function queueInput(captureId: unknown, extra: { floaterCrop?: boolean; previousSpatialId?: string; revisionNote?: string }): Record<string, unknown> {
   return {
     captureId,
     ...(extra.floaterCrop ? { floaterCrop: true } : {}),
     ...(extra.previousSpatialId ? { previousSpatialId: extra.previousSpatialId } : {}),
+    ...(extra.revisionNote ? { revisionNote: extra.revisionNote } : {}),
   };
 }
 
@@ -196,11 +235,21 @@ function summary(capture: Record<string, unknown>, job?: Record<string, unknown>
     capturedAt: capture.capturedAt,
     video: capture.video,
     photos: capture.photos,
+    faceMasking: summariseMasking(capture.faceMasking),
     derivedFrom: capture.derivedFrom,
     sizeBytes: capture.sizeBytes,
     ...(capture.skippedFiles ? { skippedFiles: capture.skippedFiles } : {}),
     ...(job ? { jobId: job.id } : {}),
   }, null, 2);
+}
+
+/** The masking decision without the per-image counts, which can run to hundreds of numbers. */
+function summariseMasking(value: unknown): unknown {
+  if (!value || typeof value !== 'object') return undefined;
+  const { report, ...rest } = value as Record<string, unknown> & { report?: Record<string, unknown> };
+  if (!report) return rest;
+  const { regionsPerImage, ...summary } = report;
+  return { ...rest, report: { ...summary, imagesWithRegions: summary.imagesWithRegions } };
 }
 
 function usageError(error: unknown): never {
@@ -239,6 +288,28 @@ async function finishImport(
   console.log(summary(capture, job));
 }
 
+/** `kubus-node spatial supersede <id> --by <id>`: asks the running Node to retire a record and release its pins. */
+export async function runSpatialCommand(args: string[], config: AppConfig): Promise<void> {
+  const [subcommand, ...rest] = args;
+  if (subcommand !== 'supersede') {
+    console.error(USAGE);
+    process.exitCode = 2;
+    return;
+  }
+  let parsed: SupersedeArguments;
+  try {
+    parsed = parseSupersedeArguments(rest);
+  } catch (error) {
+    console.error(`${(error as Error).message}\n\n${USAGE}`);
+    process.exitCode = 2;
+    return;
+  }
+  const answer = await post(config, `/gui/api/spatial/${encodeURIComponent(parsed.spatialId)}/supersede`, { by: parsed.byId });
+  if (answer === 'unreachable') throw new Error('No running Node answered; start it and try again');
+  if (answer.status !== 200 || !answer.envelope.data) fail(answer.envelope, answer.status);
+  console.log(JSON.stringify(answer.envelope.data, null, 2));
+}
+
 export async function runCaptureCommand(args: string[], config: AppConfig, logger: Logger): Promise<void> {
   const [subcommand, ...rest] = args;
   try {
@@ -247,7 +318,7 @@ export async function runCaptureCommand(args: string[], config: AppConfig, logge
       try { parsed = parseImportVideoArguments(rest); } catch (error) { usageError(error); }
       const absolute = path.resolve(parsed.file);
       const online = await post(config, '/gui/api/captures/import-video', {
-        path: absolute, artworkId: parsed.artworkId, markerId: parsed.markerId, capturedAt: parsed.capturedAt,
+        path: absolute, artworkId: parsed.artworkId, markerId: parsed.markerId, capturedAt: parsed.capturedAt, maskFaces: parsed.maskFaces,
       });
       await finishImport(config, online, async () => {
         const capture = await offline(config, async (captures) => ({ ...(await captures.importVideoFile(absolute, parsed)) }));
@@ -260,7 +331,7 @@ export async function runCaptureCommand(args: string[], config: AppConfig, logge
       const directory = path.resolve(parsed.directory);
       const videoPath = parsed.videoFile ? path.resolve(parsed.videoFile) : undefined;
       const online = await post(config, '/gui/api/captures/import-photos', {
-        path: directory, videoPath, artworkId: parsed.artworkId, markerId: parsed.markerId, capturedAt: parsed.capturedAt, capturedBy: parsed.capturedBy,
+        path: directory, videoPath, artworkId: parsed.artworkId, markerId: parsed.markerId, capturedAt: parsed.capturedAt, capturedBy: parsed.capturedBy, maskFaces: parsed.maskFaces,
       });
       await finishImport(config, online, async () => {
         const capture = await offline(config, async (captures) => ({ ...(await captures.importPhotoDirectory(directory, { ...parsed, videoPath })) }));
@@ -271,7 +342,7 @@ export async function runCaptureCommand(args: string[], config: AppConfig, logge
       let parsed: AddVideoArguments;
       try { parsed = parseAddVideoArguments(rest); } catch (error) { usageError(error); }
       const absolute = path.resolve(parsed.file);
-      const online = await post(config, '/gui/api/captures/add-video', { captureId: parsed.captureId, path: absolute, capturedAt: parsed.capturedAt });
+      const online = await post(config, '/gui/api/captures/add-video', { captureId: parsed.captureId, path: absolute, capturedAt: parsed.capturedAt, maskFaces: parsed.maskFaces });
       await finishImport(config, online, async () => {
         const capture = await offline(config, async (captures) => ({ ...(await captures.addVideoToCapture(parsed.captureId, absolute, parsed)) }));
         logger.info({ captureId: capture.id }, 'video added offline');

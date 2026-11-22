@@ -153,6 +153,8 @@ export async function serveSpatialVariant(
   role: string,
 ): Promise<void> {
   const record = getSpatialRecord(deps.store, spatialId);
+  // A superseded record's content is unpinned and must never be served again (see `supersedeSpatialRecord`).
+  if (record.state === 'superseded') throw localError(410, 'spatial_record_superseded', { message: 'This record was replaced by a newer one and is no longer served' });
   const variant = record.manifest.variants.find((candidate) => candidate.role === role);
   if (!variant) throw localError(404, 'spatial_variant_not_found');
   if (!isValidCidLike(variant.cid)) throw localError(500, 'spatial_variant_cid_invalid');

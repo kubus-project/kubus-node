@@ -4,6 +4,7 @@ import pathlib
 import struct
 import tempfile
 import unittest
+import unittest.mock
 from unittest import mock
 
 import cv2
@@ -281,6 +282,48 @@ class PhotoDatasetTests(unittest.TestCase):
         self.assertEqual(undecodable.exception.code, "photos_unreadable")
         self.assertEqual(undecodable.exception.details["usablePhotos"], 0)
         self.assertEqual(colmap.calls, [])
+
+    def test_masking_covers_photos_and_video_frames_and_counts_each_image(self):
+        from test_face_mask import FakeMasker
+
+        capture = make_photo_capture(self.root, count=20)
+        (capture / "video").mkdir()
+        (capture / "video" / "source.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
+        colmap = FakeColmap()
+        video = FakeTools(probe=probe_json(duration=10.0), frames=[(1000 + i, 0) for i in range(120)])
+
+        def runner(command, timeout):
+            return video(command, timeout) if command[0] in ("ffprobe", "ffmpeg") else colmap(command, timeout)
+
+        result = pp.prepare_photo_dataset(
+            runner, capture, self.root / "work", self.progress, include_video=True, convert=fake_convert(first_n(10_000)),
+            mask_photos=True, mask_video=True, masker=FakeMasker([(30, 30, 80, 90)]),
+        )
+        self.assertIn("masking_faces", [stage for stage, _ in self.stages])
+        self.assertEqual(result["masking"]["photos"], [1] * 20)
+        self.assertEqual(result["masking"]["video"], [1] * result["frames"]["selected"])
+
+    def test_photos_only_masking_leaves_video_frames_alone(self):
+        from test_face_mask import FakeMasker
+
+        capture = make_photo_capture(self.root, count=30)
+        result = pp.prepare_photo_dataset(
+            FakeColmap(), capture, self.root / "work", self.progress, convert=fake_convert(first_n(10_000)),
+            mask_photos=True, masker=FakeMasker([(30, 30, 80, 90)]),
+        )
+        self.assertEqual(result["masking"]["photos"], [1] * 30)
+        self.assertIsNone(result["masking"]["video"])
+        unmasked = pp.prepare_photo_dataset(FakeColmap(), capture, self.root / "work2", self.progress, convert=fake_convert(first_n(10_000)))
+        self.assertIsNone(unmasked["masking"]["photos"])
+
+    def test_a_missing_detector_fails_the_job_before_any_image_is_written(self):
+        capture = make_photo_capture(self.root, count=12)
+        from face_mask import FaceMaskingError
+
+        with unittest.mock.patch.object(pp, "FaceMasker", side_effect=FaceMaskingError("weights missing")):
+            with self.assertRaises(FaceMaskingError):
+                pp.prepare_photo_dataset(FakeColmap(), capture, self.root / "work", self.progress, mask_photos=True)
+        self.assertFalse((self.root / "work" / "dataset" / "images").exists() and any((self.root / "work" / "dataset" / "images").iterdir()))
 
     def test_a_mixed_capture_solves_photos_and_video_frames_together_with_one_camera_for_the_video(self):
         capture = make_photo_capture(self.root, count=20)

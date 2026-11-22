@@ -21,7 +21,9 @@ export interface SpatialVariant {
 export interface SpatialRevision {
   /** 1 for the first record of an artwork, previous number + 1 after that. */
   number: number;
-  reason: 'initial' | 'video_added' | 'resolve';
+  reason: 'initial' | 'video_added' | 'face_masking' | 'resolve';
+  /** Free-text reason an operator gave for the revision (for example the provenance fixes made with it). */
+  note?: string;
   previousSpatialId?: string;
   /** CID of the previous record's manifest, so the link is content-addressed. */
   previousManifestCid?: string;
@@ -68,6 +70,8 @@ export interface SpatialManifest {
     orientation?: Record<string, unknown>;
     /** The optional floater crop applied at export: box, method, splat counts before and after. */
     floaterCrop?: Record<string, unknown>;
+    /** Whether and how faces in the source images were masked: detector, model checksum and counts, never coordinates. */
+    faceMasking?: Record<string, unknown>;
   };
   createdAt: string;
 }

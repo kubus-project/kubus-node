@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { AnalyticsStore } from '../analytics/analyticsStore.js';
 import type { CaptureStore } from '../captures/captureStore.js';
+import { effectiveMasking, publicMaskingSummary } from '../captures/faceMasking.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import { localError } from '../localApi/pairingService.js';
 import type { Logger } from '../logging/logger.js';
@@ -72,9 +73,60 @@ const WORKER_STAGES: Record<string, { stage: JobStage; message: string } | undef
   extracting_frames: { stage: 'extracting_frames', message: 'Extracting and filtering frames from the video' },
   solving_poses: { stage: 'solving_poses', message: 'Solving camera poses (COLMAP)' },
   training: { stage: 'training', message: 'Training (this can take a while; progress is not reported mid-run by this worker version)' },
+  masking_faces: { stage: 'preparing_photos', message: 'Masking faces before reconstruction' },
 };
 const PROGRESS_POLL_MS = 2000;
 const PROVENANCE_MAX_BYTES = 8 * 1024;
+const MASKING_PART_KEYS = ['source', 'detector', 'model', 'weightsSha256', 'scoreThreshold', 'licence', 'opencv', 'images', 'photoImages', 'regions', 'imagesWithRegions', 'manualAdded', 'manualExcluded'] as const;
+
+/** One part (photos or video) of a face-masking record: known keys, bounded primitives and one array of counts. */
+function cleanMaskingPart(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const input = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const key of MASKING_PART_KEYS) {
+    const item = input[key];
+    if (typeof item === 'string') out[key] = item.slice(0, 120);
+    else if (typeof item === 'number' && Number.isFinite(item)) out[key] = item;
+  }
+  const counts = input.regionsPerImage;
+  if (Array.isArray(counts) && counts.length <= 512 && counts.every((entry) => Number.isInteger(entry) && entry >= 0 && entry <= 2000)) out.regionsPerImage = counts;
+  return Object.keys(out).length ? out : undefined;
+}
+
+/**
+ * The face-masking record of a new spatial record: what the worker reported for the parts it masked, plus the
+ * operator's report for photos that were masked before import. `undefined` for a capture masking does not apply to.
+ */
+export function faceMaskingProvenance(capture: { kind?: string; faceMasking?: unknown; artworkId?: string }, worker: unknown): Record<string, unknown> | undefined {
+  const kind = capture.kind ?? 'frames';
+  if (kind === 'frames') return undefined;
+  const masking = effectiveMasking(capture as Parameters<typeof effectiveMasking>[0]);
+  const reported = (worker && typeof worker === 'object' ? (worker as Record<string, unknown>).faceMasking : undefined) as Record<string, unknown> | undefined;
+  const out: Record<string, unknown> = {};
+  if (kind !== 'video') {
+    if (masking.photos === 'premasked' && masking.report) out.photos = cleanMaskingPart({ source: 'premasked', ...masking.report });
+    else if (masking.photos === 'worker') out.photos = cleanMaskingPart({ ...(reported?.photos as object | undefined), source: 'worker' });
+  }
+  if (kind === 'video' || kind === 'mixed') {
+    if (masking.video === 'worker') out.video = cleanMaskingPart({ ...(reported?.video as object | undefined), source: 'worker' });
+  }
+  const ran = Boolean(out.photos || out.video);
+  return ran ? { ran: true, ...out } : { ran: false };
+}
+
+/** Parts the worker was asked to mask that its answer does not show as masked; empty when everything ran. */
+export function missingMasking(requested: { photos?: boolean; video?: boolean } | undefined, worker: unknown): string[] {
+  if (!requested) return [];
+  const reported = (worker && typeof worker === 'object' ? (worker as Record<string, unknown>).faceMasking : undefined) as Record<string, unknown> | undefined;
+  const missing: string[] = [];
+  for (const part of ['photos', 'video'] as const) {
+    if (!requested[part]) continue;
+    const summary = reported?.[part] as Record<string, unknown> | undefined;
+    if (!summary || summary.ran !== true || typeof summary.images !== 'number' || summary.images < 1 || typeof summary.weightsSha256 !== 'string') missing.push(part);
+  }
+  return missing;
+}
 
 /** Keeps worker-reported provenance to bounded JSON primitives under known keys. */
 function sanitizeProvenance(value: unknown): Record<string, unknown> | undefined {
@@ -227,9 +279,22 @@ export class JobRuntime {
       if (typeof input.mode === 'string' && input.mode !== mode) {
         throw localError(422, 'capture_input_mode_mismatch', { message: `The capture is a ${mode} capture, not ${input.mode}` });
       }
-      const prepared = { ...(mode === 'frames' ? input : { ...input, mode }), ...this.revisionInput(input, captureId) };
+      const prepared = { ...(mode === 'frames' ? input : { ...input, mode }), ...this.revisionInput(input, captureId), ...this.maskingInput(captureId, mode) };
       return this.insert(type, prepared, captureId);
     });
+  }
+
+  /**
+   * Which parts of a capture the worker must mask before reconstruction (see `captures/faceMasking.ts`).
+   * Photos masked before import need nothing here; posed frames are not masked by this step.
+   */
+  private maskingInput(captureId: string, mode: string): Record<string, unknown> {
+    if (mode === 'frames') return {};
+    const capture = this.deps.captureStore.get(captureId);
+    const masking = effectiveMasking(capture);
+    const photos = mode !== 'video' && masking.photos === 'worker';
+    const video = (mode === 'video' || mode === 'mixed') && masking.video === 'worker';
+    return photos || video ? { maskFaces: { photos, video } } : {};
   }
 
   /**
@@ -247,6 +312,10 @@ export class JobRuntime {
     if (input.floaterCrop !== undefined) {
       if (typeof input.floaterCrop !== 'boolean') throw localError(400, 'job_floater_crop_invalid');
       out.floaterCrop = input.floaterCrop;
+    }
+    if (input.revisionNote !== undefined) {
+      if (typeof input.revisionNote !== 'string' || input.revisionNote.length > 200) throw localError(400, 'job_revision_note_invalid');
+      if (input.revisionNote.trim()) out.revisionNote = input.revisionNote.trim();
     }
     const capture = this.deps.captureStore.get(captureId);
     const records = Object.values(this.deps.store.snapshot().spatial || {}) as Array<{ id: string; createdAt: string; manifest?: SpatialManifest }>;
@@ -395,6 +464,10 @@ export class JobRuntime {
       const inputMode = job.type === 'spatial.reconstruct' && typeof job.input.mode === 'string' ? job.input.mode : 'frames';
       // Every mode that is not a posed-frame package is prepared inside the worker.
       const videoJob = inputMode !== 'frames';
+      const maskRequest = job.input.maskFaces as { photos?: boolean; video?: boolean } | undefined;
+      if (maskRequest && (maskRequest.photos || maskRequest.video) && (workerHealth as { faceMasking?: unknown }).faceMasking !== true) {
+        throw Object.assign(new Error('The spatial worker cannot mask faces; rebuild the worker image'), { code: 'worker_face_masking_unsupported' });
+      }
       if (videoJob && !(Array.isArray(workerHealth.inputModes) && workerHealth.inputModes.includes(inputMode))) {
         throw Object.assign(new Error(`The spatial worker does not accept ${inputMode} input; rebuild the worker image`), { code: `worker_${inputMode}_unsupported` });
       }
@@ -462,12 +535,15 @@ export class JobRuntime {
         const failure = workerFailure(body, response.status);
         throw Object.assign(new Error(failure.message), { code: failure.code });
       }
+      // Nothing is imported, and no record is made, for a result whose faces the worker did not mask.
+      const unmasked = missingMasking(job.input.maskFaces as { photos?: boolean; video?: boolean } | undefined, body.provenance);
+      if (unmasked.length) throw Object.assign(new Error(`The worker did not report face masking for: ${unmasked.join(', ')}`), { code: 'face_masking_failed' });
       await this.patchJob(id, (current) => {
         current.stage = 'importing'; current.progress = 0.9; current.updatedAt = new Date().toISOString();
         current.logs.push({ at: current.updatedAt, level: 'info', message: 'Importing spatial output into local Kubo' });
       });
       const spatial = await this.importOutputs(job, capture, outputDirectory, body);
-      const derivation = sanitizeProvenance(body.provenance);
+      const derivation = this.derivationOf(capture, body.provenance);
       if (derivation) await this.logDerivation(id, derivation);
       await this.patchJob(id, (current) => {
         current.state = 'completed'; current.stage = 'completed'; current.progress = 1; current.output = spatial;
@@ -519,7 +595,7 @@ export class JobRuntime {
    * was built from. Always present, so a backend can bind a grant to
    * (`id`, `revision.number`) for every record, including the first.
    */
-  private revisionOf(job: LocalJob, capture: ReturnType<CaptureStore['get']>): SpatialRevision {
+  private revisionOf(job: LocalJob, capture: ReturnType<CaptureStore['get']>, masking?: { ran?: boolean }): SpatialRevision {
     const previousId = typeof job.input.previousSpatialId === 'string' ? job.input.previousSpatialId : undefined;
     const previous = previousId ? (this.deps.store.snapshot().spatial?.[previousId] as { id: string; manifestCid?: string; manifest?: SpatialManifest } | undefined) : undefined;
     const inputs: SpatialRevision['inputs'] = { captureKind: capture.kind ?? 'frames' };
@@ -527,10 +603,14 @@ export class JobRuntime {
     if (capture.video) inputs.video = true;
     if (!previous?.manifest) return { number: 1, reason: 'initial', inputs };
     const previousCapture = previous.manifest.captureId;
+    const previousMasked = ((previous.manifest.captureProvenance.derivation?.faceMasking ?? {}) as { ran?: boolean }).ran === true;
+    const note = typeof job.input.revisionNote === 'string' && job.input.revisionNote ? { note: job.input.revisionNote.slice(0, 200) } : {};
     return {
       number: (previous.manifest.revision?.number ?? 1) + 1,
-      // `video_added` only when this capture was built from the capture the previous record came from.
-      reason: capture.derivedFrom?.captureId === previousCapture ? 'video_added' : 'resolve',
+      // `video_added` only when this capture was built from the capture the previous record came from;
+      // `face_masking` when the earlier record was reconstructed from unmasked images and this one from masked ones.
+      reason: capture.derivedFrom?.captureId === previousCapture ? 'video_added' : masking?.ran === true && !previousMasked ? 'face_masking' : 'resolve',
+      ...note,
       previousSpatialId: previous.id,
       ...(previous.manifestCid ? { previousManifestCid: previous.manifestCid } : {}),
       previousCaptureId: previousCapture,
@@ -538,8 +618,16 @@ export class JobRuntime {
     };
   }
 
+  /** The worker's provenance, bounded, with the face-masking record of the capture added. */
+  private derivationOf(capture: ReturnType<CaptureStore['get']>, provenance: unknown): Record<string, unknown> | undefined {
+    const derivation = sanitizeProvenance(provenance);
+    const masking = faceMaskingProvenance(capture, provenance);
+    if (!masking) return derivation;
+    return { ...(derivation ?? {}), faceMasking: masking };
+  }
+
   private async importOutputs(job: LocalJob, capture: ReturnType<CaptureStore['get']>, outputDirectory: string, output: WorkerOutput): Promise<Record<string, unknown>> {
-    const derivation = sanitizeProvenance(output.provenance);
+    const derivation = this.derivationOf(capture, output.provenance);
     if (!Array.isArray(output.variants) || output.variants.length === 0) throw Object.assign(new Error('Worker returned no variants'), { code: 'worker_output_invalid' });
     if (output.variants.length > 16) throw new Error('worker_output_variant_limit');
     const validated = await Promise.all(output.variants.map(async item => {
@@ -566,13 +654,16 @@ export class JobRuntime {
       await managed.acquire(added.Hash, pinOwner);
       variants.push({ role: item.role, cid: added.Hash, sizeBytes, mimeType: item.mimeType, format: item.format, storageClass: item.storageClass });
     }
+    const maskingSummary = publicMaskingSummary(derivation?.faceMasking as Record<string, unknown> | undefined);
     const manifest: SpatialManifest = {
       schema: 'kubus.spatial/1', type: 'gaussianSplat', id,
       artworkId: String(job.input.artworkId || capture.artworkId || ''), markerId: String(job.input.markerId || capture.markerId || '') || undefined,
       captureId: capture.id, captureProvenance: { source: 'localCapture', captureId: capture.id, ...(derivation ? { derivation } : {}) }, capturedAt: capture.capturedAt,
       capturedBy: typeof job.input.capturedBy === 'string' ? job.input.capturedBy : capture.capturedBy,
-      variants, transform: output.transform, viewerDefaults: output.viewerDefaults, processing: output.processing, createdAt: new Date().toISOString(),
-      revision: this.revisionOf(job, capture),
+      variants, transform: output.transform, viewerDefaults: output.viewerDefaults,
+      processing: { ...output.processing, ...(maskingSummary ? { faceMasking: maskingSummary } : {}) },
+      createdAt: new Date().toISOString(),
+      revision: this.revisionOf(job, capture, derivation?.faceMasking as { ran?: boolean } | undefined),
     };
     if (!manifest.artworkId) throw new Error('spatial_artwork_required');
     validateSpatialManifest(manifest);
@@ -680,6 +771,7 @@ function describeWorkerStage(stage: string, detail: Record<string, unknown>, fal
     const photos = (detail.photos ?? {}) as Record<string, unknown>;
     return `${fallback ?? stage}${number(photos.submitted) !== undefined ? `: ${photos.submitted} photos` : ''}`;
   }
+  if (stage === 'masking_faces') return `${fallback ?? 'Masking faces'}${number(detail.images) !== undefined ? ` in ${detail.images} images` : ''}`;
   if (stage === 'exporting') return 'Exporting the Gaussian splat';
   return fallback ?? stage;
 }

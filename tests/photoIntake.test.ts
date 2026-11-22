@@ -266,7 +266,13 @@ describe('photo reconstruction job and spatial revisions', () => {
   const WORKER_ID = '55555555-5555-4555-8555-555555555555';
   const MATRIX = [0.5, 0, 0, 0, 0, 0, -0.5, 0, 0, 0.5, 0, 0, 1, 2, 3, 1];
 
-  const processing = { protocol: 'kubus.spatial-job/1', workerVersion: 'kubus-spatial-worker/4', reconstruction: { engine: 'nerfstudio', method: 'splatfacto', iterations: 1000, outputFormat: 'ply' } };
+  /** What the worker reports for the parts it was asked to mask. */
+  const maskingReport = (requested: { photos?: boolean; video?: boolean }) => {
+    const part = (images: number) => ({ ran: true, images, regions: 3, imagesWithRegions: 2, regionsPerImage: Array.from({ length: images }, (_, index) => (index < 3 ? 1 : 0)), detector: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: 'a'.repeat(64) });
+    return { ...(requested.photos ? { photos: part(12) } : {}), ...(requested.video ? { video: part(48) } : {}) };
+  };
+
+  const processing = { protocol: 'kubus.spatial-job/1', workerVersion: 'kubus-spatial-worker/5', reconstruction: { engine: 'nerfstudio', method: 'splatfacto', iterations: 1000, outputFormat: 'ply' } };
 
   async function setup(inputModes: string[], onProcess?: (body: any) => Promise<Response>) {
     const dir = await tempDir();
@@ -278,7 +284,7 @@ describe('photo reconstruction job and spatial revisions', () => {
     const bodies: any[] = [];
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-      if (url.endsWith('/health')) return new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, workerInstanceId: WORKER_ID, gpu: { available: true, name: 'RTX 3080 Ti' }, capabilities: ['spatial.reconstruct'], inputModes }), { status: 200 });
+      if (url.endsWith('/health')) return new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, workerInstanceId: WORKER_ID, gpu: { available: true, name: 'RTX 3080 Ti' }, capabilities: ['spatial.reconstruct'], inputModes, faceMasking: true }), { status: 200 });
       if (url.endsWith('/v1/jobs/cancel')) return new Response(JSON.stringify({ ...JSON.parse(String(init?.body)), cleanupProtocol: 1, quiescent: true }));
       if (url.endsWith('/v1/process')) {
         const body = JSON.parse(String(init?.body ?? '{}'));
@@ -291,7 +297,7 @@ describe('photo reconstruction job and spatial revisions', () => {
           transform: { matrix: MATRIX, matrixOrder: 'column-major', up: [0, 0, 1], method: 'camera_up' },
           viewerDefaults: { quality: 'archive' },
           processing: { ...processing, orientation: { method: 'camera_up', confidence: 0.98 }, floaterCrop: { applied: true, splatsBefore: 100, splatsAfter: 90 } },
-          provenance: { kind: body.input.mode, photos: { submitted: 12, usable: 12 }, sfm: { registeredViews: 12, submittedViews: 12 }, splatCount: 90, orientation: { method: 'camera_up' }, crop: { applied: true, splatsBefore: 100, splatsAfter: 90 }, timings: { training: 30 } },
+          provenance: { kind: body.input.mode, ...(body.input.maskFaces ? { faceMasking: maskingReport(body.input.maskFaces) } : {}), photos: { submitted: 12, usable: 12 }, sfm: { registeredViews: 12, submittedViews: 12 }, splatCount: 90, orientation: { method: 'camera_up' }, crop: { applied: true, splatsBefore: 100, splatsAfter: 90 }, timings: { training: 30 } },
         }), { status: 200 });
       }
       throw new Error(`unexpected fetch to ${url}`);

@@ -7,7 +7,9 @@ sideways, off-centre or from behind. This module turns the solved cameras and
 sparse points into
 
 * an up vector (the mean of the cameras' up axes; if the cameras disagree, the
-  normal of the dominant plane of the sparse points, signed by the cameras),
+  normal of the dominant plane of the sparse points, signed by the cameras. That
+  fallback is a heuristic: it assumes the plane is horizontal, so it is reported
+  with a confidence below the trusted level and `trusted: false`),
 * a front direction (where the cameras stand relative to the subject, when they
   cover one side rather than a full orbit),
 * a bounding box of the subject (percentile box of the sparse points) used to
@@ -37,6 +39,10 @@ MIN_UP_CONFIDENCE = 0.6
 # The plane fallback is only trusted when the cameras look at the plane obliquely: above this mean
 # |cos| between their viewing directions and the plane normal they are face-on (a wall or a top-down floor).
 MAX_PLANE_FACE_ON = 0.8
+# The plane-normal fallback is a heuristic: it assumes the dominant plane of the sparse points is horizontal (a
+# floor or table). View geometry alone cannot tell that from a wall photographed obliquely with rolled cameras, so
+# its confidence never reaches MIN_UP_CONFIDENCE and the orientation record marks it as not trusted.
+PLANE_FALLBACK_MAX_CONFIDENCE = 0.5
 # Below this the cameras surround the subject (a full orbit), so no front exists.
 MIN_FRONT_CONFIDENCE = 0.4
 # Subject box from this percentile range of the sparse points, per axis.
@@ -148,8 +154,9 @@ def estimate_up(poses: np.ndarray, points: np.ndarray | None = None) -> dict:
         if face_on < MAX_PLANE_FACE_ON:
             if np.dot(normal, mean) < 0:
                 normal = -normal
-            # A weak camera consensus still fixes the sign; flatness says how much to trust the plane.
-            return {"method": "plane_normal", "up": _unit(normal), "confidence": flatness}
+            # A weak camera consensus still fixes the sign. Flatness says how planar the points are, not whether the
+            # plane is horizontal, so the answer is capped below the trusted level (see PLANE_FALLBACK_MAX_CONFIDENCE).
+            return {"method": "plane_normal", "up": _unit(normal), "confidence": min(flatness, PLANE_FALLBACK_MAX_CONFIDENCE)}
     if confidence > 1e-6:
         return {"method": "camera_up_weak", "up": _unit(mean), "confidence": confidence}
     return {"method": "assumed", "up": np.array([0.0, 0.0, 1.0]), "confidence": 0.0}
@@ -240,6 +247,8 @@ def analyse_scene(poses: np.ndarray, points: np.ndarray) -> dict:
     orientation: dict[str, Any] = {
         "method": up["method"],
         "confidence": round(up["confidence"], 3),
+        # Only a consensus of the cameras' own up axes is a trusted answer; every other method is a heuristic.
+        "trusted": bool(up["method"] == "camera_up" and up["confidence"] >= MIN_UP_CONFIDENCE),
         "up": [round(float(v), 5) for v in up["up"]],
         "frontConfidence": round(front["confidence"], 3) if front else None,
         "front": [round(float(v), 5) for v in front["front"]] if front else None,

@@ -4,6 +4,7 @@ import pathlib
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 
 import cv2
 import numpy as np
@@ -95,6 +96,39 @@ class VideoPipelineTests(unittest.TestCase):
             self.run_pipeline(tools)
         self.assertEqual(raised.exception.code, code)
         return raised.exception
+
+    def test_masking_runs_on_the_selected_frames_before_pose_solving_and_is_reported(self):
+        from test_face_mask import FakeMasker
+
+        masker = FakeMasker([(40, 30, 90, 80)])
+        order = []
+        real = vp.select_video_frames
+
+        def spy(*args, **kwargs):
+            after = kwargs["after_selection"]
+            kwargs["after_selection"] = lambda directory, names: (order.append("masked"), after(directory, names))[1]
+            return real(*args, **kwargs)
+
+        tools = FakeTools()
+
+        def runner(command, timeout):
+            if command[0] == "ns-process-data":
+                order.append("sfm")
+            return tools(command, timeout)
+
+        with unittest.mock.patch.object(vp, "select_video_frames", spy):
+            result = vp.prepare_video_dataset(runner, self.capture, self.work, lambda stage, detail: self.stages.append((stage, detail)), mask_video=True, masker=masker)
+        self.assertEqual(order, ["masked", "sfm"])
+        self.assertIn("masking_faces", [stage for stage, _ in self.stages])
+        regions = result["masking"]["video"]
+        self.assertEqual(len(regions), result["frames"]["selected"])
+        self.assertTrue(all(count == 1 for count in regions))
+        self.assertEqual(result["masking"]["version"]["name"], "YuNet")
+
+    def test_without_the_mask_option_nothing_is_masked(self):
+        result = self.run_pipeline(FakeTools())
+        self.assertIsNone(result["masking"]["video"])
+        self.assertIsNone(result["masking"]["version"])
 
     def test_happy_path_reports_stages_counts_and_sparse_initialisation(self):
         tools = FakeTools()

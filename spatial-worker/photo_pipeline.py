@@ -31,6 +31,7 @@ import shutil
 import struct
 from typing import Any, Callable
 
+from face_mask import FaceMaskingError, FaceMasker
 from video_pipeline import (
     MIN_REGISTRATION_RATIO,
     MIN_VIEWS_FOR_RECONSTRUCTION,
@@ -91,8 +92,12 @@ def _text(value: Any) -> str:
     return str(value).strip().strip("\x00")[:60] if value is not None else ""
 
 
-def prepare_photo(source: pathlib.Path, target: pathlib.Path, max_long_side: int = PHOTO_MAX_LONG_SIDE) -> dict:
-    """Decode `source`, bake its EXIF orientation, downscale, and write a clean JPEG to `target`."""
+def prepare_photo(source: pathlib.Path, target: pathlib.Path, max_long_side: int = PHOTO_MAX_LONG_SIDE, masker: FaceMasker | None = None) -> dict:
+    """Decode `source`, bake its EXIF orientation, mask faces when asked to, downscale, and write a clean JPEG to `target`.
+
+    Masking runs on the full-resolution upright pixels, before the downscale, so no unmasked pixel is ever
+    written to the job's image folder. A masking failure is an error, never a skipped image.
+    """
     from PIL import Image, ImageOps  # present in the worker image; imported lazily so the module imports anywhere
 
     Image.MAX_IMAGE_PIXELS = None  # Pillow only warns up to 2x its limit; the bound is enforced explicitly below
@@ -107,6 +112,15 @@ def prepare_photo(source: pathlib.Path, target: pathlib.Path, max_long_side: int
         focal, focal35 = lens.get(TAG_FOCAL_LENGTH), lens.get(TAG_FOCAL_LENGTH_35)
         upright = ImageOps.exif_transpose(opened)  # orientation applied to the pixels
         image = upright.convert("RGB")
+    regions = 0
+    if masker is not None:
+        import numpy as np
+
+        try:
+            masked, regions = masker.mask_array(np.asarray(image))
+        except Exception as error:
+            raise FaceMaskingError("face masking failed on an image") from error
+        image = Image.fromarray(masked)
     width, height = image.size
     factor = min(1.0, max_long_side / max(width, height))
     if factor < 1.0:
@@ -128,32 +142,43 @@ def prepare_photo(source: pathlib.Path, target: pathlib.Path, max_long_side: int
         "width": image.size[0], "height": image.size[1],
         "sourceWidth": width, "sourceHeight": height,
         "orientationApplied": orientation != 1,
+        "maskedRegions": regions,
         "camera": " ".join(part for part in (make, model) if part) or "unknown",
     }
 
 
-def prepare_photos(paths: list, destination: pathlib.Path, prefix: str = "photo") -> tuple:
-    """Prepare every photo; returns (names written, statistics). Unreadable files are dropped and counted."""
+def prepare_photos(paths: list, destination: pathlib.Path, prefix: str = "photo", masker: FaceMasker | None = None) -> tuple:
+    """Prepare every photo; returns (names written, statistics). Unreadable files are dropped and counted.
+
+    With a `masker`, the statistics carry `maskedRegions`: the region count of each written photo, in order.
+    """
     destination.mkdir(parents=True, exist_ok=True)
     names: list = []
     cameras: dict = {}
     rotated = 0
     unreadable = 0
+    regions: list = []
     for path in paths:
         name = f"{prefix}_{len(names):05d}.jpg"
         try:
-            facts = prepare_photo(path, destination / name)
+            facts = prepare_photo(path, destination / name, masker=masker)
+        except FaceMaskingError:
+            (destination / name).unlink(missing_ok=True)
+            raise
         except Exception:  # decoder errors are many types (OSError, ValueError, DecompressionBombError)
             unreadable += 1
             (destination / name).unlink(missing_ok=True)
             continue
         names.append(name)
+        regions.append(facts["maskedRegions"])
         rotated += 1 if facts["orientationApplied"] else 0
         cameras[facts["camera"]] = cameras.get(facts["camera"], 0) + 1
     stats = {
         "submitted": len(paths), "usable": len(names), "unreadable": unreadable,
         "orientationApplied": rotated, "cameras": cameras, "maxLongSide": PHOTO_MAX_LONG_SIDE,
     }
+    if masker is not None:
+        stats["maskedRegions"] = regions
     return names, stats
 
 
@@ -259,8 +284,15 @@ def prepare_photo_dataset(
     progress: Progress,
     include_video: bool = False,
     convert: Callable[[pathlib.Path, pathlib.Path], int] = default_convert,
+    mask_photos: bool = False,
+    mask_video: bool = False,
+    masker: FaceMasker | None = None,
 ) -> dict:
-    """Photos (and optionally the capture's video) to a posed Nerfstudio dataset. Returns dataset, facts and statistics."""
+    """Photos (and optionally the capture's video) to a posed Nerfstudio dataset. Returns dataset, facts and statistics.
+
+    `mask_photos` / `mask_video` ask for faces to be masked in the photos / the video frames before pose solving.
+    The result's `masking` holds the region counts per image and the detector's version.
+    """
     paths = find_photos(capture)
     if len(paths) < MIN_PHOTOS:
         raise WorkerError(
@@ -273,8 +305,12 @@ def prepare_photo_dataset(
     dataset = work / "dataset"
     images = dataset / "images"
     shutil.rmtree(dataset, ignore_errors=True)
+    if (mask_photos or mask_video) and masker is None:
+        masker = FaceMasker()  # raises FaceMaskingError when the pinned weights are missing or altered
+    if mask_photos:
+        progress("masking_faces", {"images": len(paths)})
     progress("preparing_photos", {"photos": {"submitted": len(paths)}})
-    names, photo_stats = prepare_photos(paths, images, "photo")
+    names, photo_stats = prepare_photos(paths, images, "photo", masker=masker if mask_photos else None)
     if len(names) < MIN_PHOTOS:
         raise WorkerError(
             "photos_unreadable",
@@ -284,8 +320,14 @@ def prepare_photo_dataset(
     groups = [(names, False)]
     video_info: dict | None = None
     frame_stats: dict | None = None
+    video_regions: list | None = None
     if include_video:
         video_names, video_info, frame_stats = select_video_frames(runner, capture, work, progress, images, prefix="video")
+        if mask_video:
+            from face_mask import mask_files
+
+            progress("masking_faces", {"images": len(video_names)})
+            video_regions = mask_files(masker, images, video_names)
         groups.append((video_names, True))
     submitted = len(names) + (len(groups[1][0]) if include_video else 0)
     progress("solving_poses", {"frames": frame_stats or {}, "photos": {"submitted": len(names)}})
@@ -298,4 +340,5 @@ def prepare_photo_dataset(
     except (OSError, ValueError):
         has_points = False
     sfm["sparsePointsInitialisation"] = has_points and (dataset / "sparse_pc.ply").is_file()
-    return {"dataset": dataset, "photos": photo_stats, "video": video_info, "frames": frame_stats, "sfm": sfm}
+    masking = {"photos": photo_stats.get("maskedRegions") if mask_photos else None, "video": video_regions, "version": masker.version if masker else None}
+    return {"dataset": dataset, "photos": photo_stats, "video": video_info, "frames": frame_stats, "sfm": sfm, "masking": masking}

@@ -287,6 +287,15 @@ export async function dispatchLocalRequest(
  * the channel. Over HTTPS the transport already authenticates the host; over
  * cleartext LAN the attacker must already be on the network.
  */
+/**
+ * A paired client cannot declare its own captures masked (or exempt from masking): the Node decides the
+ * face-masking step from its own policy, so a claim carried in uploaded metadata is discarded.
+ */
+export function dropClientMaskingClaim(payload: { metadata?: unknown }): void {
+  const metadata = payload?.metadata;
+  if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) delete (metadata as Record<string, unknown>).faceMasking;
+}
+
 async function proveIdentity(request: LocalRequest, deps: LocalApiDeps): Promise<LocalResponse> {
   identityProofAttempts.assertAllowed(
     pairingAttemptKey(request.peer.address || request.peer.kind, 'identity-proof'),
@@ -458,12 +467,14 @@ async function route(
     // package can exceed 50 MiB on the wire. Keep the endpoint bounded while
     // allowing a useful mobile capture session.
     const payload = (await request.body.json(BODY_LIMITS.capturePackage)) as unknown as CapturePackagePayload;
+    dropClientMaskingClaim(payload);
     return jsonResponse(201, await captures.create(payload));
   }
 
   if (method === 'POST' && path === '/local/v1/captures/drafts') {
     if (!(await pairing.authorize(credential, 'captures:create'))) throw localError(403, 'scope_required');
     const payload = (await request.body.json(BODY_LIMITS.captureDraftMetadata)) as unknown as CaptureDraftPayload;
+    dropClientMaskingClaim(payload);
     return jsonResponse(201, await captures.beginDraft(payload));
   }
 

@@ -333,6 +333,7 @@ def select_video_frames(
     progress: Progress,
     destination: pathlib.Path | None = None,
     prefix: str = "frame",
+    after_selection: Callable[[pathlib.Path, list], None] | None = None,
 ) -> tuple:
     """Probe the capture's video, extract, filter and select frames into `destination`.
 
@@ -356,16 +357,35 @@ def select_video_frames(
         shutil.copyfile(item["path"], chosen / name)
         names.append(name)
     shutil.rmtree(raw, ignore_errors=True)
+    if after_selection is not None:
+        after_selection(chosen, names)  # for example face masking, before anything reads the frames
     return names, info, selection
 
 
-def prepare_video_dataset(runner: Runner, capture: pathlib.Path, work: pathlib.Path, progress: Progress) -> dict:
-    """Run the whole video-to-dataset stage. Returns the dataset directory and a statistics summary."""
-    names, info, selection = select_video_frames(runner, capture, work, progress)
+def prepare_video_dataset(runner: Runner, capture: pathlib.Path, work: pathlib.Path, progress: Progress, mask_video: bool = False, masker: Any = None) -> dict:
+    """Run the whole video-to-dataset stage. Returns the dataset directory and a statistics summary.
+
+    With `mask_video`, faces in every selected frame are masked before pose solving; the result's `masking`
+    holds the region count of each frame and the detector's version.
+    """
+    regions: list | None = None
+    if mask_video:
+        from face_mask import FaceMasker, mask_files
+
+        masker = masker or FaceMasker()  # raises FaceMaskingError when the pinned weights are missing or altered
+
+        def mask_selected(directory: pathlib.Path, selected: list) -> None:
+            nonlocal regions
+            progress("masking_faces", {"images": len(selected)})
+            regions = mask_files(masker, directory, selected)
+
+        names, info, selection = select_video_frames(runner, capture, work, progress, after_selection=mask_selected)
+    else:
+        names, info, selection = select_video_frames(runner, capture, work, progress)
     chosen = work / "selected_frames"
     progress("solving_poses", {"frames": selection})
     dataset = work / "dataset"
     sfm = run_structure_from_motion(runner, chosen, dataset, len(names))
     sfm["tool"] = "colmap"
     sfm["toolVersion"] = colmap_version(runner)
-    return {"dataset": dataset, "video": info, "frames": selection, "sfm": sfm}
+    return {"dataset": dataset, "video": info, "frames": selection, "sfm": sfm, "masking": {"photos": None, "video": regions, "version": masker.version if mask_video else None}}

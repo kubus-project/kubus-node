@@ -26,6 +26,7 @@ import { spatialViewerBundle } from './public/vendor/spatialViewerBundle.js';
 import { handleLocalApi, type LocalApiDeps } from '../localApi/localApiRouter.js';
 import { localError } from '../localApi/pairingService.js';
 import { importRoots, resolveImportSource } from '../captures/importPaths.js';
+import { supersedeSpatialRecord } from '../spatial/supersede.js';
 import { buildViewModel } from './viewModel.js';
 import { renderQrSvg } from './qr.js';
 import {
@@ -250,6 +251,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     const options: Record<string, unknown> = {};
     if (body.floaterCrop !== undefined) options.floaterCrop = body.floaterCrop;
     if (body.previousSpatialId !== undefined) options.previousSpatialId = body.previousSpatialId;
+    if (body.revisionNote !== undefined) options.revisionNote = body.revisionNote;
     const job = await local.jobs.create(type as never, { captureId, artworkId: capture.artworkId, markerId: capture.markerId, ...options });
     writeJson(res, 201, { success: true, data: job });
     return;
@@ -280,7 +282,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     const source = await resolveImportSource(body.path, importRoots(deps.config.localDataPath));
     const text = (value: unknown) => (typeof value === 'string' && value.trim() ? value.trim().slice(0, 200) : undefined);
     const capture = await local.captures.importVideoFile(source, {
-      artworkId: text(body.artworkId), markerId: text(body.markerId), capturedAt: text(body.capturedAt),
+      artworkId: text(body.artworkId), markerId: text(body.markerId), capturedAt: text(body.capturedAt), maskFaces: optionalBoolean(body.maskFaces, 'capture_mask_faces_invalid'),
     });
     writeJson(res, 201, { success: true, data: capture });
     return;
@@ -296,6 +298,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     const text = (value: unknown) => (typeof value === 'string' && value.trim() ? value.trim().slice(0, 200) : undefined);
     const capture = await local.captures.importPhotoDirectory(directory, {
       artworkId: text(body.artworkId), markerId: text(body.markerId), capturedAt: text(body.capturedAt), capturedBy: text(body.capturedBy), videoPath,
+      maskFaces: optionalBoolean(body.maskFaces, 'capture_mask_faces_invalid'),
     });
     writeJson(res, 201, { success: true, data: capture });
     return;
@@ -307,7 +310,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     if (typeof body.captureId !== 'string' || !body.captureId) throw localError(400, 'capture_id_required');
     const source = await resolveImportSource(body.path, importRoots(deps.config.localDataPath));
     const capturedAt = typeof body.capturedAt === 'string' && body.capturedAt.trim() ? body.capturedAt.trim().slice(0, 40) : undefined;
-    const capture = await local.captures.addVideoToCapture(body.captureId, source, { capturedAt });
+    const capture = await local.captures.addVideoToCapture(body.captureId, source, { capturedAt, maskFaces: optionalBoolean(body.maskFaces, 'capture_mask_faces_invalid') });
     writeJson(res, 201, { success: true, data: capture });
     return;
   }
@@ -337,6 +340,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
   const spatialContentMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/content\/([^/]+)$/);
   if (req.method === 'GET' && spatialContentMatch) {
     await serveSpatialVariant(req, res, deps, decodeURIComponent(spatialContentMatch[1]!), decodeURIComponent(spatialContentMatch[2]!));
+    return;
+  }
+  const spatialSupersedeMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/supersede$/);
+  if (req.method === 'POST' && spatialSupersedeMatch) {
+    const body = await readGuiJson(req);
+    if (typeof body.by !== 'string' || !body.by) throw localError(400, 'spatial_replacement_required');
+    writeJson(res, 200, { success: true, data: await supersedeSpatialRecord({ store: deps.store, kubo: deps.kubo }, decodeURIComponent(spatialSupersedeMatch[1]!), body.by) });
     return;
   }
   const spatialMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)$/);
@@ -485,6 +495,13 @@ async function createGuiPairing(deps: GuiDeps) {
       endpoint: session.node.endpoint,
     },
   };
+}
+
+/** A request-body flag that is true, false or absent; anything else is a 400. */
+function optionalBoolean(value: unknown, code: string): boolean | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'boolean') throw localError(400, code);
+  return value;
 }
 
 async function readGuiJson(req: IncomingMessage, maxBytes = 64 * 1024): Promise<Record<string, unknown>> {

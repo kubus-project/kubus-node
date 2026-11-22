@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from gpu_tier import classify_vram_tier
 from job_control import JobControl, JobCancelled, hand_back_ownership
+from face_mask import FaceMaskingError, masking_provenance
 from photo_pipeline import prepare_photo_dataset
 from scene_frame import analyse_dataset
 from video_pipeline import WorkerError, prepare_video_dataset
@@ -24,7 +25,7 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 WORKER_AUTH_KEY_PATH = os.environ.get("WORKER_AUTH_KEY_PATH", "/var/lib/kubus-node/worker-auth.key")
 
 
-WORKER_VERSION = "kubus-spatial-worker/4"
+WORKER_VERSION = "kubus-spatial-worker/5"
 WORKER_INSTANCE_ID = str(uuid.uuid4())
 control = JobControl("/var/lib/kubus-node/private/worker-control")
 
@@ -78,6 +79,8 @@ def health() -> dict[str, Any]:
         "capabilities": ["spatial.reconstruct", "spatial.gaussianSplat"],
         # Input modes `spatial.reconstruct` accepts: posed frames, one video, still photos, or photos plus one video.
         "inputModes": ["frames", "video", "photos", "mixed"],
+        # Face masking of photos and video frames before reconstruction (`input.maskFaces`); see face_mask.py.
+        "faceMasking": True,
         "version": WORKER_VERSION,
         "cleanupProtocol": 1,
         "workerInstanceId": WORKER_INSTANCE_ID,
@@ -124,6 +127,9 @@ def process(request: ProcessRequest, x_kubus_worker_authorization: str | None = 
             return process_owned(request)
     except JobCancelled:
         raise HTTPException(status_code=409, detail="job_cancelled")
+    except FaceMaskingError as error:
+        # Masking could not run: nothing may continue with unmasked pixels.
+        raise HTTPException(status_code=500, detail={"code": "face_masking_failed", "message": str(error)})
     except WorkerError as error:
         # `detail` is an object with a stable `code`; the Node reads it.
         raise HTTPException(status_code=error.status, detail=error.detail())
@@ -202,14 +208,23 @@ def run_reconstruction(request: ProcessRequest):
     started = time.monotonic()
     runner = lambda command, timeout: control.run(request.jobId, command, timeout=timeout)
     progress = lambda stage, detail: write_progress(output, stage, detail)
+    mask = request.input.get("maskFaces")
+    mask_photos = isinstance(mask, dict) and mask.get("photos") is True
+    mask_video = isinstance(mask, dict) and mask.get("video") is True
     if mode == "video":
-        prepared = prepare_video_dataset(runner, capture, output, progress)
+        prepared = prepare_video_dataset(runner, capture, output, progress, mask_video=mask_video)
         dataset = prepared["dataset"]
         provenance = {"kind": "video", "video": prepared["video"], "frames": prepared["frames"], "sfm": prepared["sfm"]}
+        masked = masking_provenance(prepared["masking"])
+        if masked:
+            provenance["faceMasking"] = masked
     elif mode in ("photos", "mixed"):
-        prepared = prepare_photo_dataset(runner, capture, output, progress, include_video=(mode == "mixed"))
+        prepared = prepare_photo_dataset(runner, capture, output, progress, include_video=(mode == "mixed"), mask_photos=mask_photos, mask_video=mask_video)
         dataset = prepared["dataset"]
         provenance = {"kind": mode, "photos": prepared["photos"], "sfm": prepared["sfm"]}
+        masked = masking_provenance(prepared["masking"])
+        if masked:
+            provenance["faceMasking"] = masked
         if prepared["video"]:
             provenance["video"] = prepared["video"]
             provenance["frames"] = prepared["frames"]

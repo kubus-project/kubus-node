@@ -7,6 +7,7 @@ import { createReadStream } from 'node:fs';
 import { declaredFrameCount, inspectCapturePackage, isPlainObject, type CapturePackageKind, type CapturePackageReport } from './capturePackage.js';
 import { VIDEO_EXTENSIONS, VIDEO_MAX_BYTES, VIDEO_MIN_BYTES, type VideoExtension } from './videoPackage.js';
 import { PHOTO_EXTENSIONS, PHOTO_MAX_BYTES, PHOTO_MAX_COUNT, PHOTO_MIN_COUNT, listPhotoSources, type PhotoFacts } from './photoPackage.js';
+import { FaceMaskingReportError, readPremaskedReport, resolveMasking, effectiveMasking, type CaptureFaceMasking } from './faceMasking.js';
 
 export interface CaptureFilePayload { path: string; contentBase64: string; mimeType?: string }
 export interface CapturePackagePayload {
@@ -67,6 +68,11 @@ export interface CaptureRecord {
   capturedBy?: string;
   /** When each medium was captured, for a mixed capture (`capturedAt` is the earliest). */
   mediaCapturedAt?: { photos?: string; video?: string };
+  /**
+   * How faces in this capture's images are masked before reconstruction (see `faceMasking.ts`).
+   * Absent on captures made before the feature; those get the default for their artwork at processing time.
+   */
+  faceMasking?: CaptureFaceMasking;
 
   /**
    * Client-supplied idempotency key from `metadata.localCaptureId`.
@@ -98,6 +104,14 @@ function mediaMetadata(metadata: Record<string, unknown> | undefined): Partial<C
   if (derivedFrom) out.derivedFrom = { captureId: derivedFrom };
   const capturedBy = text(metadata?.capturedBy);
   if (capturedBy) out.capturedBy = capturedBy;
+  const masking = metadata?.faceMasking;
+  if (isPlainObject(masking)) {
+    const photos = masking.photos === 'premasked' || masking.photos === 'worker' || masking.photos === 'none' ? masking.photos : undefined;
+    const video = masking.video === 'worker' || masking.video === 'none' ? masking.video : undefined;
+    if (photos || video) {
+      out.faceMasking = { ...(photos ? { photos } : {}), ...(video ? { video } : {}), ...(isPlainObject(masking.report) ? { report: masking.report as unknown as CaptureFaceMasking['report'] } : {}) };
+    }
+  }
   const media = metadata?.mediaCapturedAt;
   if (isPlainObject(media)) {
     const photos = text(media.photos, 40);
@@ -652,7 +666,7 @@ export class CaptureStore {
    */
   async importVideoFile(
     sourcePath: string,
-    options: { artworkId?: string; markerId?: string; capturedAt?: string } = {},
+    options: { artworkId?: string; markerId?: string; capturedAt?: string; maskFaces?: boolean } = {},
   ): Promise<CaptureRecord> {
     let resolved: string;
     let stat;
@@ -673,7 +687,9 @@ export class CaptureStore {
     const hash = crypto.createHash('sha256');
     for await (const chunk of createReadStream(resolved)) hash.update(chunk as Buffer);
     const sha256 = hash.digest('hex');
-    const localCaptureId = `video-import:${sha256}:${options.artworkId ?? ''}:${options.markerId ?? ''}`;
+    const videoMasking = resolveMasking({ maskFaces: options.maskFaces, artworkId: options.artworkId }) ? 'worker' : 'none';
+    // The masking decision is part of the identity: the same footage imported with and without masking is two captures.
+    const localCaptureId = `video-import:${sha256}:${options.artworkId ?? ''}:${options.markerId ?? ''}${videoMasking === 'none' ? ':masking=none' : ''}`;
 
     const capturedAt = options.capturedAt && !Number.isNaN(Date.parse(options.capturedAt))
       ? new Date(options.capturedAt).toISOString()
@@ -685,7 +701,10 @@ export class CaptureStore {
       capturedAt,
       // No original file name or path: the capture is private, but the name of
       // a phone recording is still personal data nothing downstream needs.
-      metadata: { kind: 'video', source: 'local_import', localCaptureId, sha256, sourceBytes: stat.size },
+      metadata: {
+        kind: 'video', source: 'local_import', localCaptureId, sha256, sourceBytes: stat.size,
+        faceMasking: { video: videoMasking },
+      },
     });
     try {
       await this.writeDraftFileStream(
@@ -717,7 +736,7 @@ export class CaptureStore {
    */
   async importPhotoDirectory(
     sourceDirectory: string,
-    options: { artworkId?: string; markerId?: string; capturedAt?: string; capturedBy?: string; videoPath?: string; videoCapturedAt?: string } = {},
+    options: { artworkId?: string; markerId?: string; capturedAt?: string; capturedBy?: string; videoPath?: string; videoCapturedAt?: string; maskFaces?: boolean } = {},
   ): Promise<CaptureRecord & { skippedFiles: number }> {
     let resolved: string;
     try {
@@ -744,9 +763,33 @@ export class CaptureStore {
 
     const video = options.videoPath ? await this.resolveVideoFile(options.videoPath) : undefined;
     const setHash = crypto.createHash('sha256');
-    for (const photo of photos) setHash.update(await sha256File(photo.absolute));
+    const photoHashes: string[] = [];
+    for (const photo of photos) {
+      const digest = await sha256File(photo.absolute);
+      photoHashes.push(digest.toString('hex'));
+      setHash.update(digest);
+    }
     if (video) setHash.update(video.sha256);
-    const localCaptureId = `photos-import:${setHash.digest('hex')}:${options.artworkId ?? ''}:${options.markerId ?? ''}`;
+    // Masked copies come with a report that names each file by SHA-256; without one the worker masks as a job step.
+    let report;
+    try {
+      report = await readPremaskedReport(resolved, photoHashes);
+    } catch (error) {
+      if (error instanceof FaceMaskingReportError) throw localError(422, error.code, { message: error.message });
+      throw error;
+    }
+    if (report && options.maskFaces === false) {
+      throw localError(422, 'face_masking_conflict', { message: 'The directory holds a face-masking report; remove it to import without masking' });
+    }
+    const wantsMasking = resolveMasking({ maskFaces: options.maskFaces, artworkId: options.artworkId });
+    const faceMasking: CaptureFaceMasking = {
+      photos: report ? 'premasked' : wantsMasking ? 'worker' : 'none',
+      ...(video ? { video: wantsMasking ? 'worker' as const : 'none' as const } : {}),
+      ...(report ? { report } : {}),
+    };
+    // The masking decision is part of the identity (the default, worker masking, adds nothing so earlier keys still match).
+    const maskingKey = faceMasking.photos === 'worker' && (!video || faceMasking.video === 'worker') ? '' : `:masking=${faceMasking.photos}/${faceMasking.video ?? '-'}`;
+    const localCaptureId = `photos-import:${setHash.digest('hex')}:${options.artworkId ?? ''}:${options.markerId ?? ''}${maskingKey}`;
 
     const earliest = new Date(Math.min(...photos.map((photo) => photo.mtimeMs))).toISOString();
     const photosCapturedAt = validIso(options.capturedAt) ?? earliest;
@@ -759,7 +802,7 @@ export class CaptureStore {
       capturedAt,
       metadata: {
         kind: video ? 'mixed' : 'photos', source: 'local_import', localCaptureId,
-        photoCount: photos.length,
+        photoCount: photos.length, faceMasking,
         ...(options.capturedBy ? { capturedBy: options.capturedBy.slice(0, 200) } : {}),
         ...(video ? { mediaCapturedAt: { photos: photosCapturedAt, video: videoCapturedAt } } : {}),
       },
@@ -793,14 +836,15 @@ export class CaptureStore {
   async addVideoToCapture(
     baseCaptureId: string,
     videoPath: string,
-    options: { capturedAt?: string } = {},
+    options: { capturedAt?: string; maskFaces?: boolean } = {},
   ): Promise<CaptureRecord> {
     const base = this.get(baseCaptureId);
     if (base.kind !== 'photos') throw localError(422, 'capture_extension_invalid', { message: 'A video can only be added to a photo capture (kind photos)' });
     const video = await this.resolveVideoFile(videoPath);
     const photos = await listPhotoSources(base.directory);
     if (photos.length === 0) throw localError(422, 'capture_extension_invalid', { message: 'The photo capture no longer holds its photos' });
-    const localCaptureId = `video-extension:${base.id}:${video.sha256}`;
+    const videoMasking = resolveMasking({ maskFaces: options.maskFaces, artworkId: base.artworkId }) ? 'worker' as const : 'none' as const;
+    const localCaptureId = `video-extension:${base.id}:${video.sha256}${videoMasking === 'none' ? ':masking=none' : ''}`;
     const videoCapturedAt = validIso(options.capturedAt) ?? video.mtime.toISOString();
     const photosCapturedAt = base.mediaCapturedAt?.photos ?? base.capturedAt;
     const draft = await this.beginDraft({
@@ -811,6 +855,12 @@ export class CaptureStore {
       capturedAt: videoCapturedAt < photosCapturedAt ? videoCapturedAt : photosCapturedAt,
       metadata: {
         kind: 'mixed', source: 'video_extension', localCaptureId, derivedFromCaptureId: base.id, photoCount: photos.length,
+        // The photos keep whatever masking the base capture had; the video follows the default or the caller's choice.
+        faceMasking: {
+          photos: effectiveMasking(base).photos ?? 'none',
+          video: videoMasking,
+          ...(base.faceMasking?.report ? { report: base.faceMasking.report } : {}),
+        },
         ...(base.capturedBy ? { capturedBy: base.capturedBy } : {}),
         mediaCapturedAt: { photos: photosCapturedAt, video: videoCapturedAt },
       },

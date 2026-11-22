@@ -301,7 +301,7 @@ describe('video reconstruction job', () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
       if (url.endsWith('/health')) {
-        return new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, workerInstanceId: WORKER_ID, gpu: { available: true, name: 'RTX 3080 Ti' }, capabilities: ['spatial.reconstruct'], ...workerHealth }), { status: 200 });
+        return new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, workerInstanceId: WORKER_ID, gpu: { available: true, name: 'RTX 3080 Ti' }, capabilities: ['spatial.reconstruct'], faceMasking: true, ...workerHealth }), { status: 200 });
       }
       if (url.endsWith('/v1/jobs/cancel')) {
         const request = JSON.parse(String(init?.body));
@@ -396,7 +396,7 @@ describe('video reconstruction job', () => {
       return new Response(JSON.stringify({
         variants: [{ role: 'spatial_archive', path: 'result.ply', mimeType: 'application/octet-stream', format: 'ply', storageClass: 'cold' }],
         processing: { protocol: 'kubus.spatial-job/1', workerVersion: 'kubus-spatial-worker/3', reconstruction: { engine: 'nerfstudio', method: 'splatfacto', iterations: 1000, outputFormat: 'ply' } },
-        provenance: { kind: 'video', frames: { selected: 75 }, sfm: { tool: 'colmap', submittedViews: 75, registeredViews: 70, registrationRatio: 0.933 }, splatCount: 123456, injected: 'ignored' },
+        provenance: { kind: 'video', faceMasking: { video: { ran: true, images: 75, regions: 4, imagesWithRegions: 3, regionsPerImage: Array.from({ length: 75 }, (_, index) => (index < 4 ? 1 : 0)), detector: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: 'a'.repeat(64) } }, frames: { selected: 75 }, sfm: { tool: 'colmap', submittedViews: 75, registeredViews: 70, registrationRatio: 0.933 }, splatCount: 123456, injected: 'ignored' },
       }), { status: 200 });
     });
     jobsRef = jobs;
@@ -412,7 +412,7 @@ describe('video reconstruction job', () => {
     expect(messages).toContain('Solving camera poses (COLMAP): 187 extracted, 30 blurry dropped, 12 near-duplicate dropped, 75 kept');
     expect(messages).toContain('COLMAP registered 70 of 75 views; 123456 splats');
     const record = Object.values(store.snapshot().spatial ?? {})[0] as { manifest: { captureProvenance: Record<string, any> } };
-    expect(record.manifest.captureProvenance.derivation).toMatchObject({ kind: 'video', splatCount: 123456, sfm: { registeredViews: 70 } });
+    expect(record.manifest.captureProvenance.derivation).toMatchObject({ kind: 'video', splatCount: 123456, sfm: { registeredViews: 70 }, faceMasking: { ran: true, video: { source: 'worker', images: 75, regions: 4 } } });
     expect(record.manifest.captureProvenance.derivation.injected).toBeUndefined();
   }, 20000);
 
