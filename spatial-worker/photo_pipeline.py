@@ -229,7 +229,7 @@ def run_pose_solving(
     registered = registered_in_model(best)
     details = {"submittedViews": submitted, "registeredViews": registered, "registrationRatio": round(registered / submitted, 3) if submitted else 0.0,
                "modelsFound": len(models), "cameras": cameras_in_model(best)}
-    check_registration_gates(registered, submitted, details, PHOTO_MIN_REGISTERED_VIEWS, PHOTO_MIN_REGISTRATION_RATIO)
+    check_registration_gates(registered, submitted, details, PHOTO_MIN_REGISTERED_VIEWS, PHOTO_MIN_REGISTRATION_RATIO, noun="images")
     convert(best, dataset)
     transforms = dataset / "transforms.json"
     if not transforms.is_file():

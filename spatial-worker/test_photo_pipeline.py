@@ -193,6 +193,7 @@ class PhotoDatasetTests(unittest.TestCase):
         self.assertEqual(floor.exception.details["registeredViews"], 20)
         self.assertEqual(floor.exception.details["submittedViews"], 30)
         self.assertIn("at least 24", floor.exception.message)
+        self.assertIn("20 of 30 images", floor.exception.message)
         # A big set that registers 26 of 60 passes the floor but not the ratio.
         big = make_photo_capture(self.root / "big", count=60)
         with self.assertRaises(vp.WorkerError) as ratio:
