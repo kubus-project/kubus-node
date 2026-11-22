@@ -27,6 +27,7 @@ import { handleLocalApi, type LocalApiDeps } from '../localApi/localApiRouter.js
 import { localError } from '../localApi/pairingService.js';
 import { importRoots, resolveImportSource } from '../captures/importPaths.js';
 import { supersedeSpatialRecord } from '../spatial/supersede.js';
+import { purgeSupersededContent } from '../spatial/supersededBlocks.js';
 import { buildViewModel } from './viewModel.js';
 import { renderQrSvg } from './qr.js';
 import {
@@ -340,6 +341,11 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
   const spatialContentMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/content\/([^/]+)$/);
   if (req.method === 'GET' && spatialContentMatch) {
     await serveSpatialVariant(req, res, deps, decodeURIComponent(spatialContentMatch[1]!), decodeURIComponent(spatialContentMatch[2]!));
+    return;
+  }
+  if (req.method === 'POST' && parsed.pathname === '/gui/api/spatial/purge-superseded') {
+    await readGuiJson(req);
+    writeJson(res, 200, { success: true, data: await purgeSupersededContent({ store: deps.store, kubo: deps.kubo }) });
     return;
   }
   const spatialSupersedeMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/supersede$/);

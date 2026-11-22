@@ -25,7 +25,11 @@ export interface SpatialRevision {
   /** Free-text reason an operator gave for the revision (for example the provenance fixes made with it). */
   note?: string;
   previousSpatialId?: string;
-  /** CID of the previous record's manifest, so the link is content-addressed. */
+  /**
+   * The link to the previous record, so a viewer can walk the history. Deliberately absent for `reason:
+   * 'face_masking'`: the previous record was reconstructed from unmasked images, and a manifest that anyone may
+   * read must not name it (its id, its manifest CID, or the capture that still holds the unmasked photos).
+   */
   previousManifestCid?: string;
   previousCaptureId?: string;
   /** What this record was reconstructed from. */
@@ -100,7 +104,7 @@ export function validateSpatialManifest(value: unknown): SpatialManifest {
   const revision = manifest.revision;
   if (revision !== undefined && (!Number.isSafeInteger(revision.number) || revision.number < 1
     || (revision.previousSpatialId !== undefined && typeof revision.previousSpatialId !== 'string')
-    || (revision.number > 1 && !revision.previousSpatialId))) {
+    || (revision.number > 1 && !revision.previousSpatialId && revision.reason !== 'face_masking'))) {
     throw new Error('spatial_manifest_revision_invalid');
   }
   return structuredClone(manifest as SpatialManifest);

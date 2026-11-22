@@ -25,7 +25,7 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 WORKER_AUTH_KEY_PATH = os.environ.get("WORKER_AUTH_KEY_PATH", "/var/lib/kubus-node/worker-auth.key")
 
 
-WORKER_VERSION = "kubus-spatial-worker/5"
+WORKER_VERSION = "kubus-spatial-worker/6"
 WORKER_INSTANCE_ID = str(uuid.uuid4())
 control = JobControl("/var/lib/kubus-node/private/worker-control")
 
@@ -321,7 +321,7 @@ def run_reconstruction(request: ProcessRequest):
         },
     }
     if analysis:
-        result["transform"] = {"matrix": analysis["matrix"], "matrixOrder": "column-major", "up": analysis["up"], "method": analysis["orientation"]["method"]}
+        result["transform"] = {"matrix": analysis["matrix"], "matrixOrder": "column-major", "up": analysis["up"], "method": analysis["orientation"]["method"], "rotationApplied": analysis["orientation"]["rotationApplied"]}
         result["processing"]["orientation"] = analysis["orientation"]
     if crop is not None:
         result["processing"]["floaterCrop"] = crop

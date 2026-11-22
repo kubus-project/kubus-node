@@ -111,6 +111,7 @@ class OrientationTests(unittest.TestCase):
         self.assertLess(estimate["confidence"], sf.MIN_UP_CONFIDENCE)
         analysis = sf.analyse_scene(poses, flat)
         self.assertFalse(analysis["orientation"]["trusted"])
+        self.assertFalse(analysis["orientation"]["rotationApplied"])
 
     def test_a_wall_seen_face_on_is_not_given_a_sideways_up_by_the_plane_fallback(self):
         # A mural: sparse points on the wall x = 0 (its normal is horizontal), cameras facing it from x = 3
@@ -153,12 +154,23 @@ class OrientationTests(unittest.TestCase):
             analysis = sf.analyse_scene(poses, wall)
             self.assertFalse(analysis["orientation"]["trusted"], f"spread {spread}")
             self.assertLess(analysis["orientation"]["confidence"], sf.MIN_UP_CONFIDENCE)
+            # Nothing is rotated on a guess: the transform is a uniform scale plus a translation only.
+            linear = np.asarray(analysis["matrix"]).reshape(4, 4).T[:3, :3]
+            scale = float(np.cbrt(np.linalg.det(linear)))
+            np.testing.assert_allclose(linear, scale * np.eye(3), atol=1e-5, err_msg=f"spread {spread}")
+            self.assertIsNone(analysis["orientation"]["front"], f"spread {spread}")
 
     def test_a_consensus_of_camera_ups_is_trusted(self):
         poses = orbit(count=24)
         analysis = sf.analyse_scene(poses, np.random.default_rng(2).normal(size=(300, 3)))
         self.assertEqual(analysis["orientation"]["method"], "camera_up")
         self.assertTrue(analysis["orientation"]["trusted"])
+        self.assertTrue(analysis["orientation"]["rotationApplied"])
+
+    def test_the_viewer_matrix_without_an_up_only_centres_and_scales(self):
+        matrix = sf.viewer_matrix(None, np.array([1.0, 0.0, 0.0]), np.array([1.0, 2.0, 3.0]), 4.0)
+        np.testing.assert_allclose(matrix[:3, :3], 0.5 * np.eye(3), atol=1e-9)
+        np.testing.assert_allclose(apply(matrix, [1.0, 2.0, 3.0]), [0, 0, 0], atol=1e-9)
 
     def test_with_nothing_to_go_on_up_is_assumed(self):
         poses = np.stack([np.eye(4), np.eye(4)])

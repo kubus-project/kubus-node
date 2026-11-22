@@ -20,6 +20,12 @@ export interface SupersedeResult {
   state: 'superseded';
   supersededBy: string;
   released: Array<{ cid: string; pinRemoved: boolean; reason?: string }>;
+  /**
+   * Root blocks (manifest and variants) of this record that are still in the local block store. Unpinned is not
+   * deleted: while any are present Kubo's gateway serves them, and so does bitswap once the Node has peers. Run
+   * `kubus-node spatial purge-superseded` to remove exactly these blocks. Absent when the store could not be asked.
+   */
+  blocksStillStored?: number;
 }
 
 /**
@@ -31,12 +37,15 @@ export interface SupersedeResult {
  * is no longer pinned and the local gateway refuses to serve it. This is an explicit operator command, so it
  * unpins even where automatic pin release is switched off, but it only ever removes pins this Node created
  * for that record (`ManagedPins` ownership) and it never runs garbage collection: blocks stay in the local
- * block store until the operator collects them.
+ * block store until `purgeSupersededContent` (`kubus-node spatial purge-superseded`) removes exactly them, and
+ * the result says how many are still there.
+ *
+ * `superseded` is terminal: nothing sets a superseded record back to another state (the publish route refuses it).
  *
  * Idempotent: repeating it retries any pin whose release did not finish.
  */
 export async function supersedeSpatialRecord(
-  deps: { store: LocalStore; kubo: Pick<KuboClient, 'pinLs' | 'pinAdd' | 'pinRm'> },
+  deps: { store: LocalStore; kubo: Pick<KuboClient, 'pinLs' | 'pinAdd' | 'pinRm'> & Partial<Pick<KuboClient, 'blockPresent'>> },
   oldId: string,
   newId: string,
 ): Promise<SupersedeResult> {
@@ -69,5 +78,14 @@ export async function supersedeSpatialRecord(
     const result = await managed.release(cid, owner);
     released.push({ cid, pinRemoved: result.pinRemoved, ...(result.reason ? { reason: result.reason } : {}) });
   }
-  return { id: oldId, state: 'superseded', supersededBy: newId, released };
+  let blocksStillStored: number | undefined;
+  if (deps.kubo.blockPresent) {
+    try {
+      blocksStillStored = 0;
+      for (const cid of [...new Set(cids)]) if (await deps.kubo.blockPresent(cid)) blocksStillStored += 1;
+    } catch {
+      blocksStillStored = undefined;
+    }
+  }
+  return { id: oldId, state: 'superseded', supersededBy: newId, released, ...(blocksStillStored !== undefined ? { blocksStillStored } : {}) };
 }

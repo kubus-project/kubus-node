@@ -4,14 +4,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CaptureStore } from '../src/captures/captureStore.js';
-import { FACE_MASKING_REPORT_NAME, FACE_MASKING_REPORT_SCHEMA, effectiveMasking, resolveMasking, summariseReport } from '../src/captures/faceMasking.js';
+import { FACE_MASKING_REPORT_NAME, FACE_MASKING_REPORT_SCHEMA, PINNED_WEIGHTS_SHA256, effectiveMasking, resolveMasking, summariseReport } from '../src/captures/faceMasking.js';
 import { PHOTO_MIN_BYTES } from '../src/captures/photoPackage.js';
 import { VIDEO_MIN_BYTES } from '../src/captures/videoPackage.js';
 import { parseAddVideoArguments, parseImportPhotosArguments, parseImportVideoArguments, parseProcessArguments, parseSupersedeArguments } from '../src/cli/captureImport.js';
 import { CapabilityRegistry } from '../src/capabilities/registry.js';
-import { faceMaskingProvenance, JobRuntime, missingMasking } from '../src/jobs/jobRuntime.js';
+import { faceMaskingProvenance, JobRuntime, missingMasking, publicDerivation } from '../src/jobs/jobRuntime.js';
 import { ManagedPins, canonicalPinCid } from '../src/ipfs/managedPins.js';
 import { supersedeSpatialRecord } from '../src/spatial/supersede.js';
+import { findSupersededContent, purgeSupersededContent, warnAboutSupersededContent } from '../src/spatial/supersededBlocks.js';
+import { validateSpatialManifest } from '../src/spatial/models.js';
 import { serveSpatialVariant } from '../src/gui/spatialGuiApi.js';
 import { dropClientMaskingClaim } from '../src/localApi/dispatch.js';
 import { LocalStore } from '../src/state/localStore.js';
@@ -293,9 +295,12 @@ describe('masking in the job and the record', () => {
     const [record] = records(store);
     const masking = record!.manifest.captureProvenance.derivation.faceMasking;
     expect(masking).toMatchObject({ ran: true, photos: { source: 'worker', detector: 'YuNet', model: 'face_detection_yunet_2023mar', images: 9, regions: 3, imagesWithRegions: 2 } });
-    expect(masking.photos.regionsPerImage).toHaveLength(9);
+    // The manifest is what gets pinned and published: no per-image counts and no manual-list counts in it anywhere.
+    expect(JSON.stringify(record!.manifest)).not.toMatch(/regionsPerImage|manualAdded|manualExcluded/);
+    // They are kept, privately, in the job record.
+    expect((jobs.get(job.id).maskingDetail as any).photos.regionsPerImage).toHaveLength(9);
     // The record that can leave the Node says that masking ran and how many regions, never which image or where.
-    expect(record!.manifest.processing.faceMasking).toEqual({ ran: true, photos: { source: 'worker', detector: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: 'a'.repeat(64), images: 9, regions: 3, imagesWithRegions: 2 } });
+    expect(record!.manifest.processing.faceMasking).toEqual({ ran: true, photos: { source: 'worker', detector: 'YuNet', model: 'face_detection_yunet_2023mar', weightsSha256: 'a'.repeat(64), scoreThreshold: 0.4, images: 9, regions: 3, imagesWithRegions: 2 } });
     expect(JSON.stringify(record!.manifest.processing)).not.toContain('regionsPerImage');
   });
 
@@ -345,8 +350,10 @@ describe('masking in the job and the record', () => {
     expect(bodies[0].input).not.toHaveProperty('maskFaces');
     const [record] = records(store);
     const masking = record!.manifest.captureProvenance.derivation.faceMasking;
-    expect(masking).toMatchObject({ ran: true, photos: { source: 'premasked', detector: 'YuNet', weightsSha256: 'b'.repeat(64), images: 9, regions: 6, imagesWithRegions: 3, manualExcluded: 1 } });
-    expect(masking.photos.regionsPerImage).toEqual([2, 0, 1, 0, 0, 3, 0, 0, 0]);
+    expect(masking).toMatchObject({ ran: true, photos: { source: 'premasked', attestation: 'operator_report', weightsPinned: false, detector: 'YuNet', weightsSha256: 'b'.repeat(64), images: 9, regions: 6, imagesWithRegions: 3 } });
+    expect(JSON.stringify(record!.manifest)).not.toMatch(/regionsPerImage|manualAdded|manualExcluded/);
+    // The per-image counts of the operator's report stay in the private capture record.
+    expect((captures.get(capture.id).faceMasking?.report as any).regionsPerImage).toEqual([2, 0, 1, 0, 0, 3, 0, 0, 0]);
     expect(record!.manifest.processing.faceMasking).toMatchObject({ ran: true, photos: { source: 'premasked', regions: 6 } });
   });
 
@@ -369,7 +376,8 @@ describe('masking in the job and the record', () => {
 
   it('records that masking did not run for an opted-out capture, and says nothing for posed frames', () => {
     expect(faceMaskingProvenance({ kind: 'photos', artworkId: 'art-1', faceMasking: { photos: 'none' } }, undefined)).toEqual({ ran: false });
-    expect(faceMaskingProvenance({ kind: 'frames', artworkId: 'art-1' }, undefined)).toBeUndefined();
+    // A posed-frame package never passes the worker's intake: the record says so instead of staying silent.
+    expect(faceMaskingProvenance({ kind: 'frames', artworkId: 'art-1' }, undefined)).toEqual({ ran: false, reason: 'posed_frames_not_masked' });
     expect(faceMaskingProvenance({ kind: 'video', artworkId: 'art-1', faceMasking: { video: 'worker' } }, { faceMasking: { video: part(48) } })).toMatchObject({ ran: true, video: { source: 'worker', images: 48 } });
     // What the worker reports is bounded: unknown keys and non-count arrays are dropped.
     const clean = faceMaskingProvenance({ kind: 'photos', faceMasking: { photos: 'worker' } }, { faceMasking: { photos: { ...part(9), coordinates: [[1, 2]], regionsPerImage: ['x'] } } }) as any;
@@ -396,7 +404,14 @@ describe('masking in the job and the record', () => {
     const after = await jobs.create('spatial.reconstruct', { captureId: masked.id, previousSpatialId: old!.id, revisionNote: note });
     await settle(jobs, after.id);
     const revision = records(store).find((record) => record.id !== old!.id)!;
-    expect(revision.manifest.revision).toMatchObject({ number: 2, reason: 'face_masking', previousSpatialId: old!.id, note });
+    expect(revision.manifest.revision).toMatchObject({ number: 2, reason: 'face_masking', note });
+    // The manifest must not point back at the unmasked record, its manifest, or the capture holding the unmasked photos.
+    expect(revision.manifest.revision).not.toHaveProperty('previousSpatialId');
+    expect(revision.manifest.revision).not.toHaveProperty('previousManifestCid');
+    expect(revision.manifest.revision).not.toHaveProperty('previousCaptureId');
+    expect(JSON.stringify(revision.manifest)).not.toContain(old!.id);
+    expect(JSON.stringify(revision.manifest)).not.toContain(old!.manifestCid);
+    expect(JSON.stringify(revision.manifest)).not.toContain(first.id);
 
     // A further masked re-run is a plain re-solve: the earlier record was already masked.
     const again = await jobs.create('spatial.reconstruct', { captureId: masked.id, previousSpatialId: revision.id });
@@ -405,6 +420,33 @@ describe('masking in the job and the record', () => {
 
     await expect(jobs.create('spatial.reconstruct', { captureId: masked.id, revisionNote: 'x'.repeat(201) })).rejects.toMatchObject({ code: 'job_revision_note_invalid' });
     await expect(jobs.create('spatial.reconstruct', { captureId: masked.id, revisionNote: 5 })).rejects.toMatchObject({ code: 'job_revision_note_invalid' });
+  });
+});
+
+describe('what a premasked report proves', () => {
+  it('is operator-attested, and says whether it names the pinned weights', () => {
+    const entry = { sha256: 'a'.repeat(64), regions: 0 };
+    const report = (weightsSha256: string) => ({ schema: FACE_MASKING_REPORT_SCHEMA, detector: { name: 'YuNet', model: 'm', weightsSha256 }, images: [entry] });
+    expect(summariseReport(report(PINNED_WEIGHTS_SHA256), ['a'.repeat(64)])).toMatchObject({ attestation: 'operator_report', weightsPinned: true });
+    expect(summariseReport(report('c'.repeat(64)), ['a'.repeat(64)])).toMatchObject({ attestation: 'operator_report', weightsPinned: false });
+  });
+
+  it('keeps per-image and manual-list counts out of the public derivation', () => {
+    const derivation = { faceMasking: { ran: true, photos: { source: 'worker', images: 2, regions: 1, imagesWithRegions: 1, regionsPerImage: [1, 0], manualAdded: 1, manualExcluded: 2, weightsPinned: true, attestation: 'operator_report' } }, splatCount: 5 };
+    const open = publicDerivation(derivation) as any;
+    expect(JSON.stringify(open)).not.toMatch(/regionsPerImage|manualAdded|manualExcluded/);
+    expect(open.faceMasking.photos).toMatchObject({ source: 'worker', images: 2, regions: 1, weightsPinned: true, attestation: 'operator_report' });
+    expect(open.splatCount).toBe(5);
+  });
+
+  it('accepts a face-masking revision with no link to the earlier record, and no other revision without one', () => {
+    const base = {
+      schema: 'kubus.spatial/1', type: 'gaussianSplat', id: 'x', artworkId: 'a', captureId: 'c', capturedAt: '2026-08-17T06:00:00Z',
+      variants: [{ role: 'spatial_archive', cid: 'Qm', sizeBytes: 1, mimeType: 'application/octet-stream', format: 'ply', storageClass: 'cold' }],
+      processing: { protocol: 'kubus.spatial-job/1', workerVersion: 'w', reconstruction: { engine: 'nerfstudio', method: 'splatfacto', iterations: 10, outputFormat: 'ply' } },
+    };
+    expect(() => validateSpatialManifest({ ...base, revision: { number: 2, reason: 'face_masking', inputs: { captureKind: 'photos' } } })).not.toThrow();
+    expect(() => validateSpatialManifest({ ...base, revision: { number: 2, reason: 'resolve', inputs: { captureKind: 'photos' } } })).toThrow('spatial_manifest_revision_invalid');
   });
 });
 
@@ -484,6 +526,61 @@ describe('superseding a spatial record', () => {
     const result = await supersedeSpatialRecord({ store, kubo: kubo as never }, 'old', 'next');
     expect(removed).toEqual([canonicalPinCid(oldCids.manifest)]);
     expect(result.released.find((item) => item.cid === oldCids.splat)).toMatchObject({ pinRemoved: false, reason: 'preexisting_or_unknown_pin' });
+  });
+
+  it('says how many root blocks of the superseded record are still stored', async () => {
+    const { store, kubo, oldCids } = await stateWithTwoRecords();
+    const present = new Set([oldCids.manifest, oldCids.splat]);
+    const result = await supersedeSpatialRecord({ store, kubo: { ...kubo, blockPresent: async (cid: string) => present.has(cid) } as never }, 'old', 'next');
+    expect(result.blocksStillStored).toBe(2);
+    const cold = await supersedeSpatialRecord({ store, kubo: { ...kubo, blockPresent: async () => false } as never }, 'old', 'next');
+    expect(cold.blocksStillStored).toBe(0);
+  });
+
+  it('finds and removes exactly the blocks of superseded records, children first, and keeps what stays pinned', async () => {
+    const { store, kubo, oldCids, newCids } = await stateWithTwoRecords();
+    await supersedeSpatialRecord({ store, kubo: kubo as never }, 'old', 'next');
+    const children = ['child-a', 'child-b', 'shared'].map(syntheticCid);
+    const stored = new Set([oldCids.manifest, oldCids.splat, newCids.manifest, newCids.splat, ...children]);
+    const order: string[] = [];
+    const fake = {
+      blockPresent: async (cid: string) => stored.has(cid),
+      refsLocal: async (cid: string) => (cid === oldCids.splat ? [cid, ...children] : [cid]),
+      blockRm: async (cids: string[]) => cids.map((cid) => {
+        order.push(cid);
+        if (cid === children[2]) return { cid, error: 'pinned: indirect through another record' };
+        stored.delete(cid);
+        return { cid };
+      }),
+    };
+    const report = await findSupersededContent({ store, kubo: fake });
+    expect(report).toMatchObject({ present: 2, records: [{ id: 'old' }] });
+    const purged = await purgeSupersededContent({ store, kubo: fake });
+    expect(purged.records).toEqual([{ id: 'old', blocksRemoved: 4, blocksKept: 1, keptReason: 'pinned: indirect through another record' }]);
+    // Children before the root of each archive, and nothing of the current record is touched.
+    expect(order.indexOf(oldCids.splat)).toBeGreaterThan(order.indexOf(children[0]!));
+    expect(order).not.toContain(newCids.manifest);
+    expect(order).not.toContain(newCids.splat);
+    expect(stored.has(newCids.splat)).toBe(true);
+    // A shared block that could not be removed keeps the record flagged as not purged; the roots are gone.
+    expect((store.snapshot().spatial as Record<string, { contentPurgedAt?: string }>).old!.contentPurgedAt).toBeUndefined();
+    expect(await findSupersededContent({ store, kubo: fake })).toMatchObject({ present: 0 });
+    const again = await purgeSupersededContent({ store, kubo: fake });
+    expect(again.blocksRemoved).toBe(0);
+  });
+
+  it('warns at start-up while superseded content is still stored, and never throws', async () => {
+    const { store, kubo, oldCids } = await stateWithTwoRecords();
+    await supersedeSpatialRecord({ store, kubo: kubo as never }, 'old', 'next');
+    const warn = vi.fn();
+    await warnAboutSupersededContent({ store, kubo: { blockPresent: async (cid: string) => cid === oldCids.splat }, logger: { warn } });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]![1])).toContain('purge-superseded');
+    warn.mockClear();
+    await warnAboutSupersededContent({ store, kubo: { blockPresent: async () => false }, logger: { warn } });
+    expect(warn).not.toHaveBeenCalled();
+    await warnAboutSupersededContent({ store, kubo: { blockPresent: async () => { throw new Error('kubo down'); } }, logger: { warn } });
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 
   it('is no longer served', async () => {

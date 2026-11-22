@@ -12,6 +12,7 @@ const USAGE = `Usage:
   kubus-node capture add-video <captureId> <path> [--captured-at <ISO time>] [--mask-faces | --no-mask-faces] [--process] [--floater-crop]
   kubus-node capture process <captureId> [--previous <spatialId>] [--revision-note <text>] [--floater-crop]
   kubus-node spatial supersede <spatialId> --by <spatialId>
+  kubus-node spatial purge-superseded
 
 import-video imports one video file as a private capture, without the 128 MiB upload limit.
 import-photos imports a directory of still photographs (JPEG or PNG, at least 8; no camera
@@ -32,7 +33,11 @@ worker's face_mask.py (masked copies, bound to the files by SHA-256) is recorded
 unmasked originals then never enter the capture store. Otherwise the worker masks photos and video
 frames as the first step of the job and the unmasked source files stay in the private capture store.
 spatial supersede marks a record as replaced by a newer one for the same artwork and releases the Node's
-own pins on its content, so it is no longer served; it does not run garbage collection.`;
+own pins on its content, so the Node no longer serves it. Unpinned is NOT deleted: the blocks stay in the
+Kubo block store, and Kubo's gateway (and peers, once the Node is connected) can still serve them. The
+result reports how many are still stored. spatial purge-superseded removes exactly the blocks of every
+superseded record from the block store (children first, never a pinned block; it does not run garbage
+collection). Run it before enabling peering.`;
 
 export interface ImportVideoArguments {
   file: string;
@@ -291,6 +296,18 @@ async function finishImport(
 /** `kubus-node spatial supersede <id> --by <id>`: asks the running Node to retire a record and release its pins. */
 export async function runSpatialCommand(args: string[], config: AppConfig): Promise<void> {
   const [subcommand, ...rest] = args;
+  if (subcommand === 'purge-superseded') {
+    if (rest.length) {
+      console.error(`purge-superseded takes no arguments, see usage:\n\n${USAGE}`);
+      process.exitCode = 2;
+      return;
+    }
+    const purged = await post(config, '/gui/api/spatial/purge-superseded', {});
+    if (purged === 'unreachable') throw new Error('No running Node answered; start it and try again');
+    if (purged.status !== 200 || !purged.envelope.data) fail(purged.envelope, purged.status);
+    console.log(JSON.stringify(purged.envelope.data, null, 2));
+    return;
+  }
   if (subcommand !== 'supersede') {
     console.error(USAGE);
     process.exitCode = 2;

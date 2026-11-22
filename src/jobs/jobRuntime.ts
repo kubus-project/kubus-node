@@ -50,6 +50,11 @@ export interface LocalJob {
   progress: number | null;
   input: Record<string, unknown>;
   output?: Record<string, unknown>;
+  /**
+   * The full face-masking record of the run (per-image region counts, manual list counts). Private: it stays in
+   * the Node's own job record and is not part of the manifest, which can be pinned and published.
+   */
+  maskingDetail?: Record<string, unknown>;
   error?: { code: string; message: string };
   createdAt: string;
   updatedAt: string;
@@ -77,7 +82,7 @@ const WORKER_STAGES: Record<string, { stage: JobStage; message: string } | undef
 };
 const PROGRESS_POLL_MS = 2000;
 const PROVENANCE_MAX_BYTES = 8 * 1024;
-const MASKING_PART_KEYS = ['source', 'detector', 'model', 'weightsSha256', 'scoreThreshold', 'licence', 'opencv', 'images', 'photoImages', 'regions', 'imagesWithRegions', 'manualAdded', 'manualExcluded'] as const;
+const MASKING_PART_KEYS = ['source', 'attestation', 'detector', 'model', 'weightsSha256', 'weightsPinned', 'scoreThreshold', 'licence', 'opencv', 'images', 'photoImages', 'regions', 'imagesWithRegions', 'manualAdded', 'manualExcluded'] as const;
 
 /** One part (photos or video) of a face-masking record: known keys, bounded primitives and one array of counts. */
 function cleanMaskingPart(value: unknown): Record<string, unknown> | undefined {
@@ -88,6 +93,7 @@ function cleanMaskingPart(value: unknown): Record<string, unknown> | undefined {
     const item = input[key];
     if (typeof item === 'string') out[key] = item.slice(0, 120);
     else if (typeof item === 'number' && Number.isFinite(item)) out[key] = item;
+    else if (typeof item === 'boolean') out[key] = item;
   }
   const counts = input.regionsPerImage;
   if (Array.isArray(counts) && counts.length <= 512 && counts.every((entry) => Number.isInteger(entry) && entry >= 0 && entry <= 2000)) out.regionsPerImage = counts;
@@ -100,7 +106,9 @@ function cleanMaskingPart(value: unknown): Record<string, unknown> | undefined {
  */
 export function faceMaskingProvenance(capture: { kind?: string; faceMasking?: unknown; artworkId?: string }, worker: unknown): Record<string, unknown> | undefined {
   const kind = capture.kind ?? 'frames';
-  if (kind === 'frames') return undefined;
+  // A posed-frame package (an app capture) is not masked by this step: its frames never pass through the worker's
+  // intake. Say so in the record instead of leaving the question open.
+  if (kind === 'frames') return { ran: false, reason: 'posed_frames_not_masked' };
   const masking = effectiveMasking(capture as Parameters<typeof effectiveMasking>[0]);
   const reported = (worker && typeof worker === 'object' ? (worker as Record<string, unknown>).faceMasking : undefined) as Record<string, unknown> | undefined;
   const out: Record<string, unknown> = {};
@@ -113,6 +121,17 @@ export function faceMaskingProvenance(capture: { kind?: string; faceMasking?: un
   }
   const ran = Boolean(out.photos || out.video);
   return ran ? { ran: true, ...out } : { ran: false };
+}
+
+/**
+ * The derivation as it may appear in a manifest, which is pinned and can be published: the face-masking record
+ * keeps only what says that masking ran and with what (see `publicMaskingSummary`). Per-image region counts and the
+ * manual add/exclude counts stay in the capture record in the Node's private state.
+ */
+export function publicDerivation(derivation: Record<string, unknown>): Record<string, unknown> {
+  const masking = derivation.faceMasking as Record<string, unknown> | undefined;
+  if (!masking) return derivation;
+  return { ...derivation, faceMasking: publicMaskingSummary(masking) };
 }
 
 /** Parts the worker was asked to mask that its answer does not show as masked; empty when everything ran. */
@@ -547,6 +566,7 @@ export class JobRuntime {
       if (derivation) await this.logDerivation(id, derivation);
       await this.patchJob(id, (current) => {
         current.state = 'completed'; current.stage = 'completed'; current.progress = 1; current.output = spatial;
+        if (derivation?.faceMasking) current.maskingDetail = derivation.faceMasking as Record<string, unknown>;
         current.completedAt = current.updatedAt = new Date().toISOString();
         current.logs.push({ at: current.updatedAt, level: 'info', message: 'Spatial outputs imported into local Kubo' });
       });
@@ -605,15 +625,19 @@ export class JobRuntime {
     const previousCapture = previous.manifest.captureId;
     const previousMasked = ((previous.manifest.captureProvenance.derivation?.faceMasking ?? {}) as { ran?: boolean }).ran === true;
     const note = typeof job.input.revisionNote === 'string' && job.input.revisionNote ? { note: job.input.revisionNote.slice(0, 200) } : {};
+    const reason: SpatialRevision['reason'] = capture.derivedFrom?.captureId === previousCapture ? 'video_added' : masking?.ran === true && !previousMasked ? 'face_masking' : 'resolve';
     return {
       number: (previous.manifest.revision?.number ?? 1) + 1,
       // `video_added` only when this capture was built from the capture the previous record came from;
       // `face_masking` when the earlier record was reconstructed from unmasked images and this one from masked ones.
-      reason: capture.derivedFrom?.captureId === previousCapture ? 'video_added' : masking?.ran === true && !previousMasked ? 'face_masking' : 'resolve',
+      reason,
       ...note,
-      previousSpatialId: previous.id,
-      ...(previous.manifestCid ? { previousManifestCid: previous.manifestCid } : {}),
-      previousCaptureId: previousCapture,
+      // No link back to the unmasked record for a face-masking revision (see `SpatialRevision`).
+      ...(reason === 'face_masking' ? {} : {
+        previousSpatialId: previous.id,
+        ...(previous.manifestCid ? { previousManifestCid: previous.manifestCid } : {}),
+        previousCaptureId: previousCapture,
+      }),
       inputs,
     };
   }
@@ -658,7 +682,7 @@ export class JobRuntime {
     const manifest: SpatialManifest = {
       schema: 'kubus.spatial/1', type: 'gaussianSplat', id,
       artworkId: String(job.input.artworkId || capture.artworkId || ''), markerId: String(job.input.markerId || capture.markerId || '') || undefined,
-      captureId: capture.id, captureProvenance: { source: 'localCapture', captureId: capture.id, ...(derivation ? { derivation } : {}) }, capturedAt: capture.capturedAt,
+      captureId: capture.id, captureProvenance: { source: 'localCapture', captureId: capture.id, ...(derivation ? { derivation: publicDerivation(derivation) } : {}) }, capturedAt: capture.capturedAt,
       capturedBy: typeof job.input.capturedBy === 'string' ? job.input.capturedBy : capture.capturedBy,
       variants, transform: output.transform, viewerDefaults: output.viewerDefaults,
       processing: { ...output.processing, ...(maskingSummary ? { faceMasking: maskingSummary } : {}) },

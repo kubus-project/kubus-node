@@ -9,13 +9,17 @@ sparse points into
 * an up vector (the mean of the cameras' up axes; if the cameras disagree, the
   normal of the dominant plane of the sparse points, signed by the cameras. That
   fallback is a heuristic: it assumes the plane is horizontal, so it is reported
-  with a confidence below the trusted level and `trusted: false`),
+  with a confidence below the trusted level and `trusted: false`; an answer that
+  is not trusted is never used to rotate the scene, see `analyse_scene`),
 * a front direction (where the cameras stand relative to the subject, when they
   cover one side rather than a full orbit),
 * a bounding box of the subject (percentile box of the sparse points) used to
   crop stray Gaussians (floaters) at export, and
 * a 4x4 viewer transform (column-major, three.js order) that puts the subject
-  upright, centred, scaled to a radius of about 1 and facing +Z.
+  upright, centred, scaled to a radius of about 1 and facing +Z. When the up
+  estimate is not trusted the transform only centres and scales: guessing a
+  rotation could open a mural sideways, and an unrotated splat is at worst
+  tilted the way the reconstruction came out.
 
 Everything is expressed in the coordinate frame of the *exported splat file*
 (`ns-export` writes the trained Gaussian centres unchanged, so that is the
@@ -206,11 +210,14 @@ def crop_box(points: np.ndarray) -> tuple:
     return low - margin, high + margin
 
 
-def viewer_matrix(up: np.ndarray, front: np.ndarray | None, centre: np.ndarray, size: float) -> np.ndarray:
-    """4x4 matrix mapping splat coordinates to viewer coordinates (+Y up, front towards +Z, radius ~1)."""
-    upright = rotation_between(up, np.array([0.0, 1.0, 0.0]))
+def viewer_matrix(up: np.ndarray | None, front: np.ndarray | None, centre: np.ndarray, size: float) -> np.ndarray:
+    """4x4 matrix mapping splat coordinates to viewer coordinates (+Y up, front towards +Z, radius ~1).
+
+    With `up` None nothing is rotated: the subject is only centred and scaled.
+    """
+    upright = rotation_between(up, np.array([0.0, 1.0, 0.0])) if up is not None else np.eye(3)
     yaw = np.eye(3)
-    if front is not None:
+    if up is not None and front is not None:
         rotated = upright @ front
         angle = -math.atan2(rotated[0], rotated[2])
         cosine, sine = math.cos(angle), math.sin(angle)
@@ -242,13 +249,19 @@ def analyse_scene(poses: np.ndarray, points: np.ndarray) -> dict:
         size = float(np.linalg.norm(positions - centre, axis=1).max()) or 1.0
         box_low = box_high = None
     up = estimate_up(poses, points if len(points) else None)
-    front = estimate_front(poses, centre, up["up"])
-    matrix = viewer_matrix(up["up"], front["front"] if front else None, centre, size)
+    # Only a trusted answer (a consensus of the cameras' own up axes) may rotate the scene. A plane-normal, weak or
+    # assumed answer is a guess: an obliquely photographed wall with rolled cameras looks like a floor, and acting on
+    # it would open the mural sideways. Those scenes are centred and scaled but left unrotated.
+    trusted = bool(up["method"] == "camera_up" and up["confidence"] >= MIN_UP_CONFIDENCE)
+    front = estimate_front(poses, centre, up["up"]) if trusted else None
+    matrix = viewer_matrix(up["up"] if trusted else None, front["front"] if front else None, centre, size)
     orientation: dict[str, Any] = {
         "method": up["method"],
         "confidence": round(up["confidence"], 3),
         # Only a consensus of the cameras' own up axes is a trusted answer; every other method is a heuristic.
-        "trusted": bool(up["method"] == "camera_up" and up["confidence"] >= MIN_UP_CONFIDENCE),
+        "trusted": trusted,
+        # False when the answer was not trusted: the viewer transform then only centres and scales.
+        "rotationApplied": trusted,
         "up": [round(float(v), 5) for v in up["up"]],
         "frontConfidence": round(front["confidence"], 3) if front else None,
         "front": [round(float(v), 5) for v in front["front"]] if front else None,

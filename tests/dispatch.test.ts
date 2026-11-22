@@ -156,6 +156,31 @@ describe('dispatchLocalRequest', () => {
     }
   });
 
+  it('never publishes or revives a superseded spatial record', async () => {
+    const publishExistingSpatial = vi.fn(async () => ({ requested: true }));
+    deps.api = { publishExistingSpatial } as never;
+    vi.spyOn(deps.pairing, 'authorize').mockResolvedValue(true);
+    await deps.store.update((state) => {
+      state.spatial = {
+        old: { id: 'old', state: 'superseded', manifestCid: 'Qm1', manifest: {} },
+        fresh: { id: 'fresh', state: 'local', manifestCid: 'Qm2', manifest: {} },
+      } as never;
+    });
+    const publish = (id: string) => dispatchLocalRequest(request({ method: 'POST', path: `/local/v1/spatial/${id}/publish`, credential: token, body: jsonBody({ backendAuthorization: 'Bearer x', artworkId: 'a' }) }), deps);
+    await expect(publish('old')).rejects.toMatchObject({ statusCode: 409, code: 'spatial_not_publishable' });
+    expect(publishExistingSpatial).not.toHaveBeenCalled();
+    expect((deps.store.snapshot().spatial as Record<string, { state: string }>).old!.state).toBe('superseded');
+    // A superseded record stays superseded even when a request for it is in flight while it is retired.
+    await expect(publish('fresh')).resolves.toMatchObject({ kind: 'json' });
+    expect((deps.store.snapshot().spatial as Record<string, { state: string }>).fresh!.state).toBe('publication_requested');
+    publishExistingSpatial.mockImplementationOnce(async () => {
+      await deps.store.update((state) => { (state.spatial as Record<string, { state: string }>).fresh!.state = 'superseded'; });
+      return { requested: true };
+    });
+    await publish('fresh').catch(() => undefined);
+    expect((deps.store.snapshot().spatial as Record<string, { state: string }>).fresh!.state).toBe('superseded');
+  });
+
   it('serves the node identity to an authenticated, verified caller', async () => {
     const response = await dispatchLocalRequest(
       request({ method: 'GET', path: '/local/v1/info', credential: token }),

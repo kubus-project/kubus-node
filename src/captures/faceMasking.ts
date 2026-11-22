@@ -30,6 +30,8 @@ export type VideoMasking = 'worker' | 'none';
 
 export const FACE_MASKING_REPORT_NAME = 'kubus-face-masking.json';
 export const FACE_MASKING_REPORT_SCHEMA = 'kubus.face-masking/1';
+/** SHA-256 of the pinned YuNet weights (`spatial-worker/face_mask.py` `MODEL_SHA256`). */
+export const PINNED_WEIGHTS_SHA256 = '8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4';
 const REPORT_MAX_BYTES = 256 * 1024;
 const MAX_REGIONS_PER_IMAGE = 2000;
 
@@ -37,6 +39,10 @@ export interface FaceMaskingSummary {
   detector: string;
   model: string;
   weightsSha256: string;
+  /** Does the report name the pinned weights? A report is the operator's statement; the Node cannot re-run it. */
+  weightsPinned: boolean;
+  /** Always `operator_report`: the Node binds the report to the files by checksum but did not mask them. */
+  attestation: 'operator_report';
   scoreThreshold?: number;
   licence?: string;
   opencv?: string;
@@ -153,6 +159,8 @@ export function summariseReport(report: unknown, photoHashes: string[]): FaceMas
     detector: clip(detector.name)!,
     model: clip(detector.model)!,
     weightsSha256: detector.weightsSha256,
+    weightsPinned: detector.weightsSha256 === PINNED_WEIGHTS_SHA256,
+    attestation: 'operator_report',
     ...(threshold !== undefined ? { scoreThreshold: threshold } : {}),
     ...(clip(detector.licence, 40) ? { licence: clip(detector.licence, 40)! } : {}),
     ...(clip(detector.opencv, 40) ? { opencv: clip(detector.opencv, 40)! } : {}),
@@ -171,11 +179,14 @@ export async function sha256OfFile(file: string): Promise<string> {
 
 /** Compact, public-safe summary for `processing.faceMasking` (no per-image counts). */
 export function publicMaskingSummary(masking: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
-  if (!masking || masking.ran !== true) return masking ? { ran: false } : undefined;
+  if (!masking || masking.ran !== true) {
+    if (!masking) return undefined;
+    return { ran: false, ...(typeof masking.reason === 'string' ? { reason: masking.reason.slice(0, 60) } : {}) };
+  }
   const pick = (part: unknown) => {
     if (!isRecord(part)) return undefined;
     const out: Record<string, unknown> = {};
-    for (const key of ['source', 'detector', 'model', 'weightsSha256', 'images', 'regions', 'imagesWithRegions']) {
+    for (const key of ['source', 'attestation', 'detector', 'model', 'weightsSha256', 'weightsPinned', 'scoreThreshold', 'images', 'regions', 'imagesWithRegions']) {
       if (part[key] !== undefined) out[key] = part[key];
     }
     return out;

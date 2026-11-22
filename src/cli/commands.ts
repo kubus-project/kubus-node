@@ -33,6 +33,7 @@ import { PermissionUpdateService } from '../setup/permissionUpdate.js';
 import { AnalyticsStore } from '../analytics/analyticsStore.js';
 import { recoverNetworkStartup } from '../runtime/networkStartup.js';
 import { runCaptureCommand, runSpatialCommand } from './captureImport.js';
+import { warnAboutSupersededContent } from '../spatial/supersededBlocks.js';
 import { ensureImportDirectory } from '../captures/importPaths.js';
 
 /**
@@ -150,6 +151,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   if (command === 'gui') {
     participationGate.setSchedulerActive(false);
     await jobs.start();
+    void warnAboutSupersededContent({ store, kubo, logger });
     await capabilities.refresh();
     const guiConfig = { ...config, guiEnabled: true };
     const gui = await startGuiServer({ api, kubo, store, config: guiConfig, logger, actionLock, analytics, localApi: { ...localApi, config: guiConfig } });
@@ -196,6 +198,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
 
   if (command !== 'start') throw new Error(`Unknown command: ${command}`);
   await jobs.start();
+  void warnAboutSupersededContent({ store, kubo, logger });
   await capabilities.refresh();
   // Declared before the GUI so its late-bound diagnostics read the live client.
   let signaling: NodeSignalingClient | null = null;

@@ -22,8 +22,9 @@ class FakeMasker(fm.FaceMasker):
         self.boxes = boxes or []
         self.version = {"opencv": "x", **fm.DETECTOR_INFO, "weightsSha256": "a" * 64, "scoreThreshold": 0.4}
 
-    def detect(self, rgb):
-        return [tuple(box) for box in self.boxes]
+    def detect_detailed(self, rgb):
+        # (x0, y0, x1, y1) or (x0, y0, x1, y1, strong)
+        return [(tuple(box[:4]), bool(box[4]) if len(box) > 4 else False) for box in self.boxes]
 
 
 def noisy(width=400, height=300, seed=1):
@@ -125,6 +126,68 @@ class Masking(unittest.TestCase):
         self.assertTrue(np.array_equal(masked[20:70, 20:60], image[20:70, 20:60]))
         self.assertEqual(len(np.unique(masked[int(0.6 * 300):int(0.9 * 300), int(0.7 * 400):int(0.9 * 400)].reshape(-1, 3), axis=0)), 1)
 
+    def test_an_exclude_box_must_have_swallowed_exactly_the_near_certain_faces_the_reviewer_expects(self):
+        image = noisy()
+        masker = FakeMasker([(20, 20, 60, 70, True)])  # a near-certain face inside the box
+        with self.assertRaises(fm.FaceMaskingError):  # a bare box expects none: a real person could hide here
+            masker.mask_array(image, {"exclude": [[0.0, 0.0, 0.25, 0.35]]})
+        masked, count = masker.mask_array(image, {"exclude": [{"box": [0.0, 0.0, 0.25, 0.35], "expectStrong": 1, "note": "painted head"}]})
+        self.assertEqual(count, 0)
+        self.assertTrue(np.array_equal(masked, image))
+        with self.assertRaises(fm.FaceMaskingError):  # the reviewer expected one and none turned up
+            FakeMasker([]).mask_array(image, {"exclude": [{"box": [0.0, 0.0, 0.25, 0.35], "expectStrong": 1}]})
+        audit = []
+        masker.mask_array(image, {"exclude": [[0.0, 0.0, 0.25, 0.35]]}, audit=audit)
+        self.assertEqual(audit, [{"box": 0, "strongExcluded": 1, "expectStrong": 0, "ok": False}])
+
+    def test_a_weak_detection_inside_an_exclude_box_needs_no_expectation(self):
+        masked, count = FakeMasker([(20, 20, 60, 70, False)]).mask_array(noisy(), {"exclude": [[0.0, 0.0, 0.25, 0.35]]})
+        self.assertEqual(count, 0)
+
+    def test_a_face_that_only_overlaps_an_exclude_box_is_still_masked(self):
+        # Centre outside, or less than half of the face inside, so a person beside a painted head is not swallowed.
+        image = noisy()
+        beside = FakeMasker([(90, 20, 130, 70, True)])  # centre x 110 is right of the box edge (100)
+        _, count = beside.mask_array(image, {"exclude": [{"box": [0.0, 0.0, 0.25, 0.35], "expectStrong": 0}]})
+        self.assertEqual(count, 1)
+        edge = FakeMasker([(60, 20, 110, 70, True)])  # centre x 85 inside, but only 40 of 50 px inside: contained 0.8
+        _, inside = edge.mask_array(image, {"exclude": [{"box": [0.0, 0.0, 0.25, 0.35], "expectStrong": 1}]})
+        self.assertEqual(inside, 0)
+        mostly_out = FakeMasker([(90, 20, 190, 70, True)])  # centre x 140 outside the box
+        self.assertEqual(mostly_out.mask_array(image, {"exclude": [[0.0, 0.0, 0.25, 0.35]]})[1], 1)
+        lopsided = fm.excludes_detection((0, 0, 100, 100), (60, 0, 140, 50))  # centre x 100 is on the edge, half inside
+        self.assertTrue(lopsided)
+        self.assertFalse(fm.excludes_detection((0, 0, 100, 100), (70, 0, 190, 50)))  # centre outside
+
+    def test_a_box_over_a_third_of_the_image_needs_allow_large(self):
+        image = noisy()
+        with self.assertRaises(fm.FaceMaskingError):
+            FakeMasker([]).mask_array(image, {"exclude": [[0.0, 0.0, 1.0, 1.0]]})
+        masked, count = FakeMasker([]).mask_array(image, {"exclude": [{"box": [0.0, 0.0, 1.0, 1.0], "allowLarge": True}]})
+        self.assertEqual(count, 0)
+
+    def test_the_merge_keeps_a_face_strong_when_any_pass_found_it_near_certainly(self):
+        merged = fm.merge_detections([(10, 10, 60, 60, 0.95, False), (12, 11, 62, 61, 0.5, True), (200, 10, 250, 60, 0.9, False)])
+        self.assertEqual([strong for _, strong in merged], [True, False])
+
+    def test_a_non_srgb_profile_is_converted_and_an_srgb_or_missing_one_is_left_alone(self):
+        from PIL import ImageCms
+
+        image = Image.fromarray(noisy(32, 32))
+        profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+        same, kept = fm.to_srgb(image, profile)
+        self.assertIs(same, image)
+        self.assertEqual(kept, profile)
+        self.assertEqual(fm.to_srgb(image, None), (image, None))
+        with mock.patch.object(ImageCms, "getProfileDescription", return_value="Display P3"):
+            converted, embedded = fm.to_srgb(image, profile)
+        self.assertIsNot(converted, image)
+        self.assertEqual(converted.size, image.size)
+        self.assertTrue(embedded)
+        garbage, dropped = fm.to_srgb(image, b"not an icc profile")
+        self.assertIs(garbage, image)
+        self.assertIsNone(dropped)
+
     def test_summary_counts_regions_without_coordinates(self):
         summary = fm.summarise([0, 2, 1, 0], photo_images=4, version={"name": "YuNet", "model": "m", "weightsSha256": "b" * 64, "scoreThreshold": 0.4, "licence": "MIT"})
         self.assertEqual((summary["ran"], summary["images"], summary["regions"], summary["imagesWithRegions"]), (True, 4, 3, 2))
@@ -152,6 +215,20 @@ class Directory(unittest.TestCase):
             self.assertEqual([entry["regions"] for entry in written["images"]], [1, 2, 1])
             sheets = fm.contact_sheets(target, root / "sheets")
             self.assertEqual(len(sheets), 1)
+
+    def test_a_mismatched_exclude_box_stops_a_directory_run_before_any_report_exists(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            source, target = root / "in", root / "out"
+            source.mkdir()
+            Image.fromarray(noisy()).save(source / "a.jpg", "JPEG", quality=92)
+            manual = {"a.jpg": {"exclude": [[0.0, 0.0, 0.25, 0.35]]}}
+            masker = FakeMasker([(20, 20, 60, 70, True)])
+            with self.assertRaises(fm.FaceMaskingError):
+                fm.mask_directory(source, target, manual, masker=masker)
+            self.assertFalse((target / fm.REPORT_NAME).exists())
+            discovered = fm.mask_directory(source, target, manual, masker=masker, discover=True)
+            self.assertEqual(discovered["excludeAudit"][0]["strongExcluded"], 1)
 
     def test_orientation_is_baked_and_gps_is_dropped_from_the_copy(self):
         with tempfile.TemporaryDirectory() as temp:

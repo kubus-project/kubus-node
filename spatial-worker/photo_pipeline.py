@@ -31,7 +31,7 @@ import shutil
 import struct
 from typing import Any, Callable
 
-from face_mask import FaceMaskingError, FaceMasker
+from face_mask import FaceMaskingError, FaceMasker, to_srgb
 from video_pipeline import (
     MIN_REGISTRATION_RATIO,
     MIN_VIEWS_FOR_RECONSTRUCTION,
@@ -111,7 +111,8 @@ def prepare_photo(source: pathlib.Path, target: pathlib.Path, max_long_side: int
         make, model = _text(exif.get(TAG_MAKE)), _text(exif.get(TAG_MODEL))
         focal, focal35 = lens.get(TAG_FOCAL_LENGTH), lens.get(TAG_FOCAL_LENGTH_35)
         upright = ImageOps.exif_transpose(opened)  # orientation applied to the pixels
-        image = upright.convert("RGB")
+        icc = opened.info.get("icc_profile")
+        image, _ = to_srgb(upright.convert("RGB"), icc)  # a Display P3 photo is read as sRGB by everything downstream
     regions = 0
     if masker is not None:
         import numpy as np

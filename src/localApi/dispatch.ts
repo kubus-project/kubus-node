@@ -657,6 +657,9 @@ async function route(
     const spatialId = publishMatch[1]!;
     const spatial = store.snapshot().spatial?.[spatialId] as Record<string, unknown> | undefined;
     if (!spatial) throw localError(404, 'spatial_not_found');
+    // Only a record that is local (or already requested) can be offered to the backend. A superseded record
+    // (for example one reconstructed from images that showed people) must never be revived by this route.
+    if (spatial.state !== 'local' && spatial.state !== 'publication_requested') throw localError(409, 'spatial_not_publishable', { message: `A record in state ${String(spatial.state)} cannot be published` });
     const body = await request.body.json(BODY_LIMITS.json);
     const authorization = typeof body.backendAuthorization === 'string' ? body.backendAuthorization : '';
     if (!authorization.startsWith('Bearer ')) throw localError(400, 'backend_authorization_required');
@@ -666,7 +669,9 @@ async function route(
     );
     await store.update((state) => {
       const current = state.spatial?.[spatialId] as Record<string, unknown> | undefined;
-      if (current) {
+      // Re-checked inside the update: the record could have been superseded while the backend call ran, and
+      // `superseded` is terminal.
+      if (current && current.state !== 'superseded') {
         current.state = 'publication_requested';
         current.publication = result;
       }

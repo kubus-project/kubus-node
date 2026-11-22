@@ -21,14 +21,20 @@ Tuned for recall. A missed face is worse than a patch over a flower:
 - a fill of one flat colour (the region's median colour), which cannot be undone.
 
 A reviewed, per-image manual list refines the result: `add` boxes are masked as
-given, `exclude` boxes drop detections whose centre lies inside them (a painted
-face that is part of the artwork). Both use fractions of the upright image
-(0..1), so a list survives resizing. Nothing about a face is stored except the
-number of regions per image.
+given, `exclude` boxes drop detections that lie inside them (a painted face that is
+part of the artwork). Both use fractions of the upright image (0..1), so a list
+survives resizing. An exclude entry is `{"box": [x0, y0, x1, y1], "expectStrong": n,
+"note": "..."}`, one box per painted feature (a bare `[x0, y0, x1, y1]` expects 0).
+A real face inside an exclude box would silently stay unmasked, so the run counts
+the near-certain detections (score 0.9 or more with a face-shaped layout) that each
+box swallowed and FAILS unless the count equals `expectStrong`, which the reviewer
+sets after looking at the image. A box covering more than a third of the image needs
+`"allowLarge": true`. Nothing about a face is stored except the number of regions per
+image.
 
 Command line (also used from the Node's operator documentation):
 
-    python face_mask.py mask INPUT_DIR OUTPUT_DIR [--manual FILE] [--contact DIR]
+    python face_mask.py mask INPUT_DIR OUTPUT_DIR [--manual FILE] [--contact DIR] [--discover]
 
 writes masked copies, a `kubus-face-masking.json` report whose entries are bound
 to the masked files by SHA-256, and optionally review sheets. The input is only
@@ -65,6 +71,11 @@ WEAK_MIN_WIDTH = 28
 # plain wall can score 0.8; there it must be near-certain and have a face-shaped layout.
 LARGE_FRACTION = 0.12
 LARGE_MIN_SCORE = 0.9
+# An exclude box drops a detection only when its centre lies inside and at least this share of the detection's
+# own area does, so a face merely beside a painted one is not swallowed. A box bigger than MAX_EXCLUDE_AREA of
+# the image must say so (`allowLarge`).
+EXCLUDE_CONTAINED = 0.5
+MAX_EXCLUDE_AREA = 0.35
 NMS_THRESHOLD = 0.3
 # Whole-image passes (long side in pixels), then native-resolution tiles.
 WHOLE_IMAGE_SIDES = (160, 320, 640, 1280, 2560)
@@ -155,18 +166,31 @@ def _iou(a: tuple, b: tuple) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def merge_boxes(boxes: list) -> list:
-    """One box per face: the same face found by several passes is kept once (highest score first).
+def merge_detections(boxes: list) -> list:
+    """One entry per face: the same face found by several passes is kept once (highest score first).
 
     Boxes are never united, so a cluster of false detections cannot grow into one huge patch.
-    Entries are (x0, y0, x1, y1[, score]); an entry without a score ranks lowest.
+    Entries are (x0, y0, x1, y1[, score[, strong]]); an entry without a score ranks lowest. The result is a list
+    of ((x0, y0, x1, y1), strong), where `strong` is true when any pass found that face near-certainly.
     """
     ranked = sorted((tuple(box) for box in boxes), key=lambda box: box[4] if len(box) > 4 else 0.0, reverse=True)
     kept: list = []
+    strong: list = []
     for box in ranked:
-        if all(_iou(box, other) < MERGE_IOU and _overlap_of_smaller(box, other) < MERGE_CONTAINED for other in kept):
+        is_strong = len(box) > 5 and bool(box[5])
+        for index, other in enumerate(kept):
+            if _iou(box, other) >= MERGE_IOU or _overlap_of_smaller(box, other) >= MERGE_CONTAINED:
+                strong[index] = strong[index] or is_strong
+                break
+        else:
             kept.append(box)
-    return [box[:4] for box in kept]
+            strong.append(is_strong)
+    return [(tuple(box[:4]), flag) for box, flag in zip(kept, strong)]
+
+
+def merge_boxes(boxes: list) -> list:
+    """`merge_detections` without the strength flag."""
+    return [box for box, _ in merge_detections(boxes)]
 
 
 def grow_box(box: tuple, width: int, height: int) -> tuple:
@@ -192,6 +216,32 @@ def _fraction_box(box: Any, width: int, height: int) -> tuple | None:
     if x1 - x0 <= 0 or y1 - y0 <= 0:
         return None
     return (int(x0 * width), int(y0 * height), int(round(x1 * width)), int(round(y1 * height)))
+
+
+def parse_excludes(raw: Any, width: int, height: int) -> list:
+    """Exclude entries (a bare box, or {"box", "expectStrong", "allowLarge", "note"}) as dicts with a pixel box."""
+    out = []
+    for entry in raw or []:
+        spec = entry if isinstance(entry, dict) else {"box": entry}
+        pixels = _fraction_box(spec.get("box"), width, height)
+        if not pixels:
+            continue
+        area = (pixels[2] - pixels[0]) * (pixels[3] - pixels[1]) / float(width * height)
+        if area > MAX_EXCLUDE_AREA and spec.get("allowLarge") is not True:
+            raise FaceMaskingError(f"an exclude box covers {area:.0%} of the image; it needs \"allowLarge\": true after confirming nobody stands in it")
+        expect = spec.get("expectStrong", 0)
+        out.append({"pixels": pixels, "expect": expect if isinstance(expect, int) and expect >= 0 else 0, "seen": 0})
+    return out
+
+
+def excludes_detection(exclude: tuple, box: tuple) -> bool:
+    """Is the detection inside the exclude box: its centre and at least EXCLUDE_CONTAINED of its area."""
+    centre = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+    if not (exclude[0] <= centre[0] <= exclude[2] and exclude[1] <= centre[1] <= exclude[3]):
+        return False
+    ix0, iy0, ix1, iy1 = max(box[0], exclude[0]), max(box[1], exclude[1]), min(box[2], exclude[2]), min(box[3], exclude[3])
+    area = max(0.0, (box[2] - box[0]) * (box[3] - box[1]))
+    return area > 0 and max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0) / area >= EXCLUDE_CONTAINED
 
 
 class FaceMasker:
@@ -227,13 +277,18 @@ class FaceMasker:
                 native = w / scale
                 if native > LARGE_FRACTION * short_side and not (score >= LARGE_MIN_SCORE and plausible_layout(row)):
                     continue
-                if score < STRONG_SCORE and not (plausible_layout(row) and native >= WEAK_MIN_WIDTH):
+                layout = plausible_layout(row)
+                if score < STRONG_SCORE and not (layout and native >= WEAK_MIN_WIDTH):
                     continue
-                boxes.append((offset_x + x / scale, offset_y + y / scale, offset_x + (x + w) / scale, offset_y + (y + h) / scale, score))
+                boxes.append((offset_x + x / scale, offset_y + y / scale, offset_x + (x + w) / scale, offset_y + (y + h) / scale, score, bool(score >= LARGE_MIN_SCORE and layout)))
         return boxes
 
     def detect(self, rgb: Any) -> list:
         """Face boxes (x0, y0, x1, y1) in pixels of `rgb`, merged across every pass."""
+        return [box for box, _ in self.detect_detailed(rgb)]
+
+    def detect_detailed(self, rgb: Any) -> list:
+        """Like `detect`, as (box, strong) pairs: `strong` is a near-certain face (score 0.9+, face-shaped layout)."""
         cv2 = self._cv2
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         height, width = bgr.shape[:2]
@@ -250,21 +305,38 @@ class FaceMasker:
             for left in range(0, max(1, width - TILE_SIZE + TILE_STRIDE), TILE_STRIDE):
                 tile = bgr[top:min(height, top + TILE_SIZE), left:min(width, left + TILE_SIZE)]
                 boxes += self._faces(tile, 1.0, left, top, min(width, height))
-        return merge_boxes(boxes)
+        return merge_detections(boxes)
 
-    def mask_array(self, rgb: Any, manual: dict | None = None) -> tuple:
-        """Returns (masked copy, number of regions). `manual` is {"add": [...], "exclude": [...]} in image fractions."""
+    def mask_array(self, rgb: Any, manual: dict | None = None, audit: list | None = None) -> tuple:
+        """Returns (masked copy, number of regions). `manual` is {"add": [...], "exclude": [...]} in image fractions.
+
+        Every exclude box must have swallowed exactly the number of near-certain detections its entry expects
+        (`expectStrong`, default 0), or `FaceMaskingError` is raised. With `audit` given the check is not raised
+        but appended there as {"box": index, "strongExcluded": n, "expectStrong": m, "ok": bool} for every box, so
+        a reviewer can see what each one swallowed.
+        """
         import numpy as np
 
         height, width = rgb.shape[:2]
         manual = manual or {}
-        excludes = [box for box in (_fraction_box(raw, width, height) for raw in manual.get("exclude", [])) if box]
+        excludes = parse_excludes(manual.get("exclude", []), width, height)
         regions = []
-        for box in self.detect(rgb):
-            centre = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
-            if any(e[0] <= centre[0] <= e[2] and e[1] <= centre[1] <= e[3] for e in excludes):
+        for box, strong in self.detect_detailed(rgb):
+            hit = next((e for e in excludes if excludes_detection(e["pixels"], box)), None)
+            if hit is not None:
+                if strong:
+                    hit["seen"] += 1
                 continue
             regions.append(grow_box(box, width, height))
+        mismatches = []
+        for index, entry in enumerate(excludes):
+            ok = entry["seen"] == entry["expect"]
+            if audit is not None:
+                audit.append({"box": index, "strongExcluded": entry["seen"], "expectStrong": entry["expect"], "ok": ok})
+            elif not ok:
+                mismatches.append(f"exclude box {index} swallowed {entry['seen']} near-certain face detection(s), expected {entry['expect']}")
+        if mismatches:
+            raise FaceMaskingError("; ".join(mismatches) + " (look at the image, then set expectStrong)")
         added = [box for box in (_fraction_box(raw, width, height) for raw in manual.get("add", [])) if box]
         regions += added  # every region is filled; overlapping fills are harmless, a dropped one would leave pixels
         out = np.array(rgb, copy=True)
@@ -348,6 +420,30 @@ def _natural_key(name: str) -> list:
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", name)]
 
 
+def to_srgb(image: Any, icc_profile: bytes | None) -> tuple:
+    """(RGB image in sRGB, the ICC profile bytes to embed or None).
+
+    Phones tag photos Display P3. The reconstruction and the viewer read pixel values as sRGB, so a P3 photo would
+    come out slightly desaturated. A photo with a non-sRGB profile is converted to sRGB (perceptual intent, with
+    black-point compensation off); one without a profile, or already sRGB, is returned unchanged. A profile that
+    cannot be read is dropped and the pixels are left as they are.
+    """
+    if not icc_profile:
+        return image, None
+    try:
+        import io
+        from PIL import ImageCms
+
+        source = ImageCms.ImageCmsProfile(io.BytesIO(icc_profile))
+        if "srgb" in (ImageCms.getProfileDescription(source) or "").lower():
+            return image, icc_profile
+        target = ImageCms.createProfile("sRGB")
+        converted = ImageCms.profileToProfile(image, source, target, renderingIntent=ImageCms.Intent.PERCEPTUAL, outputMode="RGB")
+        return converted, ImageCms.ImageCmsProfile(target).tobytes()
+    except Exception:  # an unreadable profile must not stop masking
+        return image, None
+
+
 def _sanitised_exif(opened: Any) -> bytes:
     """EXIF of the upright copy: camera, lens and time facts kept, location and thumbnail dropped, orientation reset."""
     from PIL import Image
@@ -364,8 +460,14 @@ def _sanitised_exif(opened: Any) -> bytes:
     return exif.tobytes()
 
 
-def mask_directory(input_dir: pathlib.Path, output_dir: pathlib.Path, manual: dict | None = None, masker: FaceMasker | None = None) -> dict:
-    """Writes masked copies of every JPEG/PNG in `input_dir` (non-recursive) to `output_dir`, never modifying the input."""
+def mask_directory(input_dir: pathlib.Path, output_dir: pathlib.Path, manual: dict | None = None, masker: FaceMasker | None = None, discover: bool = False) -> dict:
+    """Writes masked copies of every JPEG/PNG in `input_dir` (non-recursive) to `output_dir`, never modifying the input.
+
+    ICC profiles other than sRGB are converted to sRGB pixels (the copy carries an sRGB profile); location, thumbnail,
+    XMP and the multi-picture (gain map) data are not carried. A manual exclude box whose count of swallowed
+    near-certain detections differs from its `expectStrong` stops the run before the report is written; with
+    `discover` the mismatches are returned in `excludeAudit` instead, for a reviewer to look at.
+    """
     import numpy as np
     from PIL import Image, ImageOps
 
@@ -375,19 +477,25 @@ def mask_directory(input_dir: pathlib.Path, output_dir: pathlib.Path, manual: di
     names = sorted((entry.name for entry in input_dir.iterdir() if entry.is_file() and not entry.is_symlink() and entry.suffix.lower() in (".jpg", ".jpeg", ".png")), key=_natural_key)
     entries = []
     counts = []
+    audits: list = []
     Image.MAX_IMAGE_PIXELS = None
     for name in names:
         with Image.open(input_dir / name) as opened:
             opened.load()
             exif = _sanitised_exif(opened) if opened.format == "JPEG" else None
-            upright = ImageOps.exif_transpose(opened).convert("RGB")
-        masked, count = masker.mask_array(np.asarray(upright), manual.get(name))
+            icc = opened.info.get("icc_profile")
+            upright, icc = to_srgb(ImageOps.exif_transpose(opened).convert("RGB"), icc)
+        audit: list = []
+        masked, count = masker.mask_array(np.asarray(upright), manual.get(name), audit=audit)
+        for item in audit:
+            if not item["ok"]:
+                audits.append({"image": name, **item})
         target = output_dir / (pathlib.Path(name).stem + (".jpg" if exif is not None else ".png"))
         result = Image.fromarray(masked)
         if exif is not None:
-            result.save(target, "JPEG", quality=95, exif=exif)
+            result.save(target, "JPEG", quality=95, exif=exif, **({"icc_profile": icc} if icc else {}))
         else:
-            result.save(target, "PNG")
+            result.save(target, "PNG", **({"icc_profile": icc} if icc else {}))
         counts.append(count)
         entry = manual.get(name) or {}
         entries.append({
@@ -396,6 +504,8 @@ def mask_directory(input_dir: pathlib.Path, output_dir: pathlib.Path, manual: di
             "manualAdded": len(entry.get("add", [])),
             "manualExcluded": len(entry.get("exclude", [])),
         })
+    if audits and not discover:
+        raise FaceMaskingError("exclude boxes do not match what was reviewed: " + json.dumps(audits))
     report = {
         "schema": REPORT_SCHEMA,
         "detector": masker.version,
@@ -403,6 +513,8 @@ def mask_directory(input_dir: pathlib.Path, output_dir: pathlib.Path, manual: di
         "totals": {"images": len(entries), "regions": sum(counts), "imagesWithRegions": sum(1 for count in counts if count),
                    "manualAdded": sum(item["manualAdded"] for item in entries), "manualExcluded": sum(item["manualExcluded"] for item in entries)},
     }
+    if audits:
+        report["excludeAudit"] = audits  # only with `discover`; a report with mismatches must not be imported
     (output_dir / REPORT_NAME).write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
     return report
 
@@ -438,6 +550,7 @@ def main(argv: list) -> int:
         return 2
     input_dir, output_dir = pathlib.Path(argv[2]), pathlib.Path(argv[3])
     manual_file = contact_dir = None
+    discover = False
     rest = argv[4:]
     while rest:
         flag = rest.pop(0)
@@ -445,14 +558,24 @@ def main(argv: list) -> int:
             manual_file = pathlib.Path(rest.pop(0))
         elif flag == "--contact" and rest:
             contact_dir = pathlib.Path(rest.pop(0))
+        elif flag == "--discover":
+            discover = True
         else:
             print(f"unknown option {flag}", file=sys.stderr)
             return 2
     manual = json.loads(manual_file.read_text(encoding="utf-8")) if manual_file else {}
-    report = mask_directory(input_dir, output_dir, manual)
+    try:
+        report = mask_directory(input_dir, output_dir, manual, discover=discover)
+    except FaceMaskingError as error:
+        print(f"face masking stopped: {error}", file=sys.stderr)
+        return 1
     if contact_dir:
         contact_sheets(output_dir, contact_dir)
     print(json.dumps(report["totals"]))
+    if report.get("excludeAudit"):
+        print(json.dumps({"excludeAudit": report["excludeAudit"]}))
+        # The report that was written must not be imported: remove it so a discovery run cannot be attached.
+        (output_dir / REPORT_NAME).unlink(missing_ok=True)
     return 0
 
 
