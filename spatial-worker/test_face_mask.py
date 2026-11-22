@@ -230,6 +230,37 @@ class LargeFaces(unittest.TestCase):
         self.assertGreaterEqual(fm.NEEDS_LOOK_LIST_LIMIT, 400 + 300)
 
 
+class ReviewFilesAreCheckedBeforeTraining(unittest.TestCase):
+    """A flagged image the Node could not keep must fail the job before training, not after hours of GPU work."""
+
+    def _masked(self, photo_files, video_files=()):
+        photos = {"needsLook": {"images": len(photo_files), "items": [{"image": i + 1, "largeBelowCertain": 1, "file": name} for i, name in enumerate(photo_files)]}}
+        video = {"needsLook": {"images": len(video_files), "items": [{"image": i + 1, "weakExcluded": 1, "file": name} for i, name in enumerate(video_files)]}}
+        return {"photos": photos, "video": video}
+
+    def test_all_present_is_empty_and_a_missing_or_oddly_named_file_is_reported(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = pathlib.Path(temp)
+            (out / "dataset" / "images").mkdir(parents=True)
+            (out / "selected_frames").mkdir()
+            (out / "dataset" / "images" / "photo_00001.jpg").write_bytes(b"x")
+            (out / "selected_frames" / "frame_00000.jpg").write_bytes(b"x")
+            (out / "dataset" / "images" / "photo_00002.png").write_bytes(b"x")
+            self.assertEqual(fm.missing_review_files(out, self._masked(["dataset/images/photo_00001.jpg"], ["selected_frames/frame_00000.jpg"])), [])
+            self.assertEqual(fm.missing_review_files(out, self._masked(["dataset/images/photo_00009.jpg"])), ["dataset/images/photo_00009.jpg"])
+            # The name shape the Node accepts is enforced here too, so a layout drift fails early.
+            self.assertEqual(fm.missing_review_files(out, self._masked(["dataset/images/photo_00002.png"])), ["dataset/images/photo_00002.png"])
+            self.assertEqual(fm.missing_review_files(out, self._masked(["../outside.jpg"])), ["../outside.jpg"])
+            self.assertEqual(fm.missing_review_files(out, None), [])
+            self.assertEqual(fm.missing_review_files(out, {"photos": {"needsLook": {"images": 1, "items": [{"image": 1}]}}}), [])
+
+    def test_a_directory_in_place_of_the_file_is_reported(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = pathlib.Path(temp)
+            (out / "dataset" / "images" / "photo_00001.jpg").mkdir(parents=True)
+            self.assertEqual(fm.missing_review_files(out, self._masked(["dataset/images/photo_00001.jpg"])), ["dataset/images/photo_00001.jpg"])
+
+
 class Masking(unittest.TestCase):
     def test_a_detected_face_becomes_one_flat_colour_and_the_rest_is_untouched(self):
         image = noisy()

@@ -575,7 +575,7 @@ function renderFaceReviewPanel(record) {
       '</div></div>').join('') + '</div>' +
     (faceReview.error ? '<p class="t-body">' + h(faceReview.error) + '</p>' : '') +
     '<div class="row"><button class="button primary" data-face-review-confirm="' + h(record.id) + '"' + (unseen > 0 || faceReview.busy ? ' disabled' : '') + '>' +
-    'I looked at every image; none shows a recognisable real face</button></div>' +
+    'I looked at all ' + h(data.items.length) + ' image(s); none shows a recognisable real face</button></div>' +
     (unseen > 0 ? '<p class="t-meta">Show every listed image first (' + h(unseen) + ' left).</p>' : '') +
     '</section>';
 }

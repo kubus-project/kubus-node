@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from gpu_tier import classify_vram_tier
 from job_control import JobControl, JobCancelled, hand_back_ownership
-from face_mask import FaceMaskingError, masking_provenance
+from face_mask import FaceMaskingError, masking_provenance, missing_review_files
 from photo_pipeline import prepare_photo_dataset
 from scene_frame import analyse_dataset
 from video_pipeline import WorkerError, prepare_video_dataset
@@ -194,6 +194,18 @@ def process_owned(request: ProcessRequest):
         hand_back_ownership(request.outputDirectory)
 
 
+def require_review_files(output: pathlib.Path, masked: dict | None) -> None:
+    """Fails before training when a flagged image's masked copy is not where the Node will look for it."""
+    missing = missing_review_files(output, masked)
+    if missing:
+        raise WorkerError(
+            "face_review_images_unavailable",
+            f"{len(missing)} flagged image(s) have no masked copy the Node can keep for review; the run stops before training",
+            500,
+            {"count": len(missing)},
+        )
+
+
 def run_reconstruction(request: ProcessRequest):
     if not torch.cuda.is_available():
         raise HTTPException(status_code=503, detail="gpu_unsupported")
@@ -221,6 +233,7 @@ def run_reconstruction(request: ProcessRequest):
         masked = masking_provenance(prepared["masking"])
         if masked:
             provenance["faceMasking"] = masked
+        require_review_files(output, masked)
     elif mode in ("photos", "mixed"):
         prepared = prepare_photo_dataset(runner, capture, output, progress, include_video=(mode == "mixed"), mask_photos=mask_photos, mask_video=mask_video)
         dataset = prepared["dataset"]
@@ -228,6 +241,7 @@ def run_reconstruction(request: ProcessRequest):
         masked = masking_provenance(prepared["masking"])
         if masked:
             provenance["faceMasking"] = masked
+        require_review_files(output, masked)
         if prepared["video"]:
             provenance["video"] = prepared["video"]
             provenance["frames"] = prepared["frames"]

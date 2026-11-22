@@ -1,4 +1,5 @@
 import { promises as fs } from 'node:fs';
+import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { localError } from '../localApi/pairingService.js';
 import type { LocalStore } from '../state/localStore.js';
@@ -127,6 +128,7 @@ export async function removeFaceReviewImages(dataRoot: string, spatialId: string
   }
 }
 
+/** `items` and `viewed` are optional on disk: a state file written before the review kept its images has neither. */
 interface StoredWithReview { state?: string; faceReview?: FaceReview }
 
 function recordOf(store: LocalStore, spatialId: string): StoredWithReview {
@@ -149,8 +151,8 @@ export function faceReviewView(store: LocalStore, spatialId: string): FaceReview
   const record = recordOf(store, spatialId);
   const review = record.faceReview;
   if (!review) throw localError(404, 'face_review_not_required', { message: 'This record has no face review' });
-  const viewed = new Set(review.viewed);
-  const items = review.items.map((item) => ({ ...item, viewed: viewed.has(item.file) }));
+  const viewed = new Set(review.viewed ?? []);
+  const items = (review.items ?? []).map((item) => ({ ...item, viewed: viewed.has(item.file) }));
   return {
     pending: review.pending,
     ...(review.acknowledged ? { acknowledged: review.acknowledged } : {}),
@@ -161,27 +163,47 @@ export function faceReviewView(store: LocalStore, spatialId: string): FaceReview
 
 /**
  * Opens one flagged image for the operator and records that it was shown. Only a name the review lists is served,
- * and only while the review is open (a superseded record's images are gone).
+ * and only while the review is open (a superseded record's images are gone). The file is opened before the
+ * record is updated, so an acknowledge or a supersede that removes the copy in between cannot turn the later read
+ * into a stream error: the caller owns the returned handle and must close it (`serveFaceReviewImage` does, by
+ * streaming it to the response).
  */
-export async function openFaceReviewImage(dataRoot: string, store: LocalStore, spatialId: string, file: string): Promise<{ path: string; mimeType: string; size: number }> {
+export async function openFaceReviewImage(dataRoot: string, store: LocalStore, spatialId: string, file: string): Promise<{ handle: FileHandle; mimeType: string; size: number }> {
   const record = recordOf(store, spatialId);
   const review = record.faceReview;
   if (!review || record.state === 'superseded') throw localError(404, 'face_review_not_found');
-  if (!STORED_NAME.test(file) || !review.items.some((item) => item.file === file)) throw localError(404, 'face_review_image_not_found');
+  if (!STORED_NAME.test(file) || !(review.items ?? []).some((item) => item.file === file)) throw localError(404, 'face_review_image_not_found');
   const target = path.join(faceReviewDirectory(dataRoot, spatialId), file);
+  let handle: FileHandle;
   let size: number;
   try {
     const info = await fs.lstat(target);
     if (!info.isFile() || info.isSymbolicLink()) throw new Error('not a file');
-    size = info.size;
+    handle = await fs.open(target, 'r');
+    try {
+      const opened = await handle.stat();
+      // `dev` is not compared: `lstat` reports 0 for it on Windows while a handle reports the volume serial.
+      if (!opened.isFile() || opened.ino !== info.ino) throw new Error('not the checked file');
+      size = opened.size;
+    } catch (error) {
+      await handle.close().catch(() => undefined);
+      throw error;
+    }
   } catch {
     throw localError(404, 'face_review_image_missing', { message: 'The stored copy of this image is gone; supersede the record and process the capture again' });
   }
-  await store.update((state) => {
-    const current = (state.spatial?.[spatialId] as StoredWithReview | undefined)?.faceReview;
-    if (current && !current.viewed.includes(file)) current.viewed.push(file);
-  });
-  return { path: target, mimeType: file.endsWith('.png') ? 'image/png' : 'image/jpeg', size };
+  try {
+    await store.update((state) => {
+      const current = (state.spatial?.[spatialId] as StoredWithReview | undefined)?.faceReview;
+      if (!current) return;
+      const viewed = current.viewed ?? (current.viewed = []);
+      if (!viewed.includes(file)) viewed.push(file);
+    });
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
+  }
+  return { handle, mimeType: file.endsWith('.png') ? 'image/png' : 'image/jpeg', size };
 }
 
 /**
@@ -201,11 +223,16 @@ export async function acknowledgeFaceReview(
   if (!review) throw localError(404, 'face_review_not_required', { message: 'This record has no face review' });
   if (record.state === 'superseded') throw localError(409, 'spatial_not_publishable', { message: 'A superseded record cannot be reviewed' });
   if (review.acknowledged) return faceReviewView(store, spatialId);
-  const viewed = new Set(review.viewed);
-  const unseen = review.items.filter((item) => !viewed.has(item.file)).length;
+  // A review written before the images were kept (`{ pending, jobId }` only) has nothing to show: it is never
+  // acknowledgeable, the record has to be superseded and processed again.
+  if (!Array.isArray(review.items)) {
+    throw localError(409, 'face_review_images_unavailable', { message: 'The flagged images of this record were not kept; supersede the record and process the capture again' });
+  }
+  const viewed = new Set(review.viewed ?? []);
+  const unseen = (review.items ?? []).filter((item) => !viewed.has(item.file)).length;
   if (unseen > 0) throw localError(409, 'face_review_images_unseen', { message: `${unseen} flagged image(s) have not been shown yet`, unseen });
   if (review.itemsTruncated && options.allowTruncated !== true) {
-    throw localError(409, 'face_review_list_truncated', { message: `${review.pending} images are flagged but only ${review.items.length} are listed; confirm that the rest was looked at (allowTruncated)` });
+    throw localError(409, 'face_review_list_truncated', { message: `${review.pending} images are flagged but only ${(review.items ?? []).length} are listed; confirm that the rest was looked at (allowTruncated)` });
   }
   await store.update((state) => {
     const current = (state.spatial?.[spatialId] as StoredWithReview | undefined)?.faceReview;

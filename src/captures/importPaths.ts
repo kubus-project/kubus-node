@@ -25,21 +25,28 @@ export async function ensureImportDirectory(localDataPath: string): Promise<stri
 /** Resolves a requested file to its real path and proves it sits inside an import root. */
 export async function resolveImportSource(requested: unknown, roots: string[]): Promise<string> {
   if (typeof requested !== 'string' || !requested.trim() || requested.includes('\0')) throw localError(400, 'import_path_required');
+  const lexical = path.resolve(requested);
+  const realRoots: string[] = [];
+  for (const root of roots) {
+    try {
+      realRoots.push(await fs.realpath(root));
+    } catch {
+      // A root that does not exist holds nothing to import.
+    }
+  }
+  const inside = (candidate: string, base: string) => candidate === base || candidate.startsWith(`${base}${path.sep}`);
   let real: string;
   try {
-    real = await fs.realpath(path.resolve(requested));
+    real = await fs.realpath(lexical);
   } catch {
-    throw localError(404, 'capture_video_source_not_found', { message: 'No file at that path on the Node' });
-  }
-  for (const root of roots) {
-    let realRoot: string;
-    try {
-      realRoot = await fs.realpath(root);
-    } catch {
-      continue;
+    // Not found: say so only for a path that lies inside an import folder. Anywhere else the answer is the same
+    // refusal an existing file there gets, so the route does not tell a caller what exists on the Node's disk.
+    if (realRoots.some((base) => inside(lexical, base)) || roots.some((base) => inside(lexical, path.resolve(base)))) {
+      throw localError(404, 'import_source_not_found', { message: 'No file at that path in the import folders' });
     }
-    if (real === realRoot || real.startsWith(`${realRoot}${path.sep}`)) return real;
+    throw localError(403, 'import_path_not_allowed', { message: "The file is not inside one of the Node's import folders (the imports folder of its data directory, or a folder listed in KUBUS_IMPORT_DIRS)" });
   }
+  if (realRoots.some((base) => inside(real, base))) return real;
   // The folders themselves are not named in the answer (a caller does not need the Node's disk layout); the operator
   // finds them in docs/SPATIAL.md: `<data>/imports` and the folders listed in KUBUS_IMPORT_DIRS.
   throw localError(403, 'import_path_not_allowed', { message: "The file is not inside one of the Node's import folders (the imports folder of its data directory, or a folder listed in KUBUS_IMPORT_DIRS)" });

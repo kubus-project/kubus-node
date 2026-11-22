@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { CaptureStore } from '../src/captures/captureStore.js';
+import { CaptureStore, copyVerified } from '../src/captures/captureStore.js';
 import { PINNED_WEIGHTS_SHA256 } from '../src/captures/faceMasking.js';
 import { inspectCapturePackage } from '../src/captures/capturePackage.js';
 import { importRoots, resolveImportSource } from '../src/captures/importPaths.js';
@@ -163,8 +163,8 @@ describe('local photo import', () => {
     const dir = await tempDir();
     const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
     const captures = new CaptureStore(dir, store);
-    const source = path.join(dir, 'drop', 'Lala');
-    await writePhotos(source, count, (index) => jpeg({ orientation: index % 2 ? 6 : undefined, size: 20_000 + index }), 'Lala-');
+    const source = path.join(dir, 'drop', 'Mural');
+    await writePhotos(source, count, (index) => jpeg({ orientation: index % 2 ? 6 : undefined, size: 20_000 + index }), 'Mural-');
     return { dir, store, captures, source };
   }
 
@@ -179,7 +179,7 @@ describe('local photo import', () => {
     expect(names[0]).toBe('00001.jpg');
     expect(names).toHaveLength(12);
     const metadata = JSON.stringify(JSON.parse(await fs.readFile(path.join(first.directory, 'capture.json'), 'utf8')));
-    expect(metadata).not.toContain('Lala');
+    expect(metadata).not.toContain('Mural');
     expect(metadata).not.toContain('Thumbs');
     const again = await captures.importPhotoDirectory(source, { artworkId: 'art-1', markerId: 'marker-1' });
     expect(again.id).toBe(first.id);
@@ -190,15 +190,15 @@ describe('local photo import', () => {
   it('refuses a missing directory, too few photos, a bad photo and a link, leaving no capture behind', async () => {
     const { captures, dir, source } = await setup(12);
     await expect(captures.importPhotoDirectory(path.join(dir, 'nope'))).rejects.toMatchObject({ code: 'capture_photo_source_not_found' });
-    await expect(captures.importPhotoDirectory(path.join(dir, 'drop', 'Lala', 'Lala-1.jpg'))).rejects.toMatchObject({ code: 'capture_photo_source_not_found' });
+    await expect(captures.importPhotoDirectory(path.join(dir, 'drop', 'Mural', 'Mural-1.jpg'))).rejects.toMatchObject({ code: 'capture_photo_source_not_found' });
     const few = path.join(dir, 'drop', 'few');
     await writePhotos(few, 3);
     await expect(captures.importPhotoDirectory(few)).rejects.toMatchObject({ code: 'capture_photos_too_few' });
-    await fs.writeFile(path.join(source, 'Lala-3.jpg'), Buffer.alloc(PHOTO_MIN_BYTES + 5, 4));
+    await fs.writeFile(path.join(source, 'Mural-3.jpg'), Buffer.alloc(PHOTO_MIN_BYTES + 5, 4));
     await expect(captures.importPhotoDirectory(source)).rejects.toMatchObject({ code: 'capture_photo_invalid' });
     const linkDir = path.join(dir, 'drop', 'linked');
     await writePhotos(linkDir, 10);
-    const linked = await fs.symlink(path.join(source, 'Lala-1.jpg'), path.join(linkDir, 'IMG_50.jpg')).then(() => true, () => false);
+    const linked = await fs.symlink(path.join(source, 'Mural-1.jpg'), path.join(linkDir, 'IMG_50.jpg')).then(() => true, () => false);
     if (linked) await expect(captures.importPhotoDirectory(linkDir)).rejects.toMatchObject({ code: 'capture_photo_invalid' });
     expect(captures.list()).toHaveLength(0);
     expect(await fs.readdir(path.join(dir, 'private', 'captures')).catch(() => [])).toEqual([]);
@@ -238,10 +238,28 @@ describe('local photo import', () => {
     expect(captures.list()).toHaveLength(2);
   });
 
+  it('stores a source file only when the bytes copied are the bytes that were hashed', async () => {
+    const dir = await tempDir();
+    const file = path.join(dir, 'a.jpg');
+    await fs.writeFile(file, Buffer.from('first version'));
+    const hashed = (await import('node:crypto')).createHash('sha256').update('first version').digest('hex');
+    const good = copyVerified(file, hashed);
+    for await (const chunk of good.chunks) void chunk;
+    expect(() => good.verify()).not.toThrow();
+    // The file changed after it was hashed (the report vouched for the earlier bytes).
+    await fs.writeFile(file, Buffer.from('second version'));
+    const changed = copyVerified(file, hashed);
+    for await (const chunk of changed.chunks) void chunk;
+    try { changed.verify(); throw new Error('verify should have thrown'); } catch (error) { expect(error).toMatchObject({ code: 'capture_source_changed' }); }
+    // A copy that did not read to the end is not a verified copy either.
+    const partial = copyVerified(file, hashed);
+    expect(() => partial.verify()).toThrow();
+  });
+
   it('confines a directory import to the import roots', async () => {
     const dir = await tempDir();
     const roots = importRoots(dir, {});
-    const inside = path.join(roots[0]!, 'lala');
+    const inside = path.join(roots[0]!, 'mural');
     await writePhotos(inside, 8);
     await expect(resolveImportSource(inside, roots)).resolves.toBe(await fs.realpath(inside));
     await expect(resolveImportSource(dir, roots)).rejects.toMatchObject({ code: 'import_path_not_allowed' });
@@ -292,7 +310,7 @@ describe('photo reconstruction job and spatial revisions', () => {
     const dir = await tempDir();
     const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
     const captures = new CaptureStore(dir, store);
-    const source = path.join(dir, 'drop', 'lala');
+    const source = path.join(dir, 'drop', 'mural');
     await writePhotos(source, 12);
     const photos = await captures.importPhotoDirectory(source, { artworkId: 'art-1', markerId: 'marker-1', capturedAt: '2026-08-17T06:00:00Z' });
     const bodies: any[] = [];
@@ -374,6 +392,8 @@ describe('photo reconstruction job and spatial revisions', () => {
       expect(failed.error?.message).not.toContain('must not leak');
     }
     expect(workerFailure({ detail: { code: 'photos_unreadable', message: 'm', details: { submittedPhotos: 5, usablePhotos: 2 } } }, 422).message).toBe('m (submittedPhotos=5, usablePhotos=2)');
+    // The worker's own refusal to run a flagged-image job that could not be reviewed keeps its code.
+    expect(workerFailure({ detail: { code: 'face_review_images_unavailable', message: 'm' } }, 500).code).toBe('face_review_images_unavailable');
   });
 
   it('stores the worker transform and orientation in the manifest and numbers the first record 1', async () => {

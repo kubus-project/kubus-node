@@ -181,7 +181,9 @@ describe('local video import', () => {
     await expect(resolveImportSource(inside, roots)).resolves.toBe(await fs.realpath(inside));
     await expect(resolveImportSource(outside, roots)).rejects.toMatchObject({ code: 'import_path_not_allowed' });
     await expect(resolveImportSource(path.join(roots[0]!, '..', 'state.json'), roots)).rejects.toMatchObject({ code: 'import_path_not_allowed' });
-    await expect(resolveImportSource(path.join(roots[0]!, 'missing.mp4'), roots)).rejects.toMatchObject({ code: 'capture_video_source_not_found' });
+    await expect(resolveImportSource(path.join(roots[0]!, 'missing.mp4'), roots)).rejects.toMatchObject({ code: 'import_source_not_found' });
+    // A path outside the folders gets the same refusal whether or not it exists (no oracle for the Node's disk).
+    await expect(resolveImportSource(path.join(dir, 'does-not-exist-anywhere.mp4'), roots)).rejects.toMatchObject({ code: 'import_path_not_allowed' });
     await expect(resolveImportSource('', roots)).rejects.toMatchObject({ code: 'import_path_required' });
     const link = path.join(roots[0]!, 'link.mp4');
     const linked = await fs.symlink(outside, link).then(() => true, () => false);

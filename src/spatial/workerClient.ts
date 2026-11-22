@@ -81,6 +81,7 @@ export const WORKER_TYPED_ERROR_CODES = new Set([
   'photos_unreadable',
   'sfm_failed',
   'face_masking_failed',
+  'face_review_images_unavailable',
 ]);
 
 /**

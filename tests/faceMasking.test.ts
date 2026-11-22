@@ -69,7 +69,7 @@ async function writePhotos(directory: string, count: number): Promise<Buffer[]> 
   for (let index = 0; index < count; index += 1) {
     const data = jpeg(index);
     written.push(data);
-    await fs.writeFile(path.join(directory, `Lala-${index + 1}.jpg`), data);
+    await fs.writeFile(path.join(directory, `Mural-${index + 1}.jpg`), data);
   }
   return written;
 }
@@ -162,7 +162,7 @@ describe('capture import records the masking decision', () => {
 
   it('records premasked photos with the report, and keeps the unmasked originals out of the store by design', async () => {
     const { dir, captures } = await newStore();
-    const source = path.join(dir, 'masked', 'lala');
+    const source = path.join(dir, 'masked', 'mural');
     const written = await writePhotos(source, 9);
     await fs.writeFile(path.join(source, FACE_MASKING_REPORT_NAME), JSON.stringify(reportFor(written, [2, 0, 1, 0, 0, 3, 0, 0, 0])));
     const capture = await captures.importPhotoDirectory(source, { artworkId: 'art-1' });
@@ -175,12 +175,12 @@ describe('capture import records the masking decision', () => {
 
   it('refuses a report that does not match the photos, or one that opts out of masking', async () => {
     const { dir, captures } = await newStore();
-    const source = path.join(dir, 'masked', 'lala');
+    const source = path.join(dir, 'masked', 'mural');
     const written = await writePhotos(source, 9);
     await fs.writeFile(path.join(source, FACE_MASKING_REPORT_NAME), JSON.stringify(reportFor(written, [])));
-    await fs.writeFile(path.join(source, 'Lala-3.jpg'), jpeg(77)); // changed after masking
+    await fs.writeFile(path.join(source, 'Mural-3.jpg'), jpeg(77)); // changed after masking
     await expect(captures.importPhotoDirectory(source, { artworkId: 'art-1' })).rejects.toMatchObject({ code: 'face_masking_report_mismatch' });
-    await fs.writeFile(path.join(source, 'Lala-3.jpg'), written[2]!);
+    await fs.writeFile(path.join(source, 'Mural-3.jpg'), written[2]!);
     await expect(captures.importPhotoDirectory(source, { artworkId: 'art-1', maskFaces: false })).rejects.toMatchObject({ code: 'face_masking_conflict' });
     await fs.writeFile(path.join(source, FACE_MASKING_REPORT_NAME), '{ not json');
     await expect(captures.importPhotoDirectory(source, { artworkId: 'art-1' })).rejects.toMatchObject({ code: 'face_masking_report_invalid' });

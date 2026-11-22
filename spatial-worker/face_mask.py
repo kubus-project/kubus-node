@@ -35,7 +35,7 @@ image.
 A large face (wider than 12 percent of the short side) is masked only when near-certain (score 0.9 or more
 with a face-shaped layout): the coarse passes that see large faces also score walls, and above all the painted
 heads of the artwork itself, at 0.7 to 0.9, and a patch over a painted head destroys what is being captured
-(measured on the six Head of Flowers sets: masking large detections from 0.7 patched whole painted heads and
+(measured on six sets of photographs of painted street portraits: masking large detections from 0.7 patched whole painted heads and
 added 46 regions in four of the six). Two things a run cannot decide are therefore reported for a human to
 look at, never silently dropped: a detection that is not near-certain but lies inside an exclude box
 (`weakExcluded`: a real, turned or occluded face next to a painted one would stay unmasked), and a large
@@ -62,6 +62,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import sys
 from typing import Any, Callable
 
@@ -482,6 +483,35 @@ def masking_provenance(masking: dict | None) -> dict | None:
     if video is not None:
         out["video"] = summarise(video, version=masking["version"], extra={"needsLook": needs_look(masking.get("videoReview"), None, masking.get("videoFiles"), masking.get("videoSeconds"))})
     return out or None
+
+
+REVIEW_FILE_SHAPE = re.compile(r"^(?:dataset/images/(?:photo|video)_\d{5}\.jpg|selected_frames/frame_\d{5}\.jpg)$")
+
+
+def missing_review_files(output: pathlib.Path, masked: dict | None) -> list:
+    """Flagged images whose masked copy the Node could not keep: checked at the end of preparation, before training.
+
+    The Node copies every `needsLook` image out of the job's output directory before that directory is removed.
+    A flagged image whose file is missing, is not a regular file under `output`, or has a name the Node does not
+    accept would only be found out after training and export, losing the whole GPU run. Items without a `file`
+    (photos masked before import) are the Node's own to find. Returns the offending names; empty when all is well.
+    """
+    problems: list = []
+    root = pathlib.Path(output).resolve()
+    for part in (masked or {}).values():
+        for item in ((part or {}).get("needsLook") or {}).get("items") or []:
+            name = item.get("file")
+            if name is None:
+                continue
+            target = root / str(name)
+            try:
+                ok = (REVIEW_FILE_SHAPE.match(str(name)) is not None and not target.is_symlink()
+                      and target.is_file() and root in target.resolve().parents)
+            except OSError:
+                ok = False
+            if not ok:
+                problems.append(str(name))
+    return problems
 
 
 def mask_file(masker: FaceMasker, path: pathlib.Path, manual: dict | None = None) -> int:

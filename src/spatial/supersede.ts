@@ -95,8 +95,17 @@ export async function supersedeSpatialRecord(
   if (replacement.createdAt <= old.createdAt) throw localError(422, 'spatial_replacement_not_newer', { message: 'The replacing record is not newer' });
 
   await deps.store.update((state) => {
-    const current = (state.spatial as Record<string, StoredSpatial> | undefined)?.[oldId];
+    const spatial = state.spatial as Record<string, StoredSpatial> | undefined;
+    const current = spatial?.[oldId];
     if (!current) return;
+    // The other checks are repeated on the state this update sees, not only on the snapshot read above: two
+    // operator actions (a second supersede with another replacement, a supersede of the replacement) can overlap.
+    if (current.supersededBy && current.supersededBy !== newId) throw localError(409, 'spatial_already_superseded', { message: 'The record was already superseded by another record' });
+    const target = spatial?.[newId];
+    if (!target?.manifest) throw localError(404, 'spatial_replacement_not_found', { message: 'No local spatial record has the replacing id' });
+    if (target.state !== 'local' && target.state !== 'publication_requested') {
+      throw localError(422, 'spatial_replacement_unavailable', { message: 'The replacing record is itself superseded or unavailable' });
+    }
     // Checked again here, inside the update: the publish route claims the record in an update of its own, and a
     // request that began after the read above must not be retired under the backend's feet.
     if (current.state === 'publication_requested' || publishInFlight(current)) throw localError(409, 'spatial_publication_active', PUBLICATION_ACTIVE);

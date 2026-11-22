@@ -128,6 +128,31 @@ async function sha256File(file: string): Promise<Buffer> {
   return hash.digest();
 }
 
+/**
+ * Streams a file into a draft while hashing the bytes that are actually stored, and refuses the file when those bytes
+ * are not the ones that were hashed earlier (the report, the capture identity): a source changed between the check
+ * and the copy must not be stored under the earlier hash.
+ */
+export function copyVerified(file: string, expectedHex: string): { chunks: AsyncIterable<Buffer>; verify: () => void } {
+  const hash = crypto.createHash('sha256');
+  let done = false;
+  async function* chunks(): AsyncGenerator<Buffer> {
+    for await (const chunk of createReadStream(file)) {
+      hash.update(chunk as Buffer);
+      yield chunk as Buffer;
+    }
+    done = true;
+  }
+  return {
+    chunks: chunks(),
+    verify: () => {
+      if (!done || hash.digest('hex') !== expectedHex) {
+        throw localError(409, 'capture_source_changed', { message: 'A source file changed while it was being imported; nothing was stored. Import again once the folder is stable.' });
+      }
+    },
+  };
+}
+
 /** An ISO timestamp for a parseable date string, else undefined. */
 function validIso(value: string | undefined): string | undefined {
   return value && !Number.isNaN(Date.parse(value)) ? new Date(value).toISOString() : undefined;
@@ -708,13 +733,9 @@ export class CaptureStore {
       },
     });
     try {
-      await this.writeDraftFileStream(
-        draft.id,
-        `video/source.${extension}`,
-        createReadStream(resolved) as unknown as AsyncIterable<Buffer>,
-        VIDEO_MIME_TYPES[extension],
-        VIDEO_MAX_BYTES,
-      );
+      const copy = copyVerified(resolved, sha256);
+      await this.writeDraftFileStream(draft.id, `video/source.${extension}`, copy.chunks, VIDEO_MIME_TYPES[extension], VIDEO_MAX_BYTES);
+      copy.verify();
       return await this.commitDraft(draft.id);
     } catch (error) {
       await this.discardDraft(draft.id).catch(() => undefined);
@@ -831,14 +852,17 @@ export class CaptureStore {
     });
     try {
       for (const [index, photo] of photos.entries()) {
+        const copy = copyVerified(photo.absolute, photoHashes[index]!);
         await this.writeDraftFileStream(
           draft.id, `photos/${String(index + 1).padStart(5, '0')}.${photo.extension}`,
-          createReadStream(photo.absolute) as unknown as AsyncIterable<Buffer>,
-          photo.extension === 'png' ? 'image/png' : 'image/jpeg', PHOTO_MAX_BYTES,
+          copy.chunks, photo.extension === 'png' ? 'image/png' : 'image/jpeg', PHOTO_MAX_BYTES,
         );
+        copy.verify();
       }
       if (video) {
-        await this.writeDraftFileStream(draft.id, `video/source.${video.extension}`, createReadStream(video.resolved) as unknown as AsyncIterable<Buffer>, VIDEO_MIME_TYPES[video.extension], VIDEO_MAX_BYTES);
+        const copy = copyVerified(video.resolved, video.sha256);
+        await this.writeDraftFileStream(draft.id, `video/source.${video.extension}`, copy.chunks, VIDEO_MIME_TYPES[video.extension], VIDEO_MAX_BYTES);
+        copy.verify();
       }
       return { ...(await this.commitDraft(draft.id)), skippedFiles: skipped };
     } catch (error) {
@@ -902,7 +926,9 @@ export class CaptureStore {
           relative.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg', PHOTO_MAX_BYTES,
         );
       }
-      await this.writeDraftFileStream(draft.id, `video/source.${video.extension}`, createReadStream(video.resolved) as unknown as AsyncIterable<Buffer>, VIDEO_MIME_TYPES[video.extension], VIDEO_MAX_BYTES);
+      const copy = copyVerified(video.resolved, video.sha256);
+      await this.writeDraftFileStream(draft.id, `video/source.${video.extension}`, copy.chunks, VIDEO_MIME_TYPES[video.extension], VIDEO_MAX_BYTES);
+      copy.verify();
       return await this.commitDraft(draft.id);
     } catch (error) {
       await this.discardDraft(draft.id).catch(() => undefined);

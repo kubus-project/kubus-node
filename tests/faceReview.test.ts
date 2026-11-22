@@ -5,7 +5,7 @@ import path from 'node:path';
 import type { AppConfig } from '../src/config/schema.js';
 import { ActionLock } from '../src/runtime/actionLock.js';
 import { startGuiServer } from '../src/gui/guiServer.js';
-import { listSpatialSummaries } from '../src/gui/spatialGuiApi.js';
+import { listSpatialSummaries, serveFaceReviewImage } from '../src/gui/spatialGuiApi.js';
 import { LocalStore } from '../src/state/localStore.js';
 import {
   WORKER_REVIEW_FILE, acknowledgeFaceReview, faceReviewDirectory, faceReviewView, openFaceReviewImage, removeFaceReviewImages, storeFaceReview, withoutFaceReview,
@@ -45,6 +45,13 @@ async function setup(options: { images?: number; truncated?: boolean } = {}) {
   return { dir, store, review };
 }
 
+/** Opens one image the way the route does and closes the handle again (a test has no response to stream it into). */
+async function look(dir: string, store: LocalStore, file: string, id = SPATIAL_ID) {
+  const image = await openFaceReviewImage(dir, store, id, file);
+  await image.handle.close();
+  return image;
+}
+
 const recordOf = (store: LocalStore) => store.snapshot().spatial![SPATIAL_ID] as unknown as { state: string; faceReview?: { viewed: string[]; acknowledged?: { at: string; by: string } } };
 
 describe('face review of a record', () => {
@@ -81,14 +88,14 @@ describe('face review of a record', () => {
     expect(faceReviewView(store, SPATIAL_ID)).toMatchObject({ pending: 3, unseen: 3, itemsTruncated: false });
     for (const name of ['photos-00099.jpg', '../state.json', 'photos-00003.jpg/..', 'result.ply']) await expect(openFaceReviewImage(dir, store, SPATIAL_ID, name)).rejects.toMatchObject({ statusCode: 404 });
     expect(recordOf(store).faceReview!.viewed).toEqual([]);
-    const opened = await openFaceReviewImage(dir, store, SPATIAL_ID, 'photos-00003.jpg');
+    const opened = await look(dir, store, 'photos-00003.jpg');
     expect(opened).toMatchObject({ mimeType: 'image/jpeg', size: 'masked 0'.length });
     expect(recordOf(store).faceReview!.viewed).toEqual(['photos-00003.jpg']);
-    await openFaceReviewImage(dir, store, SPATIAL_ID, 'photos-00003.jpg');
+    await look(dir, store, 'photos-00003.jpg');
     expect(recordOf(store).faceReview!.viewed).toEqual(['photos-00003.jpg']);
     await expect(acknowledgeFaceReview(dir, store, SPATIAL_ID, 'gui-operator')).rejects.toMatchObject({ code: 'face_review_images_unseen', details: { unseen: 2 } });
-    await openFaceReviewImage(dir, store, SPATIAL_ID, 'photos-00004.jpg');
-    await openFaceReviewImage(dir, store, SPATIAL_ID, 'video-00008.jpg');
+    await look(dir, store, 'photos-00004.jpg');
+    await look(dir, store, 'video-00008.jpg');
     const done = await acknowledgeFaceReview(dir, store, SPATIAL_ID, 'gui-operator');
     expect(done.acknowledged?.by).toBe('gui-operator');
     expect(Date.parse(done.acknowledged!.at)).not.toBeNaN();
@@ -98,9 +105,79 @@ describe('face review of a record', () => {
     expect(await acknowledgeFaceReview(dir, store, SPATIAL_ID, 'someone-else')).toEqual(done);
   });
 
+  it('opens the file before it records the look, so a copy removed in between is still read and never becomes a stream error', async () => {
+    const { dir, store } = await setup();
+    const realUpdate = store.update.bind(store);
+    store.update = (async (mutator: Parameters<LocalStore['update']>[0]) => {
+      // An acknowledge or a supersede in another request removes the copy between the check and the response.
+      await removeFaceReviewImages(dir, SPATIAL_ID);
+      return realUpdate(mutator);
+    }) as LocalStore['update'];
+    const image = await openFaceReviewImage(dir, store, SPATIAL_ID, 'photos-00003.jpg');
+    try {
+      expect((await image.handle.readFile()).toString()).toBe('masked 0');
+    } finally {
+      await image.handle.close();
+    }
+    store.update = realUpdate;
+    await expect(fs.stat(faceReviewDirectory(dir, SPATIAL_ID))).rejects.toThrow();
+    await expect(openFaceReviewImage(dir, store, SPATIAL_ID, 'photos-00003.jpg')).rejects.toMatchObject({ code: 'face_review_image_missing' });
+  });
+
+  it('serves the image through the route helper and ends the response quietly when the copy is gone', async () => {
+    const { dir, store } = await setup();
+    const sent: Buffer[] = [];
+    const { Writable } = await import('node:stream');
+    const response = Object.assign(new Writable({ write(chunk, _encoding, done) { sent.push(Buffer.from(chunk)); done(); } }), { writeHead: () => undefined });
+    await serveFaceReviewImage(response as never, { store, dataRoot: dir }, SPATIAL_ID, 'photos-00003.jpg');
+    await new Promise((resolve) => response.on('finish', resolve));
+    expect(Buffer.concat(sent).toString()).toBe('masked 0');
+    await fs.rm(path.join(faceReviewDirectory(dir, SPATIAL_ID), 'photos-00004.jpg'));
+    await expect(serveFaceReviewImage(response as never, { store, dataRoot: dir }, SPATIAL_ID, 'photos-00004.jpg')).rejects.toMatchObject({ code: 'face_review_image_missing' });
+  });
+
+  it('tolerates a review of the older shape (no images, no looks): readable, listed, and never acknowledgeable', async () => {
+    const { dir, store } = await setup();
+    await store.update((state) => { (state.spatial![SPATIAL_ID] as { faceReview?: unknown }).faceReview = { pending: 2, jobId: 'job-0' }; });
+    expect(faceReviewView(store, SPATIAL_ID)).toMatchObject({ pending: 2, items: [], unseen: 0 });
+    expect(listSpatialSummaries(store)[0]!.faceReview).toEqual({ pending: 2, acknowledged: false, unseen: 0 });
+    await expect(acknowledgeFaceReview(dir, store, SPATIAL_ID, 'gui-operator')).rejects.toMatchObject({ statusCode: 409, code: 'face_review_images_unavailable' });
+    await expect(openFaceReviewImage(dir, store, SPATIAL_ID, 'photos-00003.jpg')).rejects.toMatchObject({ statusCode: 404 });
+    expect(recordOf(store).faceReview).not.toHaveProperty('acknowledged');
+  });
+
+  it('checks the replacement and an earlier supersede again inside the update, not only on the snapshot it read', async () => {
+    const { dir, store } = await setup();
+    const newer = '33333333-3333-4333-8333-333333333333';
+    const other = '44444444-4444-4444-8444-444444444444';
+    for (const [id, cid, at] of [[newer, 'm2', '11:00'], [other, 'm3', '12:00']] as const) {
+      await store.update((state) => {
+        (state.spatial ??= {})[id] = { id, state: 'local', manifestCid: syntheticCid(cid), createdAt: `2026-11-22T${at}:00.000Z`, manifest: { artworkId: 'art-1', captureId: cid, capturedAt: 'x', variants: [] } } as never;
+      });
+    }
+    const kubo = { pinLs: async () => ({ Keys: {} }), pinAdd: async () => undefined, pinRm: async () => undefined };
+    const realUpdate = store.update.bind(store);
+    let hook: (() => Promise<void>) | undefined;
+    store.update = (async (mutator: Parameters<LocalStore['update']>[0]) => {
+      const run = hook;
+      hook = undefined;
+      if (run) await run();
+      return realUpdate(mutator);
+    }) as LocalStore['update'];
+    // Between the read and the update the replacement is itself retired.
+    hook = async () => { await realUpdate((state) => { (state.spatial![newer] as { state: string }).state = 'superseded'; }); };
+    await expect(supersedeSpatialRecord({ store, kubo: kubo as never, dataRoot: dir }, SPATIAL_ID, newer)).rejects.toMatchObject({ statusCode: 422, code: 'spatial_replacement_unavailable' });
+    expect(recordOf(store).state).toBe('local');
+    // Between the read and the update another supersede, with a different replacement, wins.
+    hook = async () => { await realUpdate((state) => { Object.assign(state.spatial![SPATIAL_ID] as object, { state: 'superseded', supersededBy: newer }); }); };
+    await expect(supersedeSpatialRecord({ store, kubo: kubo as never, dataRoot: dir }, SPATIAL_ID, other)).rejects.toMatchObject({ statusCode: 409, code: 'spatial_already_superseded' });
+    expect((recordOf(store) as { supersededBy?: string }).supersededBy).toBe(newer);
+    store.update = realUpdate;
+  });
+
   it('refuses an acknowledgement of a cut list unless the operator says the rest was looked at', async () => {
     const { dir, store } = await setup({ truncated: true });
-    for (const name of ['photos-00003.jpg', 'photos-00004.jpg', 'video-00008.jpg']) await openFaceReviewImage(dir, store, SPATIAL_ID, name);
+    for (const name of ['photos-00003.jpg', 'photos-00004.jpg', 'video-00008.jpg']) await look(dir, store, name);
     await expect(acknowledgeFaceReview(dir, store, SPATIAL_ID, 'gui-operator')).rejects.toMatchObject({ code: 'face_review_list_truncated' });
     expect((await acknowledgeFaceReview(dir, store, SPATIAL_ID, 'gui-operator', { allowTruncated: true })).acknowledged).toBeDefined();
   });

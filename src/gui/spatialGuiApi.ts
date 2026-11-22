@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { promises as fs, createReadStream } from 'node:fs';
 import path from 'node:path';
-import { Readable } from 'node:stream';
+import { Readable, pipeline } from 'node:stream';
 import type { CaptureRecord, CaptureStore } from '../captures/captureStore.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import type { JobRuntime, LocalJob } from '../jobs/jobRuntime.js';
@@ -69,7 +69,7 @@ export function listSpatialSummaries(store: LocalStore): SpatialRecordSummary[] 
       createdAt: record.createdAt,
       state: record.state,
       manifestCid: record.manifestCid,
-      ...(record.faceReview ? { faceReview: { pending: record.faceReview.pending, acknowledged: Boolean(record.faceReview.acknowledged), unseen: record.faceReview.items.filter((item) => !record.faceReview!.viewed.includes(item.file)).length } } : {}),
+      ...(record.faceReview ? { faceReview: { pending: record.faceReview.pending, acknowledged: Boolean(record.faceReview.acknowledged), unseen: (record.faceReview.items ?? []).filter((item) => !(record.faceReview!.viewed ?? []).includes(item.file)).length } } : {}),
       variants: record.manifest.variants.map((variant) => ({
         role: variant.role,
         format: variant.format,
@@ -218,7 +218,8 @@ export async function serveFaceReviewImage(
 ): Promise<void> {
   const image = await openFaceReviewImage(deps.dataRoot, deps.store, spatialId, file);
   res.writeHead(200, { 'Content-Type': image.mimeType, 'Content-Length': String(image.size), 'Cache-Control': 'private, no-store' });
-  createReadStream(image.path).pipe(res);
+  // The handle was opened before the record was updated; a read error now only ends this response, never the process.
+  pipeline(image.handle.createReadStream(), res, () => undefined);
 }
 
 /**
@@ -256,7 +257,7 @@ export async function serveCaptureFile(
     'Content-Length': String(stat.size),
     'Cache-Control': 'private, no-store',
   });
-  createReadStream(target).pipe(res);
+  pipeline(createReadStream(target), res, () => undefined);
 }
 
 function mimeTypeFor(relativePath: string): string {
