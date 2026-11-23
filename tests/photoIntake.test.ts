@@ -329,7 +329,7 @@ describe('photo reconstruction job and spatial revisions', () => {
           transform: { matrix: MATRIX, matrixOrder: 'column-major', up: [0, 0, 1], method: 'camera_up' },
           viewerDefaults: { quality: 'archive' },
           processing: { ...processing, orientation: { method: 'camera_up', confidence: 0.98 }, floaterCrop: { applied: true, splatsBefore: 100, splatsAfter: 90 } },
-          provenance: { kind: body.input.mode, ...(body.input.maskFaces ? { faceMasking: maskingReport(body.input.maskFaces) } : {}), photos: { submitted: 12, usable: 12 }, sfm: { registeredViews: 12, submittedViews: 12 }, splatCount: 90, orientation: { method: 'camera_up' }, crop: { applied: true, splatsBefore: 100, splatsAfter: 90 }, timings: { training: 30 } },
+          provenance: { kind: body.input.mode, ...(body.input.maskFaces ? { faceMasking: maskingReport(body.input.maskFaces) } : {}), photos: { submitted: 12, usable: 12 }, ...(body.input.maskFaces?.video ? { frames: { selected: 48 } } : {}), sfm: { registeredViews: 12, submittedViews: 12 }, splatCount: 90, orientation: { method: 'camera_up' }, crop: { applied: true, splatsBefore: 100, splatsAfter: 90 }, timings: { training: 30 } },
         }), { status: 200 });
       }
       throw new Error(`unexpected fetch to ${url}`);

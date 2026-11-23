@@ -82,6 +82,19 @@ describe('face review of a record', () => {
     expect(() => faceReviewDirectory(dir, '../escape')).toThrow();
   });
 
+  it('keeps a flagged premasked photo of any size the import accepts and refuses one it would not have accepted', async () => {
+    const { dir } = await setup();
+    const work = path.join(dir, 'work3');
+    await fs.mkdir(work, { recursive: true });
+    const big = await fs.open(path.join(work, 'big.png'), 'w'); await big.truncate(70 * 1024 * 1024); await big.close();
+    const review = await storeFaceReview(dir, OTHER_ID, 'job-3', 1, [{ part: 'photos', image: 1, relative: 'big.png', root: work }], false);
+    expect(review.items).toMatchObject([{ file: 'photos-00001.png' }]);
+    expect((await fs.stat(path.join(faceReviewDirectory(dir, OTHER_ID), 'photos-00001.png'))).size).toBe(70 * 1024 * 1024);
+    await removeFaceReviewImages(dir, OTHER_ID);
+    const huge = await fs.open(path.join(work, 'huge.png'), 'w'); await huge.truncate(121 * 1024 * 1024); await huge.close();
+    await expect(storeFaceReview(dir, OTHER_ID, 'job-3', 1, [{ part: 'photos', image: 1, relative: 'huge.png', root: work }], false)).rejects.toMatchObject({ code: 'face_review_images_unavailable' });
+  });
+
   it('records that an image was shown only when it is served, refuses names the review does not list, and cannot be acknowledged before all were shown', async () => {
     const { dir, store } = await setup();
     await expect(acknowledgeFaceReview(dir, store, SPATIAL_ID, 'gui-operator')).rejects.toMatchObject({ statusCode: 409, code: 'face_review_images_unseen', details: { unseen: 3 } });
@@ -305,6 +318,19 @@ describe('face review in the GUI routes', () => {
     try {
       for (const [method, suffix] of [['GET', '/face-review'], ['GET', '/face-review/image/photos-00003.jpg'], ['POST', '/face-review/acknowledge']] as const) {
         expect((await fetch(url(suffix), { method })).status).toBe(401);
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('answers a malformed percent escape in a record id or image name with a 400, not a 500', async () => {
+    const { server } = await start();
+    const base = server.url.replace('/gui', '/gui/api/spatial');
+    try {
+      for (const suffix of ['/%E0%A4%A/face-review', `/${SPATIAL_ID}/face-review/image/photos-%zz.jpg`, '/%/face-review/acknowledge']) {
+        const response = await fetch(base + suffix, { method: suffix.endsWith('acknowledge') ? 'POST' : 'GET', headers });
+        expect(response.status).toBe(400);
       }
     } finally {
       await server.close();

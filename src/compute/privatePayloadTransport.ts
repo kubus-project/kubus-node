@@ -53,7 +53,13 @@ export class PrivatePayloadTransport {
       if (providerEncryptionKey.asymmetricKeyType !== 'x25519') throw new Error();
     } catch { throw localError(400, 'compute_provider_key_invalid'); }
     const capture = this.deps.captures.get(captureId);
+    // Photo and video captures hold the raw, unmasked source of whatever was in
+    // front of the camera; masking happens inside the local worker job, never on
+    // the stored files. Packing them would hand those frames to another node
+    // operator, so they stay on this Node until the Node masks before packing.
+    if (capture.kind === 'photos' || capture.kind === 'video' || capture.kind === 'mixed') throw localError(422, 'remote_compute_media_capture_unsupported');
     const files = await walkFiles(capture.directory);
+    if (files.some((file) => file.path.startsWith('photos/') || file.path.startsWith('video/'))) throw localError(422, 'remote_compute_media_capture_unsupported');
     const rawBytes = files.reduce((sum, item) => sum + item.bytes.byteLength, 0);
     if (rawBytes > this.deps.maxInputBytes) throw localError(413, 'remote_compute_input_too_large');
     const packed: PackedCapture = { schema: 'kubus.private-capture/1', capture: { ...capture, directory: undefined }, files: files.map((file) => ({ path: file.path, contentBase64: file.bytes.toString('base64') })) };

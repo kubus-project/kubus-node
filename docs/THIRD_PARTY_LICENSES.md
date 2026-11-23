@@ -10,6 +10,7 @@ Key spatial and storage components in the 0.8 alpha line are:
 | Nerfstudio | 1.1.5 | Apache-2.0; `nerfstudio-project/nerfstudio` |
 | gsplat | 1.4.0 | Apache-2.0; `nerfstudio-project/gsplat`; version required by Nerfstudio 1.1.5 |
 | YuNet face detector (weights) | `face_detection_yunet_2023mar.onnx`, SHA-256 `8f2383e4...2552fa4`, OpenCV Zoo `48b10fa5` | MIT, copyright 2020 Shiqi Yu (`spatial-worker/models/LICENSE.yunet`); the network was trained with `ShiqiYu/libfacedetection.train`, BSD-3-Clause (`spatial-worker/models/LICENSE.libfacedetection.train`). Run through OpenCV (Apache-2.0, already part of the Nerfstudio image). Both licenses permit redistribution inside an AGPL-3.0-only project with the notices kept. |
+| undici (HTTP client with long header timeouts for the worker request) | 6.21.2 | MIT; `nodejs/undici` |
 | FastAPI | 0.141.1 | MIT; `fastapi/fastapi` |
 | Uvicorn | 0.52.1 | BSD-3-Clause; `encode/uvicorn` |
 | Node.js base image | 22 Alpine | Node.js MIT plus Alpine package licenses |

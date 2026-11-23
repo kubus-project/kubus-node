@@ -203,7 +203,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
   const revokeMatch = parsed.pathname.match(/^\/gui\/api\/devices\/([^/]+)$/);
   if (req.method === 'DELETE' && revokeMatch) {
     const local = requireLocalApi(deps);
-    await local.pairing.revoke(decodeURIComponent(revokeMatch[1]!));
+    await local.pairing.revoke(decodePathParam(revokeMatch[1]!));
     writeJson(res, 200, { success: true, data: { disconnected: true } });
     return;
   }
@@ -262,13 +262,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
   const jobMatch = parsed.pathname.match(/^\/gui\/api\/jobs\/([^/]+)$/);
   if (req.method === 'GET' && jobMatch) {
     const local = requireLocalApi(deps);
-    writeJson(res, 200, { success: true, data: getJobSummary(local.jobs, decodeURIComponent(jobMatch[1]!)) });
+    writeJson(res, 200, { success: true, data: getJobSummary(local.jobs, decodePathParam(jobMatch[1]!)) });
     return;
   }
   const jobCancelMatch = parsed.pathname.match(/^\/gui\/api\/jobs\/([^/]+)\/cancel$/);
   if (req.method === 'POST' && jobCancelMatch) {
     const local = requireLocalApi(deps);
-    const job = await local.jobs.cancel(decodeURIComponent(jobCancelMatch[1]!));
+    const job = await local.jobs.cancel(decodePathParam(jobCancelMatch[1]!));
     writeJson(res, 200, { success: true, data: job });
     return;
   }
@@ -322,13 +322,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     const local = requireLocalApi(deps);
     // Diagnostics rather than the bare record: the one question an operator
     // has about a capture is whether it can still be processed.
-    writeJson(res, 200, { success: true, data: await getCaptureDiagnostics(local.captures, decodeURIComponent(captureMatch[1]!)) });
+    writeJson(res, 200, { success: true, data: await getCaptureDiagnostics(local.captures, decodePathParam(captureMatch[1]!)) });
     return;
   }
   const captureContentMatch = parsed.pathname.match(/^\/gui\/api\/captures\/([^/]+)\/content\/(.+)$/);
   if (req.method === 'GET' && captureContentMatch) {
     const local = requireLocalApi(deps);
-    await serveCaptureFile(res, local, decodeURIComponent(captureContentMatch[1]!), decodeURIComponent(captureContentMatch[2]!));
+    await serveCaptureFile(res, local, decodePathParam(captureContentMatch[1]!), decodePathParam(captureContentMatch[2]!));
     return;
   }
   if (req.method === 'GET' && parsed.pathname === '/gui/api/spatial') {
@@ -337,12 +337,12 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
   }
   const spatialManifestMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/manifest$/);
   if (req.method === 'GET' && spatialManifestMatch) {
-    writeJson(res, 200, { success: true, data: getSpatialRecord(deps.store, decodeURIComponent(spatialManifestMatch[1]!)).manifest });
+    writeJson(res, 200, { success: true, data: getSpatialRecord(deps.store, decodePathParam(spatialManifestMatch[1]!)).manifest });
     return;
   }
   const spatialContentMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/content\/([^/]+)$/);
   if (req.method === 'GET' && spatialContentMatch) {
-    await serveSpatialVariant(req, res, deps, decodeURIComponent(spatialContentMatch[1]!), decodeURIComponent(spatialContentMatch[2]!));
+    await serveSpatialVariant(req, res, deps, decodePathParam(spatialContentMatch[1]!), decodePathParam(spatialContentMatch[2]!));
     return;
   }
   if (req.method === 'POST' && parsed.pathname === '/gui/api/spatial/purge-superseded') {
@@ -354,30 +354,30 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
   if (req.method === 'POST' && spatialSupersedeMatch) {
     const body = await readGuiJson(req);
     if (typeof body.by !== 'string' || !body.by) throw localError(400, 'spatial_replacement_required');
-    writeJson(res, 200, { success: true, data: await supersedeSpatialRecord({ store: deps.store, kubo: deps.kubo, dataRoot: deps.config.localDataPath }, decodeURIComponent(spatialSupersedeMatch[1]!), body.by) });
+    writeJson(res, 200, { success: true, data: await supersedeSpatialRecord({ store: deps.store, kubo: deps.kubo, dataRoot: deps.config.localDataPath }, decodePathParam(spatialSupersedeMatch[1]!), body.by) });
     return;
   }
   // Face review: the images face masking flagged, shown to the operator one by one, then acknowledged.
   const faceReviewMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/face-review$/);
   if (req.method === 'GET' && faceReviewMatch) {
-    writeJson(res, 200, { success: true, data: faceReviewView(deps.store, decodeURIComponent(faceReviewMatch[1]!)) });
+    writeJson(res, 200, { success: true, data: faceReviewView(deps.store, decodePathParam(faceReviewMatch[1]!)) });
     return;
   }
   const faceReviewImageMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/face-review\/image\/([^/]+)$/);
   if (req.method === 'GET' && faceReviewImageMatch) {
-    await serveFaceReviewImage(res, { store: deps.store, dataRoot: deps.config.localDataPath }, decodeURIComponent(faceReviewImageMatch[1]!), decodeURIComponent(faceReviewImageMatch[2]!));
+    await serveFaceReviewImage(res, { store: deps.store, dataRoot: deps.config.localDataPath }, decodePathParam(faceReviewImageMatch[1]!), decodePathParam(faceReviewImageMatch[2]!));
     return;
   }
   const faceReviewAcknowledgeMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/face-review\/acknowledge$/);
   if (req.method === 'POST' && faceReviewAcknowledgeMatch) {
     const body = await readGuiJson(req);
     if (body.confirm !== true) throw localError(400, 'face_review_confirmation_required', { message: 'Confirm that you looked at every listed image and that none shows a recognisable face' });
-    writeJson(res, 200, { success: true, data: await acknowledgeFaceReview(deps.config.localDataPath, deps.store, decodeURIComponent(faceReviewAcknowledgeMatch[1]!), 'gui-operator', { allowTruncated: body.allowTruncated === true }) });
+    writeJson(res, 200, { success: true, data: await acknowledgeFaceReview(deps.config.localDataPath, deps.store, decodePathParam(faceReviewAcknowledgeMatch[1]!), 'gui-operator', { allowTruncated: body.allowTruncated === true }) });
     return;
   }
   const spatialMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)$/);
   if (req.method === 'GET' && spatialMatch) {
-    const record = getSpatialRecord(deps.store, decodeURIComponent(spatialMatch[1]!));
+    const record = getSpatialRecord(deps.store, decodePathParam(spatialMatch[1]!));
     writeJson(res, 200, { success: true, data: record });
     return;
   }
@@ -547,6 +547,17 @@ async function readGuiJson(req: IncomingMessage, maxBytes = 64 * 1024): Promise<
     return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as Record<string, unknown>;
   } catch {
     const error = new Error('json_invalid') as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+}
+
+/** A malformed percent escape in an id or name is the caller's mistake: a 400, not a 500. */
+function decodePathParam(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    const error = new Error('path_parameter_invalid') as Error & { statusCode?: number };
     error.statusCode = 400;
     throw error;
   }

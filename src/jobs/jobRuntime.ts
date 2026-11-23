@@ -189,15 +189,24 @@ function pinned(part: unknown): boolean {
   return Boolean(part) && typeof part === 'object' && (part as Record<string, unknown>).weightsSha256 === PINNED_WEIGHTS_SHA256;
 }
 
-/** Parts the worker was asked to mask that its answer does not show as masked (or masked with other than the pinned weights); empty when everything ran. */
+/**
+ * Parts the worker was asked to mask that its answer does not show as masked (or masked with other than the pinned
+ * weights, or fewer images than it prepared); empty when everything ran. The count it masked is compared with the
+ * count it reports having prepared (`photos.usable`, `frames.selected`) so a part masked in part does not pass.
+ */
 export function missingMasking(requested: { photos?: boolean; video?: boolean } | undefined, worker: unknown): string[] {
   if (!requested) return [];
-  const reported = (worker && typeof worker === 'object' ? (worker as Record<string, unknown>).faceMasking : undefined) as Record<string, unknown> | undefined;
+  const record = (worker && typeof worker === 'object' ? worker : {}) as Record<string, unknown>;
+  const reported = record.faceMasking as Record<string, unknown> | undefined;
+  const prepared: Record<'photos' | 'video', unknown> = {
+    photos: (record.photos as Record<string, unknown> | undefined)?.usable,
+    video: (record.frames as Record<string, unknown> | undefined)?.selected,
+  };
   const missing: string[] = [];
   for (const part of ['photos', 'video'] as const) {
     if (!requested[part]) continue;
     const summary = reported?.[part] as Record<string, unknown> | undefined;
-    if (!summary || summary.ran !== true || typeof summary.images !== 'number' || summary.images < 1 || summary.weightsSha256 !== PINNED_WEIGHTS_SHA256) missing.push(part);
+    if (!summary || summary.ran !== true || typeof summary.images !== 'number' || summary.images < 1 || summary.weightsSha256 !== PINNED_WEIGHTS_SHA256 || summary.images !== prepared[part]) missing.push(part);
   }
   return missing;
 }

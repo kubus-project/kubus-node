@@ -394,12 +394,14 @@ def select_video_frames(
     prefix: str = "frame",
     after_selection: Callable[[pathlib.Path, list], None] | None = None,
     seconds: list | None = None,
+    masking_requested: bool = False,
 ) -> tuple:
     """Probe the capture's video, extract, filter and select frames into `destination`.
 
     Returns (file names written, video facts, selection statistics). Shared by the
     video intake and the mixed photo + video intake. A `seconds` list is filled with each selected frame's position
-    in the footage (seconds, in the order of the names).
+    in the footage (seconds, in the order of the names). `masking_requested` (also implied by `after_selection`) makes
+    unmasked raw frames that cannot be removed an error, for the intake that masks later as well as the one that masks here.
     """
     video = find_source_video(capture)
     info = probe_video(runner, video)
@@ -420,7 +422,7 @@ def select_video_frames(
         names.append(name)
         if seconds is not None:
             seconds.append(frame_seconds(item["path"], rate))
-    if not remove_raw_frames(raw) and after_selection is not None:
+    if not remove_raw_frames(raw) and (masking_requested or after_selection is not None):
         # Face masking was asked for, so unmasked extractions that cannot be removed are not left beside the masked copies:
         # the job stops here and its directory is removed by the cleanup journal.
         raise WorkerError("raw_frames_not_removed", "The unmasked extracted video frames could not be removed, so the job was stopped")
@@ -448,7 +450,7 @@ def prepare_video_dataset(runner: Runner, capture: pathlib.Path, work: pathlib.P
             progress("masking_faces", {"images": len(selected)})
             regions = mask_frame_sequence(masker, directory, selected, review=review)
 
-        names, info, selection = select_video_frames(runner, capture, work, progress, after_selection=mask_selected, seconds=seconds)
+        names, info, selection = select_video_frames(runner, capture, work, progress, after_selection=mask_selected, seconds=seconds, masking_requested=True)
     else:
         names, info, selection = select_video_frames(runner, capture, work, progress)
     chosen = work / "selected_frames"

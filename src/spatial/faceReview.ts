@@ -3,6 +3,7 @@ import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { localError } from '../localApi/pairingService.js';
 import type { LocalStore } from '../state/localStore.js';
+import { PHOTO_MAX_BYTES } from '../captures/photoPackage.js';
 
 /**
  * The human look that face masking leaves behind, and the operator's way to do it.
@@ -41,7 +42,8 @@ export interface FaceReview {
 
 const RECORD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const STORED_NAME = /^(photos|video)-\d{5,6}\.(jpg|jpeg|png)$/;
-const MAX_IMAGE_BYTES = 64 * 1024 * 1024;
+/** A flagged premasked photo is kept as imported, so the review accepts everything the import accepts. */
+const MAX_IMAGE_BYTES = PHOTO_MAX_BYTES;
 
 /** The worker's name for a flagged image, relative to the job's output directory. Anything else is refused. */
 export const WORKER_REVIEW_FILE = /^(?:dataset\/images\/(?:photo|video)_\d{5}\.jpg|selected_frames\/frame_\d{5}\.jpg)$/;

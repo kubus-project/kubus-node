@@ -22,6 +22,29 @@ describe('encrypted private compute payload transport', () => {
     expect(kubo.addBytes).not.toHaveBeenCalled();
     expect(kubo.pinAdd).not.toHaveBeenCalled();
   });
+  it('refuses to pack a photo, video or mixed capture for a remote provider, whatever the masking setting', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-private-transport-media-')); dirs.push(dir);
+    await fs.mkdir(path.join(dir, 'photos'), { recursive: true });
+    await fs.writeFile(path.join(dir, 'photos', 'a.jpg'), 'synthetic-raw-photo');
+    const requesterStore = new LocalStore(path.join(dir, 'requester.json')); await requesterStore.load();
+    const providerStore = new LocalStore(path.join(dir, 'provider.json')); await providerStore.load();
+    const providerPublic = (await new ComputeIdentityService(providerStore).publicIdentity()).encryptionPublicKey;
+    const kubo = { addBytes: vi.fn(), pinAdd: vi.fn(), pinLs: vi.fn() };
+    const records = [
+      { id: 'c-photos', kind: 'photos', directory: dir, faceMasking: { mode: 'premasked' } },
+      { id: 'c-video', kind: 'video', directory: dir },
+      { id: 'c-mixed', kind: 'mixed', directory: dir, faceMasking: { mode: 'none' } },
+      { id: 'c-untyped', directory: dir },
+    ];
+    const captures = { get: vi.fn((id: string) => records.find((record) => record.id === id)) };
+    const transport = new PrivatePayloadTransport({ captures, kubo, store: requesterStore, identity: {}, dataRoot: dir, maxInputBytes: 1024 * 1024 } as never);
+    for (const record of records) {
+      await expect(transport.encryptCapture(record.id, 'provider-1', providerPublic)).rejects.toMatchObject({ code: 'remote_compute_media_capture_unsupported', statusCode: 422 });
+    }
+    expect(kubo.addBytes).not.toHaveBeenCalled();
+    expect(kubo.pinAdd).not.toHaveBeenCalled();
+    expect(requesterStore.snapshot().privateComputeCids ?? {}).toEqual({});
+  });
   it('uses X25519 + HKDF + AES-256-GCM and detects tampering', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-private-transport-')); dirs.push(dir);
     const requesterStore = new LocalStore(path.join(dir, 'requester.json')); await requesterStore.load();

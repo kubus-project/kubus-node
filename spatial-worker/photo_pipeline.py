@@ -335,7 +335,7 @@ def prepare_photo_dataset(
     video_review: list = []
     video_seconds: list = []
     if include_video:
-        video_names, video_info, frame_stats = select_video_frames(runner, capture, work, progress, images, prefix="video", seconds=video_seconds)
+        video_names, video_info, frame_stats = select_video_frames(runner, capture, work, progress, images, prefix="video", seconds=video_seconds, masking_requested=mask_video)
         if mask_video:
             from face_mask import mask_frame_sequence
 

@@ -280,7 +280,7 @@ describe('masking in the job and the record', () => {
         return new Response(JSON.stringify({
           variants: [{ role: 'spatial_archive', path: 'result.ply', mimeType: 'application/octet-stream', format: 'ply', storageClass: 'cold' }],
           processing,
-          provenance: { kind: body.input.mode, sfm: { registeredViews: 9, submittedViews: 9, minRegisteredViews: 24, minRegistrationRatio: 0.6, gateLowered: false }, splatCount: 90, ...(faceMasking ? { faceMasking } : {}) },
+          provenance: { kind: body.input.mode, sfm: { registeredViews: 9, submittedViews: 9, minRegisteredViews: 24, minRegistrationRatio: 0.6, gateLowered: false }, splatCount: 90, ...(faceMasking ? { faceMasking, ...((faceMasking as any).photos ? { photos: { usable: (faceMasking as any).photos.images } } : {}), ...((faceMasking as any).video ? { frames: { selected: (faceMasking as any).video.images } } : {}) } : {}) },
         }), { status: 200 });
       }
       throw new Error(`unexpected fetch to ${url}`);
@@ -342,7 +342,15 @@ describe('masking in the job and the record', () => {
     for (const report of [{ photos: { ran: true, images: 0, weightsSha256: PINNED_WEIGHTS_SHA256 } }, { photos: { ran: true, images: 9 } }, { photos: { ran: false, images: 9, weightsSha256: PINNED_WEIGHTS_SHA256 } }, { photos: { ran: true, images: 9, weightsSha256: 'a'.repeat(64) } }]) {
       expect(missingMasking({ photos: true }, { faceMasking: report })).toEqual(['photos']);
     }
-    expect(missingMasking({ photos: true, video: true }, { faceMasking: { photos: part(9) } })).toEqual(['video']);
+    expect(missingMasking({ photos: true, video: true }, { photos: { usable: 9 }, faceMasking: { photos: part(9) } })).toEqual(['video']);
+    // Masking fewer images than the worker prepared is no better than none (one photo of nine, one frame of 48).
+    expect(missingMasking({ photos: true }, { photos: { usable: 9 }, faceMasking: { photos: part(1) } })).toEqual(['photos']);
+    expect(missingMasking({ photos: true }, { photos: { usable: 9 }, faceMasking: { photos: part(9) } })).toEqual([]);
+    expect(missingMasking({ video: true }, { frames: { selected: 48 }, faceMasking: { video: part(47) } })).toEqual(['video']);
+    expect(missingMasking({ video: true }, { frames: { selected: 48 }, faceMasking: { video: part(48) } })).toEqual([]);
+    // A worker that does not say how many images it prepared cannot show that it masked them all.
+    expect(missingMasking({ photos: true }, { faceMasking: { photos: part(9) } })).toEqual(['photos']);
+
     expect(missingMasking({ photos: false, video: false }, undefined)).toEqual([]);
     expect(missingMasking(undefined, undefined)).toEqual([]);
   });

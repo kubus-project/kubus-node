@@ -236,14 +236,6 @@ export class PairingService {
     });
   }
 
-  /** The id of the live (not revoked) credential a token belongs to, for the record of who acknowledged something. */
-  credentialIdFor(token: string | undefined): string | undefined {
-    if (!token?.startsWith('kubus_local_')) return undefined;
-    const hash = digest(token);
-    return Object.entries(this.store.snapshot().localCredentials || {})
-      .find(([, credential]) => !credential.revokedAt && safeEqual(credential.tokenHash, hash))?.[0];
-  }
-
   async authorize(token: string | undefined, requiredScope: LocalScope): Promise<boolean> {
     if (!token?.startsWith('kubus_local_')) return false;
     const hash = digest(token);

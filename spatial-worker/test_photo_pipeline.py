@@ -360,6 +360,42 @@ class PhotoDatasetTests(unittest.TestCase):
         self.assertEqual(len(result["masking"]["videoSeconds"]), result["frames"]["selected"])
         self.assertEqual(result["masking"]["videoSeconds"], sorted(result["masking"]["videoSeconds"]))
 
+    def mixed_capture_runner(self):
+        capture = make_photo_capture(self.root, count=20)
+        (capture / "video").mkdir()
+        (capture / "video" / "source.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
+        colmap = FakeColmap()
+        video = FakeTools(probe=probe_json(duration=10.0), frames=[(1000 + i, 0) for i in range(120)])
+
+        def runner(command, timeout):
+            return video(command, timeout) if command[0] in ("ffprobe", "ffmpeg") else colmap(command, timeout)
+
+        return capture, runner
+
+    def test_a_mixed_job_that_masks_video_stops_when_the_unmasked_raw_frames_cannot_be_removed(self):
+        from test_face_mask import FakeMasker
+
+        capture, runner = self.mixed_capture_runner()
+        with unittest.mock.patch.object(vp, "remove_raw_frames", return_value=False):
+            with self.assertRaises(vp.WorkerError) as raised:
+                pp.prepare_photo_dataset(
+                    runner, capture, self.root / "work", self.progress, include_video=True, convert=fake_convert(first_n(10_000)),
+                    mask_photos=True, mask_video=True, masker=FakeMasker([(30, 30, 80, 90)]),
+                )
+        self.assertEqual(raised.exception.code, "raw_frames_not_removed")
+        self.assertNotIn("solving_poses", [stage for stage, _ in self.stages])
+
+    def test_a_mixed_job_that_does_not_mask_video_carries_on_when_the_raw_frames_cannot_be_removed(self):
+        from test_face_mask import FakeMasker
+
+        capture, runner = self.mixed_capture_runner()
+        with unittest.mock.patch.object(vp, "remove_raw_frames", return_value=False):
+            result = pp.prepare_photo_dataset(
+                runner, capture, self.root / "work", self.progress, include_video=True, convert=fake_convert(first_n(10_000)),
+                mask_photos=True, masker=FakeMasker([(30, 30, 80, 90)]),
+            )
+        self.assertIsNone(result["masking"]["video"])
+
     def test_photos_only_masking_leaves_video_frames_alone(self):
         from test_face_mask import FakeMasker
 
