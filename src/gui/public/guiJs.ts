@@ -580,6 +580,14 @@ function renderFaceReviewPanel(record) {
     '</section>';
 }
 
+// True only while the opened face review is actually showing: it sits on the
+// Spatial section's detail view of that very record. Leaving it (another
+// section, back, another record) must let the periodic refresh redraw again.
+function faceReviewOnScreen() {
+  return !!(faceReview.id && activeSection === 'spatial' && library.detail &&
+    library.detail.kind === 'spatial' && library.detail.id === faceReview.id);
+}
+
 function resetFaceReview() {
   Object.keys(faceReview.images).forEach((file) => URL.revokeObjectURL(faceReview.images[file]));
   faceReview = { id: null, data: null, loading: false, error: null, images: {}, busy: false };
@@ -1366,6 +1374,7 @@ function bindSectionEvents() {
     button.addEventListener('click', () => {
       library.tab = button.dataset.libTab;
       library.detail = null;
+      resetFaceReview();
       renderSection();
     });
   });
@@ -1565,13 +1574,14 @@ async function refresh() {
     const firstLoad = model === null;
     model = next;
     if (firstLoad) render();
-    else if ($('#spatialPreviewMount iframe') || faceReview.id) {
+    else if ($('#spatialPreviewMount iframe') || faceReviewOnScreen()) {
       // An interactive Spatial preview is live: rebuilding the shell/section
       // would destroy its iframe (and the WebGL context inside it) out from
       // under the viewer every 10s, snapping the user back to "Open
       // interactive preview" mid-session. The model is still refreshed above
       // so the rest of the GUI stays current; only the DOM rebuild for this
-      // tick is skipped, and resumes once the preview closes.
+      // tick is skipped, and resumes once the preview closes or the
+      // opened face review is no longer on screen (another section, back).
     } else {
       // Keep the shell; only the section content and nav flags change.
       renderShell();
