@@ -10,6 +10,17 @@ kubus node uses SemVer. Exact Git and container tags are immutable.
 
 An alpha or beta never updates `latest`. Every `v*` tag runs type checking, tests, the TypeScript build, dependency audit, node and worker image builds, release-bundle checksums, and SPDX SBOM generation before GitHub release assets are published. A failed workflow is a failed release, regardless of whether the Git tag exists.
 
+## v0.8.8 — Video intake, photo-set captures and face masking
+
+Stable release lined up with the kubus 0.8.8 family. Protocol (version 3) is unchanged. The local API only gains spatial fields and error codes, and older records simply lack the new optional fields.
+
+- **Native video intake.** A phone video is accepted directly; long worker requests and worker ownership hand-back are handled so a long reconstruction no longer times out.
+- **Photo-set and mixed captures.** A capture can be a set of photos or a mix of photos and video. The registration gate states images, not frames, and its result is stored in the record.
+- **Face masking before reconstruction.** Photos and video frames are masked by default, with a flat fill that cannot be undone, and detection is tuned for recall. Images the run cannot decide (a weak detection inside an exclude box, a large detection that was not near-certain) are counted per image as review counts. A record with such images cannot be published (`409 spatial_face_review_pending`) until the operator has looked at each flagged image in the Node's own GUI (Face review); no flag a paired client sends can skip it. Choosing per face which faces stay unmasked is planned for 0.8.9; today the choice is per capture.
+- **Revisions, supersede and unpin.** A spatial record can be superseded by a revision (`kubus-node spatial supersede`); the superseded record's pins are released, its content is answered with 410 and `purge-superseded` removes the blocks. A masked revision of an unmasked record carries no link back to it. Viewer orientation and floater crop are improved.
+- **Provenance.** Each record keeps the provenance of its inputs, masking and gate decisions.
+- **Security.** undici is pinned to 6.29.1 for the high-severity audit advisories.
+
 ## v0.8.6 — Crash-safe runtime leases and pin reconciliation
 
 Stable release lined up with the kubus 0.8.6 family. Protocol (version 3), the local API and stored data are unchanged.
