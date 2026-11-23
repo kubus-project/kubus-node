@@ -102,3 +102,32 @@ class JobControl:
         if item and not item["done"].wait(timeout):
             raise TimeoutError("worker_not_quiescent")
         return {"jobId": job_id, "quiescent": True, "cleanupProtocol": 1}
+
+
+def hand_back_ownership(directory):
+    """Give a job's output tree to the owner of its top directory.
+
+    The worker runs as root; the Node creates the job directory as its own
+    unprivileged user and later deletes it during cleanup. Files left owned by
+    root make that deletion fail with EACCES, which blocks the whole cleanup
+    journal (and with it every later job). Best effort and symlink-safe: it
+    never follows a link and never raises.
+    """
+    root = pathlib.Path(directory)
+    try:
+        info = root.stat()
+    except OSError:
+        return
+    if os.geteuid() != 0 or info.st_uid == 0:
+        return
+
+    def own(path):
+        try:
+            os.lchown(path, info.st_uid, info.st_gid)
+        except OSError:
+            pass
+
+    own(root)
+    for base, directories, files in os.walk(root, followlinks=False):
+        for name in directories + files:
+            own(os.path.join(base, name))

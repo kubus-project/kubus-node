@@ -63,7 +63,8 @@ jobs:
       - run: npm audit --audit-level=high
       - run: git diff --check
       - run: docker compose config
-      - run: docker compose build kubus-node-agent kubus-spatial-worker
+      - run: docker compose -p kubus-worker-ci build kubus-node-agent kubus-spatial-worker
+      - run: bash scripts/test_worker_python.sh kubus-worker-ci-kubus-spatial-worker
 
   images:
     name: Build and push immutable images

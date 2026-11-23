@@ -1,13 +1,14 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { promises as fs, createReadStream } from 'node:fs';
 import path from 'node:path';
-import { Readable } from 'node:stream';
+import { Readable, pipeline } from 'node:stream';
 import type { CaptureRecord, CaptureStore } from '../captures/captureStore.js';
 import type { KuboClient } from '../ipfs/kuboClient.js';
 import type { JobRuntime, LocalJob } from '../jobs/jobRuntime.js';
 import { localError } from '../localApi/pairingService.js';
 import type { SpatialManifest } from '../spatial/models.js';
 import type { LocalStore } from '../state/localStore.js';
+import { openFaceReviewImage, type FaceReview } from '../spatial/faceReview.js';
 import { isValidCidLike } from '../utils/cid.js';
 
 /**
@@ -33,6 +34,8 @@ export interface SpatialRecordSummary {
   state: string;
   manifestCid: string;
   variants: Array<{ role: string; format: string; mimeType: string; sizeBytes: number; storageClass: string }>;
+  /** Present when face masking left images for the operator to look at; `acknowledged` once they did. */
+  faceReview?: { pending: number; acknowledged: boolean; unseen: number };
 }
 
 interface SpatialStoreRecord {
@@ -42,6 +45,7 @@ interface SpatialStoreRecord {
   manifest: SpatialManifest;
   createdAt: string;
   privateSourceCapture?: boolean;
+  faceReview?: FaceReview;
 }
 
 function isSpatialStoreRecord(value: unknown): value is SpatialStoreRecord {
@@ -65,6 +69,7 @@ export function listSpatialSummaries(store: LocalStore): SpatialRecordSummary[] 
       createdAt: record.createdAt,
       state: record.state,
       manifestCid: record.manifestCid,
+      ...(record.faceReview ? { faceReview: { pending: record.faceReview.pending, acknowledged: Boolean(record.faceReview.acknowledged), unseen: (record.faceReview.items ?? []).filter((item) => !(record.faceReview!.viewed ?? []).includes(item.file)).length } } : {}),
       variants: record.manifest.variants.map((variant) => ({
         role: variant.role,
         format: variant.format,
@@ -153,6 +158,8 @@ export async function serveSpatialVariant(
   role: string,
 ): Promise<void> {
   const record = getSpatialRecord(deps.store, spatialId);
+  // A superseded record's content is unpinned and must never be served again (see `supersedeSpatialRecord`).
+  if (record.state === 'superseded') throw localError(410, 'spatial_record_superseded', { message: 'This record was replaced by a newer one and is no longer served' });
   const variant = record.manifest.variants.find((candidate) => candidate.role === role);
   if (!variant) throw localError(404, 'spatial_variant_not_found');
   if (!isValidCidLike(variant.cid)) throw localError(500, 'spatial_variant_cid_invalid');
@@ -202,6 +209,19 @@ export async function serveSpatialVariant(
   Readable.fromWeb(body as import('node:stream/web').ReadableStream).pipe(res);
 }
 
+/** Streams one flagged, masked image of a record's face review; serving it is what records that the operator was shown it. */
+export async function serveFaceReviewImage(
+  res: ServerResponse,
+  deps: { store: LocalStore; dataRoot: string },
+  spatialId: string,
+  file: string,
+): Promise<void> {
+  const image = await openFaceReviewImage(deps.dataRoot, deps.store, spatialId, file);
+  res.writeHead(200, { 'Content-Type': image.mimeType, 'Content-Length': String(image.size), 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' });
+  // The handle was opened before the record was updated; a read error now only ends this response, never the process.
+  pipeline(image.handle.createReadStream(), res, () => undefined);
+}
+
 /**
  * Streams one frame image from a capture directory - a bounded, authenticated
  * alternative to exposing the capture's filesystem path in the UI. Only a
@@ -237,7 +257,7 @@ export async function serveCaptureFile(
     'Content-Length': String(stat.size),
     'Cache-Control': 'private, no-store',
   });
-  createReadStream(target).pipe(res);
+  pipeline(createReadStream(target), res, () => undefined);
 }
 
 function mimeTypeFor(relativePath: string): string {

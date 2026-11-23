@@ -165,9 +165,12 @@ export class ManagedPins {
     if (state.desiredCids.some((record) => same(record.cid))) return true;
     for (const item of Object.values(state.spatial || {})) {
       const record = item as {
+        state?: string;
         manifestCid?: string;
         manifest?: { variants?: Array<{ cid?: string }> };
       };
+      // A superseded record is history only: it no longer holds its content pinned.
+      if (record.state === 'superseded') continue;
       if (
         same(record.manifestCid) ||
         record.manifest?.variants?.some((variant) => same(variant.cid))

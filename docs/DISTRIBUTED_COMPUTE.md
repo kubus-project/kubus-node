@@ -23,6 +23,8 @@ The provider pins the temporary CID, verifies the ciphertext hash and authentica
 
 The remote provider necessarily sees plaintext source data while processing. Encryption protects transport and intermediaries, not against the selected provider.
 
+**Photo and video captures are never sent to a provider.** Masking happens inside the local worker job, never on the stored files, so a `photos`, `video` or `mixed` capture still holds the unmasked source of whoever stood in front of the camera. `POST /local/v1/compute/jobs` refuses such a capture with `422 remote_compute_media_capture_unsupported` before anything is read or encrypted (the packing code refuses any file under `photos/` or `video/` as well). Only posed-frame captures can be offered to a remote provider until the Node masks before it packs; run photo and video captures on this Node's own worker.
+
 ## Output and verification
 
 The provider signs a receipt binding job, input hash, job-spec hash, output CIDs, worker/protocol version and completion time. The requester retrieves the manifest and variants by CID, checks membership/retrievability, previews the unpublished result, then signs acceptance or rejection. The backend verifies both signatures against the identities captured for the assignment and checks the exact job, hashes, output CID set, decision, timestamps and protocol version. Publication is a separate authenticated CID-first request through the canonical spatial-publication service.

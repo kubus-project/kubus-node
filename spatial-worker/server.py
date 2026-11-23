@@ -6,7 +6,7 @@ import hmac
 import json
 import os
 import pathlib
-import subprocess
+import time
 import uuid
 from typing import Any
 
@@ -15,12 +15,17 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 
 from gpu_tier import classify_vram_tier
-from job_control import JobControl, JobCancelled
+from job_control import JobControl, JobCancelled, hand_back_ownership
+from face_mask import FaceMaskingError, masking_provenance, missing_review_files
+from photo_pipeline import prepare_photo_dataset
+from scene_frame import analyse_dataset
+from video_pipeline import WorkerError, prepare_video_dataset
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 WORKER_AUTH_KEY_PATH = os.environ.get("WORKER_AUTH_KEY_PATH", "/var/lib/kubus-node/worker-auth.key")
 
 
+WORKER_VERSION = "kubus-spatial-worker/10"
 WORKER_INSTANCE_ID = str(uuid.uuid4())
 control = JobControl("/var/lib/kubus-node/private/worker-control")
 
@@ -63,7 +68,7 @@ def health() -> dict[str, Any]:
             "status": "unsupported",
             "gpu": gpu,
             "capabilities": [],
-            "version": "kubus-spatial-worker/2",
+            "version": WORKER_VERSION,
             "cleanupProtocol": 1,
             "workerInstanceId": WORKER_INSTANCE_ID,
             "detail": "A CUDA-capable NVIDIA GPU is required for local reconstruction",
@@ -72,7 +77,14 @@ def health() -> dict[str, Any]:
         "status": "ready",
         "gpu": gpu,
         "capabilities": ["spatial.reconstruct", "spatial.gaussianSplat"],
-        "version": "kubus-spatial-worker/2",
+        # Input modes `spatial.reconstruct` accepts: posed frames, one video, still photos, or photos plus one video.
+        "inputModes": ["frames", "video", "photos", "mixed"],
+        # Face masking of photos and video frames before reconstruction (`input.maskFaces`); see face_mask.py.
+        "faceMasking": True,
+        # The images face masking flags carry `file` (and a frame's `seconds`) in `needsLook.items`, so the Node can keep
+        # a masked copy for the operator to look at before the job's working directory is removed.
+        "faceReviewImages": True,
+        "version": WORKER_VERSION,
         "cleanupProtocol": 1,
         "workerInstanceId": WORKER_INSTANCE_ID,
     }
@@ -118,6 +130,12 @@ def process(request: ProcessRequest, x_kubus_worker_authorization: str | None = 
             return process_owned(request)
     except JobCancelled:
         raise HTTPException(status_code=409, detail="job_cancelled")
+    except FaceMaskingError as error:
+        # Masking could not run: nothing may continue with unmasked pixels.
+        raise HTTPException(status_code=500, detail={"code": "face_masking_failed", "message": str(error)})
+    except WorkerError as error:
+        # `detail` is an object with a stable `code`; the Node reads it.
+        raise HTTPException(status_code=error.status, detail=error.detail())
     except ValueError:
         raise HTTPException(status_code=409, detail="job_identity_invalid_or_active")
 
@@ -135,7 +153,60 @@ async def cancel(request: JobRequest, x_kubus_worker_authorization: str | None =
         raise HTTPException(status_code=503, detail="worker_not_quiescent")
 
 
+def write_progress(output: pathlib.Path, stage: str, detail: dict | None = None) -> None:
+    """Publish the current stage where the Node can read it while the request is in flight."""
+    output.mkdir(parents=True, exist_ok=True)
+    target = output / "worker-progress.json"
+    temporary = output / "worker-progress.json.tmp"
+    temporary.write_text(json.dumps({
+        "stage": stage, "detail": detail or {}, "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }), encoding="utf-8")
+    os.replace(temporary, target)
+
+
+def ply_vertex_count(path: pathlib.Path) -> int | None:
+    try:
+        with path.open("rb") as handle:
+            for _ in range(200):
+                line = handle.readline()
+                if line.startswith(b"element vertex "):
+                    return int(line.split()[2])
+                if line.startswith(b"end_header"):
+                    break
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def wants_floater_crop(request: ProcessRequest) -> bool:
+    """Per-job `floaterCrop` wins; otherwise the worker's `KUBUS_SPATIAL_FLOATER_CROP` default (off)."""
+    requested = request.input.get("floaterCrop")
+    if isinstance(requested, bool):
+        return requested
+    return os.environ.get("KUBUS_SPATIAL_FLOATER_CROP", "0") == "1"
+
+
 def process_owned(request: ProcessRequest):
+    try:
+        return run_reconstruction(request)
+    finally:
+        # Success, failure or cancellation: the Node must be able to delete what this root process wrote.
+        hand_back_ownership(request.outputDirectory)
+
+
+def require_review_files(output: pathlib.Path, masked: dict | None) -> None:
+    """Fails before training when a flagged image's masked copy is not where the Node will look for it."""
+    missing = missing_review_files(output, masked)
+    if missing:
+        raise WorkerError(
+            "face_review_images_unavailable",
+            f"{len(missing)} flagged image(s) have no masked copy the Node can keep for review; the run stops before training",
+            500,
+            {"count": len(missing)},
+        )
+
+
+def run_reconstruction(request: ProcessRequest):
     if not torch.cuda.is_available():
         raise HTTPException(status_code=503, detail="gpu_unsupported")
     shared_root = pathlib.Path("/var/lib/kubus-node").resolve()
@@ -143,23 +214,67 @@ def process_owned(request: ProcessRequest):
     output = ensure_child(shared_root, request.outputDirectory)
     if request.type != "spatial.reconstruct":
         raise HTTPException(status_code=422, detail="job_type_not_supported_by_worker")
-    transforms = capture / "transforms.json"
-    if not transforms.is_file():
-        raise HTTPException(status_code=422, detail="capture_requires_nerfstudio_transforms_json")
+    mode = request.input.get("mode") or "frames"
+    if mode not in ("frames", "video", "photos", "mixed"):
+        raise HTTPException(status_code=422, detail="input_mode_not_supported_by_worker")
     output.mkdir(parents=True, exist_ok=True)
+    provenance: dict[str, Any] = {}
+    timings: dict[str, float] = {}
+    started = time.monotonic()
+    runner = lambda command, timeout: control.run(request.jobId, command, timeout=timeout)
+    progress = lambda stage, detail: write_progress(output, stage, detail)
+    mask = request.input.get("maskFaces")
+    mask_photos = isinstance(mask, dict) and mask.get("photos") is True
+    mask_video = isinstance(mask, dict) and mask.get("video") is True
+    if mode == "video":
+        prepared = prepare_video_dataset(runner, capture, output, progress, mask_video=mask_video)
+        dataset = prepared["dataset"]
+        provenance = {"kind": "video", "video": prepared["video"], "frames": prepared["frames"], "sfm": prepared["sfm"]}
+        masked = masking_provenance(prepared["masking"])
+        if masked:
+            provenance["faceMasking"] = masked
+        require_review_files(output, masked)
+    elif mode in ("photos", "mixed"):
+        prepared = prepare_photo_dataset(runner, capture, output, progress, include_video=(mode == "mixed"), mask_photos=mask_photos, mask_video=mask_video)
+        dataset = prepared["dataset"]
+        provenance = {"kind": mode, "photos": prepared["photos"], "sfm": prepared["sfm"]}
+        masked = masking_provenance(prepared["masking"])
+        if masked:
+            provenance["faceMasking"] = masked
+        require_review_files(output, masked)
+        if prepared["video"]:
+            provenance["video"] = prepared["video"]
+            provenance["frames"] = prepared["frames"]
+    else:
+        dataset = capture
+        if not (dataset / "transforms.json").is_file():
+            raise HTTPException(status_code=422, detail="capture_requires_nerfstudio_transforms_json")
+    timings["intake"] = round(time.monotonic() - started, 1)
     iterations = str(max(1000, min(int(os.environ.get("KUBUS_SPATIAL_MAX_ITERATIONS", "15000")), 30000)))
+    write_progress(output, "training", {"iterations": int(iterations)})
     command = [
-        "ns-train", "splatfacto", "--data", str(capture), "--output-dir", str(output / "training"),
+        "ns-train", "splatfacto", "--data", str(dataset), "--output-dir", str(output / "training"),
         "--max-num-iterations", iterations, "--viewer.quit-on-train-completion", "True",
     ]
+    trained_at = time.monotonic()
     completed = control.run(request.jobId, command, timeout=24 * 60 * 60)
+    timings["training"] = round(time.monotonic() - trained_at, 1)
     if completed.returncode != 0:
         raise HTTPException(status_code=500, detail=(completed.stderr or completed.stdout)[-2000:])
     configs = sorted(glob.glob(str(output / "training" / "**" / "config.yml"), recursive=True))
     if not configs:
         raise HTTPException(status_code=500, detail="training_config_not_found")
+    # Orientation and the crop box come from the COLMAP solution, mapped into the frame the splat is written in.
+    analysis: dict[str, Any] | None = None
+    if mode != "frames":
+        try:
+            analysis = analyse_dataset(dataset / "transforms.json", dataset / "sparse_pc.ply", pathlib.Path(configs[-1]).parent / "dataparser_transforms.json")
+        except Exception as error:  # orientation is a convenience; it must never fail a finished training run
+            provenance["orientation"] = {"method": "unavailable", "error": type(error).__name__}
+    write_progress(output, "exporting", {})
     export_dir = output / "export"
     export_dir.mkdir(exist_ok=True)
+    exported_at = time.monotonic()
     export = control.run(request.jobId,
         ["ns-export", "gaussian-splat", "--load-config", configs[-1], "--output-dir", str(export_dir)],
         timeout=2 * 60 * 60,
@@ -169,7 +284,40 @@ def process_owned(request: ProcessRequest):
     candidates = sorted(export_dir.glob("*.ply"))
     if not candidates:
         raise HTTPException(status_code=500, detail="gaussian_export_not_found")
-    return {
+    chosen = candidates[-1]
+    crop: dict[str, Any] | None = None
+    if wants_floater_crop(request):
+        crop = {"applied": False}
+        if analysis and analysis.get("box"):
+            box = analysis["box"]
+            centre = [(lo + hi) / 2.0 for lo, hi in zip(box["min"], box["max"])]
+            size = [hi - lo for lo, hi in zip(box["min"], box["max"])]
+            cropped = control.run(request.jobId, [
+                "ns-export", "gaussian-splat", "--load-config", configs[-1], "--output-dir", str(export_dir),
+                "--output-filename", "splat-cropped.ply",
+                "--obb-center", *[f"{value:.6f}" for value in centre],
+                "--obb-rotation", "0", "0", "0",
+                "--obb-scale", *[f"{value:.6f}" for value in size],
+            ], timeout=2 * 60 * 60)
+            before, after = ply_vertex_count(chosen), ply_vertex_count(export_dir / "splat-cropped.ply")
+            if cropped.returncode == 0 and after:
+                crop = {**box, "applied": True, "splatsBefore": before, "splatsAfter": after, "rotation": [0, 0, 0]}
+                chosen = export_dir / "splat-cropped.ply"
+            else:
+                crop = {"applied": False, "reason": "crop_export_failed", "splatsBefore": before}
+        else:
+            crop = {"applied": False, "reason": "no_subject_box"}
+    timings["export"] = round(time.monotonic() - exported_at, 1)
+    provenance["timings"] = timings
+    if analysis:
+        provenance["orientation"] = {key: value for key, value in analysis["orientation"].items() if not isinstance(value, list)}
+    if crop is not None:
+        provenance["crop"] = {key: value for key, value in crop.items() if not isinstance(value, (list, dict))}
+    splats = ply_vertex_count(chosen)
+    if splats is not None:
+        provenance["splatCount"] = splats
+    candidates = [chosen]
+    result: dict[str, Any] = {
         "variants": [{
             "role": "spatial_archive",
             "path": str(candidates[-1].relative_to(output)),
@@ -180,7 +328,7 @@ def process_owned(request: ProcessRequest):
         "viewerDefaults": {"quality": "archive"},
         "processing": {
             "protocol": "kubus.spatial-job/1",
-            "workerVersion": "kubus-spatial-worker/2",
+            "workerVersion": WORKER_VERSION,
             "reconstruction": {
                 "engine": "nerfstudio",
                 "method": "splatfacto",
@@ -189,3 +337,11 @@ def process_owned(request: ProcessRequest):
             },
         },
     }
+    if analysis:
+        result["transform"] = {"matrix": analysis["matrix"], "matrixOrder": "column-major", "up": analysis["up"], "method": analysis["orientation"]["method"], "rotationApplied": analysis["orientation"]["rotationApplied"]}
+        result["processing"]["orientation"] = analysis["orientation"]
+    if crop is not None:
+        result["processing"]["floaterCrop"] = crop
+    if provenance:
+        result["provenance"] = provenance
+    return result

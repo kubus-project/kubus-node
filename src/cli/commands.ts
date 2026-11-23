@@ -32,6 +32,9 @@ import { startSetupServer } from '../gui/setupServer.js';
 import { PermissionUpdateService } from '../setup/permissionUpdate.js';
 import { AnalyticsStore } from '../analytics/analyticsStore.js';
 import { recoverNetworkStartup } from '../runtime/networkStartup.js';
+import { runCaptureCommand, runSpatialCommand } from './captureImport.js';
+import { warnAboutSupersededContent } from '../spatial/supersededBlocks.js';
+import { ensureImportDirectory } from '../captures/importPaths.js';
 
 /**
  * Whether a command may sweep orphaned capture directories.
@@ -71,6 +74,16 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     else console.log(JSON.stringify(buildStatusSummary(config, readStore.snapshot(), await liveStatus(readApi, readKubo)), null, 2));
     return;
   }
+  // `capture ...` reaches a running Node over its local API, or imports offline
+  // under its own lease; it must not take the writer lease first.
+  if (command === 'capture') {
+    await runCaptureCommand(argv.slice(1), config, logger);
+    return;
+  }
+  if (command === 'spatial') {
+    await runSpatialCommand(argv.slice(1), config);
+    return;
+  }
   const writerLease = await acquireRuntimeLease(config.localStatePath);
   const longRunning = command === 'start' || command === 'gui';
   try {
@@ -89,6 +102,8 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   await computeIdentity.initialize();
   const pairing = new PairingService(store, config, identity);
   const captures = new CaptureStore(config.localDataPath, store);
+  // The place an operator puts a video to import (`kubus-node capture import-video`).
+  if (reclaimsOrphanedCaptures(command)) await ensureImportDirectory(config.localDataPath).catch(() => undefined);
   // Streaming-upload drafts are in-memory, so a restart mid-transfer leaves a
   // capture directory with no owner. Reclaim those before serving, or every
   // interrupted upload permanently consumes disk.
@@ -136,6 +151,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   if (command === 'gui') {
     participationGate.setSchedulerActive(false);
     await jobs.start();
+    void warnAboutSupersededContent({ store, kubo, logger });
     await capabilities.refresh();
     const guiConfig = { ...config, guiEnabled: true };
     const gui = await startGuiServer({ api, kubo, store, config: guiConfig, logger, actionLock, analytics, localApi: { ...localApi, config: guiConfig } });
@@ -182,6 +198,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
 
   if (command !== 'start') throw new Error(`Unknown command: ${command}`);
   await jobs.start();
+  void warnAboutSupersededContent({ store, kubo, logger });
   await capabilities.refresh();
   // Declared before the GUI so its late-bound diagnostics read the live client.
   let signaling: NodeSignalingClient | null = null;

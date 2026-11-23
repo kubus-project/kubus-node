@@ -73,6 +73,33 @@ describe('local GUI safety helpers', () => {
     expect(() => new Function(guiJs)).not.toThrow();
   });
 
+  it('freezes the periodic refresh only while the opened face review is on screen', () => {
+    const start = guiJs.indexOf('function faceReviewOnScreen()');
+    const end = guiJs.indexOf('function resetFaceReview()');
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const onScreen = new Function(
+      'faceReview',
+      'activeSection',
+      'library',
+      `${guiJs.slice(start, end)}
+return faceReviewOnScreen();`,
+    ) as (review: unknown, section: string, lib: unknown) => boolean;
+    const review = { id: 'sp1' };
+    const detail = { kind: 'spatial', id: 'sp1' };
+    expect(onScreen(review, 'spatial', { detail })).toBe(true);
+    // Another section, back to the list, another record or no review at all:
+    // the refresh must redraw again instead of freezing the GUI.
+    expect(onScreen(review, 'processing', { detail })).toBe(false);
+    expect(onScreen(review, 'spatial', { detail: null })).toBe(false);
+    expect(onScreen(review, 'spatial', { detail: { kind: 'spatial', id: 'sp2' } })).toBe(false);
+    expect(onScreen(review, 'spatial', { detail: { kind: 'capture', id: 'sp1' } })).toBe(false);
+    expect(onScreen({ id: null }, 'spatial', { detail })).toBe(false);
+    // The refresh branch must use the predicate, not the bare state flag.
+    expect(guiJs).toContain("$('#spatialPreviewMount iframe') || faceReviewOnScreen()");
+    expect(guiJs).not.toContain('|| faceReview.id) {');
+  });
+
   it('binds the copy action inserted with an active pairing session', () => {
     const pairingRenderer = guiJs.slice(
       guiJs.indexOf('function renderPairingArea()'),

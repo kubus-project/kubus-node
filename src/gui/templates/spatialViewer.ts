@@ -72,6 +72,13 @@ export const spatialViewerBootstrapJs = `
   const headers = { Accept: 'application/octet-stream' };
   if (token) headers.Authorization = 'Bearer ' + token;
 
+  // The manifest's viewer transform (upright, centred, front towards the camera).
+  // Best effort: a record without one, or a manifest that cannot be read, opens untransformed.
+  const transformRequest = fetch('/gui/api/spatial/' + encodeURIComponent(id) + '/manifest', { headers: Object.assign({}, headers, { Accept: 'application/json' }) })
+    .then(function (response) { return response.ok ? response.json() : null; })
+    .then(function (body) { return body && body.data && body.data.transform ? body.data.transform : undefined; })
+    .catch(function () { return undefined; });
+
   fetch('/gui/api/spatial/' + encodeURIComponent(id) + '/content/' + encodeURIComponent(role), { headers: headers })
     .then(function (response) {
       if (!response.ok) throw new Error('HTTP ' + response.status);
@@ -79,7 +86,7 @@ export const spatialViewerBootstrapJs = `
     })
     .then(function (blob) {
       const objectUrl = URL.createObjectURL(blob);
-      return window.loadSpatial(objectUrl);
+      return transformRequest.then(function (transform) { return window.loadSpatial(objectUrl, transform); });
     })
     .catch(function (error) {
       fail('This spatial archive could not be loaded.');

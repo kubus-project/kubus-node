@@ -156,6 +156,176 @@ describe('dispatchLocalRequest', () => {
     }
   });
 
+  it('does not hand a superseded record to a paired client', async () => {
+    await deps.store.update((state) => {
+      state.spatial = {
+        old: { id: 'old', state: 'superseded', manifestCid: 'Qm1', manifest: { variants: [] } },
+        fresh: { id: 'fresh', state: 'local', manifestCid: 'Qm2', manifest: { variants: [] } },
+      } as never;
+    });
+    const get = (id: string) => dispatchLocalRequest(request({ method: 'GET', path: `/local/v1/spatial/${id}`, credential: token }), deps);
+    await expect(get('old')).rejects.toMatchObject({ statusCode: 410, code: 'spatial_record_superseded' });
+    await expect(get('fresh')).resolves.toMatchObject({ kind: 'json' });
+  });
+
+  it('does not hand the manifest or CIDs of a superseded record to a paired client through the job record', async () => {
+    await deps.store.update((state) => {
+      state.spatial = {
+        old: { id: 'old', state: 'superseded', manifestCid: 'QmOLD', manifest: { variants: [{ cid: 'QmOLDVARIANT' }] } },
+        fresh: { id: 'fresh', state: 'local', manifestCid: 'QmFRESH', manifest: { variants: [] } },
+      } as never;
+    });
+    const retired = { id: 'j-old', state: 'completed', output: { id: 'old', manifestCid: 'QmOLD', manifest: { variants: [{ cid: 'QmOLDVARIANT' }] } } };
+    const current = { id: 'j-new', state: 'completed', output: { id: 'fresh', manifestCid: 'QmFRESH', manifest: { variants: [] } } };
+    deps.jobs = { get: (id: string) => (id === 'j-old' ? retired : current), list: () => [retired, current], health: () => ({ running: 0, queued: 0 }) } as never;
+    const read = async (route: string) => (await dispatchLocalRequest(request({ method: 'GET', path: route, credential: token }), deps) as { value: any }).value;
+    const single = await read('/local/v1/jobs/j-old');
+    expect(single.id).toBe('j-old');
+    expect(JSON.stringify(single)).not.toMatch(/QmOLD|manifest/);
+    const listed = (await read('/local/v1/jobs')).jobs as Array<Record<string, any>>;
+    expect(JSON.stringify(listed.find((job) => job.id === 'j-old'))).not.toMatch(/QmOLD|manifest/);
+    expect(listed.find((job) => job.id === 'j-new')!.output.manifestCid).toBe('QmFRESH');
+    // The job object itself (what the operator's own tools read) is not changed.
+    expect(retired.output.manifestCid).toBe('QmOLD');
+  });
+
+  it('applies the same job filter to the cancel and create responses as to the reads', async () => {
+    const review = { pending: 2, jobId: 'j-old', items: [{ part: 'photos', image: 1, file: 'photos-00001.jpg' }], viewed: [] };
+    await deps.store.update((state) => {
+      state.spatial = {
+        old: { id: 'old', state: 'superseded', manifestCid: 'QmOLD', manifest: { variants: [{ cid: 'QmOLDVARIANT' }] } },
+        pending: { id: 'pending', state: 'local', manifestCid: 'QmPEND', manifest: { variants: [] }, faceReview: review },
+      } as never;
+    });
+    const retired = { id: 'j-old', state: 'completed', maskingDetail: { photos: { needsLook: { images: 2 } } }, output: { id: 'old', manifestCid: 'QmOLD', faceReview: review, manifest: { variants: [{ cid: 'QmOLDVARIANT' }] } } };
+    const reviewing = { id: 'j-pend', state: 'completed', maskingDetail: { photos: { needsLook: { images: 2 } } }, output: { id: 'pending', manifestCid: 'QmPEND', faceReview: review, manifest: { variants: [] } } };
+    deps.jobs = {
+      get: () => retired,
+      list: () => [retired, reviewing],
+      cancel: async (id: string) => (id === 'j-old' ? retired : reviewing),
+      create: async () => reviewing,
+      health: () => ({ running: 0, queued: 0 }),
+    } as never;
+    const post = async (route: string, body: unknown = {}) =>
+      (await dispatchLocalRequest(request({ method: 'POST', path: route, credential: token, body: jsonBody(body) }), deps) as { value: Record<string, any> }).value;
+    const cancelledRetired = await post('/local/v1/jobs/j-old/cancel');
+    expect(cancelledRetired.id).toBe('j-old');
+    expect(JSON.stringify(cancelledRetired)).not.toMatch(/QmOLD|faceReview|maskingDetail|needsLook|manifest/);
+    for (const shown of [await post('/local/v1/jobs/j-pend/cancel'), await post('/local/v1/jobs', { type: 'spatial.reconstruct', input: {} })]) {
+      expect(JSON.stringify(shown)).not.toMatch(/faceReview|maskingDetail|needsLook|photos-00001/);
+      expect(shown.output.manifestCid).toBe('QmPEND');
+    }
+    // The job objects themselves (what the operator's own tools read) are not changed.
+    expect(retired.output.faceReview).toBeDefined();
+    expect(reviewing.maskingDetail).toBeDefined();
+  });
+
+  it('never publishes or revives a superseded spatial record', async () => {
+    const publishExistingSpatial = vi.fn(async () => ({ requested: true }));
+    deps.api = { publishExistingSpatial } as never;
+    vi.spyOn(deps.pairing, 'authorize').mockResolvedValue(true);
+    await deps.store.update((state) => {
+      state.spatial = {
+        old: { id: 'old', state: 'superseded', manifestCid: 'Qm1', manifest: {} },
+        fresh: { id: 'fresh', state: 'local', manifestCid: 'Qm2', manifest: {} },
+      } as never;
+    });
+    const publish = (id: string) => dispatchLocalRequest(request({ method: 'POST', path: `/local/v1/spatial/${id}/publish`, credential: token, body: jsonBody({ backendAuthorization: 'Bearer x', artworkId: 'a' }) }), deps);
+    await expect(publish('old')).rejects.toMatchObject({ statusCode: 409, code: 'spatial_not_publishable' });
+    expect(publishExistingSpatial).not.toHaveBeenCalled();
+    expect((deps.store.snapshot().spatial as Record<string, { state: string }>).old!.state).toBe('superseded');
+    // A superseded record stays superseded even when a request for it is in flight while it is retired.
+    await expect(publish('fresh')).resolves.toMatchObject({ kind: 'json' });
+    expect((deps.store.snapshot().spatial as Record<string, { state: string }>).fresh!.state).toBe('publication_requested');
+    publishExistingSpatial.mockImplementationOnce(async () => {
+      await deps.store.update((state) => { (state.spatial as Record<string, { state: string }>).fresh!.state = 'superseded'; });
+      return { requested: true };
+    });
+    await publish('fresh').catch(() => undefined);
+    expect((deps.store.snapshot().spatial as Record<string, { state: string }>).fresh!.state).toBe('superseded');
+  });
+
+  it('refuses to publish a record with images left to look at until the operator acknowledged them in the GUI; no client flag can do it', async () => {
+    const publishExistingSpatial = vi.fn(async () => ({ requested: true }));
+    deps.api = { publishExistingSpatial } as never;
+    const review = { pending: 3, jobId: 'job-1', items: [{ part: 'photos', image: 2, file: 'photos-00002.jpg' }], viewed: ['photos-00002.jpg'] };
+    await deps.store.update((state) => {
+      state.spatial = {
+        flagged: { id: 'flagged', state: 'local', manifestCid: 'Qm1', manifest: {}, faceReview: review },
+        looked: { id: 'looked', state: 'local', manifestCid: 'Qm4', manifest: {}, faceReview: { ...review, acknowledged: { at: '2026-11-22T10:00:00.000Z', by: 'gui-operator' } } },
+        clean: { id: 'clean', state: 'local', manifestCid: 'Qm2', manifest: {} },
+        legacy: { id: 'legacy', state: 'local', manifestCid: 'Qm3', manifest: {}, faceReview: { pending: 0, jobId: 'job-0' } },
+      } as never;
+    });
+    const publish = (id: string, extra: Record<string, unknown> = {}) => dispatchLocalRequest(request({ method: 'POST', path: `/local/v1/spatial/${id}/publish`, credential: token, body: jsonBody({ backendAuthorization: 'Bearer x', artworkId: 'a', ...extra }) }), deps);
+    const record = (id: string) => (deps.store.snapshot().spatial as Record<string, { state: string; publishInFlightAt?: string; publication?: unknown; faceReview?: { pending: number; acknowledged?: { at: string; by: string } } }>)[id]!;
+    await expect(publish('flagged')).rejects.toMatchObject({ statusCode: 409, code: 'spatial_face_review_pending', details: { pending: 3 } });
+    // The old body flag does nothing: the look is the operator's, in the GUI, and the Node checks the images were shown.
+    await expect(publish('flagged', { acknowledgeFaceReview: true })).rejects.toMatchObject({ code: 'spatial_face_review_pending' });
+    expect(publishExistingSpatial).not.toHaveBeenCalled();
+    expect(record('flagged').state).toBe('local');
+    expect(record('flagged').faceReview?.acknowledged).toBeUndefined();
+    // After the operator's acknowledgement (recorded by the GUI route), and for records with nothing flagged, publishing works.
+    await expect(publish('looked')).resolves.toMatchObject({ kind: 'json' });
+    expect(record('looked').state).toBe('publication_requested');
+    expect(record('looked').publishInFlightAt).toBeUndefined();
+    // The backend never receives the Node's private review state.
+    const sent = publishExistingSpatial.mock.calls[0] as unknown as [{ spatial: Record<string, unknown> }];
+    expect(sent[0].spatial.faceReview).toBeUndefined();
+    expect(sent[0].spatial.id).toBe('looked');
+    await expect(publish('clean')).resolves.toMatchObject({ kind: 'json' });
+    await expect(publish('legacy')).resolves.toMatchObject({ kind: 'json' });
+    expect(record('clean').faceReview).toBeUndefined();
+  });
+
+  it('claims the record while the backend call runs, so a supersede cannot retire it, and keeps a publication the backend accepted', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const publishExistingSpatial = vi.fn(async () => { await gate; return { requested: true }; });
+    deps.api = { publishExistingSpatial } as never;
+    await deps.store.update((state) => { state.spatial = { fresh: { id: 'fresh', state: 'local', manifestCid: 'Qm1', manifest: {} } } as never; });
+    const record = () => (deps.store.snapshot().spatial as Record<string, { state: string; publishInFlightAt?: string; publication?: unknown }>).fresh!;
+    const pending = dispatchLocalRequest(request({ method: 'POST', path: '/local/v1/spatial/fresh/publish', credential: token, body: jsonBody({ backendAuthorization: 'Bearer x', artworkId: 'a' }) }), deps);
+    while (!record().publishInFlightAt) await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(record().state).toBe('local');
+    release();
+    await expect(pending).resolves.toMatchObject({ kind: 'json' });
+    expect(record().publishInFlightAt).toBeUndefined();
+    expect(record().publication).toEqual({ requested: true });
+    // A failed backend call releases the claim.
+    await deps.store.update((state) => { state.spatial = { again: { id: 'again', state: 'local', manifestCid: 'Qm2', manifest: {} } } as never; });
+    publishExistingSpatial.mockImplementationOnce(async () => { throw new Error('backend down'); });
+    await expect(dispatchLocalRequest(request({ method: 'POST', path: '/local/v1/spatial/again/publish', credential: token, body: jsonBody({ backendAuthorization: 'Bearer x', artworkId: 'a' }) }), deps)).rejects.toThrow('backend down');
+    expect((deps.store.snapshot().spatial as Record<string, { publishInFlightAt?: string }>).again!.publishInFlightAt).toBeUndefined();
+  });
+
+  it('keeps the private face review of a record away from paired clients (record and job output)', async () => {
+    const review = { pending: 1, jobId: 'job-1', items: [{ part: 'photos', image: 4, file: 'photos-00004.jpg' }], viewed: [], acknowledged: { at: 'x', by: 'cred-1' } };
+    await deps.store.update((state) => { state.spatial = { r1: { id: 'r1', state: 'local', manifestCid: 'Qm1', manifest: { variants: [] }, faceReview: review } } as never; });
+    const response = await dispatchLocalRequest(request({ method: 'GET', path: '/local/v1/spatial/r1', credential: token }), deps) as { value: Record<string, unknown> };
+    expect(response.value.id).toBe('r1');
+    expect(JSON.stringify(response.value)).not.toMatch(/faceReview|photos-00004|cred-1/);
+    const job = { id: 'j1', state: 'completed', output: { id: 'r1', faceReview: review } };
+    deps.jobs = { get: () => job, list: () => [job], health: () => ({ running: 0, queued: 0 }) } as never;
+    for (const route of ['/local/v1/jobs/j1', '/local/v1/jobs']) {
+      const shown = await dispatchLocalRequest(request({ method: 'GET', path: route, credential: token }), deps) as { value: unknown };
+      expect(JSON.stringify(shown.value)).not.toMatch(/faceReview|cred-1/);
+      expect(JSON.stringify(shown.value)).toContain('r1');
+    }
+    expect(job.output.faceReview).toBeDefined();
+  });
+
+  it('keeps the private face-masking detail of a job away from paired clients', async () => {
+    const job = { id: 'j1', state: 'completed', maskingDetail: { photos: { needsLook: { images: 1, items: [{ image: 4, largeBelowCertain: 1 }] } } } };
+    deps.jobs = { get: () => job, list: () => [job], health: () => ({ running: 0, queued: 0 }) } as never;
+    for (const route of ['/local/v1/jobs/j1', '/local/v1/jobs']) {
+      const response = await dispatchLocalRequest(request({ method: 'GET', path: route, credential: token }), deps) as { value: unknown };
+      expect(JSON.stringify(response.value)).not.toMatch(/maskingDetail|needsLook/);
+    }
+    // The job object itself (what the operator's GUI routes serve) is not changed.
+    expect(job.maskingDetail).toBeDefined();
+  });
+
   it('serves the node identity to an authenticated, verified caller', async () => {
     const response = await dispatchLocalRequest(
       request({ method: 'GET', path: '/local/v1/info', credential: token }),

@@ -777,6 +777,10 @@ details.disclosure > .stack, details.disclosure > .stack-sm { margin-top: var(--
 }
 .viewer-fullscreen { justify-self: start; }
 
+/* --- Face review ----------------------------------------------------------- */
+.face-review-item { display: grid; gap: var(--k-space-xs); padding: var(--k-space-sm) 0; border-top: 1px solid var(--k-border); }
+.face-review-image img { display: block; width: 100%; max-width: 960px; height: auto; border: 1px solid var(--k-border); border-radius: var(--k-radius-sm); }
+
 /* --- Responsive --------------------------------------------------------- */
 /* Tablet and small laptop: the sidebar becomes a horizontal section bar. */
 @media (max-width: 1024px) {

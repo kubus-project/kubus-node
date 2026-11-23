@@ -25,6 +25,10 @@ import { spatialViewerBootstrapJs, spatialViewerHtml } from './templates/spatial
 import { spatialViewerBundle } from './public/vendor/spatialViewerBundle.js';
 import { handleLocalApi, type LocalApiDeps } from '../localApi/localApiRouter.js';
 import { localError } from '../localApi/pairingService.js';
+import { importRoots, resolveImportSource } from '../captures/importPaths.js';
+import { acknowledgeFaceReview, faceReviewView } from '../spatial/faceReview.js';
+import { supersedeSpatialRecord } from '../spatial/supersede.js';
+import { purgeSupersededContent } from '../spatial/supersededBlocks.js';
 import { buildViewModel } from './viewModel.js';
 import { renderQrSvg } from './qr.js';
 import {
@@ -35,6 +39,7 @@ import {
   listJobSummaries,
   listSpatialSummaries,
   serveCaptureFile,
+  serveFaceReviewImage,
   serveSpatialVariant,
 } from './spatialGuiApi.js';
 
@@ -198,7 +203,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
   const revokeMatch = parsed.pathname.match(/^\/gui\/api\/devices\/([^/]+)$/);
   if (req.method === 'DELETE' && revokeMatch) {
     const local = requireLocalApi(deps);
-    await local.pairing.revoke(decodeURIComponent(revokeMatch[1]!));
+    await local.pairing.revoke(decodePathParam(revokeMatch[1]!));
     writeJson(res, 200, { success: true, data: { disconnected: true } });
     return;
   }
@@ -245,20 +250,25 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     if (!captureId) throw localError(400, 'job_capture_required');
     const capture = local.captures.get(captureId);
     const type = typeof body.type === 'string' ? body.type : 'spatial.reconstruct';
-    const job = await local.jobs.create(type as never, { captureId, artworkId: capture.artworkId, markerId: capture.markerId });
+    // Operator options: only the two the runtime validates (a boolean crop switch, a record to revise).
+    const options: Record<string, unknown> = {};
+    if (body.floaterCrop !== undefined) options.floaterCrop = body.floaterCrop;
+    if (body.previousSpatialId !== undefined) options.previousSpatialId = body.previousSpatialId;
+    if (body.revisionNote !== undefined) options.revisionNote = body.revisionNote;
+    const job = await local.jobs.create(type as never, { captureId, artworkId: capture.artworkId, markerId: capture.markerId, ...options });
     writeJson(res, 201, { success: true, data: job });
     return;
   }
   const jobMatch = parsed.pathname.match(/^\/gui\/api\/jobs\/([^/]+)$/);
   if (req.method === 'GET' && jobMatch) {
     const local = requireLocalApi(deps);
-    writeJson(res, 200, { success: true, data: getJobSummary(local.jobs, decodeURIComponent(jobMatch[1]!)) });
+    writeJson(res, 200, { success: true, data: getJobSummary(local.jobs, decodePathParam(jobMatch[1]!)) });
     return;
   }
   const jobCancelMatch = parsed.pathname.match(/^\/gui\/api\/jobs\/([^/]+)\/cancel$/);
   if (req.method === 'POST' && jobCancelMatch) {
     const local = requireLocalApi(deps);
-    const job = await local.jobs.cancel(decodeURIComponent(jobCancelMatch[1]!));
+    const job = await local.jobs.cancel(decodePathParam(jobCancelMatch[1]!));
     writeJson(res, 200, { success: true, data: job });
     return;
   }
@@ -267,18 +277,58 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
     writeJson(res, 200, { success: true, data: listCaptureSummaries(local.captures) });
     return;
   }
+  if (req.method === 'POST' && parsed.pathname === '/gui/api/captures/import-video') {
+    // Imports a video already on this Node's disk, bypassing the 128 MiB
+    // streaming-upload request cap. The path is confined to the import roots.
+    const local = requireLocalApi(deps);
+    const body = await readGuiJson(req);
+    const source = await resolveImportSource(body.path, importRoots(deps.config.localDataPath));
+    const text = (value: unknown) => (typeof value === 'string' && value.trim() ? value.trim().slice(0, 200) : undefined);
+    const capture = await local.captures.importVideoFile(source, {
+      artworkId: text(body.artworkId), markerId: text(body.markerId), capturedAt: text(body.capturedAt), maskFaces: optionalBoolean(body.maskFaces, 'capture_mask_faces_invalid'),
+    });
+    writeJson(res, 201, { success: true, data: capture });
+    return;
+  }
+  if (req.method === 'POST' && parsed.pathname === '/gui/api/captures/import-photos') {
+    // Imports a directory of photographs (and optionally one video) already on
+    // this Node's disk. Both paths are confined to the import roots.
+    const local = requireLocalApi(deps);
+    const body = await readGuiJson(req);
+    const roots = importRoots(deps.config.localDataPath);
+    const directory = await resolveImportSource(body.path, roots);
+    const videoPath = body.videoPath === undefined || body.videoPath === null ? undefined : await resolveImportSource(body.videoPath, roots);
+    const text = (value: unknown) => (typeof value === 'string' && value.trim() ? value.trim().slice(0, 200) : undefined);
+    const capture = await local.captures.importPhotoDirectory(directory, {
+      artworkId: text(body.artworkId), markerId: text(body.markerId), capturedAt: text(body.capturedAt), capturedBy: text(body.capturedBy), videoPath,
+      maskFaces: optionalBoolean(body.maskFaces, 'capture_mask_faces_invalid'),
+    });
+    writeJson(res, 201, { success: true, data: capture });
+    return;
+  }
+  if (req.method === 'POST' && parsed.pathname === '/gui/api/captures/add-video') {
+    // Builds a NEW mixed capture from a stored photo capture plus a video on this Node's disk.
+    const local = requireLocalApi(deps);
+    const body = await readGuiJson(req);
+    if (typeof body.captureId !== 'string' || !body.captureId) throw localError(400, 'capture_id_required');
+    const source = await resolveImportSource(body.path, importRoots(deps.config.localDataPath));
+    const capturedAt = typeof body.capturedAt === 'string' && body.capturedAt.trim() ? body.capturedAt.trim().slice(0, 40) : undefined;
+    const capture = await local.captures.addVideoToCapture(body.captureId, source, { capturedAt, maskFaces: optionalBoolean(body.maskFaces, 'capture_mask_faces_invalid') });
+    writeJson(res, 201, { success: true, data: capture });
+    return;
+  }
   const captureMatch = parsed.pathname.match(/^\/gui\/api\/captures\/([^/]+)$/);
   if (req.method === 'GET' && captureMatch) {
     const local = requireLocalApi(deps);
     // Diagnostics rather than the bare record: the one question an operator
     // has about a capture is whether it can still be processed.
-    writeJson(res, 200, { success: true, data: await getCaptureDiagnostics(local.captures, decodeURIComponent(captureMatch[1]!)) });
+    writeJson(res, 200, { success: true, data: await getCaptureDiagnostics(local.captures, decodePathParam(captureMatch[1]!)) });
     return;
   }
   const captureContentMatch = parsed.pathname.match(/^\/gui\/api\/captures\/([^/]+)\/content\/(.+)$/);
   if (req.method === 'GET' && captureContentMatch) {
     const local = requireLocalApi(deps);
-    await serveCaptureFile(res, local, decodeURIComponent(captureContentMatch[1]!), decodeURIComponent(captureContentMatch[2]!));
+    await serveCaptureFile(res, local, decodePathParam(captureContentMatch[1]!), decodePathParam(captureContentMatch[2]!));
     return;
   }
   if (req.method === 'GET' && parsed.pathname === '/gui/api/spatial') {
@@ -287,17 +337,47 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, deps: Gu
   }
   const spatialManifestMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/manifest$/);
   if (req.method === 'GET' && spatialManifestMatch) {
-    writeJson(res, 200, { success: true, data: getSpatialRecord(deps.store, decodeURIComponent(spatialManifestMatch[1]!)).manifest });
+    writeJson(res, 200, { success: true, data: getSpatialRecord(deps.store, decodePathParam(spatialManifestMatch[1]!)).manifest });
     return;
   }
   const spatialContentMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/content\/([^/]+)$/);
   if (req.method === 'GET' && spatialContentMatch) {
-    await serveSpatialVariant(req, res, deps, decodeURIComponent(spatialContentMatch[1]!), decodeURIComponent(spatialContentMatch[2]!));
+    await serveSpatialVariant(req, res, deps, decodePathParam(spatialContentMatch[1]!), decodePathParam(spatialContentMatch[2]!));
+    return;
+  }
+  if (req.method === 'POST' && parsed.pathname === '/gui/api/spatial/purge-superseded') {
+    await readGuiJson(req);
+    writeJson(res, 200, { success: true, data: await purgeSupersededContent({ store: deps.store, kubo: deps.kubo }) });
+    return;
+  }
+  const spatialSupersedeMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/supersede$/);
+  if (req.method === 'POST' && spatialSupersedeMatch) {
+    const body = await readGuiJson(req);
+    if (typeof body.by !== 'string' || !body.by) throw localError(400, 'spatial_replacement_required');
+    writeJson(res, 200, { success: true, data: await supersedeSpatialRecord({ store: deps.store, kubo: deps.kubo, dataRoot: deps.config.localDataPath }, decodePathParam(spatialSupersedeMatch[1]!), body.by) });
+    return;
+  }
+  // Face review: the images face masking flagged, shown to the operator one by one, then acknowledged.
+  const faceReviewMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/face-review$/);
+  if (req.method === 'GET' && faceReviewMatch) {
+    writeJson(res, 200, { success: true, data: faceReviewView(deps.store, decodePathParam(faceReviewMatch[1]!)) });
+    return;
+  }
+  const faceReviewImageMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/face-review\/image\/([^/]+)$/);
+  if (req.method === 'GET' && faceReviewImageMatch) {
+    await serveFaceReviewImage(res, { store: deps.store, dataRoot: deps.config.localDataPath }, decodePathParam(faceReviewImageMatch[1]!), decodePathParam(faceReviewImageMatch[2]!));
+    return;
+  }
+  const faceReviewAcknowledgeMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)\/face-review\/acknowledge$/);
+  if (req.method === 'POST' && faceReviewAcknowledgeMatch) {
+    const body = await readGuiJson(req);
+    if (body.confirm !== true) throw localError(400, 'face_review_confirmation_required', { message: 'Confirm that you looked at every listed image and that none shows a recognisable face' });
+    writeJson(res, 200, { success: true, data: await acknowledgeFaceReview(deps.config.localDataPath, deps.store, decodePathParam(faceReviewAcknowledgeMatch[1]!), 'gui-operator', { allowTruncated: body.allowTruncated === true }) });
     return;
   }
   const spatialMatch = parsed.pathname.match(/^\/gui\/api\/spatial\/([^/]+)$/);
   if (req.method === 'GET' && spatialMatch) {
-    const record = getSpatialRecord(deps.store, decodeURIComponent(spatialMatch[1]!));
+    const record = getSpatialRecord(deps.store, decodePathParam(spatialMatch[1]!));
     writeJson(res, 200, { success: true, data: record });
     return;
   }
@@ -443,6 +523,13 @@ async function createGuiPairing(deps: GuiDeps) {
   };
 }
 
+/** A request-body flag that is true, false or absent; anything else is a 400. */
+function optionalBoolean(value: unknown, code: string): boolean | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'boolean') throw localError(400, code);
+  return value;
+}
+
 async function readGuiJson(req: IncomingMessage, maxBytes = 64 * 1024): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -460,6 +547,17 @@ async function readGuiJson(req: IncomingMessage, maxBytes = 64 * 1024): Promise<
     return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as Record<string, unknown>;
   } catch {
     const error = new Error('json_invalid') as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+}
+
+/** A malformed percent escape in an id or name is the caller's mistake: a 400, not a 500. */
+function decodePathParam(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    const error = new Error('path_parameter_invalid') as Error & { statusCode?: number };
     error.statusCode = 400;
     throw error;
   }

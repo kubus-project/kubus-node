@@ -4,9 +4,33 @@ import tempfile
 import threading
 import time
 import unittest
-from job_control import JobControl, JobCancelled
+import os
+from job_control import JobControl, JobCancelled, hand_back_ownership
 
 JOB = "11111111-1111-4111-8111-111111111111"
+
+
+class HandBackOwnershipTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "needs root to create foreign-owned files")
+    def test_root_written_files_are_given_to_the_directory_owner(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = pathlib.Path(temp) / "job"
+            output.mkdir()
+            os.chown(output, 12345, 23456)
+            (output / "training" / "run").mkdir(parents=True)
+            (output / "training" / "run" / "weights.ckpt").write_bytes(b"x")
+            (output / "export.ply").write_bytes(b"y")
+            outside = pathlib.Path(temp) / "outside.txt"
+            outside.write_text("keep")
+            (output / "link").symlink_to(outside)
+            hand_back_ownership(output)
+            for path in [output, output / "training", output / "training" / "run", output / "training" / "run" / "weights.ckpt", output / "export.ply"]:
+                self.assertEqual((path.stat().st_uid, path.stat().st_gid), (12345, 23456), str(path))
+            # The symlink target is never touched.
+            self.assertEqual(outside.stat().st_uid, 0)
+
+    def test_missing_directory_is_not_an_error(self):
+        hand_back_ownership("/nonexistent/kubus-job")
 
 
 class JobControlTests(unittest.TestCase):

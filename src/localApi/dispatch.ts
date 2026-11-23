@@ -12,6 +12,7 @@ import type { JobRuntime, JobType } from '../jobs/jobRuntime.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
 import type { RemoteComputeRuntime } from '../compute/remoteComputeRuntime.js';
 import { computeAuthorizationRequired } from '../compute/credentialFingerprint.js';
+import { withoutFaceReview } from '../spatial/faceReview.js';
 import type { LocalStore } from '../state/localStore.js';
 import { isValidCidLike, normalizeCid } from '../utils/cid.js';
 import { IdempotencyStore } from './idempotencyStore.js';
@@ -61,6 +62,31 @@ const SCOPE_BY_ROUTE: Array<[RegExp, LocalScope]> = [
 ];
 
 const pairingAttempts = new PairingAttemptLimiter();
+
+/**
+ * A job as a paired client sees it. `maskingDetail` (per-image face-masking counts, which images need a look) and the
+ * `faceReview` of the record in its output are the operator's, served by the GUI routes, not by the paired-client API.
+ * The output of a job whose spatial record was superseded is history too: it carries the retired record's manifest and
+ * CIDs, which the 410 of the record route and `purge-superseded` exist to take out of circulation, so it is dropped.
+ */
+function publicJob<T extends { maskingDetail?: unknown; output?: unknown }>(job: T, spatial?: Record<string, unknown> | null): T {
+  let out = job;
+  if ('maskingDetail' in out) {
+    const { maskingDetail: _private, ...rest } = out;
+    out = rest as T;
+  }
+  if (out.output && typeof out.output === 'object') {
+    const id = (out.output as { id?: unknown }).id;
+    const record = typeof id === 'string' ? (spatial?.[id] as { state?: unknown } | undefined) : undefined;
+    if (record?.state === 'superseded') {
+      const { output: _retired, ...rest } = out;
+      out = rest as T;
+    } else {
+      out = { ...out, output: withoutFaceReview(out.output as object) };
+    }
+  }
+  return out;
+}
 
 /**
  * The session id bound into every HTTP identity proof.
@@ -287,6 +313,21 @@ export async function dispatchLocalRequest(
  * the channel. Over HTTPS the transport already authenticates the host; over
  * cleartext LAN the attacker must already be on the network.
  */
+/**
+ * Metadata keys that only the Node's own importers may write into a capture: the face-masking decision (the Node
+ * decides it from its own policy), the capture a media capture was derived from (it picks which earlier spatial
+ * record a revision links to) and the operator and per-medium capture times (they end up in the manifest).
+ */
+const NODE_OWNED_METADATA = ['faceMasking', 'derivedFromCaptureId', 'capturedBy', 'mediaCapturedAt'] as const;
+
+/** A paired client cannot declare these in uploaded metadata: a claim carried there is discarded. */
+export function dropClientProvenanceClaims(payload: { metadata?: unknown }): void {
+  const metadata = payload?.metadata;
+  if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) {
+    for (const key of NODE_OWNED_METADATA) delete (metadata as Record<string, unknown>)[key];
+  }
+}
+
 async function proveIdentity(request: LocalRequest, deps: LocalApiDeps): Promise<LocalResponse> {
   identityProofAttempts.assertAllowed(
     pairingAttemptKey(request.peer.address || request.peer.kind, 'identity-proof'),
@@ -458,12 +499,14 @@ async function route(
     // package can exceed 50 MiB on the wire. Keep the endpoint bounded while
     // allowing a useful mobile capture session.
     const payload = (await request.body.json(BODY_LIMITS.capturePackage)) as unknown as CapturePackagePayload;
+    dropClientProvenanceClaims(payload);
     return jsonResponse(201, await captures.create(payload));
   }
 
   if (method === 'POST' && path === '/local/v1/captures/drafts') {
     if (!(await pairing.authorize(credential, 'captures:create'))) throw localError(403, 'scope_required');
     const payload = (await request.body.json(BODY_LIMITS.captureDraftMetadata)) as unknown as CaptureDraftPayload;
+    dropClientProvenanceClaims(payload);
     return jsonResponse(201, await captures.beginDraft(payload));
   }
 
@@ -514,16 +557,23 @@ async function route(
     const body = await request.body.json(BODY_LIMITS.json);
     return jsonResponse(
       201,
-      await jobs.create(
-        String(body.type || '') as JobType,
-        (body.input && typeof body.input === 'object' ? body.input : {}) as Record<string, unknown>,
+      publicJob(
+        await jobs.create(
+          String(body.type || '') as JobType,
+          (body.input && typeof body.input === 'object' ? body.input : {}) as Record<string, unknown>,
+        ),
+        store.snapshot().spatial as Record<string, unknown> | undefined,
       ),
     );
   }
 
   if (method === 'GET' && path === '/local/v1/jobs') {
     const gate = await participationGate.refresh();
-    const list = jobs.list().map((job) => (gate.leaseEligible || !job.output ? job : { ...job, output: undefined }));
+    const spatialRecords = store.snapshot().spatial as Record<string, unknown> | undefined;
+    const list = jobs.list().map((job) => {
+      const shown = publicJob(job, spatialRecords);
+      return gate.leaseEligible || !shown.output ? shown : { ...shown, output: undefined };
+    });
     return jsonResponse(200, { jobs: list });
   }
 
@@ -536,13 +586,14 @@ async function route(
   const cancelMatch = path.match(/^\/local\/v1\/jobs\/([^/]+)\/cancel$/);
   if (method === 'POST' && cancelMatch) {
     if (!(await pairing.authorize(credential, 'jobs:create'))) throw localError(403, 'scope_required');
-    return jsonResponse(200, await jobs.cancel(cancelMatch[1]!));
+    // The cancel of a job that already finished returns that job as stored, so it goes through the same filter as the reads.
+    return jsonResponse(200, publicJob(await jobs.cancel(cancelMatch[1]!), store.snapshot().spatial as Record<string, unknown> | undefined));
   }
 
   const jobMatch = path.match(/^\/local\/v1\/jobs\/([^/]+)$/);
   if (method === 'GET' && jobMatch) {
     const job = jobs.get(jobMatch[1]!);
-    return jsonResponse(200, job);
+    return jsonResponse(200, publicJob(job, store.snapshot().spatial as Record<string, unknown> | undefined));
   }
 
   if (method === 'POST' && path === '/local/v1/compute/candidates') {
@@ -646,28 +697,65 @@ async function route(
     const spatialId = publishMatch[1]!;
     const spatial = store.snapshot().spatial?.[spatialId] as Record<string, unknown> | undefined;
     if (!spatial) throw localError(404, 'spatial_not_found');
+    // Only a record that is local (or already requested) can be offered to the backend. A superseded record
+    // (for example one reconstructed from images that showed people) must never be revived by this route.
+    if (spatial.state !== 'local' && spatial.state !== 'publication_requested') throw localError(409, 'spatial_not_publishable', { message: `A record in state ${String(spatial.state)} cannot be published` });
     const body = await request.body.json(BODY_LIMITS.json);
     const authorization = typeof body.backendAuthorization === 'string' ? body.backendAuthorization : '';
     if (!authorization.startsWith('Bearer ')) throw localError(400, 'backend_authorization_required');
-    const result = await api.publishExistingSpatial(
-      { spatial, artworkId: body.artworkId, markerId: body.markerId },
-      authorization,
-    );
+    // Face masking can leave images for a human to look at (see `faceReview` on the record). Publishing to IPFS is
+    // irreversible, so the record is not offered until the operator has looked at every listed image in the Node's
+    // own GUI (Spatial, the record, Face review): the Node checks that each was shown before it records the
+    // acknowledgement. There is no flag a paired client can send instead.
+    const review = spatial.faceReview as { pending?: number; acknowledged?: unknown } | undefined;
+    if (review && typeof review.pending === 'number' && review.pending > 0 && !review.acknowledged) {
+      throw localError(409, 'spatial_face_review_pending', {
+        message: `Face masking left ${review.pending} image(s) for a human to look at. The operator looks at them in the Node's GUI (Spatial, open the record, Face review) and confirms; then publish again`,
+        pending: review.pending,
+      });
+    }
+    // Claimed inside one state update, so a supersede cannot slip in between the check above and the backend call
+    // (`supersedeSpatialRecord` refuses a record with a publication in flight, checked in its own update).
     await store.update((state) => {
       const current = state.spatial?.[spatialId] as Record<string, unknown> | undefined;
-      if (current) {
-        current.state = 'publication_requested';
-        current.publication = result;
-      }
+      if (!current || (current.state !== 'local' && current.state !== 'publication_requested')) throw localError(409, 'spatial_not_publishable', { message: `A record in state ${String(current?.state)} cannot be published` });
+      current.publishInFlightAt = new Date().toISOString();
+    });
+    let result: Awaited<ReturnType<typeof api.publishExistingSpatial>>;
+    try {
+      // The backend gets the record without the Node's private review state.
+      result = await api.publishExistingSpatial(
+        { spatial: withoutFaceReview(spatial), artworkId: body.artworkId, markerId: body.markerId },
+        authorization,
+      );
+    } catch (error) {
+      await store.update((state) => {
+        const current = state.spatial?.[spatialId] as Record<string, unknown> | undefined;
+        if (current) delete current.publishInFlightAt;
+      }).catch(() => undefined);
+      throw error;
+    }
+    await store.update((state) => {
+      const current = state.spatial?.[spatialId] as Record<string, unknown> | undefined;
+      if (!current) return;
+      delete current.publishInFlightAt;
+      // The backend accepted the request: that is kept even on a record that was retired meanwhile (the claim above
+      // makes that impossible from this code, but never hide a live publication), and `superseded` stays terminal.
+      current.publication = result;
+      if (current.state !== 'superseded') current.state = 'publication_requested';
     });
     return jsonResponse(202, result);
   }
 
   const spatialMatch = path.match(/^\/local\/v1\/spatial\/([^/]+)$/);
   if (method === 'GET' && spatialMatch) {
-    const value = store.snapshot().spatial?.[spatialMatch[1]!];
+    const value = store.snapshot().spatial?.[spatialMatch[1]!] as { state?: string } | undefined;
     if (!value) throw localError(404, 'spatial_not_found');
-    return jsonResponse(200, value);
+    // A superseded record (for example one reconstructed from unmasked images) is history: its manifest and CIDs
+    // are not handed to a paired client, in line with the 410 of the GUI content route.
+    if (value.state === 'superseded') throw localError(410, 'spatial_record_superseded', { message: 'This record was replaced by a newer one and is no longer served' });
+    // The Node's private review state (which images were flagged, who acknowledged) stays with the operator.
+    return jsonResponse(200, withoutFaceReview(value));
   }
 
   throw localError(404, 'local_route_not_found');

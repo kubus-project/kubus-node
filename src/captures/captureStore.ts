@@ -3,7 +3,11 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { LocalStore } from '../state/localStore.js';
 import { localError } from '../localApi/pairingService.js';
-import { declaredFrameCount, inspectCapturePackage, isPlainObject, type CapturePackageReport } from './capturePackage.js';
+import { createReadStream } from 'node:fs';
+import { declaredFrameCount, inspectCapturePackage, isPlainObject, type CapturePackageKind, type CapturePackageReport } from './capturePackage.js';
+import { VIDEO_EXTENSIONS, VIDEO_MAX_BYTES, VIDEO_MIN_BYTES, type VideoExtension } from './videoPackage.js';
+import { PHOTO_EXTENSIONS, PHOTO_MAX_BYTES, PHOTO_MAX_COUNT, PHOTO_MIN_COUNT, listPhotoSources, type PhotoFacts } from './photoPackage.js';
+import { FaceMaskingReportError, readPremaskedReport, resolveMasking, effectiveMasking, choseNoMasking, type CaptureFaceMasking } from './faceMasking.js';
 
 export interface CaptureFilePayload { path: string; contentBase64: string; mimeType?: string }
 export interface CapturePackagePayload {
@@ -48,6 +52,27 @@ export interface CaptureRecord {
   fileCount: number;
   directory: string;
   retention?: { deleteAfter?: string };
+  /** `video`, `photos` or `mixed` for a media package; absent or `frames` for posed frames. */
+  kind?: CapturePackageKind;
+  /** Container facts of the source video, for a `video` or `mixed` capture. */
+  video?: { extension: string; sizeBytes: number; durationSeconds?: number };
+  /** Counts and sizes of the photo set, for a `photos` or `mixed` capture (never file names). */
+  photos?: PhotoFacts;
+  /**
+   * The capture this one was built from (a later video added to a photo
+   * capture). The earlier capture is kept untouched; a reconstruction of this
+   * one links its spatial revision to the earlier capture's record.
+   */
+  derivedFrom?: { captureId: string };
+  /** Free-text capture operator / photographer label, when the importer supplied one. */
+  capturedBy?: string;
+  /** When each medium was captured, for a mixed capture (`capturedAt` is the earliest). */
+  mediaCapturedAt?: { photos?: string; video?: string };
+  /**
+   * How faces in this capture's images are masked before reconstruction (see `faceMasking.ts`).
+   * Absent on captures made before the feature; those get the default for their artwork at processing time.
+   */
+  faceMasking?: CaptureFaceMasking;
 
   /**
    * Client-supplied idempotency key from `metadata.localCaptureId`.
@@ -69,6 +94,68 @@ function localCaptureIdOf(payload: { metadata?: Record<string, unknown> }): stri
   if (typeof raw !== 'string') return undefined;
   const trimmed = raw.trim();
   return trimmed.length > 0 && trimmed.length <= 200 ? trimmed : undefined;
+}
+
+/** `derivedFrom`, `capturedBy` and per-medium times that an import wrote into a media capture's metadata. */
+function mediaMetadata(metadata: Record<string, unknown> | undefined): Partial<CaptureRecord> {
+  const out: Partial<CaptureRecord> = {};
+  const text = (value: unknown, limit = 200) => (typeof value === 'string' && value.trim() && value.length <= limit ? value.trim() : undefined);
+  const derivedFrom = text(metadata?.derivedFromCaptureId);
+  if (derivedFrom) out.derivedFrom = { captureId: derivedFrom };
+  const capturedBy = text(metadata?.capturedBy);
+  if (capturedBy) out.capturedBy = capturedBy;
+  const masking = metadata?.faceMasking;
+  if (isPlainObject(masking)) {
+    const photos = masking.photos === 'premasked' || masking.photos === 'worker' || masking.photos === 'none' ? masking.photos : undefined;
+    const video = masking.video === 'worker' || masking.video === 'none' ? masking.video : undefined;
+    if (photos || video) {
+      out.faceMasking = { ...(photos ? { photos } : {}), ...(video ? { video } : {}), ...(masking.optedOut === true ? { optedOut: true } : {}), ...(isPlainObject(masking.report) ? { report: masking.report as unknown as CaptureFaceMasking['report'] } : {}) };
+    }
+  }
+  const media = metadata?.mediaCapturedAt;
+  if (isPlainObject(media)) {
+    const photos = text(media.photos, 40);
+    const video = text(media.video, 40);
+    if (photos || video) out.mediaCapturedAt = { ...(photos ? { photos } : {}), ...(video ? { video } : {}) };
+  }
+  return out;
+}
+
+/** SHA-256 of a file, streamed. */
+async function sha256File(file: string): Promise<Buffer> {
+  const hash = crypto.createHash('sha256');
+  for await (const chunk of createReadStream(file)) hash.update(chunk as Buffer);
+  return hash.digest();
+}
+
+/**
+ * Streams a file into a draft while hashing the bytes that are actually stored, and refuses the file when those bytes
+ * are not the ones that were hashed earlier (the report, the capture identity): a source changed between the check
+ * and the copy must not be stored under the earlier hash.
+ */
+export function copyVerified(file: string, expectedHex: string): { chunks: AsyncIterable<Buffer>; verify: () => void } {
+  const hash = crypto.createHash('sha256');
+  let done = false;
+  async function* chunks(): AsyncGenerator<Buffer> {
+    for await (const chunk of createReadStream(file)) {
+      hash.update(chunk as Buffer);
+      yield chunk as Buffer;
+    }
+    done = true;
+  }
+  return {
+    chunks: chunks(),
+    verify: () => {
+      if (!done || hash.digest('hex') !== expectedHex) {
+        throw localError(409, 'capture_source_changed', { message: 'A source file changed while it was being imported; nothing was stored. Import again once the folder is stable.' });
+      }
+    },
+  };
+}
+
+/** An ISO timestamp for a parseable date string, else undefined. */
+function validIso(value: string | undefined): string | undefined {
+  return value && !Number.isNaN(Date.parse(value)) ? new Date(value).toISOString() : undefined;
 }
 
 function safeRelativePath(raw: string): string {
@@ -102,6 +189,14 @@ async function draftMarkerAgeMs(directory: string): Promise<number | null> {
     return null;
   }
 }
+
+const VIDEO_MIME_TYPES: Record<VideoExtension, string> = {
+  mp4: 'video/mp4',
+  mov: 'video/quicktime',
+  m4v: 'video/x-m4v',
+  webm: 'video/webm',
+  mkv: 'video/x-matroska',
+};
 
 const MAX_CAPTURE_BYTES = 5 * 1024 * 1024 * 1024;
 const MAX_CAPTURE_FILES = 5000;
@@ -529,6 +624,16 @@ export class CaptureStore {
         directory: draft.directory,
         retention: payload.retention,
         localCaptureId,
+        ...(inspection.kind && inspection.kind !== 'frames' ? {
+          kind: inspection.kind,
+          ...(inspection.video ? { video: {
+            extension: inspection.video.extension,
+            sizeBytes: inspection.video.sizeBytes,
+            durationSeconds: inspection.video.durationSeconds,
+          } } : {}),
+          ...(inspection.photos ? { photos: inspection.photos } : {}),
+          ...mediaMetadata(payload.metadata),
+        } : {}),
       };
       await fs.writeFile(
         path.join(draft.directory, 'capture.json'),
@@ -570,6 +675,283 @@ export class CaptureStore {
       // repeated. An abandoned draft is reclaimed by the orphan sweep.
       throw error;
     }
+  }
+
+  /**
+   * Imports one video file from the local disk as a `video` capture.
+   *
+   * The streaming upload route caps a request at 128 MiB, which a phone video
+   * exceeds. A file already on the Node's own disk needs no request at all: it
+   * is streamed straight into a draft and committed through the same integrity
+   * boundary every other capture crosses, so a truncated or unreadable video is
+   * refused here and never reaches a GPU.
+   *
+   * Idempotent: the key is the file's SHA-256 plus the artwork and marker, so
+   * importing the same footage twice returns the capture it already made.
+   */
+  async importVideoFile(
+    sourcePath: string,
+    options: { artworkId?: string; markerId?: string; capturedAt?: string; maskFaces?: boolean } = {},
+  ): Promise<CaptureRecord> {
+    let resolved: string;
+    let stat;
+    try {
+      resolved = await fs.realpath(sourcePath);
+      stat = await fs.stat(resolved);
+    } catch {
+      throw localError(404, 'capture_video_source_not_found');
+    }
+    if (!stat.isFile()) throw localError(400, 'capture_video_source_not_a_file');
+    const extension = path.extname(resolved).slice(1).toLowerCase() as VideoExtension;
+    if (!VIDEO_EXTENSIONS.includes(extension)) {
+      throw localError(415, 'capture_video_extension_unsupported', { allowed: [...VIDEO_EXTENSIONS] });
+    }
+    if (stat.size < VIDEO_MIN_BYTES) throw localError(422, 'capture_video_size_invalid', { message: 'The video file is too small to contain usable footage' });
+    if (stat.size > VIDEO_MAX_BYTES) throw localError(413, 'capture_video_size_invalid', { message: 'The video file exceeds the size limit' });
+
+    const hash = crypto.createHash('sha256');
+    for await (const chunk of createReadStream(resolved)) hash.update(chunk as Buffer);
+    const sha256 = hash.digest('hex');
+    const videoMasking = resolveMasking({ maskFaces: options.maskFaces, artworkId: options.artworkId }) ? 'worker' : 'none';
+    // The masking decision is part of the identity: the same footage imported with and without masking is two captures.
+    const optedOut = choseNoMasking({ maskFaces: options.maskFaces });
+    const localCaptureId = `video-import:${sha256}:${options.artworkId ?? ''}:${options.markerId ?? ''}${videoMasking === 'none' ? ':masking=none' : ''}${optedOut && !options.artworkId ? ':optout' : ''}`;
+
+    const capturedAt = options.capturedAt && !Number.isNaN(Date.parse(options.capturedAt))
+      ? new Date(options.capturedAt).toISOString()
+      : stat.mtime.toISOString();
+    const draft = await this.beginDraft({
+      schema: 'kubus.capture/1',
+      artworkId: options.artworkId,
+      markerId: options.markerId,
+      capturedAt,
+      // No original file name or path: the capture is private, but the name of
+      // a phone recording is still personal data nothing downstream needs.
+      metadata: {
+        kind: 'video', source: 'local_import', localCaptureId, sha256, sourceBytes: stat.size,
+        faceMasking: { video: videoMasking, ...(optedOut ? { optedOut: true } : {}) },
+      },
+    });
+    try {
+      const copy = copyVerified(resolved, sha256);
+      await this.writeDraftFileStream(draft.id, `video/source.${extension}`, copy.chunks, VIDEO_MIME_TYPES[extension], VIDEO_MAX_BYTES);
+      copy.verify();
+      return await this.commitDraft(draft.id);
+    } catch (error) {
+      await this.discardDraft(draft.id).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /**
+   * Imports a directory of still photographs as a `photos` capture, optionally
+   * together with one video as a `mixed` capture.
+   *
+   * Photos carry no ARCore pose, so the worker solves cameras with COLMAP. The
+   * directory is read non-recursively; symbolic links are refused, files whose
+   * extension is not an image are skipped and counted, and every photo is
+   * streamed into a draft under a constant name (`photos/00001.jpg`) so no
+   * original file name (a phone's personal naming) is stored or ever reaches a
+   * path. The package then crosses the same integrity boundary as any capture.
+   * Idempotent: the key is the SHA-256 of every file (in name order), the
+   * optional video, and the artwork and marker.
+   */
+  async importPhotoDirectory(
+    sourceDirectory: string,
+    options: { artworkId?: string; markerId?: string; capturedAt?: string; capturedBy?: string; videoPath?: string; videoCapturedAt?: string; maskFaces?: boolean } = {},
+  ): Promise<CaptureRecord & { skippedFiles: number }> {
+    let resolved: string;
+    try {
+      resolved = await fs.realpath(sourceDirectory);
+      if (!(await fs.stat(resolved)).isDirectory()) throw new Error('not a directory');
+    } catch {
+      throw localError(404, 'capture_photo_source_not_found');
+    }
+    const entries = await fs.readdir(resolved, { withFileTypes: true });
+    const photos: Array<{ absolute: string; extension: string; mtimeMs: number }> = [];
+    let skipped = 0;
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name, 'en', { numeric: true }))) {
+      const extension = path.extname(entry.name).slice(1).toLowerCase();
+      if (!(PHOTO_EXTENSIONS as readonly string[]).includes(extension)) { skipped += 1; continue; }
+      if (entry.isSymbolicLink()) throw localError(422, 'capture_photo_invalid', { message: 'A photo is a symbolic link; only regular files are accepted' });
+      if (!entry.isFile()) { skipped += 1; continue; }
+      const absolute = path.join(resolved, entry.name);
+      const stat = await fs.stat(absolute);
+      if (stat.size > PHOTO_MAX_BYTES) throw localError(422, 'capture_photo_size_invalid', { message: `A photo file exceeds the ${Math.round(PHOTO_MAX_BYTES / 2 ** 20)} MiB limit` });
+      photos.push({ absolute, extension: extension === 'jpeg' ? 'jpg' : extension, mtimeMs: stat.mtimeMs });
+    }
+    if (photos.length < PHOTO_MIN_COUNT) throw localError(422, 'capture_photos_too_few', { message: `A photo capture needs at least ${PHOTO_MIN_COUNT} photos; found ${photos.length}` });
+    if (photos.length > PHOTO_MAX_COUNT) throw localError(422, 'capture_photos_too_many', { message: `A photo capture holds at most ${PHOTO_MAX_COUNT} photos; found ${photos.length}` });
+
+    const video = options.videoPath ? await this.resolveVideoFile(options.videoPath) : undefined;
+    const setHash = crypto.createHash('sha256');
+    const photoHashes: string[] = [];
+    for (const photo of photos) {
+      const digest = await sha256File(photo.absolute);
+      photoHashes.push(digest.toString('hex'));
+      setHash.update(digest);
+    }
+    if (video) setHash.update(video.sha256);
+    // Masked copies come with a report that names each file by SHA-256; without one the worker masks as a job step.
+    let report;
+    try {
+      report = await readPremaskedReport(resolved, photoHashes);
+    } catch (error) {
+      if (error instanceof FaceMaskingReportError) throw localError(422, error.code, { message: error.message });
+      throw error;
+    }
+    if (report && options.maskFaces === false) {
+      throw localError(422, 'face_masking_conflict', { message: 'The directory holds a face-masking report; remove it to import without masking' });
+    }
+    const wantsMasking = resolveMasking({ maskFaces: options.maskFaces, artworkId: options.artworkId });
+    const faceMasking: CaptureFaceMasking = {
+      photos: report ? 'premasked' : wantsMasking ? 'worker' : 'none',
+      ...(video ? { video: wantsMasking ? 'worker' as const : 'none' as const } : {}),
+      ...(report ? { report } : {}),
+      ...(choseNoMasking({ maskFaces: options.maskFaces }) ? { optedOut: true } : {}),
+    };
+    // The masking decision is part of the identity (the default, worker masking, adds nothing so earlier keys still match).
+    const maskingKey = faceMasking.photos === 'worker' && (!video || faceMasking.video === 'worker') ? '' : `:masking=${faceMasking.photos}/${faceMasking.video ?? '-'}`;
+    // An explicit opt-out is not the default of a capture without an artwork, so the two are different captures.
+    const optOutKey = faceMasking.optedOut && !options.artworkId ? ':optout' : '';
+    const localCaptureId = `photos-import:${setHash.digest('hex')}:${options.artworkId ?? ''}:${options.markerId ?? ''}${maskingKey}${optOutKey}`;
+    // The import is idempotent on the files, so a retry converges on the capture that exists. A retry that states a
+    // different operator or capture time must not silently get the old record back: say so.
+    const stated = validIso(options.capturedAt);
+    const existing = (Object.values(this.store.snapshot().captures || {}) as CaptureRecord[]).find((record) => record.localCaptureId === localCaptureId);
+    if (existing) {
+      const differs: string[] = [];
+      // Compared the way the value was stored: trimmed, and a label over 200 characters is dropped (stores nothing), not cut.
+      const statedBy = typeof options.capturedBy === 'string' && options.capturedBy.trim() && options.capturedBy.length <= 200 ? options.capturedBy.trim() : undefined;
+      if (statedBy && statedBy !== existing.capturedBy) differs.push('capturedBy');
+      if (stated && stated !== (existing.mediaCapturedAt?.photos ?? existing.capturedAt)) differs.push('capturedAt');
+      if (differs.length) {
+        throw localError(409, 'capture_exists_with_different_provenance', {
+          message: `These files were already imported as capture ${existing.id} with a different ${differs.join(' and ')}; its provenance is not changed by a re-import. Import the files from a copy that differs in content, or process the existing capture as it is`,
+          captureId: existing.id,
+          differs,
+        });
+      }
+    }
+
+    const earliest = new Date(Math.min(...photos.map((photo) => photo.mtimeMs))).toISOString();
+    const photosCapturedAt = stated ?? earliest;
+    const videoCapturedAt = video ? validIso(options.videoCapturedAt) ?? video.mtime.toISOString() : undefined;
+    const capturedAt = videoCapturedAt && videoCapturedAt < photosCapturedAt ? videoCapturedAt : photosCapturedAt;
+    const draft = await this.beginDraft({
+      schema: 'kubus.capture/1',
+      artworkId: options.artworkId,
+      markerId: options.markerId,
+      capturedAt,
+      metadata: {
+        kind: video ? 'mixed' : 'photos', source: 'local_import', localCaptureId,
+        photoCount: photos.length, faceMasking,
+        ...(options.capturedBy ? { capturedBy: options.capturedBy.slice(0, 200) } : {}),
+        ...(video ? { mediaCapturedAt: { photos: photosCapturedAt, video: videoCapturedAt } } : {}),
+      },
+    });
+    try {
+      for (const [index, photo] of photos.entries()) {
+        const copy = copyVerified(photo.absolute, photoHashes[index]!);
+        await this.writeDraftFileStream(
+          draft.id, `photos/${String(index + 1).padStart(5, '0')}.${photo.extension}`,
+          copy.chunks, photo.extension === 'png' ? 'image/png' : 'image/jpeg', PHOTO_MAX_BYTES,
+        );
+        copy.verify();
+      }
+      if (video) {
+        const copy = copyVerified(video.resolved, video.sha256);
+        await this.writeDraftFileStream(draft.id, `video/source.${video.extension}`, copy.chunks, VIDEO_MIME_TYPES[video.extension], VIDEO_MAX_BYTES);
+        copy.verify();
+      }
+      return { ...(await this.commitDraft(draft.id)), skippedFiles: skipped };
+    } catch (error) {
+      await this.discardDraft(draft.id).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /**
+   * Adds a later video to an existing photo capture for the same artwork.
+   *
+   * Builds a NEW `mixed` capture holding the base capture's photos and the
+   * video; the base capture is not modified or removed. The new capture records
+   * `derivedFrom`, so a reconstruction of it produces a new spatial revision
+   * that links to the base capture's spatial record instead of replacing it.
+   */
+  async addVideoToCapture(
+    baseCaptureId: string,
+    videoPath: string,
+    options: { capturedAt?: string; maskFaces?: boolean } = {},
+  ): Promise<CaptureRecord> {
+    const base = this.get(baseCaptureId);
+    if (base.kind !== 'photos') throw localError(422, 'capture_extension_invalid', { message: 'A video can only be added to a photo capture (kind photos)' });
+    const video = await this.resolveVideoFile(videoPath);
+    const photos = await listPhotoSources(base.directory);
+    if (photos.length === 0) throw localError(422, 'capture_extension_invalid', { message: 'The photo capture no longer holds its photos' });
+    const videoMasking = resolveMasking({ maskFaces: options.maskFaces, artworkId: base.artworkId }) ? 'worker' as const : 'none' as const;
+    // Opted out as a whole only when the base capture was, or the caller opted the video out while its photos are masked:
+    // photos that are unmasked by default (no artwork) stay unmasked by default.
+    const optedOut = base.faceMasking?.optedOut === true || (choseNoMasking({ maskFaces: options.maskFaces }) && (effectiveMasking(base).photos ?? 'none') !== 'none');
+    const localCaptureId = `video-extension:${base.id}:${video.sha256}${videoMasking === 'none' ? ':masking=none' : ''}${optedOut && !base.artworkId ? ':optout' : ''}`;
+    const videoCapturedAt = validIso(options.capturedAt) ?? video.mtime.toISOString();
+    const photosCapturedAt = base.mediaCapturedAt?.photos ?? base.capturedAt;
+    const draft = await this.beginDraft({
+      schema: 'kubus.capture/1',
+      artworkId: base.artworkId,
+      markerId: base.markerId,
+      // The earliest time: the rights window starts at the first capture of the artwork.
+      capturedAt: videoCapturedAt < photosCapturedAt ? videoCapturedAt : photosCapturedAt,
+      metadata: {
+        kind: 'mixed', source: 'video_extension', localCaptureId, derivedFromCaptureId: base.id, photoCount: photos.length,
+        // The photos keep whatever masking the base capture had; the video follows the default or the caller's choice.
+        faceMasking: {
+          photos: effectiveMasking(base).photos ?? 'none',
+          video: videoMasking,
+          ...(optedOut ? { optedOut: true } : {}),
+          ...(base.faceMasking?.report ? { report: base.faceMasking.report } : {}),
+        },
+        ...(base.capturedBy ? { capturedBy: base.capturedBy } : {}),
+        mediaCapturedAt: { photos: photosCapturedAt, video: videoCapturedAt },
+      },
+    });
+    try {
+      for (const relative of photos) {
+        if ((await fs.lstat(path.join(base.directory, relative))).isSymbolicLink()) {
+          throw localError(422, 'capture_photo_invalid', { message: 'A stored photo is a symbolic link; only regular files are accepted' });
+        }
+        await this.writeDraftFileStream(
+          draft.id, relative,
+          createReadStream(path.join(base.directory, relative)) as unknown as AsyncIterable<Buffer>,
+          relative.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg', PHOTO_MAX_BYTES,
+        );
+      }
+      const copy = copyVerified(video.resolved, video.sha256);
+      await this.writeDraftFileStream(draft.id, `video/source.${video.extension}`, copy.chunks, VIDEO_MIME_TYPES[video.extension], VIDEO_MAX_BYTES);
+      copy.verify();
+      return await this.commitDraft(draft.id);
+    } catch (error) {
+      await this.discardDraft(draft.id).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /** Real path, extension, size bounds, modification time and SHA-256 of a video file about to be imported. */
+  private async resolveVideoFile(sourcePath: string): Promise<{ resolved: string; extension: VideoExtension; sha256: string; mtime: Date }> {
+    let resolved: string;
+    let stat;
+    try {
+      resolved = await fs.realpath(sourcePath);
+      stat = await fs.stat(resolved);
+    } catch {
+      throw localError(404, 'capture_video_source_not_found');
+    }
+    if (!stat.isFile()) throw localError(400, 'capture_video_source_not_a_file');
+    const extension = path.extname(resolved).slice(1).toLowerCase() as VideoExtension;
+    if (!VIDEO_EXTENSIONS.includes(extension)) throw localError(415, 'capture_video_extension_unsupported', { allowed: [...VIDEO_EXTENSIONS] });
+    if (stat.size < VIDEO_MIN_BYTES) throw localError(422, 'capture_video_size_invalid', { message: 'The video file is too small to contain usable footage' });
+    if (stat.size > VIDEO_MAX_BYTES) throw localError(413, 'capture_video_size_invalid', { message: 'The video file exceeds the size limit' });
+    return { resolved, extension, sha256: (await sha256File(resolved)).toString('hex'), mtime: stat.mtime };
   }
 
   /** True while a queued or running job reads this capture. */
@@ -628,6 +1010,10 @@ export class CaptureStore {
     onError?: (error: unknown) => void;
   } = {}): { stop(): void } {
     const timer = setInterval(() => {
+      // A tick that finds a sweep still running skips: `reclaimOrphanedDirectories` would join it and hand every
+      // overlapping tick the same count, so one reclaimed directory was reported once per tick (a flake at a 10 ms
+      // interval, double reporting otherwise). The next tick sweeps again.
+      if (this.sweeping) return;
       this.reclaimOrphanedDirectories().then(
         (count) => { if (count > 0) options.onReclaimed?.(count); },
         (error: unknown) => options.onError?.(error),

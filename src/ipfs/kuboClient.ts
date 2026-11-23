@@ -123,6 +123,54 @@ export class KuboClient {
     }
   }
 
+  /** Is the block in the local block store? Never asks the network (`offline=true`). */
+  async blockPresent(cid: string): Promise<boolean> {
+    try {
+      await this.post('block/stat', { arg: normalizeCid(cid), offline: 'true' });
+      return true;
+    } catch (error) {
+      const message = String((error as Error).message).toLowerCase();
+      // Only Kubo's own "not found" answer means the block is absent. Any other failure (an HTTP 500 for another
+      // reason, a datastore error) must not read as "absent": the caller would skip the block and report it purged.
+      if (message.includes('not found') || message.includes('could not find')) return false;
+      throw error;
+    }
+  }
+
+  /** The CID itself and every block below it that the local block store holds, root first. Never asks the network. */
+  async refsLocal(cid: string): Promise<string[]> {
+    const params = new URLSearchParams({ arg: normalizeCid(cid), recursive: 'true', unique: 'true', offline: 'true' });
+    const response = await fetch(`${this.apiBase}/refs?${params.toString()}`, { method: 'POST', signal: AbortSignal.timeout(5 * 60 * 1000) });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`Kubo refs failed with HTTP ${response.status}: ${text.slice(0, 200)}`);
+    const out = [normalizeCid(cid)];
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      const entry = JSON.parse(line) as { Ref?: string; Err?: string };
+      if (entry.Err) throw new Error(`Kubo refs: ${entry.Err.slice(0, 200)}`);
+      if (entry.Ref) out.push(entry.Ref);
+    }
+    return out;
+  }
+
+  /**
+   * Removes blocks from the block store. Kubo refuses a block that is pinned (directly or through a pinned
+   * parent), so content another record still holds survives; those blocks come back with an error.
+   */
+  async blockRm(cids: string[]): Promise<Array<{ cid: string; error?: string }>> {
+    if (!cids.length) return [];
+    const params = new URLSearchParams();
+    for (const cid of cids) params.append('arg', normalizeCid(cid));
+    params.set('force', 'true');
+    const response = await fetch(`${this.apiBase}/block/rm?${params.toString()}`, { method: 'POST', signal: AbortSignal.timeout(5 * 60 * 1000) });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`Kubo block/rm failed with HTTP ${response.status}: ${text.slice(0, 200)}`);
+    return text.split('\n').filter((line) => line.trim()).map((line) => {
+      const entry = JSON.parse(line) as { Hash?: string; Error?: string };
+      return { cid: entry.Hash ?? '', ...(entry.Error ? { error: entry.Error.slice(0, 200) } : {}) };
+    });
+  }
+
   async blockStat(cid: string): Promise<unknown> {
     return this.post('block/stat', { arg: normalizeCid(cid) });
   }
