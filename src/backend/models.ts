@@ -209,6 +209,7 @@ export interface ComputeCandidate {
   signingPublicKey: string;
   protocolVersion: string;
   maxAcceptedInputBytes: number;
+  privateOutputProtocol?: string | null;
   score: number;
 }
 

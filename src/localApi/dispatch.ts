@@ -646,6 +646,7 @@ async function route(
         provider: (body.provider && typeof body.provider === 'object' ? body.provider : {}) as never,
         requirements: (body.requirements && typeof body.requirements === 'object' ? body.requirements : {}) as Record<string, unknown>,
         type: typeof body.type === 'string' ? body.type : undefined,
+        privateOutput: body.privateOutput === true,
       }),
     );
   }

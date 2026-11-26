@@ -30,3 +30,9 @@ The remote provider necessarily sees plaintext source data while processing. Enc
 The provider signs a receipt binding job, input hash, job-spec hash, output CIDs, worker/protocol version and completion time. The requester retrieves the manifest and variants by CID, checks membership/retrievability, previews the unpublished result, then signs acceptance or rejection. The backend verifies both signatures against the identities captured for the assignment and checks the exact job, hashes, output CID set, decision, timestamps and protocol version. Publication is a separate authenticated CID-first request through the canonical spatial-publication service.
 
 Rewards require a completed verified job and use `spatial-compute-units-1`; see [REWARDS.md](REWARDS.md). Direct libp2p/QUIC negotiation is not yet an attributable compute transport. Encrypted temporary IPFS payloads are the implemented alpha data plane.
+
+## Encrypted result transport
+
+An explicitly negotiated `kubus.private-output/1` job records the requester's X25519 public key at assignment. The provider encrypts each worker variant and the spatial manifest before writing to Kubo. The signed output receipt binds ciphertext references and digests, plaintext lengths and digests, and the recipient key envelopes to the job and job-spec hash. The requester re-verifies the signature, file sizes, and digests before making the result available in its private local staging directory. An accepted acknowledgement signs the exact output commitment. The default result transport remains compatible with existing jobs.
+
+This transport can be tested independently of browser source dispatch. A browser pilot still needs a registered managed requester, a source-revision binding, and a private candidate import into the backend before it can accept photo and video processing requests.

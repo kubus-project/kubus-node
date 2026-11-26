@@ -216,6 +216,7 @@ export class KuboClient {
   async catStream(
     cid: string,
     range?: { offset: number; length: number },
+    signal?: AbortSignal,
   ): Promise<{ body: ReadableStream<Uint8Array>; cancel: () => void }> {
     const controller = new AbortController();
     const params: Record<string, string> = { arg: normalizeCid(cid) };
@@ -223,7 +224,9 @@ export class KuboClient {
       params.offset = String(range.offset);
       params.length = String(range.length);
     }
-    const response = await fetch(this.url('cat', params), { method: 'POST', signal: controller.signal });
+    const response = await fetch(this.url('cat', params), {
+      method: 'POST', signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal,
+    });
     if (!response.ok || !response.body) throw new Error(`Kubo cat failed with HTTP ${response.status}`);
     return { body: response.body, cancel: () => controller.abort() };
   }

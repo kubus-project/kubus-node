@@ -145,7 +145,7 @@ export class KubusApiClient {
     return this.request('/api/publications/spatial/cid', { method: 'POST', body: payload, authorization: userAuthorization });
   }
 
-  getComputeCandidates(params: { type?: string; minimumVramBytes?: number; inputBytes?: number }, userAuthorization: string): Promise<{ nodes: ComputeCandidate[]; protocolVersion: string }> {
+  getComputeCandidates(params: { type?: string; minimumVramBytes?: number; inputBytes?: number; privateOutput?: boolean }, userAuthorization: string): Promise<{ nodes: ComputeCandidate[]; protocolVersion: string }> {
     return this.request(`/api/compute/nodes/available${queryString(params)}`, { authorization: userAuthorization });
   }
 

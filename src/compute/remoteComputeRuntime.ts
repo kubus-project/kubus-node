@@ -1,4 +1,6 @@
+import crypto from 'node:crypto';
 import { promises as fs } from 'node:fs';
+import stableStringify from 'json-stable-stringify';
 import path from 'node:path';
 import type { KubusApiClient } from '../backend/kubusApiClient.js';
 import type { ComputeCandidate, RemoteComputeJob } from '../backend/models.js';
@@ -20,6 +22,33 @@ import { effectiveComputeProviderSettings, validateComputeProviderSettings, type
 
 import { ProviderCleanup, type RemoteRuntimeRecord } from './providerCleanup.js';
 import { ManagedPins } from '../ipfs/managedPins.js';
+import { jobIdPattern } from '../jobs/ownedWorkDirectory.js';
+import {
+  PRIVATE_OUTPUT_PROTOCOL, openOutputBlob, outputCommitmentDigest, validatePrivateOutput, type PrivateOutputCommitment,
+} from './privateOutputTransport.js';
+
+function isPrivateOutput(job: RemoteComputeJob): boolean {
+  return (job.canonicalJobSpec?.processing as { outputMode?: unknown } | undefined)?.outputMode === PRIVATE_OUTPUT_PROTOCOL;
+}
+
+function signedPrivateOutput(job: RemoteComputeJob): PrivateOutputCommitment {
+  if (!jobIdPattern.test(job.id) || !job.outputManifestCid) throw localError(422, 'private_output_job_invalid');
+  const receipt = job.providerReceipt as { payload?: Record<string, unknown>; signature?: unknown } | undefined;
+  const payload = receipt?.payload;
+  const key = job.verification?.providerSigningPublicKey;
+  if (!payload || typeof key !== 'string' || typeof receipt?.signature !== 'string' ||
+      payload.jobId !== job.id || payload.inputHash !== job.inputHash || payload.jobSpecHash !== job.jobSpecHash ||
+      payload.protocolVersion !== job.protocolVersion || !Array.isArray(payload.outputCids) ||
+      stableStringify([...payload.outputCids].sort()) !== stableStringify([...job.outputCids].sort())) {
+    throw localError(422, 'private_output_signature_binding_invalid');
+  }
+  const publicKey = crypto.createPublicKey({ key: Buffer.from(key, 'base64'), format: 'der', type: 'spki' });
+  if (publicKey.asymmetricKeyType !== 'ed25519' ||
+      !crypto.verify(null, Buffer.from(stableStringify(payload) ?? ''), publicKey, Buffer.from(receipt.signature, 'base64'))) {
+    throw localError(422, 'private_output_signature_invalid');
+  }
+  return validatePrivateOutput(payload.privateOutput, job.id, job.outputManifestCid, job.outputCids);
+}
 
 const POLL_INTERVAL_MS = 5000;
 const POLL_MAX_BACKOFF_MS = 60000;
@@ -226,10 +255,13 @@ export class RemoteComputeRuntime {
     return this.deps.api.getComputeCandidates(options, authorization);
   }
 
-  async requestJob(input: { authorization: string; captureId: string; provider: ComputeCandidate; requirements: Record<string, unknown>; type?: string }): Promise<RemoteComputeJob> {
+  async requestJob(input: { authorization: string; captureId: string; provider: ComputeCandidate; requirements: Record<string, unknown>; type?: string; privateOutput?: boolean }): Promise<RemoteComputeJob> {
     requireUserAuthorization(input.authorization);
     await this.deps.gate.assertUsefulOperation('remote_compute_submission');
     if (!input.provider?.nodeId || !input.provider.encryptionPublicKey) throw localError(400, 'compute_provider_invalid');
+    if (input.privateOutput && input.provider.privateOutputProtocol !== PRIVATE_OUTPUT_PROTOCOL) {
+      throw localError(409, 'private_output_provider_protocol_required');
+    }
     const encrypted = await this.deps.transport.encryptCapture(input.captureId, input.provider.nodeId, input.provider.encryptionPublicKey);
     try {
       const job = await this.deps.api.createRemoteComputeJob({
@@ -238,6 +270,7 @@ export class RemoteComputeRuntime {
         type: input.type || 'spatial.reconstruct',
         requirements: input.requirements,
         ...encrypted,
+        jobSpec: { ...encrypted.jobSpec, ...(input.privateOutput ? { outputMode: PRIVATE_OUTPUT_PROTOCOL } : {}) },
       }, input.authorization);
       await this.deps.store.update((state) => {
         (state.remoteJobs ??= {})[job.id] = { backendJobId: job.id, role: 'requester', state: job.state, updatedAt: new Date().toISOString() } satisfies RemoteRuntimeRecord;
@@ -268,6 +301,7 @@ export class RemoteComputeRuntime {
     await this.deps.gate.assertUsefulOperation('remote_compute_result_retrieval');
     const job = await this.getRequesterJob(jobId, authorization);
     if (!['OUTPUT_READY', 'VERIFYING', 'VERIFIED', 'COMPLETED'].includes(job.state) || !job.outputManifestCid) throw localError(409, 'remote_compute_output_not_ready');
+    if (isPrivateOutput(job)) return this.retrieveSealedOutput(job);
     const manifestBytes = await this.deps.kubo.cat(job.outputManifestCid);
     let manifest: SpatialManifest;
     try { manifest = validateSpatialManifest(JSON.parse(Buffer.from(manifestBytes).toString('utf8'))); } catch { throw localError(422, 'remote_compute_manifest_invalid'); }
@@ -282,10 +316,64 @@ export class RemoteComputeRuntime {
     return record;
   }
 
+  private async retrieveSealedOutput(job: RemoteComputeJob): Promise<Record<string, unknown>> {
+    const commitment = signedPrivateOutput(job);
+    const binding = outputCommitmentDigest(commitment);
+    const parent = path.join(this.deps.config.localDataPath, 'private', 'remote-results');
+    const target = path.join(parent, job.id);
+    await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+    const existing = await this.sealedResultRecord(target, binding);
+    if (existing) return existing;
+    const staging = await fs.mkdtemp(path.join(parent, `${job.id}-`));
+    try {
+      const key = await this.deps.identity.encryptionPrivateKey();
+      const manifestBlob = commitment.blobs.find(item => item.role === 'manifest')!;
+      const manifestPath = path.join(staging, 'manifest.json');
+      await openOutputBlob({ blob: manifestBlob, kubo: this.deps.kubo, recipientPrivateKey: key, jobId: job.id, destination: manifestPath });
+      const manifest = validateSpatialManifest(JSON.parse(await fs.readFile(manifestPath, 'utf8')));
+      const variants = new Map(commitment.blobs.filter(item => item.role !== 'manifest').map(item => [item.role, item]));
+      if (manifest.variants.length !== variants.size) throw localError(422, 'private_output_variant_binding_invalid');
+      for (const variant of manifest.variants) {
+        const blob = variants.get(variant.role);
+        if (!blob || blob.cid !== variant.cid || blob.plaintextBytes !== variant.sizeBytes) {
+          throw localError(422, 'private_output_variant_binding_invalid');
+        }
+        await openOutputBlob({ blob, kubo: this.deps.kubo, recipientPrivateKey: key, jobId: job.id,
+          destination: path.join(staging, variant.role) });
+        variants.delete(variant.role);
+      }
+      const result = { id: manifest.id, state: 'private_staged', remoteComputeJobId: job.id, binding };
+      await fs.writeFile(path.join(staging, 'verified.json'), JSON.stringify(result), { mode: 0o600, flag: 'wx' });
+      try {
+        await fs.rename(staging, target);
+      } catch (error) {
+        if (!(await this.sealedResultRecord(target, binding))) throw error;
+      }
+      return result;
+    } finally { await fs.rm(staging, { recursive: true, force: true }); }
+  }
+
+  private async sealedResultRecord(directory: string, binding: string): Promise<Record<string, unknown> | null> {
+    try {
+      const record = JSON.parse(await fs.readFile(path.join(directory, 'verified.json'), 'utf8')) as Record<string, unknown>;
+      if (record.binding !== binding) throw localError(409, 'private_output_stage_conflict');
+      return record;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+
   async acknowledgeRequesterOutput(jobId: string, authorization: string, accepted: boolean, reason?: string): Promise<RemoteComputeJob> {
     requireUserAuthorization(authorization);
     const job = await this.deps.api.getRemoteComputeJob(jobId, authorization);
-    const payload = { jobId: job.id, inputHash: job.inputHash, jobSpecHash: job.jobSpecHash, outputCids: job.outputCids, accepted, reason: reason || null, acknowledgedAt: new Date().toISOString(), protocolVersion: job.protocolVersion };
+    const privateOutputBinding = isPrivateOutput(job) && accepted ? outputCommitmentDigest(signedPrivateOutput(job)) : null;
+    if (privateOutputBinding && !(await this.sealedResultRecord(
+      path.join(this.deps.config.localDataPath, 'private', 'remote-results', job.id), privateOutputBinding,
+    ))) throw localError(409, 'private_output_not_staged');
+    const payload = { jobId: job.id, inputHash: job.inputHash, jobSpecHash: job.jobSpecHash, outputCids: job.outputCids, accepted, reason: reason || null, acknowledgedAt: new Date().toISOString(), protocolVersion: job.protocolVersion,
+      ...(privateOutputBinding ? { privateOutputBinding } : {}),
+    };
     const signature = await this.deps.identity.signPayload(payload);
     const updated = await this.deps.api.acknowledgeRemoteComputeJob(jobId, { accepted, receipt: { payload, signature } }, authorization);
     if (['COMPLETED', 'DISPUTED', 'FAILED', 'CANCELLED'].includes(updated.state)) await this.releaseRequesterInput(updated);
@@ -411,6 +499,7 @@ export class RemoteComputeRuntime {
     const existing = this.deps.store.snapshot().remoteJobs?.[job.id] as RemoteRuntimeRecord | undefined;
     if (['CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED'].includes(job.state)) {
       if (existing?.role === 'provider' && existing.cleanup) await this.providerCleanup.request(job.id);
+      if (existing?.role === 'provider') await this.releaseEncryptedOutput(job.id);
       return;
     }
     if (job.state === 'OUTPUT_READY' && existing?.cleanup) {
@@ -482,7 +571,12 @@ export class RemoteComputeRuntime {
         const capture = await this.readRemoteCapture(captureId, directory);
         await this.deps.captures.registerRemote(capture);
         this.providerCleanup.assertPreparing(job.id);
-        const local = await this.deps.jobs.create(job.type as 'spatial.reconstruct', { captureId, artworkId: capture.artworkId, markerId: capture.markerId, remoteComputeJobId: job.id });
+        const requesterKey = isPrivateOutput(job) ? job.verification?.requesterEncryptionPublicKey : null;
+        if (isPrivateOutput(job) && typeof requesterKey !== 'string') throw localError(422, 'private_output_requester_key_unavailable');
+        const local = await this.deps.jobs.create(job.type as 'spatial.reconstruct', {
+          captureId, artworkId: capture.artworkId, markerId: capture.markerId, remoteComputeJobId: job.id,
+          ...(requesterKey ? { privateOutputRequesterPublicKey: requesterKey } : {}),
+        });
         await this.deps.store.update(state => {
           const current = state.remoteJobs![job.id] as RemoteRuntimeRecord;
           current.localJobId = local.id; current.state = 'RUNNING'; current.updatedAt = new Date().toISOString();
@@ -504,12 +598,19 @@ export class RemoteComputeRuntime {
 
   private async submitProviderOutput(job: RemoteComputeJob, local: LocalJob, record: RemoteRuntimeRecord): Promise<void> {
     const nodeId = this.deps.store.snapshot().nodeId!;
-    const spatial = local.output as { manifestCid?: string; manifest?: SpatialManifest } | undefined;
-    if (!spatial?.manifestCid || !spatial.manifest) throw localError(500, 'remote_output_invalid');
-    const outputCids = [spatial.manifestCid, ...spatial.manifest.variants.map((variant) => variant.cid)];
-    const payload = { jobId: job.id, inputHash: job.inputHash, jobSpecHash: job.jobSpecHash, outputCids, workerVersion: String(this.deps.store.snapshot().latestHeartbeat?.agentVersion || 'unknown'), protocolVersion: job.protocolVersion, completedAt: new Date().toISOString() };
+    const spatial = local.output as { manifestCid?: string; manifest?: SpatialManifest; privateOutput?: PrivateOutputCommitment } | undefined;
+    const privateOutput = isPrivateOutput(job) ? spatial?.privateOutput : null;
+    const outputManifestCid = privateOutput?.manifestCid ?? spatial?.manifestCid;
+    const outputCids = privateOutput ? privateOutput.blobs.map(item => item.cid) :
+      outputManifestCid && spatial?.manifest ? [outputManifestCid, ...spatial.manifest.variants.map(variant => variant.cid)] : [];
+    if (!outputManifestCid || !outputCids.length || (isPrivateOutput(job) && !privateOutput)) {
+      throw localError(500, 'remote_output_invalid');
+    }
+    const payload = { jobId: job.id, inputHash: job.inputHash, jobSpecHash: job.jobSpecHash, outputCids, workerVersion: String(this.deps.store.snapshot().latestHeartbeat?.agentVersion || 'unknown'), protocolVersion: job.protocolVersion, completedAt: new Date().toISOString(),
+      ...(privateOutput ? { privateOutput } : {}),
+    };
     const signature = await this.deps.identity.signPayload(payload);
-    await this.deps.api.submitProviderComputeOutput(job.id, { nodeId, outputManifestCid: spatial.manifestCid, outputCids, receipt: { payload, signature } });
+    await this.deps.api.submitProviderComputeOutput(job.id, { nodeId, outputManifestCid, outputCids, receipt: { payload, signature } });
     await this.cleanupProvider(job, record);
     await this.updateRecord(job.id, 'provider', 'OUTPUT_READY');
   }
@@ -526,6 +627,19 @@ export class RemoteComputeRuntime {
 
   private async cleanupProvider(job: RemoteComputeJob, _record: RemoteRuntimeRecord): Promise<void> {
     await this.providerCleanup.request(job.id);
+  }
+
+  private async releaseEncryptedOutput(jobId: string): Promise<void> {
+    const owner = `provider-output:${jobId}`;
+    const managed = new ManagedPins(this.deps.kubo, this.deps.store, { allowUnpin: this.deps.config.managedPinReleaseEnabled === true });
+    for (const [cid, record] of Object.entries(this.deps.store.snapshot().privateComputeCids || {})) {
+      if (record.role !== 'private_output' || record.jobId !== jobId || record.pinOwner !== owner || record.releasedAt) continue;
+      await managed.release(cid, owner);
+      await this.deps.store.update(state => {
+        const saved = state.privateComputeCids?.[cid];
+        if (saved?.pinOwner === owner) saved.releasedAt = new Date().toISOString();
+      });
+    }
   }
 
   private async releaseRequesterInput(job: RemoteComputeJob): Promise<void> {

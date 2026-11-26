@@ -8,6 +8,7 @@ import type { CapabilityRegistry } from '../capabilities/registry.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
 import type { ComputeIdentityService } from '../compute/computeIdentity.js';
 import { effectiveComputeProviderSettings } from '../compute/providerSettings.js';
+import { PRIVATE_OUTPUT_PROTOCOL } from '../compute/privateOutputTransport.js';
 
 function clampRatio(value: number): number {
   return Math.min(Math.max(Number.isFinite(value) ? value : 0, 0), 1);
@@ -80,6 +81,7 @@ export async function sendHeartbeat(api: KubusApiClient, kubo: KuboClient, store
         runningJobs: jobs.filter((job) => job.state === 'running' && (job as { input?: { remoteComputeJobId?: string } }).input?.remoteComputeJobId).length,
         queuedJobs: jobs.filter((job) => job.state === 'queued' && (job as { input?: { remoteComputeJobId?: string } }).input?.remoteComputeJobId).length,
         protocolVersion: 'kubus.compute/1',
+        privateOutputProtocol: PRIVATE_OUTPUT_PROTOCOL,
         encryptionPublicKey: computeIdentity?.encryptionPublicKey,
         signingPublicKey: computeIdentity?.signingPublicKey,
       },

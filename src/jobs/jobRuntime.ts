@@ -18,6 +18,7 @@ import { resolveWorkerOutputFile } from './workerOutput.js';
 import { JobCleanup } from './jobCleanup.js';
 import { ManagedPins } from '../ipfs/managedPins.js';
 import type { CapabilityRegistry } from '../capabilities/registry.js';
+import { PRIVATE_OUTPUT_PROTOCOL, sealOutputBlob, validatePrivateOutput, type PrivateOutputBlob } from '../compute/privateOutputTransport.js';
 
 export type JobType = 'spatial.reconstruct' | 'spatial.optimize' | 'spatial.generate_preview';
 export type JobState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
@@ -781,14 +782,33 @@ export class JobRuntime {
       return { item, target: await resolveWorkerOutputFile(outputDirectory, item.path) };
     }));
     const variants: SpatialVariant[] = [];
+    const privateTarget = typeof job.input.privateOutputRequesterPublicKey === 'string' &&
+      typeof job.input.remoteComputeJobId === 'string' ? {
+        requesterPublicKey: job.input.privateOutputRequesterPublicKey,
+        jobId: job.input.remoteComputeJobId,
+        temporaryDirectory: outputDirectory,
+        kubo: this.deps.kubo,
+      } : null;
+    if (privateTarget && maskingNeedsLookCounts(derivation?.faceMasking).images > 0) {
+      throw new Error('remote_face_review_required');
+    }
+    const sealed: PrivateOutputBlob[] = [];
     const id = crypto.randomUUID();
-    const pinOwner = `spatial:${id}`;
+    const pinOwner = privateTarget ? `provider-output:${privateTarget.jobId}` : `spatial:${id}`;
     // Before anything is added to Kubo: the flagged masked images are kept for the operator's look, and a record
     // whose review could not be done is never made.
     const faceReview = await this.keepFaceReview(id, job, capture, outputDirectory, derivation?.faceMasking);
     try {
       const managed = new ManagedPins(this.deps.kubo, this.deps.store);
       for (const { item, target } of validated) {
+        if (privateTarget) {
+          const blob = await sealOutputBlob({ ...privateTarget, source: target, role: item.role });
+          sealed.push(blob);
+          await this.pinEncryptedOutput(blob, pinOwner, privateTarget.jobId);
+          variants.push({ role: item.role, cid: blob.cid, sizeBytes: blob.plaintextBytes,
+            mimeType: item.mimeType, format: item.format, storageClass: item.storageClass });
+          continue;
+        }
         // Streamed from disk: a Gaussian splat PLY can be hundreds of megabytes
         // and must never be held whole in Node's memory just to re-emit it as
         // multipart form data.
@@ -812,6 +832,17 @@ export class JobRuntime {
       if (!manifest.artworkId) throw new Error('spatial_artwork_required');
       validateSpatialManifest(manifest);
       const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+      if (privateTarget) {
+        const source = path.join(outputDirectory, `${id}.spatial.json`);
+        await fs.writeFile(source, manifestBytes, { mode: 0o600, flag: 'wx' });
+        const blob = await sealOutputBlob({ ...privateTarget, source, role: 'manifest' });
+        sealed.push(blob);
+        const commitment = validatePrivateOutput({
+          schema: PRIVATE_OUTPUT_PROTOCOL, manifestCid: blob.cid, blobs: sealed,
+        }, privateTarget.jobId, blob.cid, sealed.map(item => item.cid));
+        await this.pinEncryptedOutput(blob, pinOwner, privateTarget.jobId);
+        return { privateOutput: commitment };
+      }
       const added = await this.deps.kubo.addBytes(manifestBytes, `${id}.spatial.json`, { pin: false });
       if (!added.Hash) throw new Error('kubo_add_manifest_missing_cid');
       await managed.acquire(added.Hash, pinOwner);
@@ -821,8 +852,21 @@ export class JobRuntime {
       return record;
     } catch (error) {
       if (faceReview) await removeFaceReviewImages(this.deps.dataRoot, id);
+      if (privateTarget) {
+        const managed = new ManagedPins(this.deps.kubo, this.deps.store);
+        for (const blob of sealed) await managed.release(blob.cid, pinOwner).catch(() => undefined);
+      }
       throw error;
     }
+  }
+
+  private async pinEncryptedOutput(blob: PrivateOutputBlob, pinOwner: string, jobId: string): Promise<void> {
+    await this.deps.store.update(state => {
+      (state.privateComputeCids ??= {})[blob.cid] = {
+        role: 'private_output', jobId, pinOwner, createdAt: new Date().toISOString(),
+      };
+    });
+    await new ManagedPins(this.deps.kubo, this.deps.store).acquire(blob.cid, pinOwner);
   }
 
   /**
