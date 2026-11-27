@@ -123,7 +123,11 @@ function makeBridge(prepare?: PrepareOutcome) {
     }),
   };
   const captures = { registerRemote: vi.fn(async (record: unknown) => record), removeRemote: vi.fn(async () => undefined) };
-  const transport = { encryptCapture: vi.fn(async () => ({ inputCid: 'bafyinput', inputBytes: 10, inputHash: 'a'.repeat(64), inputKeyEnvelope: {}, jobSpec: { fileCount: 3 } })) };
+  let encryptions = 0;
+  const transport = { encryptCapture: vi.fn(async (_captureId: string, _provider: string, _key: string) => {
+    encryptions += 1;
+    return { inputCid: `bafyinput${encryptions}`, inputBytes: 10 + encryptions, inputHash: encryptions.toString(16).padStart(64, 'e'), inputKeyEnvelope: { context: `envelope-${encryptions}` }, jobSpec: { fileCount: 3 } };
+  }) };
   const staged = path.join(dataRoot, 'private', 'remote-results', job().id);
   const remote = {
     stagePrivateOutput: vi.fn(async () => {
@@ -135,6 +139,7 @@ function makeBridge(prepare?: PrepareOutcome) {
     }),
     signedAcknowledgement: vi.fn(async (_job: RemoteComputeJob, accepted: boolean, reason?: string) => ({ payload: { accepted, reason }, signature: 'sig' })),
     releaseInput: vi.fn(async () => undefined),
+    releaseUnusedInput: vi.fn(async (_cid: string) => undefined),
   };
   const prepareFn = vi.fn(async ({ outputDirectory }: { outputDirectory: string }): Promise<PrepareOutcome> => {
     if (prepareOutcome) return prepareOutcome;
@@ -651,6 +656,165 @@ describe('provider cleanup attestation replacement and earlier jobs', () => {
     await bridge.collectAttestations(nodeId);
     expect((await stateFile()).providerCleanups[earlier]).toMatchObject({ status: 'verified', attestation: { state: 'complete', finalState: 'FAILED' } });
     expect((await stateFile()).providerCleanups[earlier].code).toBeUndefined();
+  });
+});
+
+describe('encrypted input reuse', () => {
+  const providerOf = (id: string, key = 'key') => ({ nodeId: id, encryptionPublicKey: key, privateOutputProtocol: PRIVATE_OUTPUT_PROTOCOL, spatialOutputProtocol: SPATIAL_OUTPUT_PROTOCOL });
+  const jobCalls = () => calls.filter(call => call.action === 'compute-job');
+  /** Makes the next `count` compute-job calls fail the way a lost or refused request does. */
+  function failJobCalls(api: ReturnType<typeof makeBridge>['api'], count: number) {
+    const original = api.reconstructionCall.getMockImplementation()!;
+    let left = count;
+    api.reconstructionCall.mockImplementation(async (id: string, action: string, body: Record<string, unknown>) => {
+      if (action === 'compute-job' && left > 0) { left -= 1; calls.push({ action, body }); throw new KubusApiError('unavailable', 503, { success: false }); }
+      return original(id, action, body);
+    });
+  }
+  const pending = async () => (await stateFile()).pendingInput as Record<string, any> | undefined;
+
+  test('a compute-job that keeps failing for the same provider encrypts once and re-sends the identical input', async () => {
+    const { bridge, api, transport, remote } = makeBridge();
+    failJobCalls(api, 2);
+    await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+    await expect(bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }))).rejects.toThrow('unavailable');
+    await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+    expect(transport.encryptCapture).toHaveBeenCalledTimes(1);
+    const sent = jobCalls().map(call => call.body);
+    expect(sent).toHaveLength(3);
+    expect(sent[1]).toEqual(sent[0]);
+    expect(sent[2]).toEqual(sent[0]);
+    expect(sent[0]).toMatchObject({ providerNodeId: providerA, inputCid: 'bafyinput1', inputKeyEnvelope: { context: 'envelope-1' } });
+    // The job exists now: its input belongs to the job and is released with it, not as an unused one.
+    expect(await pending()).toBeUndefined();
+    expect(remote.releaseUnusedInput).not.toHaveBeenCalled();
+  });
+
+  test('the descriptor is stored in the attempt state with the capture, provider and provider key it was made for', async () => {
+    const { bridge, api } = makeBridge();
+    failJobCalls(api, 1);
+    await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+    expect(await pending()).toMatchObject({
+      captureId: `managed-${reconstructionId}`, providerNodeId: providerA, providerEncryptionPublicKey: 'key', inputCid: 'bafyinput1', inputBytes: 11,
+      inputKeyEnvelope: { context: 'envelope-1' }, jobSpec: { fileCount: 3 },
+    });
+  });
+
+  test('a different provider releases the unused input pin and encrypts for the new one', async () => {
+    const { bridge, api, transport, remote } = makeBridge();
+    failJobCalls(api, 1);
+    await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+    providers = [providerOf(providerB, 'key-b')];
+    await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+    expect(remote.releaseUnusedInput).toHaveBeenCalledTimes(1);
+    expect(remote.releaseUnusedInput).toHaveBeenCalledWith('bafyinput1');
+    expect(transport.encryptCapture).toHaveBeenLastCalledWith(`managed-${reconstructionId}`, providerB, 'key-b');
+    expect(jobCalls().at(-1)!.body).toMatchObject({ providerNodeId: providerB, inputCid: 'bafyinput2' });
+    expect(await pending()).toBeUndefined();
+  });
+
+  test('a changed provider key re-encrypts and releases the old input', async () => {
+    const { bridge, api, transport, remote } = makeBridge();
+    failJobCalls(api, 1);
+    await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+    providers = [providerOf(providerA, 'rotated-key')];
+    await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+    expect(transport.encryptCapture).toHaveBeenCalledTimes(2);
+    expect(transport.encryptCapture).toHaveBeenLastCalledWith(`managed-${reconstructionId}`, providerA, 'rotated-key');
+    expect(remote.releaseUnusedInput).toHaveBeenCalledWith('bafyinput1');
+    expect(jobCalls().at(-1)!.body).toMatchObject({ providerNodeId: providerA, inputCid: 'bafyinput2' });
+  });
+
+  test('a restart reuses the stored descriptor instead of encrypting again', async () => {
+    const first = makeBridge();
+    failJobCalls(first.api, 1);
+    await expect(first.bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+    const second = makeBridge();
+    await second.bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+    expect(second.transport.encryptCapture).not.toHaveBeenCalled();
+    expect(second.remote.releaseUnusedInput).not.toHaveBeenCalled();
+    const sent = jobCalls().map(call => call.body);
+    expect(sent[1]).toEqual(sent[0]);
+  });
+
+  test('a provider that disappears keeps the descriptor for its return, and the pin is released when the attempt ends', async () => {
+    const { bridge, api, remote } = makeBridge();
+    failJobCalls(api, 1);
+    await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+    providers = [];
+    await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+    expect(await pending()).toMatchObject({ inputCid: 'bafyinput1' });
+    await bridge.advance(nodeId, attempt({ state: 'waiting_for_node', cancelRequested: true }));
+    expect(remote.releaseUnusedInput).toHaveBeenCalledWith('bafyinput1');
+    expect(await pending()).toBeUndefined();
+  });
+
+  describe('terminal paths release an input no job holds', () => {
+    /** A stored descriptor that no job uses, as left by a crash between encrypting and creating the job. */
+    async function leave(cid = 'bafystale') {
+      const state = await stateFile();
+      state.pendingInput = { captureId: state.captureId, providerNodeId: providerA, providerEncryptionPublicKey: 'key', inputCid: cid, inputBytes: 5, inputHash: 'f'.repeat(64), inputKeyEnvelope: {}, jobSpec: {} };
+      await fs.writeFile(path.join(root(), 'state.json'), JSON.stringify(state));
+    }
+
+    test('cancelled', async () => {
+      const { bridge, api, remote } = makeBridge();
+      failJobCalls(api, 1);
+      await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+      await bridge.advance(nodeId, attempt({ state: 'waiting_for_node', cancelRequested: true }));
+      expect(actions().slice(-2)).toEqual(['cancelled', 'cleanup']);
+      expect(remote.releaseUnusedInput).toHaveBeenCalledWith('bafyinput1');
+      expect(calls.at(-1)!.body).toEqual({ nodeId, state: 'complete' });
+      expect(await pending()).toBeUndefined();
+    });
+
+    test('ready', async () => {
+      const { bridge, remote } = makeBridge();
+      await bridge.advance(nodeId, attempt());
+      await leave();
+      await bridge.advance(nodeId, processing());
+      expect(remote.releaseInput).toHaveBeenCalled();
+      expect(remote.releaseUnusedInput).toHaveBeenCalledWith('bafystale');
+      expect(await pending()).toBeUndefined();
+    });
+
+    test('failed', async () => {
+      const { bridge, api, remote } = makeBridge();
+      await bridge.advance(nodeId, attempt());
+      await leave();
+      for (const provider of [providerA, providerB, '99999999-9999-4999-8999-999999999999']) {
+        api.getReconstructionComputeJob.mockResolvedValueOnce(job('FAILED', provider));
+        await bridge.advance(nodeId, processing());
+      }
+      expect(calls.at(-2)).toMatchObject({ action: 'failure', body: { code: 'no_provider_completed' } });
+      expect(remote.releaseUnusedInput).toHaveBeenCalledWith('bafystale');
+      expect(remote.releaseUnusedInput).toHaveBeenCalledTimes(1);
+      expect(await pending()).toBeUndefined();
+    });
+
+    test('needs more views', async () => {
+      const { bridge, remote } = makeBridge();
+      await bridge.advance(nodeId, attempt());
+      await leave();
+      // The prepared capture is gone, so matching prepares again, and that preparation reports too few views.
+      const state = await stateFile(); delete state.captureId;
+      await fs.writeFile(path.join(root(), 'state.json'), JSON.stringify(state));
+      prepareOutcome = { ok: false, code: 'too_few_views', inputs: [], details: { registeredViews: 3, requiredViews: 20 } };
+      await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+      expect(calls.some(call => call.action === 'failure' && call.body.code === 'too_few_views')).toBe(true);
+      expect(remote.releaseUnusedInput).toHaveBeenCalledWith('bafystale');
+      expect(await pending()).toBeUndefined();
+    });
+
+    test('a release that fails is reported as a failed requester cleanup and the descriptor stays for review', async () => {
+      const { bridge, api, remote } = makeBridge();
+      failJobCalls(api, 1);
+      await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+      remote.releaseUnusedInput.mockRejectedValueOnce(new Error('kubo offline'));
+      await bridge.advance(nodeId, attempt({ state: 'waiting_for_node', cancelRequested: true }));
+      expect(calls.at(-1)).toMatchObject({ action: 'cleanup', body: { state: 'failed' } });
+      expect(await pending()).toMatchObject({ inputCid: 'bafyinput1' });
+    });
   });
 });
 

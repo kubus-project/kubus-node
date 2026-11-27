@@ -106,3 +106,26 @@ it('preserves the encrypted input after ambiguous backend submission failure', a
   expect(store.snapshot().privateComputeCids![cid]).toMatchObject({ submissionState: 'unconfirmed', submissionReconciliationRequired: true });
   expect(runtime.cleanupDiagnostics().requesterSubmissionsUnconfirmed).toBe(1);
 });
+it('releases an unused encrypted input by CID without a job, once, and unpins it when nothing else holds it', async () => {
+  const { own, runtime, kubo, store, pins } = await fixture();
+  await own();
+  await runtime.releaseUnusedInput(cid);
+  expect(kubo.pinRm).toHaveBeenCalledWith(canonicalPinCid(cid));
+  expect(pins.size).toBe(0);
+  expect(store.snapshot().privateComputeCids![cid]!.releasedAt).toBeDefined();
+  // Idempotent: a second release (a retry after a crash) does nothing.
+  await runtime.releaseUnusedInput(cid);
+  expect(kubo.pinRm).toHaveBeenCalledTimes(1);
+});
+it('does not release an unused input that is unknown, legacy (no owner) or still held by another owner', async () => {
+  const { own, manager, runtime, kubo, store } = await fixture();
+  await runtime.releaseUnusedInput(syntheticCid('never-seen'));
+  await store.update(state => { state.privateComputeCids![cid] = { role: 'encrypted_input', createdAt: new Date().toISOString() }; });
+  await runtime.releaseUnusedInput(cid);
+  expect(kubo.pinRm).not.toHaveBeenCalled();
+  await own();
+  await manager.acquire(cid, 'archive:other-authorized-record');
+  await runtime.releaseUnusedInput(cid);
+  expect(kubo.pinRm).not.toHaveBeenCalled();
+  expect(store.snapshot().managedPins![canonicalPinCid(cid)]!.owners).toHaveProperty('archive:other-authorized-record');
+});

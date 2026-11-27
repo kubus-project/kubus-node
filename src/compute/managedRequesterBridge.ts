@@ -37,7 +37,7 @@ export interface ManagedRequesterDeps {
   prepare: (input: { jobId: string; captureDirectory: string; outputDirectory: string; fileIds: Map<string, string> }) => Promise<PrepareOutcome>;
   captures: Pick<CaptureStore, 'registerRemote' | 'removeRemote'>;
   transport: Pick<PrivatePayloadTransport, 'encryptCapture'>;
-  remote: Pick<RemoteComputeRuntime, 'signedAcknowledgement' | 'stagePrivateOutput' | 'releaseInput'>;
+  remote: Pick<RemoteComputeRuntime, 'signedAcknowledgement' | 'stagePrivateOutput' | 'releaseInput' | 'releaseUnusedInput'>;
   logger: Logger;
   maxProviderAttempts?: number;
   intervalMs?: number;
@@ -59,8 +59,28 @@ export interface ProviderCleanupRecord {
   attestation?: Pick<ProviderCleanupPayload, 'state' | 'items' | 'outputPins' | 'reason' | 'completedAt' | 'finalState'> & { verifiedAt: string };
 }
 
+/**
+ * The encrypted job input made for one provider, kept until a job holds it. Encrypting picks a fresh key and so a fresh
+ * CID, and every CID is pinned: a tick that encrypted again after a failed or unanswered `compute-job` call leaked one
+ * pin per tick. The descriptor is reused verbatim for the same capture, provider and provider key (the backend answers a
+ * repeated request for it with the same job), and released when it is replaced or the attempt ends. The key envelope is
+ * wrapped to the provider's key and the file is private to this Node (0600); nothing here is ever logged.
+ */
+export interface PendingJobInput {
+  captureId: string;
+  providerNodeId: string;
+  providerEncryptionPublicKey: string;
+  inputCid: string;
+  inputBytes: number;
+  inputHash: string;
+  inputKeyEnvelope: unknown;
+  jobSpec: Record<string, unknown>;
+}
+
 interface LocalState {
   excludedProviders: string[];
+  /** The encrypted input prepared for the provider this attempt is sending to; absent once a job holds it. */
+  pendingInput?: PendingJobInput;
   /** Providers whose result was the legacy raw-archive shape; they are excluded like any other and named in the final failure. */
   outdatedProviders?: string[];
   captureId?: string;
@@ -285,19 +305,52 @@ export class ManagedRequesterBridge {
       await this.progress(nodeId, attempt, 'waiting_for_node', 'waiting_for_node');
       return;
     }
-    const encrypted = await this.deps.transport.encryptCapture(state.captureId, provider.nodeId, provider.encryptionPublicKey);
+    const encrypted = await this.inputFor(attempt.id, state, provider);
     await this.deps.api.reconstructionCall(attempt.id, 'compute-job', {
       nodeId, providerNodeId: provider.nodeId, type: 'spatial.reconstruct',
-      requirements: { qualityTier: 'standard', iterationTier: 'standard' }, ...encrypted,
+      requirements: { qualityTier: 'standard', iterationTier: 'standard' },
+      inputCid: encrypted.inputCid, inputBytes: encrypted.inputBytes, inputHash: encrypted.inputHash, inputKeyEnvelope: encrypted.inputKeyEnvelope,
       jobSpec: { ...encrypted.jobSpec, outputMode: PRIVATE_OUTPUT_PROTOCOL, inputMode: 'prepared' },
       expiresInSeconds: 86400,
     });
+    // The job holds the input now (and releases it with the job); it is no longer an unused one.
+    await this.clearPendingInput(attempt.id, encrypted.inputCid);
     attempt.state = 'processing';
+  }
+
+  /**
+   * The encrypted input for this provider: the stored one when it was made for the same capture, provider and provider
+   * key, otherwise a new one, after the stored one (made for something else, never sent) has been released.
+   */
+  private async inputFor(id: string, state: LocalState, provider: ComputeCandidate): Promise<PendingJobInput> {
+    const stored = state.pendingInput;
+    if (stored && stored.captureId === state.captureId && stored.providerNodeId === provider.nodeId && stored.providerEncryptionPublicKey === provider.encryptionPublicKey) return stored;
+    if (stored) {
+      await this.deps.remote.releaseUnusedInput(stored.inputCid);
+      await this.writeState(id, { ...(await this.readState(id)), pendingInput: undefined });
+    }
+    const made = await this.deps.transport.encryptCapture(state.captureId!, provider.nodeId, provider.encryptionPublicKey);
+    const input: PendingJobInput = {
+      captureId: state.captureId!, providerNodeId: provider.nodeId, providerEncryptionPublicKey: provider.encryptionPublicKey,
+      inputCid: made.inputCid, inputBytes: made.inputBytes, inputHash: made.inputHash, inputKeyEnvelope: made.inputKeyEnvelope, jobSpec: made.jobSpec,
+    };
+    // Written before the request that uses it, so a failed or unanswered request (or a restart) finds it again.
+    await this.writeState(id, { ...(await this.readState(id)), pendingInput: input });
+    return input;
+  }
+
+  /** Forgets the stored input once a job holds it; `onlyCid` leaves a different, still unused one alone. */
+  private async clearPendingInput(id: string, onlyCid?: string): Promise<void> {
+    const state = await this.readState(id);
+    if (!state.pendingInput || (onlyCid && state.pendingInput.inputCid !== onlyCid)) return;
+    await this.writeState(id, { ...state, pendingInput: undefined });
   }
 
   /** Follows the provider's job; a lost or failed provider returns the attempt to matching with that node excluded. */
   private async follow(nodeId: string, attempt: ManagedReconstruction): Promise<void> {
     const job = await this.deps.api.getReconstructionComputeJob(attempt.id, nodeId);
+    // A request whose answer was lost still created the job: its input is the job's now, whatever the state recorded.
+    await this.clearPendingInput(attempt.id, job.inputCid);
     if (job.state === 'COMPLETED') return this.importCandidate(nodeId, attempt, job);
     if (job.state === 'OUTPUT_READY') {
       let accepted = true;
@@ -459,6 +512,17 @@ export class ManagedRequesterBridge {
     } catch (error) {
       outcome = 'failed';
       this.deps.logger.warn({ code: 'managed_requester_input_release_failed', error: String((error as Error).message) }, 'encrypted input release requires retry');
+    }
+    try {
+      // An input prepared for a provider but never held by a job has no job to release it: release it here.
+      const unused = (await this.readState(id)).pendingInput;
+      if (unused) {
+        await this.deps.remote.releaseUnusedInput(unused.inputCid);
+        await this.clearPendingInput(id);
+      }
+    } catch (error) {
+      outcome = 'failed';
+      this.deps.logger.warn({ code: 'managed_requester_input_release_failed', error: String((error as Error).message) }, 'unused encrypted input release requires retry');
     }
     try {
       // The provider's decrypted result, staged here to verify and import it, goes with the rest.

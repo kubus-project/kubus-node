@@ -415,6 +415,17 @@ export class RemoteComputeRuntime {
     await this.updateRecord(job.id, 'requester', job.state);
   }
 
+  /**
+   * Releases an encrypted input pin that no job holds (prepared for a provider, never sent, or replaced). Idempotent: an
+   * input that is already released, or has no managed owner, is left alone.
+   */
+  async releaseUnusedInput(inputCid: string): Promise<void> {
+    const record = this.deps.store.snapshot().privateComputeCids?.[inputCid];
+    if (!record || record.role !== 'encrypted_input' || !record.pinOwner || record.releasedAt) return;
+    await new ManagedPins(this.deps.kubo, this.deps.store, { allowUnpin: this.deps.config.managedPinReleaseEnabled === true }).release(inputCid, record.pinOwner);
+    await this.deps.store.update((state) => { const item = state.privateComputeCids?.[inputCid]; if (item) item.releasedAt = new Date().toISOString(); });
+  }
+
   async cancelRequesterJob(jobId: string, authorization: string): Promise<RemoteComputeJob> {
     requireUserAuthorization(authorization);
     const job = await this.deps.api.cancelRemoteComputeJob(jobId, authorization);
