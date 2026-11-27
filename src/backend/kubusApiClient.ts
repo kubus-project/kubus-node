@@ -182,6 +182,11 @@ export class KubusApiClient {
     return this.request(`/api/compute/provider/jobs/${encodeURIComponent(jobId)}/output`, { method: 'POST', body: payload });
   }
 
+  /** The provider's signed statement of what it did with a finished job's data; only the job's provider may send it. */
+  submitProviderCleanupAttestation(jobId: string, payload: { nodeId: string; attestation: { payload: unknown; signature: string } }): Promise<unknown> {
+    return this.request(`/api/compute/provider/jobs/${encodeURIComponent(jobId)}/cleanup`, { method: 'POST', body: payload });
+  }
+
   // Managed requester bridge. These use the Node's own operator token and always name this node; the backend
   // accepts only the configured pilot requester owned by that operator.
   claimReconstruction(nodeId: string): Promise<ManagedReconstruction | null> {

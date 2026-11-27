@@ -237,3 +237,16 @@ it('retains capture metadata and a retry record if file removal fails', async ()
   await cleanup.request(id);
   expect(store.snapshot().captures?.['remote-' + id]).toBeUndefined();
 });
+it('journals when the job was taken and whether a decrypted input directory was there to remove', async () => {
+  const { cleanup, target, store } = await fixture();
+  await cleanup.own(job());
+  expect(Date.parse(record(store).cleanup!.receivedAt!)).toBeLessThanOrEqual(Date.now());
+  await readable(target);
+  await cleanup.request(id);
+  expect(record(store).cleanup?.decryptedInputRemoved).toBe(true);
+  // A job declined or expired before anything was decrypted has nothing to remove, and the journal says so.
+  const empty = await fixture();
+  await empty.cleanup.own(job());
+  await empty.cleanup.request(id);
+  expect(record(empty.store).cleanup).toMatchObject({ plaintext: 'complete', decryptedInputRemoved: false });
+});

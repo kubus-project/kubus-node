@@ -25,8 +25,14 @@ it('cleans partial job-owned files before a worker was attempted without network
   const { cleanup, target, store } = await fixture(); const fetch = vi.spyOn(globalThis, 'fetch');
   await cleanup.reconcile(id); expect(fetch).not.toHaveBeenCalled();
   await expect(fs.stat(target)).rejects.toMatchObject({ code: 'ENOENT' });
-  expect(store.snapshot().jobCleanup?.[id]?.state).toBe('complete');
+  expect(store.snapshot().jobCleanup?.[id]).toMatchObject({ state: 'complete', removed: true });
   await cleanup.reconcile(id);
+});
+it('records that nothing was there to remove when the work directory never existed', async () => {
+  const { cleanup, target, store } = await fixture();
+  await fs.rm(target, { recursive: true });
+  await cleanup.reconcile(id);
+  expect(store.snapshot().jobCleanup?.[id]).toMatchObject({ state: 'complete', removed: false });
 });
 it('unknown legacy paths are never automatically removed', async () => {
   const { cleanup, root } = await fixture(); const other = '33333333-3333-4333-8333-333333333333';

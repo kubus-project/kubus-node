@@ -22,6 +22,7 @@ import { PrivatePayloadTransport, type ComputeKeyEnvelope } from './privatePaylo
 import { effectiveComputeProviderSettings, validateComputeProviderSettings, type ComputeProviderSettings } from './providerSettings.js';
 
 import { ProviderCleanup, type RemoteRuntimeRecord } from './providerCleanup.js';
+import { ProviderCleanupAttestor } from './providerCleanupAttestation.js';
 import { ManagedPins } from '../ipfs/managedPins.js';
 import { jobIdPattern } from '../jobs/ownedWorkDirectory.js';
 import {
@@ -60,6 +61,7 @@ export class RemoteComputeRuntime {
   private timer?: NodeJS.Timeout;
   private cleanupTimer?: NodeJS.Timeout;
   private readonly providerCleanup: ProviderCleanup;
+  private readonly attestor: ProviderCleanupAttestor;
   private polling = false;
   private stopped = true;
   private readonly backoff = new Backoff(POLL_INTERVAL_MS, POLL_MAX_BACKOFF_MS);
@@ -69,9 +71,16 @@ export class RemoteComputeRuntime {
   constructor(private readonly deps: {
     api: KubusApiClient; kubo: KuboClient; store: LocalStore; config: AppConfig; captures: CaptureStore; jobs: JobRuntime;
     gate: NetworkParticipationGate; identity: ComputeIdentityService; transport: PrivatePayloadTransport; logger: Logger;
-  }) { this.providerCleanup = new ProviderCleanup(deps.store, deps.jobs, deps.config.localDataPath, async (cid, owner) => {
-    await new ManagedPins(deps.kubo, deps.store, { allowUnpin: deps.config.managedPinReleaseEnabled === true }).release(cid, owner);
-  }); }
+  }) {
+    this.providerCleanup = new ProviderCleanup(deps.store, deps.jobs, deps.config.localDataPath, async (cid, owner) => {
+      await new ManagedPins(deps.kubo, deps.store, { allowUnpin: deps.config.managedPinReleaseEnabled === true }).release(cid, owner);
+    });
+    this.attestor = new ProviderCleanupAttestor({
+      store: deps.store, nodeId: () => deps.store.snapshot().nodeId, logger: deps.logger,
+      sign: payload => deps.identity.signProviderCleanup(payload),
+      submit: (jobId, body) => deps.api.submitProviderCleanupAttestation(jobId, body),
+    });
+  }
 
   start(): void {
     if (!this.cleanupTimer) {
@@ -135,6 +144,8 @@ export class RemoteComputeRuntime {
     await managed.reconcile({ ownerPrefix: 'requester-input:' }).catch(() => undefined);
     await managed.reconcile({ ownerPrefix: 'provider-output:' }).catch(() => undefined);
     await this.providerCleanup.reconcilePending();
+    // A statement the backend has not accepted yet survives a restart and is re-sent once its backoff elapses.
+    await this.attestor.retryDue().catch(() => undefined);
     return this.cleanupDiagnostics();
   }
 
@@ -521,8 +532,13 @@ export class RemoteComputeRuntime {
     const nodeId = this.deps.store.snapshot().nodeId!;
     const existing = this.deps.store.snapshot().remoteJobs?.[job.id] as RemoteRuntimeRecord | undefined;
     if (['CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED'].includes(job.state)) {
-      if (existing?.role === 'provider' && existing.cleanup) await this.providerCleanup.request(job.id);
-      if (existing?.role === 'provider') await this.releaseEncryptedOutput(job.id);
+      // Terminal only: the sealed result stays pinned until the requester has acknowledged it (COMPLETED) or the job ended.
+      let failure: unknown;
+      try { if (existing?.role === 'provider' && existing.cleanup) await this.providerCleanup.request(job.id); } catch (error) { failure = error; }
+      try { if (existing?.role === 'provider') await this.releaseEncryptedOutput(job.id); } catch (error) { failure ??= error; }
+      // The statement says what the journals say, so a failed step is stated as failed rather than left unsaid.
+      await this.attestor.attest(job).catch(() => this.deps.logger.warn({ code: 'provider_cleanup_attestation_failed', jobId: job.id }, 'provider cleanup attestation could not be queued'));
+      if (failure) throw failure;
       return;
     }
     if (job.state === 'OUTPUT_READY' && existing?.cleanup) {

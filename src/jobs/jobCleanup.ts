@@ -9,6 +9,8 @@ export interface JobCleanupRecord {
   state: 'pending' | 'blocked' | 'complete';
   workerInstanceId?: string;
   workerAttempted: boolean;
+  /** Set when the work directory was removed: false means there was nothing to remove (a cleanup attestation reads this). */
+  removed?: boolean;
   updatedAt: string;
   reason?: string;
 }
@@ -69,10 +71,10 @@ export class JobCleanup {
       }
       // Resolve every existing parent. Reject symlinks/junctions rather than
       // follow a job path into captures, another job, or an external directory.
-      await removeOwnedWorkDirectory(this.dataRoot, 'jobs', jobId);
+      const removed = await removeOwnedWorkDirectory(this.dataRoot, 'jobs', jobId);
       await this.store.update(state => {
         const current = state.jobCleanup?.[jobId];
-        if (current) { current.state = 'complete'; current.reason = undefined; current.updatedAt = new Date().toISOString(); }
+        if (current) { current.state = 'complete'; current.removed = removed; current.reason = undefined; current.updatedAt = new Date().toISOString(); }
       });
     } catch (error) {
       await this.store.update(state => {

@@ -15,6 +15,10 @@ export interface ProviderCleanupState {
   plaintext: 'pending' | 'blocked' | 'complete';
   inputPinReleasePending: boolean;
   pinOwner?: string;
+  /** When this Node first took the job (before any download); a cleanup attestation states it. */
+  receivedAt?: string;
+  /** Whether the decrypted input directory existed when it was removed; absent until removal. */
+  decryptedInputRemoved?: boolean;
   reason?: string;
 }
 export interface RemoteRuntimeRecord {
@@ -66,6 +70,7 @@ export class ProviderCleanup {
           plaintext: 'pending',
           inputPinReleasePending: true,
           pinOwner: `provider-input:${job.id}`,
+          receivedAt: new Date().toISOString(),
         },
       };
       if (
@@ -188,11 +193,12 @@ export class ProviderCleanup {
       );
       if (capture && path.resolve(String(capture.directory || '')) !== expected)
         throw new Error('provider_capture_path_mismatch');
-      await removeOwnedWorkDirectory(this.dataRoot, 'remote-jobs', id);
+      const removed = await removeOwnedWorkDirectory(this.dataRoot, 'remote-jobs', id);
       await this.store.update((state) => {
         if (state.captures) delete state.captures[captureId];
         const current = state.remoteJobs?.[id] as RemoteRuntimeRecord;
         current.cleanup!.plaintext = 'complete';
+        current.cleanup!.decryptedInputRemoved = removed;
         current.cleanup!.reason = undefined;
         current.updatedAt = new Date().toISOString();
       });
