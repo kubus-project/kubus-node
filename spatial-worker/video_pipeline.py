@@ -395,6 +395,7 @@ def select_video_frames(
     after_selection: Callable[[pathlib.Path, list], None] | None = None,
     seconds: list | None = None,
     masking_requested: bool = False,
+    video: pathlib.Path | None = None,
 ) -> tuple:
     """Probe the capture's video, extract, filter and select frames into `destination`.
 
@@ -402,11 +403,13 @@ def select_video_frames(
     video intake and the mixed photo + video intake. A `seconds` list is filled with each selected frame's position
     in the footage (seconds, in the order of the names). `masking_requested` (also implied by `after_selection`) makes
     unmasked raw frames that cannot be removed an error, for the intake that masks later as well as the one that masks here.
+    An explicit `video` selects one clip of a multi-clip source set; its raw extractions get their own directory.
     """
-    video = find_source_video(capture)
+    explicit = video is not None
+    video = video if explicit else find_source_video(capture)
     info = probe_video(runner, video)
     target, extract_count = plan_frames(info["durationSeconds"])
-    raw = work / "raw_frames"
+    raw = work / (f"raw_frames_{prefix}" if explicit else "raw_frames")
     progress("extracting_frames", {"video": info, "targetFrames": target, "extractFrames": extract_count})
     paths = extract_frames(runner, video, raw, extract_count, info["durationSeconds"], info["frameRate"])
     rate = frame_sample_rate(extract_count, info["durationSeconds"], info["frameRate"])

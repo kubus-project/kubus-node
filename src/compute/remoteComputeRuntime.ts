@@ -12,6 +12,7 @@ import { localError } from '../localApi/pairingService.js';
 import type { Logger } from '../logging/logger.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
 import { validateSpatialManifest, type SpatialManifest } from '../spatial/models.js';
+import { inspectCapturePackage } from '../captures/capturePackage.js';
 import { redactSecrets } from '../logging/logBuffer.js';
 import { Backoff } from '../scheduler/backoff.js';
 import type { LocalStore } from '../state/localStore.js';
@@ -367,6 +368,18 @@ export class RemoteComputeRuntime {
   async acknowledgeRequesterOutput(jobId: string, authorization: string, accepted: boolean, reason?: string): Promise<RemoteComputeJob> {
     requireUserAuthorization(authorization);
     const job = await this.deps.api.getRemoteComputeJob(jobId, authorization);
+    const receipt = await this.signedAcknowledgement(job, accepted, reason);
+    const updated = await this.deps.api.acknowledgeRemoteComputeJob(jobId, { accepted, receipt }, authorization);
+    if (['COMPLETED', 'DISPUTED', 'FAILED', 'CANCELLED'].includes(updated.state)) await this.releaseRequesterInput(updated);
+    await this.updateRecord(updated.id, 'requester', updated.state);
+    return updated;
+  }
+
+  /**
+   * The requester's signed receipt for a job read by any route. An accepted private-output job is acknowledged only
+   * after its decrypted result is staged here, and the receipt commits to that exact output.
+   */
+  async signedAcknowledgement(job: RemoteComputeJob, accepted: boolean, reason?: string): Promise<{ payload: Record<string, unknown>; signature: string }> {
     const privateOutputBinding = isPrivateOutput(job) && accepted ? outputCommitmentDigest(signedPrivateOutput(job)) : null;
     if (privateOutputBinding && !(await this.sealedResultRecord(
       path.join(this.deps.config.localDataPath, 'private', 'remote-results', job.id), privateOutputBinding,
@@ -374,11 +387,20 @@ export class RemoteComputeRuntime {
     const payload = { jobId: job.id, inputHash: job.inputHash, jobSpecHash: job.jobSpecHash, outputCids: job.outputCids, accepted, reason: reason || null, acknowledgedAt: new Date().toISOString(), protocolVersion: job.protocolVersion,
       ...(privateOutputBinding ? { privateOutputBinding } : {}),
     };
-    const signature = await this.deps.identity.signPayload(payload);
-    const updated = await this.deps.api.acknowledgeRemoteComputeJob(jobId, { accepted, receipt: { payload, signature } }, authorization);
-    if (['COMPLETED', 'DISPUTED', 'FAILED', 'CANCELLED'].includes(updated.state)) await this.releaseRequesterInput(updated);
-    await this.updateRecord(updated.id, 'requester', updated.state);
-    return updated;
+    return { payload, signature: await this.deps.identity.signPayload(payload) };
+  }
+
+  /** Verifies and decrypts a private-output job's result into private staging; returns where its variants are. */
+  async stagePrivateOutput(job: RemoteComputeJob): Promise<{ directory: string; record: Record<string, unknown> }> {
+    if (!isPrivateOutput(job)) throw localError(422, 'private_output_required');
+    const record = await this.retrieveSealedOutput(job);
+    return { directory: path.join(this.deps.config.localDataPath, 'private', 'remote-results', job.id), record };
+  }
+
+  /** Releases the requester's encrypted input pin once the job is over; also used by the managed requester. */
+  async releaseInput(job: RemoteComputeJob): Promise<void> {
+    await this.releaseRequesterInput(job);
+    await this.updateRecord(job.id, 'requester', job.state);
   }
 
   async cancelRequesterJob(jobId: string, authorization: string): Promise<RemoteComputeJob> {
@@ -657,7 +679,9 @@ export class RemoteComputeRuntime {
     const files = Array.isArray(manifest.files) ? manifest.files : [];
     let sizeBytes = 0;
     for (const item of files) { const relative = String((item as { path?: string }).path || ''); if (relative) sizeBytes += (await fs.stat(path.join(directory, relative))).size; }
-    return { id, schema: 'kubus.capture/1', state: 'stored', private: true, artworkId: String(manifest.artworkId || ''), markerId: String(manifest.markerId || '') || undefined, capturedAt: String(manifest.capturedAt || new Date().toISOString()), createdAt: new Date().toISOString(), sizeBytes, fileCount: files.length, directory };
+    // A managed requester's masked dataset is recognised from its files, so the record says it was masked upstream.
+    const prepared = (await inspectCapturePackage(directory)).kind === 'prepared';
+    return { id, schema: 'kubus.capture/1', state: 'stored', private: true, artworkId: String(manifest.artworkId || ''), markerId: String(manifest.markerId || '') || undefined, capturedAt: String(manifest.capturedAt || new Date().toISOString()), createdAt: new Date().toISOString(), sizeBytes, fileCount: files.length, directory, ...(prepared ? { kind: 'prepared' as const } : {}) };
   }
 
   private async updateRecord(jobId: string, role: 'requester' | 'provider', stateValue: string): Promise<void> {

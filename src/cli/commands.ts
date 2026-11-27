@@ -27,6 +27,7 @@ import { WorkerAuthService } from '../spatial/workerAuth.js';
 import { ComputeIdentityService } from '../compute/computeIdentity.js';
 import { PrivatePayloadTransport } from '../compute/privatePayloadTransport.js';
 import { RemoteComputeRuntime } from '../compute/remoteComputeRuntime.js';
+import { ManagedRequesterBridge, workerPrepare } from '../compute/managedRequesterBridge.js';
 import { NodeSignalingClient } from '../webrtc/nodeSignalingClient.js';
 import { startSetupServer } from '../gui/setupServer.js';
 import { PermissionUpdateService } from '../setup/permissionUpdate.js';
@@ -218,6 +219,13 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
       scheduler = new Scheduler({ api, kubo, store, config, logger, gate: participationGate, identity: computeIdentity, capabilities, actionLock });
       scheduler.start();
       remoteCompute.start();
+      if (config.managedRequesterEnabled && config.spatialWorkerUrl) {
+        new ManagedRequesterBridge({
+          api, nodeId: () => store.snapshot().nodeId, dataRoot: config.localDataPath,
+          prepare: workerPrepare({ workerUrl: config.spatialWorkerUrl, workerAuth }), captures, transport: privateTransport,
+          remote: remoteCompute, logger,
+        }).start();
+      }
       // The signaling namespace authorizes the durable node id against the
       // operator token, so it can only start after registration. It remains
       // explicitly non-fatal: a signaling outage must not take down LAN access,

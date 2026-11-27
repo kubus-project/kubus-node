@@ -35,4 +35,19 @@ Rewards require a completed verified job and use `spatial-compute-units-1`; see 
 
 An explicitly negotiated `kubus.private-output/1` job records the requester's X25519 public key at assignment. The provider encrypts each worker variant and the spatial manifest before writing to Kubo. The signed output receipt binds ciphertext references and digests, plaintext lengths and digests, and the recipient key envelopes to the job and job-spec hash. The requester re-verifies the signature, file sizes, and digests before making the result available in its private local staging directory. An accepted acknowledgement signs the exact output commitment. The default result transport remains compatible with existing jobs.
 
-This transport can be tested independently of browser source dispatch. A browser pilot still needs a registered managed requester, a source-revision binding, and a private candidate import into the backend before it can accept photo and video processing requests.
+This transport can be tested independently of browser source dispatch.
+
+## Managed requester (browser pilot)
+
+The Kubus-operated requester Node runs with `KUBUS_MANAGED_REQUESTER=true` and is the node the backend names in `SPATIAL_PILOT_REQUESTER_NODE_ID`. It polls `/api/spatial/reconstruction-bridge` with its own operator token. The backend binds each claimed attempt to the walletless artist, the artwork and an immutable source revision. The requester sees only file ids, formats, sizes and SHA-256 digests.
+
+For each attempt it:
+
+1. Downloads every source file in chunks and verifies its size and digest. A resumed attempt keeps files already verified.
+2. Prepares the set on its own worker in the `source_set` input mode: photos and any number of clips, faces always masked, COLMAP poses, stopping before training. Typed failures such as `sfm_failed` or `frames_too_blurry` go back to the artist with per-file usable-view counts.
+3. Packs only `capture.json` and the masked dataset as a `prepared` capture. That kind holds no file under `photos/` or `video/`, so the media-capture refusal above still holds for raw media.
+4. Matches a provider that advertises `kubus.private-output/1`, encrypts the capture to that provider, and has the backend create the job. The canonical spec carries the attempt's source binding.
+5. Follows the job. A verified, staged result is acknowledged and uploaded as the artist's new private candidate. A result that fails verification is disputed. A failed, expired or disputed job releases the encrypted input and excludes that provider. After three providers the attempt fails as `no_provider_completed`.
+6. When the artist cancels, cancels the provider job, releases the input and confirms.
+
+Work files go when an attempt ends. Verified source copies stay until the backend's retention list names the attempt: seven days after the last attempt, or when the artist deletes the sources. A provider trains a `prepared` capture in the worker's `prepared` input mode. Providers therefore need a worker image that advertises `prepared` in `inputModes`; one without it fails the job, and the requester moves to the next provider.

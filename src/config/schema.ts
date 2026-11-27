@@ -48,6 +48,8 @@ export interface AppConfig {
   spatialWorkerUrl?: string;
   offerRemoteCompute: boolean;
   remoteComputePaused: boolean;
+  /** Kubus-operated pilot requester: claims browser reconstruction attempts from the backend bridge. Off by default. */
+  managedRequesterEnabled?: boolean;
   remoteComputeMaxConcurrency: number;
   remoteComputeMaxQueueDepth: number;
   remoteComputeMaxInputBytes: number;

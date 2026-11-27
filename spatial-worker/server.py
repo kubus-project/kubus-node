@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import pathlib
+import shutil
 import time
 import uuid
 from typing import Any
@@ -19,6 +20,7 @@ from job_control import JobControl, JobCancelled, hand_back_ownership
 from face_mask import FaceMaskingError, masking_provenance, missing_review_files
 from photo_pipeline import prepare_photo_dataset
 from scene_frame import analyse_dataset
+from source_set import prepare_source_set, read_prepared_record, write_prepared_record
 from video_pipeline import WorkerError, prepare_video_dataset
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -78,7 +80,9 @@ def health() -> dict[str, Any]:
         "gpu": gpu,
         "capabilities": ["spatial.reconstruct", "spatial.gaussianSplat"],
         # Input modes `spatial.reconstruct` accepts: posed frames, one video, still photos, or photos plus one video.
-        "inputModes": ["frames", "video", "photos", "mixed"],
+        # `source_set` (photos and any number of clips) prepares a masked, posed dataset and stops before training;
+        # `prepared` trains such a dataset, as a remote provider does for the managed requester.
+        "inputModes": ["frames", "video", "photos", "mixed", "source_set", "prepared"],
         # Face masking of photos and video frames before reconstruction (`input.maskFaces`); see face_mask.py.
         "faceMasking": True,
         # The images face masking flags carry `file` (and a frame's `seconds`) in `needsLook.items`, so the Node can keep
@@ -206,6 +210,20 @@ def require_review_files(output: pathlib.Path, masked: dict | None) -> None:
         )
 
 
+def prepare_only(runner, capture: pathlib.Path, output: pathlib.Path, progress, mask: bool) -> dict[str, Any]:
+    """The managed requester's stage: a masked, posed dataset and per-input feedback, without training."""
+    prepared = prepare_source_set(runner, capture, output, progress, mask=mask)
+    masked = masking_provenance(prepared["masking"])
+    require_review_files(output, masked)
+    dataset = prepared["dataset"]
+    # COLMAP's database and binary model are not needed to train and would only enlarge what leaves this Node.
+    shutil.rmtree(dataset / "colmap", ignore_errors=True)
+    record = {"workerVersion": WORKER_VERSION, "sfm": prepared["sfm"], "inputs": prepared["inputs"], "faceMasking": masked}
+    write_prepared_record(dataset, record)
+    progress("prepared", {"views": prepared["sfm"].get("registeredViews")})
+    return {"prepared": {"path": str(dataset.relative_to(output)), **record}}
+
+
 def run_reconstruction(request: ProcessRequest):
     if not torch.cuda.is_available():
         raise HTTPException(status_code=503, detail="gpu_unsupported")
@@ -215,7 +233,7 @@ def run_reconstruction(request: ProcessRequest):
     if request.type != "spatial.reconstruct":
         raise HTTPException(status_code=422, detail="job_type_not_supported_by_worker")
     mode = request.input.get("mode") or "frames"
-    if mode not in ("frames", "video", "photos", "mixed"):
+    if mode not in ("frames", "video", "photos", "mixed", "source_set", "prepared"):
         raise HTTPException(status_code=422, detail="input_mode_not_supported_by_worker")
     output.mkdir(parents=True, exist_ok=True)
     provenance: dict[str, Any] = {}
@@ -226,6 +244,8 @@ def run_reconstruction(request: ProcessRequest):
     mask = request.input.get("maskFaces")
     mask_photos = isinstance(mask, dict) and mask.get("photos") is True
     mask_video = isinstance(mask, dict) and mask.get("video") is True
+    if mode == "source_set":
+        return prepare_only(runner, capture, output, progress, mask=mask_photos or mask_video)
     if mode == "video":
         prepared = prepare_video_dataset(runner, capture, output, progress, mask_video=mask_video)
         dataset = prepared["dataset"]
@@ -245,6 +265,15 @@ def run_reconstruction(request: ProcessRequest):
         if prepared["video"]:
             provenance["video"] = prepared["video"]
             provenance["frames"] = prepared["frames"]
+    elif mode == "prepared":
+        dataset = capture / "dataset"
+        if not (dataset / "transforms.json").is_file():
+            raise HTTPException(status_code=422, detail="capture_requires_nerfstudio_transforms_json")
+        record = read_prepared_record(dataset)
+        # The requester masked and posed these images on its own worker; say so, with its counts, never its images.
+        provenance = {"kind": "prepared", "preparedBy": {
+            "workerVersion": record.get("workerVersion"), "sfm": record.get("sfm"), "faceMasking": record.get("faceMasking"),
+        }}
     else:
         dataset = capture
         if not (dataset / "transforms.json").is_file():

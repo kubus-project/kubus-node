@@ -213,6 +213,24 @@ export interface ComputeCandidate {
   score: number;
 }
 
+/** One reconstruction attempt as the managed requester sees it: digests and sizes, never file names or the artist. */
+export interface ManagedReconstruction {
+  id: string;
+  artworkId: string;
+  attempt: number;
+  state: 'preparing' | 'waiting_for_node' | 'processing' | 'importing' | 'ready' | 'needs_more_views' | 'failed' | 'cancelled';
+  stage: string | null;
+  sourceRevision: number;
+  sourceDigest: string;
+  files: Array<{ id: string; format: 'jpeg' | 'png' | 'mp4' | 'mov'; sizeBytes: number; sha256: string }>;
+  chunkSizeBytes: number;
+  cancelRequested: boolean;
+  computeJobId: string | null;
+  providerNodeId: string | null;
+  candidateDraftId: string | null;
+  leaseExpiresAt: string | null;
+}
+
 export interface RemoteComputeJob {
   id: string;
   requesterNodeId?: string | null;

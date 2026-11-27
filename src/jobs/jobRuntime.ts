@@ -153,6 +153,16 @@ export function faceMaskingProvenance(capture: { kind?: string; faceMasking?: un
   // A posed-frame package (an app capture) is not masked by this step: its frames never pass through the worker's
   // intake. Say so in the record instead of leaving the question open.
   if (kind === 'frames') return { ran: false, reason: 'posed_frames_not_masked' };
+  if (kind === 'prepared') {
+    // Masked by the managed requester's worker before the dataset left it; the provider only carries its summary.
+    const record = (worker && typeof worker === 'object' ? (worker as Record<string, unknown>).preparedBy : undefined) as Record<string, unknown> | undefined;
+    const parts = (record?.faceMasking && typeof record.faceMasking === 'object' ? record.faceMasking : {}) as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const part of ['photos', 'video'] as const) {
+      if (parts[part]) out[part] = cleanMaskingPart({ ...(parts[part] as object), source: 'worker', attestation: 'requester_worker', weightsPinned: pinned(parts[part]) });
+    }
+    return Object.keys(out).length ? { ran: true, ...out } : { ran: false, reason: 'prepared_without_masking' };
+  }
   const masking = effectiveMasking(capture as Parameters<typeof effectiveMasking>[0]);
   const reported = (worker && typeof worker === 'object' ? (worker as Record<string, unknown>).faceMasking : undefined) as Record<string, unknown> | undefined;
   const out: Record<string, unknown> = {};
@@ -404,7 +414,8 @@ export class JobRuntime {
    * Photos masked before import need nothing here; posed frames are not masked by this step.
    */
   private maskingInput(captureId: string, mode: string, jobArtworkId: string | undefined): Record<string, unknown> {
-    if (mode === 'frames') return {};
+    // A prepared dataset was masked on the requester's worker before it was packed; there is nothing left to mask.
+    if (mode === 'frames' || mode === 'prepared') return {};
     const capture = this.deps.captureStore.get(captureId);
     // The default (masking for an artwork) is decided at import from the capture's artwork. A job that names an
     // artwork for a capture imported without one would bind a splat of unmasked images to that artwork.

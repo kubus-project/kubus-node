@@ -11,6 +11,7 @@ import type {
   RewardableCid,
   RewardsResponse,
   ComputeCandidate,
+  ManagedReconstruction,
   RemoteComputeJob,
 } from './models.js';
 import type { AuthProvider } from './operatorAuth.js';
@@ -179,6 +180,63 @@ export class KubusApiClient {
 
   submitProviderComputeOutput(jobId: string, payload: Record<string, unknown>): Promise<RemoteComputeJob> {
     return this.request(`/api/compute/provider/jobs/${encodeURIComponent(jobId)}/output`, { method: 'POST', body: payload });
+  }
+
+  // Managed requester bridge. These use the Node's own operator token and always name this node; the backend
+  // accepts only the configured pilot requester owned by that operator.
+  claimReconstruction(nodeId: string): Promise<ManagedReconstruction | null> {
+    return this.request('/api/spatial/reconstruction-bridge/claim', { method: 'POST', body: { nodeId } });
+  }
+
+  reconstructionRetention(nodeId: string): Promise<{ purge: string[] }> {
+    return this.request(`/api/spatial/reconstruction-bridge/retention${queryString({ nodeId })}`);
+  }
+
+  readReconstructionChunk(id: string, fileId: string, offset: number, nodeId: string): Promise<Buffer> {
+    return this.binary(`/api/spatial/reconstruction-bridge/${encodeURIComponent(id)}/files/${encodeURIComponent(fileId)}/chunks/${offset}${queryString({ nodeId })}`, 'GET');
+  }
+
+  /** A JSON bridge action (`progress`, `providers`, `compute-job`, `compute-job/acknowledge`, ...). */
+  reconstructionCall<T>(id: string, action: string, body: Record<string, unknown>): Promise<T> {
+    if (!/^[a-z-]+(\/[a-z-]+)?$/.test(action)) throw new Error('reconstruction_bridge_action_invalid');
+    return this.request(`/api/spatial/reconstruction-bridge/${encodeURIComponent(id)}/${action}`, { method: 'POST', body });
+  }
+
+  getReconstructionComputeJob(id: string, nodeId: string): Promise<RemoteComputeJob> {
+    return this.request(`/api/spatial/reconstruction-bridge/${encodeURIComponent(id)}/compute-job${queryString({ nodeId })}`);
+  }
+
+  async appendReconstructionCandidate(id: string, offset: number, bytes: Buffer, nodeId: string): Promise<{ reconstruction: ManagedReconstruction; candidate: { state: string } }> {
+    const response = await this.binary(`/api/spatial/reconstruction-bridge/${encodeURIComponent(id)}/candidate/chunks/${offset}${queryString({ nodeId })}`, 'PUT', bytes);
+    return normalizeData(safeJson(response.toString('utf8'))) as { reconstruction: ManagedReconstruction; candidate: { state: string } };
+  }
+
+  /** One bounded binary exchange (a 4 MiB chunk either way), retried like JSON requests. */
+  private async binary(path: string, method: 'GET' | 'PUT', body?: Buffer): Promise<Buffer> {
+    const backoff = new Backoff(500, 5000);
+    let last: unknown;
+    for (let attempt = 0; attempt <= this.retries; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), Math.max(this.timeoutMs, 60_000));
+      try {
+        const headers: Record<string, string> = { Accept: method === 'GET' ? 'application/octet-stream' : 'application/json', ...this.options.auth.headers() };
+        if (body) headers['Content-Type'] = 'application/octet-stream';
+        const response = await fetch(`${this.baseUrl}${path}`, { method, headers, body: body ? new Uint8Array(body) : undefined, signal: controller.signal });
+        const bytes = Buffer.from(await response.arrayBuffer());
+        if (!response.ok) {
+          const parsed = safeJson(bytes.toString('utf8'));
+          throw new KubusApiError(extractError(parsed) ?? `Kubus API ${method} ${path} failed with HTTP ${response.status}`, response.status, parsed);
+        }
+        return bytes;
+      } catch (error) {
+        last = error;
+        if (!isTransient(error) || attempt >= this.retries) throw error;
+        await sleep(backoff.failure());
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    throw last instanceof Error ? last : new Error(String(last));
   }
 
   private async request<T>(path: string, init: { method?: string; body?: unknown; auth?: boolean; authorization?: string } = {}): Promise<T> {

@@ -27,7 +27,7 @@ export type CapturePackageProblem =
  * What a capture package carries: posed frames, one source video, still photos
  * (no poses; COLMAP solves them), or photos and one video together.
  */
-export type CapturePackageKind = 'frames' | 'video' | 'photos' | 'mixed';
+export type CapturePackageKind = 'frames' | 'video' | 'photos' | 'mixed' | 'prepared';
 
 export interface CapturePackageReport {
   ok: boolean;
@@ -148,6 +148,7 @@ export async function inspectCapturePackage(
     const hasPhotos = (await listPhotoSources(directory)).length > 0;
     const hasVideo = (await listVideoSources(directory)).length > 0;
     if (hasPhotos || hasVideo) return inspectMedia(directory, hasPhotos, hasVideo);
+    if (await hasContent(directory, 'dataset/prepared.json')) return inspectPrepared(directory);
     return report('capture_frames_missing', 'The capture has no frames.json', ['frames.json']);
   }
 
@@ -221,6 +222,35 @@ export async function inspectCapturePackage(
   }
 
   return { ok: true, missingPaths: [], missingCount: 0, frameCount: frames.length, kind: 'frames' };
+}
+
+/**
+ * A `prepared` package is a masked, posed Nerfstudio dataset that a managed requester's worker made from a browser
+ * source set (`dataset/transforms.json`, `dataset/images/*`, `dataset/prepared.json`). It holds no raw photo or
+ * video, so it is the only media-derived package a remote provider may receive. Every referenced image must be a
+ * file inside `dataset/`.
+ */
+async function inspectPrepared(directory: string): Promise<CapturePackageReport> {
+  const fail = (message: string, missing: string[] = []) => ({ ...report(missing.length ? 'capture_frame_file_missing' : 'capture_frames_invalid', message, missing), kind: 'prepared' as const });
+  let record: unknown;
+  let transforms: unknown;
+  try {
+    record = JSON.parse(await fs.readFile(path.join(directory, 'dataset', 'prepared.json'), 'utf8'));
+    transforms = JSON.parse(await fs.readFile(path.join(directory, 'dataset', 'transforms.json'), 'utf8'));
+  } catch {
+    return fail('The prepared dataset has no readable prepared.json and transforms.json');
+  }
+  if (!isPlainObject(record) || record.schema !== 'kubus.prepared-dataset/1') return fail('prepared.json does not declare kubus.prepared-dataset/1');
+  if (!isPlainObject(transforms) || !Array.isArray(transforms.frames) || transforms.frames.length === 0) return fail('transforms.json declares no frames');
+  if (transforms.frames.length > MAX_FRAMES) return fail(`transforms.json declares more than ${MAX_FRAMES} frames`);
+  const missing: string[] = [];
+  for (const frame of transforms.frames) {
+    const relative = isPlainObject(frame) ? captureRelativePath(String(frame.file_path ?? '').replace(/^\.\//, '')) : null;
+    if (!relative || !relative.startsWith('images/')) return fail('A prepared frame path is not under images/');
+    if (!(await hasContent(path.join(directory, 'dataset'), relative))) missing.push(`dataset/${relative}`);
+  }
+  if (missing.length) return fail(`${missing.length} prepared images are missing`, missing);
+  return { ok: true, missingPaths: [], missingCount: 0, frameCount: transforms.frames.length, kind: 'prepared' };
 }
 
 async function inspectMedia(directory: string, hasPhotos: boolean, hasVideo: boolean): Promise<CapturePackageReport> {
