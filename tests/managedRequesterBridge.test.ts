@@ -1477,12 +1477,12 @@ describe('retention purge', () => {
     await expect(fs.stat(root())).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  test('an attempt whose pin cannot be released yet is kept and not acknowledged, and is tried again on the next purge', async () => {
+  test('an attempt whose pin release failed is kept and not acknowledged, and is tried again on the next purge', async () => {
     const { bridge, api, remote } = await finished();
     const state = await stateFile();
     await fs.writeFile(path.join(root(), 'state.json'), JSON.stringify({ ...state, unusedInputs: ['bafyleft'] }));
     api.reconstructionRetention.mockResolvedValue({ purge: [reconstructionId] });
-    remote.releaseUnusedInput.mockResolvedValueOnce({ released: false, reason: 'pin_release_activation_required' });
+    remote.releaseUnusedInput.mockRejectedValueOnce(new Error('kubo offline'));
     expect(await bridge.purgeExpired(nodeId)).toEqual([]);
     expect(api.ackReconstructionRetention).not.toHaveBeenCalled();
     expect((await fs.stat(path.join(root(), 'state.json'))).isFile()).toBe(true);
@@ -1493,25 +1493,39 @@ describe('retention purge', () => {
     await expect(fs.stat(root())).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  test('with pin release switched off the raw sources are still deleted at retention; only the record stays, unacknowledged, with the CID for a later retry', async () => {
+  test('with pin release switched off the attempt is acknowledged once its sources and results are gone, and the unreleased pin stays tracked in the record', async () => {
     const { bridge, api, remote } = makeBridge();
     await bridge.advance(nodeId, attempt());
     expect((await fs.stat(path.join(root(), 'set', 'photos', '11111111-1111-4111-8111-111111111111.jpg'))).isFile()).toBe(true);
     expect((await stateFile()).heldInputs).toEqual(['bafyinput1']);
-    api.reconstructionRetention.mockResolvedValue({ purge: [reconstructionId] });
+    // A backend list that drops a row only when it is acknowledged: an attempt that is never acknowledged blocks the rest of the list.
+    const acknowledged = new Set<string>();
+    api.reconstructionRetention.mockImplementation(async () => ({ purge: [reconstructionId].filter(id => !acknowledged.has(id)) }));
+    api.ackReconstructionRetention.mockImplementation(async (_nodeId: string, ids: string[]) => { ids.forEach(id => acknowledged.add(id)); return { acknowledged: ids.length }; });
     remote.releaseUnusedInput.mockResolvedValue({ released: false, reason: 'pin_release_activation_required' });
-    // Every pass gives the same answer: not acknowledged, and the artist's raw photos and clips are gone after the first.
-    for (let pass = 0; pass < 2; pass += 1) {
-      expect(await bridge.purgeExpired(nodeId)).toEqual([]);
-      await expect(fs.stat(path.join(root(), 'set'))).rejects.toMatchObject({ code: 'ENOENT' });
-      expect((await stateFile()).heldInputs).toEqual(['bafyinput1']);
-    }
-    expect(api.ackReconstructionRetention).not.toHaveBeenCalled();
-    // Once the pin can be released the attempt is purged and acknowledged as before.
-    remote.releaseUnusedInput.mockResolvedValue(undefined);
     expect(await bridge.purgeExpired(nodeId)).toEqual([reconstructionId]);
-    await expect(fs.stat(root())).rejects.toMatchObject({ code: 'ENOENT' });
     expect(api.ackReconstructionRetention).toHaveBeenCalledWith(nodeId, [reconstructionId]);
+    await expect(fs.stat(path.join(root(), 'set'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.stat(stagedDir())).rejects.toMatchObject({ code: 'ENOENT' });
+    const state = await stateFile();
+    expect(state.heldInputs).toEqual(['bafyinput1']);
+    expect(state.requesterCleanup).toBe('pending');
+    // The backend no longer lists it, so it does not hold up later attempts.
+    expect(await bridge.purgeExpired(nodeId)).toEqual([]);
+  });
+
+  test('a purged attempt that kept an unreleased pin is released and removed by the sweep once release works', async () => {
+    const { bridge, api, remote } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    api.reconstructionRetention.mockResolvedValueOnce({ purge: [reconstructionId] });
+    remote.releaseUnusedInput.mockResolvedValue({ released: false, reason: 'pin_release_activation_required' });
+    await bridge.purgeExpired(nodeId);
+    await bridge.sweep(nodeId);
+    expect((await fs.stat(root())).isDirectory()).toBe(true);
+    remote.releaseUnusedInput.mockResolvedValue(undefined);
+    await bridge.sweep(nodeId);
+    expect(remote.releaseUnusedInput).toHaveBeenLastCalledWith('bafyinput1');
+    await expect(fs.stat(root())).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   test('a release that threw also leaves no raw sources behind', async () => {

@@ -110,6 +110,8 @@ interface LocalState {
   providerCleanups?: Record<string, ProviderCleanupRecord>;
   /** What this requester reported for its own cleanup of the attempt: everything released (`complete`), a pin still held because release is switched off (`pending`), or a step that failed (`failed`). */
   requesterCleanup?: 'complete' | 'pending' | 'failed';
+  /** Retention acknowledged this attempt while an input pin was still held (release switched off); the sweep removes the record once the pin is released. */
+  sourcesPurged?: boolean;
 }
 
 /** The backend refuses a lightweight companion for a full file at or under this size; the full file serves as its own preview. */
@@ -255,7 +257,23 @@ export class ManagedRequesterBridge {
     // The artist's raw photos and clips are deleted at retention whatever else is still held: a pin that cannot be released
     // (release switched off, Kubo down) keeps only the record, with the CID, unacknowledged, so the next pass retries it.
     await this.removeSources(id);
-    if (outcome !== 'complete') return false;
+    if (outcome === 'failed') return false;
+    if (outcome === 'pending') {
+      // Pin release is switched off (a deliberate state, not an error): the sources, results and work files are gone, so the
+      // attempt is acknowledged and the backend's retention list moves on; waiting for a pin that may never release would
+      // keep the oldest rows listed for ever and starve every later attempt. The pin stays tracked in the record, and the
+      // sweep releases it and removes the record once release works.
+      const current = await this.readState(id);
+      if (current.requesterCleanup !== 'pending' || !current.sourcesPurged) {
+        await this.writeState(id, { ...current, requesterCleanup: 'pending', sourcesPurged: true });
+        const nodeId = this.deps.nodeId();
+        if (current.requesterCleanup !== 'pending' && nodeId) {
+          await this.deps.api.reconstructionCall(id, 'cleanup', { nodeId, state: 'pending' })
+            .catch(error => this.deps.logger.warn({ code: 'managed_requester_cleanup_report_failed', error: String((error as Error).message) }, 'requester cleanup could not be reported'));
+        }
+      }
+      return true;
+    }
     await fs.rm(directory, { recursive: true, force: true });
     return true;
   }
@@ -313,6 +331,8 @@ export class ManagedRequesterBridge {
       await this.writeState(id, { ...(await this.readState(id)), requesterCleanup: outcome });
       await this.deps.api.reconstructionCall(id, 'cleanup', { nodeId, state: outcome })
         .catch(error => this.deps.logger.warn({ code: 'managed_requester_cleanup_report_failed', error: String((error as Error).message) }, 'requester cleanup could not be reported'));
+      // Retention already acknowledged this attempt and nothing lists it again: with its last pin released, the record goes.
+      if (outcome === 'complete' && state.sourcesPurged) await fs.rm(this.root(id), { recursive: true, force: true });
     }
   }
 
