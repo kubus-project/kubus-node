@@ -60,7 +60,7 @@ export class JobCleanup {
         const response = await fetch(`${this.workerUrl}/v1/jobs/cancel`, {
           method: 'POST', signal: AbortSignal.timeout(20_000),
           headers: { 'Content-Type': 'application/json',
-            'X-Kubus-Worker-Authorization': await this.workerAuth.issue(jobId, record.type) },
+            'X-Kubus-Worker-Authorization': await this.workerAuth.issue(jobId, record.type, { purpose: 'cancel' }) },
           body: JSON.stringify({ jobId, type: record.type, workerInstanceId: record.workerInstanceId }),
         });
         const receipt = await response.json() as Record<string, unknown>;

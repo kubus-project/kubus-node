@@ -97,6 +97,30 @@ class SourceSetTests(unittest.TestCase):
         self.assertEqual(len(inputs), 10)
         self.assertTrue(all(item["submittedViews"] == 1 for item in inputs))
 
+    def test_inputs_whose_images_the_masker_flagged_for_a_look_are_named(self):
+        class Flagging(FakeMasker):
+            """Flags every third image it sees, the way a large unmasked face-like detection would."""
+            def __init__(self):
+                super().__init__([])
+                self.seen = 0
+
+            def find_regions(self, rgb, manual=None, audit=None, review=None):
+                self.seen += 1
+                if review is not None and self.seen % 3 == 0:
+                    review["largeBelowCertain"] = 1
+                return []
+
+        capture = self.capture(photos=30, clips=0)
+        result = ss.prepare_source_set(FakeColmap(), capture, self.root / "work", self.progress,
+                                       masker=Flagging(), convert=fake_convert(first_n(10_000)))
+        flagged = [item["input"] for item in result["inputs"] if item.get("faceReview")]
+        self.assertEqual(len(flagged), 10)
+        self.assertTrue(all(item["faceReview"] == 1 for item in result["inputs"] if item.get("faceReview")))
+        # Nothing flagged: the key is absent, so existing consumers see the same record as before.
+        clean = ss.prepare_source_set(FakeColmap(), capture, self.root / "work2", self.progress,
+                                      masker=FakeMasker([]), convert=fake_convert(first_n(10_000)))
+        self.assertFalse(any("faceReview" in item for item in clean["inputs"]))
+
     def test_an_empty_set_is_refused(self):
         capture = self.root / "capture"
         capture.mkdir()

@@ -1,8 +1,5 @@
 import glob
 import asyncio
-import base64
-import hashlib
-import hmac
 import json
 import os
 import pathlib
@@ -17,20 +14,24 @@ from pydantic import BaseModel
 
 from gpu_tier import classify_vram_tier
 from job_control import JobControl, JobCancelled, hand_back_ownership
+from face_gate import PROVIDER_FACE_REVIEW_CODE, flagged_images
 from face_mask import FaceMaskingError, masking_provenance, missing_review_files
 from photo_pipeline import prepare_photo_dataset
 from scene_frame import analyse_dataset
 from source_set import prepare_source_set, read_prepared_record, write_prepared_record
 from splat_variants import OUTPUT_PROTOCOL, OUTPUT_VARIANTS, convert_export
 from video_pipeline import WorkerError, prepare_video_dataset
+from worker_token import NonceCache, TokenError, mask_flags, request_mode, verify_token
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 WORKER_AUTH_KEY_PATH = os.environ.get("WORKER_AUTH_KEY_PATH", "/var/lib/kubus-node/worker-auth.key")
 
 
-WORKER_VERSION = "kubus-spatial-worker/11"
+WORKER_VERSION = "kubus-spatial-worker/12"
 WORKER_INSTANCE_ID = str(uuid.uuid4())
 control = JobControl("/var/lib/kubus-node/private/worker-control")
+# Every token nonce this worker accepted, until the token expires: a captured header is good once.
+TOKEN_NONCES = NonceCache()
 
 
 class JobRequest(BaseModel):
@@ -95,6 +96,8 @@ def health() -> dict[str, Any]:
         "outputProtocol": OUTPUT_PROTOCOL,
         "version": WORKER_VERSION,
         "cleanupProtocol": 1,
+        # Tokens are single use and bound to the endpoint, the directories, the input mode and the masking request.
+        "tokenProtocol": 2,
         "workerInstanceId": WORKER_INSTANCE_ID,
     }
 
@@ -106,32 +109,26 @@ def ensure_child(root: pathlib.Path, candidate: str) -> pathlib.Path:
     return resolved
 
 
-def decode_urlsafe(value: str) -> bytes:
-    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
-
-
-def authorize_worker(token: str | None, request: JobRequest) -> None:
-    if not token or "." not in token:
-        raise HTTPException(status_code=401, detail="worker_authorization_required")
+def authorize_worker(token: str | None, request: JobRequest, purpose: str) -> None:
+    """Accepts a token only for this job, endpoint and (for `process`) these directories, mode and masking; once."""
     try:
-        payload_raw, signature = token.split(".", 1)
         secret = pathlib.Path(WORKER_AUTH_KEY_PATH).read_bytes()
-        expected = base64.urlsafe_b64encode(hmac.new(secret, payload_raw.encode(), hashlib.sha256).digest()).decode().rstrip("=")
-        if not hmac.compare_digest(signature, expected):
-            raise ValueError("signature")
-        payload = json.loads(decode_urlsafe(payload_raw))
-        if payload.get("jobId") != request.jobId or payload.get("type") != request.type:
-            raise ValueError("binding")
-        now = int(__import__("time").time())
-        if int(payload.get("exp", 0)) < now or int(payload.get("iat", now + 1)) > now + 30:
-            raise ValueError("expiry")
-    except (OSError, ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
+        bound: dict[str, Any] = {}
+        if purpose == "process":
+            bound = {
+                "capture_directory": request.captureDirectory, "output_directory": request.outputDirectory,
+                "mode": request_mode(request.input), "mask": mask_flags(request.input),
+            }
+        verify_token(token, secret, job_id=request.jobId, type_=request.type, purpose=purpose, seen=TOKEN_NONCES, **bound)
+    except TokenError as error:
+        raise HTTPException(status_code=401, detail="worker_authorization_required" if error.reason == "missing" else "worker_authorization_invalid")
+    except OSError:
         raise HTTPException(status_code=401, detail="worker_authorization_invalid")
 
 
 @app.post("/v1/process")
 def process(request: ProcessRequest, x_kubus_worker_authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    authorize_worker(x_kubus_worker_authorization, request)
+    authorize_worker(x_kubus_worker_authorization, request, "process")
     if request.workerInstanceId != WORKER_INSTANCE_ID:
         raise HTTPException(status_code=409, detail="worker_instance_changed")
     try:
@@ -151,7 +148,7 @@ def process(request: ProcessRequest, x_kubus_worker_authorization: str | None = 
 
 @app.post("/v1/jobs/cancel")
 async def cancel(request: JobRequest, x_kubus_worker_authorization: str | None = Header(default=None)):
-    authorize_worker(x_kubus_worker_authorization, request)
+    authorize_worker(x_kubus_worker_authorization, request, "cancel")
     if request.workerInstanceId != WORKER_INSTANCE_ID:
         raise HTTPException(status_code=409, detail="worker_instance_changed")
     try:
@@ -215,6 +212,15 @@ def require_review_files(output: pathlib.Path, masked: dict | None) -> None:
         )
 
 
+def require_no_face_review(record: dict) -> None:
+    """A provider never trains on images the requester's face masker flagged for a human look (or on unchecked ones)."""
+    flagged = flagged_images(record)
+    if flagged is None:
+        raise WorkerError(PROVIDER_FACE_REVIEW_CODE, "The prepared dataset does not show that its faces were masked and checked; the run stops before training", 422)
+    if flagged:
+        raise WorkerError(PROVIDER_FACE_REVIEW_CODE, f"{flagged} image(s) of the prepared dataset were flagged for a face review; the run stops before training", 422, {"count": flagged})
+
+
 def prepare_only(runner, capture: pathlib.Path, output: pathlib.Path, progress, mask: bool) -> dict[str, Any]:
     """The managed requester's stage: a masked, posed dataset and per-input feedback, without training."""
     prepared = prepare_source_set(runner, capture, output, progress, mask=mask)
@@ -275,6 +281,7 @@ def run_reconstruction(request: ProcessRequest):
         if not (dataset / "transforms.json").is_file():
             raise HTTPException(status_code=422, detail="capture_requires_nerfstudio_transforms_json")
         record = read_prepared_record(dataset)
+        require_no_face_review(record)
         # The requester masked and posed these images on its own worker; say so, with its counts, never its images.
         provenance = {"kind": "prepared", "preparedBy": {
             "workerVersion": record.get("workerVersion"), "sfm": record.get("sfm"), "faceMasking": record.get("faceMasking"),

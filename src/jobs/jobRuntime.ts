@@ -655,7 +655,7 @@ export class JobRuntime {
         current.stage = first.stage; current.progress = null; current.updatedAt = new Date().toISOString();
         current.logs.push({ at: current.updatedAt, level: 'info', message: first.message });
       });
-      const authorization = await this.deps.workerAuth.issue(id, job.type);
+      const authorization = await this.deps.workerAuth.issue(id, job.type, { purpose: 'process', captureDirectory: workerCaptureDirectory, outputDirectory, input: job.input });
       if (controller.signal.aborted || this.get(id).state === 'cancelled') return;
       await this.cleanup.markWorkerAttempt(id, workerHealth.workerInstanceId);
       if (controller.signal.aborted || this.get(id).state === 'cancelled') return;
@@ -805,7 +805,7 @@ export class JobRuntime {
     // private-output job (frames, photos, video) keeps its single archive: the worker only splits prepared output.
     if (privateTarget && capture.kind === 'prepared') assertSpatialOutputRoles(validated.map(({ item }) => item.role));
     if (privateTarget && maskingNeedsLookCounts(derivation?.faceMasking).images > 0) {
-      throw new Error('remote_face_review_required');
+      throw Object.assign(new Error('remote_face_review_required'), { code: 'provider_face_review_required' });
     }
     const sealed: PrivateOutputBlob[] = [];
     const id = crypto.randomUUID();

@@ -46,7 +46,7 @@ def find_clips(capture: pathlib.Path) -> list:
     )
 
 
-def _input_feedback(inputs: list, registered: set | None) -> list:
+def _input_feedback(inputs: list, registered: set | None, flagged: set | None = None) -> list:
     out = []
     for item in inputs:
         names = item["names"]
@@ -54,9 +54,20 @@ def _input_feedback(inputs: list, registered: set | None) -> list:
         reason = item.get("reason")
         if not reason and usable == 0:
             reason = "not_registered" if registered is not None else "no_usable_views"
-        out.append({"input": item["input"], "kind": item["kind"], "submittedViews": len(names),
-                    "usableViews": usable, "usable": usable > 0, "reason": reason if usable == 0 else None})
+        entry = {"input": item["input"], "kind": item["kind"], "submittedViews": len(names),
+                 "usableViews": usable, "usable": usable > 0, "reason": reason if usable == 0 else None}
+        # How many of the input's images the face masker flagged for a human look (absent when none), so the requester
+        # can say which files the artist has to replace.
+        looked = sum(1 for name in names if flagged and name in flagged)
+        if looked:
+            entry["faceReview"] = looked
+        out.append(entry)
     return out
+
+
+def _flagged_names(names: list, reviews: list) -> set:
+    """The images whose masking review carries a flag (`weakExcluded` or `largeBelowCertain`), by file name."""
+    return {name for name, review in zip(names, reviews) if isinstance(review, dict) and (review.get("weakExcluded") or review.get("largeBelowCertain"))}
 
 
 def prepare_source_set(
@@ -177,7 +188,8 @@ def prepare_source_set(
     sfm["tool"] = "colmap"
     sfm["toolVersion"] = colmap_version(runner)
     registered = set(_registered_names(dataset / "transforms.json"))
-    feedback = _input_feedback(inputs, registered)
+    flagged = (_flagged_names(photo_names, photo_review) | _flagged_names(video_names, video_review)) if mask else set()
+    feedback = _input_feedback(inputs, registered, flagged)
     masking = {
         "photos": photo_regions if mask and photo_names else None,
         "photosReview": photo_review if mask and photo_names else None,

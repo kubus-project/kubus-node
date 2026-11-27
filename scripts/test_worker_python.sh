@@ -28,5 +28,5 @@ MSYS_NO_PATHCONV=1 docker run --rm --network none --entrypoint sh -v "$src:/src:
   mkdir /tmp/worker-tests
   cp -r /src/. /tmp/worker-tests/
   cd /tmp/worker-tests
-  python -m unittest test_face_mask test_photo_pipeline test_video_pipeline test_source_set test_scene_frame test_job_control test_gpu_tier test_splat_variants test_image_contents
+  python -m unittest test_face_mask test_photo_pipeline test_video_pipeline test_source_set test_scene_frame test_job_control test_gpu_tier test_splat_variants test_image_contents test_worker_token test_face_gate test_server_gate
 '

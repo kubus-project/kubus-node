@@ -50,7 +50,7 @@ async function registerPrepared(dir: string, captures: CaptureStore) {
 }
 
 /** A provider-side job whose worker answers with `variants`, sealed to a requester key; returns the finished job. */
-async function runRemoteJob(variants: Array<{ role: string; name: string }>, options: { prepared?: boolean } = {}) {
+async function runRemoteJob(variants: Array<{ role: string; name: string }>, options: { prepared?: boolean; processed?: (body: Record<string, unknown>) => Promise<Response | undefined> | Response | undefined } = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-provider-output-')); dirs.push(dir);
   const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
   const captures = new CaptureStore(dir, store);
@@ -65,6 +65,8 @@ async function runRemoteJob(variants: Array<{ role: string; name: string }>, opt
     if (url.endsWith('/v1/jobs/cancel')) return new Response(JSON.stringify({ ...JSON.parse(String(init?.body)), cleanupProtocol: 1, quiescent: true }));
     if (url.endsWith('/v1/process')) {
       const body = JSON.parse(String(init?.body ?? '{}'));
+      const custom = await options.processed?.(body);
+      if (custom) return custom;
       await fs.mkdir(path.join(body.outputDirectory, 'render'), { recursive: true });
       for (const [index, variant] of variants.entries()) await fs.writeFile(path.join(body.outputDirectory, 'render', variant.name), Buffer.alloc(64, index + 1));
       return new Response(JSON.stringify({
@@ -117,6 +119,35 @@ describe('provider output of a managed reconstruction', () => {
     const { job, store } = await runRemoteJob([{ role: 'spatial_archive', name: 'reconstruction.ply' }], { prepared: true });
     expect(job.state).toBe('failed');
     expect(job.error?.code).toBe('worker_output_roles_invalid');
+    expect(Object.keys(store.snapshot().privateComputeCids ?? {})).toEqual([]);
+  });
+
+  it('a worker that refuses the dataset for a face review fails the job with the typed provider code and seals nothing', async () => {
+    const { job, store } = await runRemoteJob([{ role: 'spatial_mobile', name: 'reconstruction.ply' }], {
+      prepared: true,
+      processed: () => new Response(JSON.stringify({ detail: { code: 'provider_face_review_required', message: '1 image(s) of the prepared dataset were flagged for a face review', details: { count: 1 } } }), { status: 422 }),
+    });
+    expect(job.state).toBe('failed');
+    expect(job.error?.code).toBe('provider_face_review_required');
+    expect(Object.keys(store.snapshot().privateComputeCids ?? {})).toEqual([]);
+  });
+
+  it('a result whose masking record still has flagged images carries the same typed code and seals nothing', async () => {
+    const { job, store } = await runRemoteJob([{ role: 'spatial_mobile', name: 'reconstruction.ply' }], {
+      prepared: true,
+      // An older worker that did not refuse before training: the provider Node's own check still stops the result.
+      processed: async body => {
+        await fs.mkdir(path.join(String(body.outputDirectory), 'render'), { recursive: true });
+        await fs.writeFile(path.join(String(body.outputDirectory), 'render', 'reconstruction.ply'), Buffer.alloc(64, 1));
+        return new Response(JSON.stringify({
+          variants: [{ role: 'spatial_mobile', path: 'render/reconstruction.ply', mimeType: 'application/octet-stream', format: 'ply', storageClass: 'warm' }],
+          processing: { protocol: 'kubus.spatial-job/1', workerVersion: 'kubus-spatial-worker/11', reconstruction: { engine: 'nerfstudio', method: 'splatfacto', iterations: 1000, outputFormat: 'ply' }, lightweight: null },
+          provenance: { kind: 'prepared', preparedBy: { workerVersion: 'x', faceMasking: { photos: { ran: true, images: 30, needsLook: { images: 1, weakExcluded: 0, largeBelowCertain: 1, items: [] } } } } },
+        }));
+      },
+    });
+    expect(job.state).toBe('failed');
+    expect(job.error?.code).toBe('provider_face_review_required');
     expect(Object.keys(store.snapshot().privateComputeCids ?? {})).toEqual([]);
   });
 

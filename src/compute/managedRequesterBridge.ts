@@ -724,10 +724,11 @@ export function workerPrepare(deps: { workerUrl: string; workerAuth: WorkerAuthS
       throw Object.assign(new Error('The requester worker cannot prepare source sets; rebuild the worker image'), { code: 'worker_source_set_unsupported' });
     }
     const type = 'spatial.reconstruct';
+    const input = { mode: 'source_set', maskFaces: { photos: true, video: true } };
     const response = await longWorkerFetch(`${deps.workerUrl}/v1/process`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Kubus-Worker-Authorization': await deps.workerAuth.issue(jobId, type) },
-      body: JSON.stringify({ jobId, type, workerInstanceId: health.workerInstanceId, captureDirectory, outputDirectory, input: { mode: 'source_set', maskFaces: { photos: true, video: true } } }),
+      headers: { 'Content-Type': 'application/json', 'X-Kubus-Worker-Authorization': await deps.workerAuth.issue(jobId, type, { purpose: 'process', captureDirectory, outputDirectory, input }) },
+      body: JSON.stringify({ jobId, type, workerInstanceId: health.workerInstanceId, captureDirectory, outputDirectory, input }),
     });
     const body = await response.json().catch(() => ({})) as { prepared?: { path?: string; inputs?: unknown; sfm?: Record<string, unknown> }; detail?: { code?: string; details?: Record<string, unknown> } };
     const mapInputs = (raw: unknown): InputFeedback[] => (Array.isArray(raw) ? raw : []).flatMap(item => {
