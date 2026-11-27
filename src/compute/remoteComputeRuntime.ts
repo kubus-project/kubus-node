@@ -133,6 +133,7 @@ export class RemoteComputeRuntime {
     // removal of independently owned readable source directories.
     await managed.reconcile({ ownerPrefix: 'provider-input:' }).catch(() => undefined);
     await managed.reconcile({ ownerPrefix: 'requester-input:' }).catch(() => undefined);
+    await managed.reconcile({ ownerPrefix: 'provider-output:' }).catch(() => undefined);
     await this.providerCleanup.reconcilePending();
     return this.cleanupDiagnostics();
   }

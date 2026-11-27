@@ -210,6 +210,8 @@ export interface ComputeCandidate {
   protocolVersion: string;
   maxAcceptedInputBytes: number;
   privateOutputProtocol?: string | null;
+  /** `kubus.spatial-output/2` for a provider whose worker writes the full and lightweight variants; absent means legacy. */
+  spatialOutputProtocol?: string | null;
   score: number;
 }
 

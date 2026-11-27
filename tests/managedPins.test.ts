@@ -282,3 +282,11 @@ it('re-probes a record left pending by a crash and never removes a pin it did no
   expect(kubo.pinRm).not.toHaveBeenCalled();
   expect(pins.has(v0)).toBe(true);
 });
+it('accepts the provider-output owner a remote job uses for its sealed result blobs', async () => {
+  const { store, kubo, manager } = await fixture();
+  const owner = 'provider-output:3ef91af5-5335-4595-8e8a-0618d2c1c039';
+  await manager.acquire(v0, owner);
+  expect(store.snapshot().managedPins?.[cid]?.owners[owner]).toBeDefined();
+  expect(await manager.release(cid, owner)).toMatchObject({ ownerReleased: true, pinRemoved: true });
+  expect(kubo.pinRm).toHaveBeenCalledWith(cid);
+});

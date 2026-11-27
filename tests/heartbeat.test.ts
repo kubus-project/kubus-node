@@ -131,4 +131,23 @@ describe('sendHeartbeat', () => {
       vi.useRealTimers();
     }
   });
+
+  it('advertises the spatial output protocol only when the worker reports it', async () => {
+    const run = async (workerBody: Record<string, unknown>) => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+        status: 'ready', gpu: { available: true, name: 'RTX' }, capabilities: ['spatial.reconstruct'], ...workerBody,
+      }), { status: 200 }));
+      const sendHeartbeatMock = vi.fn(async (payload) => ({ heartbeat: payload, status: { status: 'healthy' } }));
+      await sendHeartbeat(
+        { sendHeartbeat: sendHeartbeatMock } as never, kubo, makeStore({ nodeId: 'node-1' }) as never,
+        { operatorWallet: 'wallet', skipPinning: false } as AppConfig,
+        new CapabilityRegistry(kubo, 'http://kubus-spatial-worker:8790'),
+      );
+      return sendHeartbeatMock.mock.calls[0]![0].metadata.remoteCompute;
+    };
+    expect(await run({ outputProtocol: 'kubus.spatial-output/2' })).toMatchObject({ spatialOutputProtocol: 'kubus.spatial-output/2' });
+    // A worker that predates the protocol, or reports something unreadable, leaves the field out (legacy).
+    expect(await run({})).not.toHaveProperty('spatialOutputProtocol');
+    expect(await run({ outputProtocol: 'evil protocol' })).not.toHaveProperty('spatialOutputProtocol');
+  });
 });

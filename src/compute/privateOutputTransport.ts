@@ -9,6 +9,8 @@ import { canonicalPinCid } from '../utils/cid.js';
 import { encryptionPublicKey, unwrapComputeKey, wrapComputeKey, type ComputeKeyEnvelope } from './computeKeyEnvelope.js';
 
 export const PRIVATE_OUTPUT_PROTOCOL = 'kubus.private-output/1';
+/** What the worker's output is: a full render derivative (`spatial_mobile`) and an optional lightweight (`spatial_preview`). */
+export const SPATIAL_OUTPUT_PROTOCOL = 'kubus.spatial-output/2';
 export const MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 256 * 1024;
 const MAX_RESULT_BYTES = 2 * MAX_OUTPUT_BYTES;
@@ -166,6 +168,35 @@ export async function openOutputBlob({
     download?.cancel();
     await fs.rm(temporary, { force: true });
     dataKey.fill(0);
+  }
+}
+
+export type SpatialOutputShape =
+  | { kind: 'v2'; full: PrivateOutputBlob; lightweight: PrivateOutputBlob | null }
+  | { kind: 'legacy' }
+  | { kind: 'invalid' };
+
+/**
+ * Reads a validated commitment as a `kubus.spatial-output/2` result: the manifest, one `spatial_mobile` (the full
+ * render derivative) and at most one `spatial_preview` (the lightweight). A result with `spatial_archive` and no
+ * `spatial_mobile` is a legacy provider's raw-training-file output and is never imported.
+ */
+export function spatialOutputShape(output: Pick<PrivateOutputCommitment, 'blobs'>): SpatialOutputShape {
+  const mobile = output.blobs.filter(blob => blob.role === 'spatial_mobile');
+  const preview = output.blobs.filter(blob => blob.role === 'spatial_preview');
+  const archive = output.blobs.some(blob => blob.role === 'spatial_archive');
+  if (archive && !mobile.length) return { kind: 'legacy' };
+  const others = output.blobs.filter(blob => !['manifest', 'spatial_mobile', 'spatial_preview'].includes(blob.role));
+  if (mobile.length !== 1 || preview.length > 1 || others.length) return { kind: 'invalid' };
+  return { kind: 'v2', full: mobile[0]!, lightweight: preview[0] ?? null };
+}
+
+/** The roles a worker may hand a provider for a private-output job; anything else is a legacy or wrong worker. */
+export function assertSpatialOutputRoles(roles: readonly string[]): void {
+  const mobile = roles.filter(role => role === 'spatial_mobile').length;
+  const preview = roles.filter(role => role === 'spatial_preview').length;
+  if (mobile !== 1 || preview > 1 || roles.length !== mobile + preview) {
+    throw Object.assign(new Error('worker_output_roles_invalid'), { code: 'worker_output_roles_invalid' });
   }
 }
 

@@ -18,7 +18,7 @@ import { resolveWorkerOutputFile } from './workerOutput.js';
 import { JobCleanup } from './jobCleanup.js';
 import { ManagedPins } from '../ipfs/managedPins.js';
 import type { CapabilityRegistry } from '../capabilities/registry.js';
-import { PRIVATE_OUTPUT_PROTOCOL, sealOutputBlob, validatePrivateOutput, type PrivateOutputBlob } from '../compute/privateOutputTransport.js';
+import { PRIVATE_OUTPUT_PROTOCOL, assertSpatialOutputRoles, sealOutputBlob, validatePrivateOutput, type PrivateOutputBlob } from '../compute/privateOutputTransport.js';
 
 export type JobType = 'spatial.reconstruct' | 'spatial.optimize' | 'spatial.generate_preview';
 export type JobState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
@@ -800,6 +800,9 @@ export class JobRuntime {
         temporaryDirectory: outputDirectory,
         kubo: this.deps.kubo,
       } : null;
+    // A remote job returns the render derivative and at most a lightweight preview; a worker that still returns the
+    // raw training file (`spatial_archive`) must not have it sealed and signed for the requester.
+    if (privateTarget) assertSpatialOutputRoles(validated.map(({ item }) => item.role));
     if (privateTarget && maskingNeedsLookCounts(derivation?.faceMasking).images > 0) {
       throw new Error('remote_face_review_required');
     }

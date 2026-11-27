@@ -43,7 +43,7 @@ export class ManagedPins {
 
   private checkOwner(owner: string): void {
     if (
-      !/^(?:archive|spatial|requester-input|provider-input|manual):[a-zA-Z0-9_.:-]{1,480}$/.test(
+      !/^(?:archive|spatial|requester-input|provider-input|provider-output|manual):[a-zA-Z0-9_.:-]{1,480}$/.test(
         owner,
       )
     )
