@@ -173,9 +173,22 @@ class OrphanReapTests(unittest.TestCase):
         self.assertFalse(self.control.group_file(JOB).exists())
 
 
-    def test_the_group_is_recorded_before_the_command_runs_and_names_the_command_itself(self):
+    def test_the_launcher_records_the_group_before_the_command_runs_without_any_help_from_the_parent(self):
         import json
-        # The command reads its own record: it exists at its first instruction, so no gap follows the fork.
+        import subprocess
+        # Start the launcher directly, with no record_group from this process: if the record exists when the command
+        # first runs, only the launcher in the new session can have written it, so no gap follows the fork.
+        code = ("import json,os,sys;print(json.dumps({'pid':os.getpid(),'record':json.load(open(sys.argv[1]))}))")
+        command = [sys.executable, "-c", code, str(self.control.group_file(JOB))]
+        self.assertFalse(self.control.group_file(JOB).exists())
+        process = subprocess.run(self.control.launcher(JOB, command), capture_output=True, text=True, timeout=10,
+                                 start_new_session=True)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        seen = json.loads(process.stdout)
+        self.assertEqual(seen["record"]["pgid"], seen["pid"])
+
+    def test_run_names_the_command_itself_in_the_record_and_forgets_it_afterwards(self):
+        import json
         code = ("import json,os,sys;print(json.dumps({'pid':os.getpid(),'record':json.load(open(sys.argv[1]))}))")
         with self.control.job(JOB):
             completed = self.control.run(JOB, [sys.executable, "-c", code, str(self.control.group_file(JOB))], timeout=10)
