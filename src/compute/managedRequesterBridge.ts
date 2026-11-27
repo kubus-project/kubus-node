@@ -507,7 +507,7 @@ export class ManagedRequesterBridge {
         const stale = replaceable && Date.parse(payload.completedAt) <= Date.parse(current.attestation!.completedAt);
         if (!stale) {
           changed = true;
-          next = { ...next, status: 'verified', nextCheckAt: payload.state === 'failed' ? new Date(Date.now() + ATTESTATION_RETRY_BASE_MS).toISOString() : undefined, attestation: { state: payload.state, items: payload.items, outputPins: payload.outputPins, reason: payload.reason, completedAt: payload.completedAt, finalState: payload.finalState, verifiedAt: new Date().toISOString() } };
+          next = { ...next, status: 'verified', code: undefined, nextCheckAt: payload.state === 'failed' ? new Date(Date.now() + ATTESTATION_RETRY_BASE_MS).toISOString() : undefined, attestation: { state: payload.state, items: payload.items, outputPins: payload.outputPins, reason: payload.reason, completedAt: payload.completedAt, finalState: payload.finalState, verifiedAt: new Date().toISOString() } };
         }
       } catch (error) {
         const code = String((error as { code?: string }).code || 'provider_cleanup_attestation_invalid');
@@ -539,6 +539,9 @@ export class ManagedRequesterBridge {
         // Asked for by job id: an earlier, excluded provider job is no longer the attempt's current one.
         const fetched = await this.deps.api.getReconstructionComputeJob(id, nodeId, record.jobId).catch(() => null);
         const view = fetched && fetched.id === record.jobId ? fetched : null;
+        // A backend that answers with the current job (it does not read the job id) cannot give an earlier job's statement:
+        // the record says so instead of looking merely late, and nothing is verified from the other job.
+        if (!view && fetched) await this.markViewUnavailable(id, record.jobId);
         // Verified against what was pinned while the job was current, never against a view of a different job.
         const verification = { ...(view?.verification ?? {}), ...(record.providerSigningPublicKey ? { providerSigningPublicKey: record.providerSigningPublicKey } : {}) };
         await this.recordAttestation(id, {
@@ -547,6 +550,14 @@ export class ManagedRequesterBridge {
         } as RemoteComputeJob);
       }
     }
+  }
+
+  /** Notes on an awaiting record that the backend could not return that job, so an incomplete record explains itself. */
+  private async markViewUnavailable(id: string, jobId: string): Promise<void> {
+    const state = await this.readState(id);
+    const current = state.providerCleanups?.[jobId];
+    if (!current || current.status !== 'awaiting' || current.code === 'provider_job_view_unavailable') return;
+    await this.writeState(id, { ...state, providerCleanups: { ...state.providerCleanups, [jobId]: { ...current, code: 'provider_job_view_unavailable' } } });
   }
 
   /** Removes everything but the verified source copies, which retention removes later. */

@@ -640,7 +640,7 @@ describe('provider cleanup attestation replacement and earlier jobs', () => {
     // A backend that ignores the job id answers with the current job: nothing is verified from it.
     await bridge.collectAttestations(nodeId);
     expect(api.getReconstructionComputeJob).toHaveBeenLastCalledWith(reconstructionId, nodeId, earlier);
-    expect((await stateFile()).providerCleanups[earlier]).toMatchObject({ status: 'awaiting', attempts: 2 });
+    expect((await stateFile()).providerCleanups[earlier]).toMatchObject({ status: 'awaiting', attempts: 2, code: 'provider_job_view_unavailable' });
     await makeDue(earlier);
     const statement = signedAttestation({ jobId: earlier, finalState: 'FAILED' });
     api.getReconstructionComputeJob.mockImplementation((async (_id: string, _node: string, requested?: string) => requested === earlier
@@ -648,6 +648,7 @@ describe('provider cleanup attestation replacement and earlier jobs', () => {
       : job()) as never);
     await bridge.collectAttestations(nodeId);
     expect((await stateFile()).providerCleanups[earlier]).toMatchObject({ status: 'verified', attestation: { state: 'complete', finalState: 'FAILED' } });
+    expect((await stateFile()).providerCleanups[earlier].code).toBeUndefined();
   });
 });
 
