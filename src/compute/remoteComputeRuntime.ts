@@ -350,7 +350,9 @@ export class RemoteComputeRuntime {
       const manifestBlob = commitment.blobs.find(item => item.role === 'manifest')!;
       const manifestPath = path.join(staging, 'manifest.json');
       await openOutputBlob({ blob: manifestBlob, kubo: this.deps.kubo, recipientPrivateKey: key, jobId: job.id, destination: manifestPath });
-      const manifest = validateSpatialManifest(JSON.parse(await fs.readFile(manifestPath, 'utf8')));
+      // The manifest is the provider's: any shape the validator trips over (not only the ones it names) is a wrong result.
+      const manifestText = await fs.readFile(manifestPath, 'utf8');
+      const manifest = verifyingOutput(() => validateSpatialManifest(JSON.parse(manifestText)));
       const variants = new Map(commitment.blobs.filter(item => item.role !== 'manifest').map(item => [item.role, item]));
       if (manifest.variants.length !== variants.size) throw localError(422, 'private_output_variant_binding_invalid');
       for (const variant of manifest.variants) {
