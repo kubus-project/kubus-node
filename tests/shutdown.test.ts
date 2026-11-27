@@ -226,8 +226,10 @@ setInterval(() => {}, 1000);`;
   ])('runCli leaves no lease file behind after %s', async (_name, command, tail) => {
     const { state, leaseFile, lease } = await leased();
     await lease.release();
-    // A state file the runtime cannot read: runCli takes the lease, then fails loading it.
-    await fs.writeFile(state, '{broken');
+    // A worker auth key that is too short: runCli takes the lease, then WorkerAuthService.initialize throws
+    // worker_auth_key_too_short on every platform. (A corrupt state.json is not a failure: LocalStore.load recovers it.)
+    const shortKey = path.join(path.dirname(state), 'short-worker-auth.key');
+    await fs.writeFile(shortKey, 'short');
     const env = {
       ...process.env,
       KUBUS_NODE_CONFIG_PATH: path.join(path.dirname(state), 'missing-config.env'),
@@ -236,6 +238,7 @@ setInterval(() => {}, 1000);`;
       IPFS_GATEWAY_URL: 'http://127.0.0.1:1', LOCAL_STATE_PATH: state, NODE_ENV: 'test', LOG_LEVEL: 'silent',
       HEARTBEAT_INTERVAL_MS: '5000', CID_SYNC_INTERVAL_MS: '30000', COMMITMENT_INTERVAL_MS: '30000',
       STATUS_INTERVAL_MS: '10000', MAX_PINNED_CIDS: '10', CID_CLASS_FILTERS: 'hot,warm',
+      WORKER_AUTH_KEY_PATH: shortKey,
     };
     const code = `import { runCli } from ${JSON.stringify(sourceUrl('src/cli/commands.ts'))};
 import { promises as fs } from 'node:fs';
@@ -250,6 +253,7 @@ ${tail}`;
     child.stderr.on('data', (chunk) => { error += String(chunk); });
     const status = await new Promise<number | null>((resolve) => { child.once('exit', (value) => resolve(value)); });
     // The lease really was taken before the failure (otherwise the test proves nothing)...
+    expect(output).toContain('RUNCLI_ERROR worker_auth_key_too_short');
     expect(output).toContain('LEASE_HELD_AFTER_FAILURE true');
     expect(status).toBe(tail ? 75 : 0);
     // ...and the exit hook runCli armed removed it.
