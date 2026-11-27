@@ -256,4 +256,6 @@ export interface RemoteComputeJob {
   requesterReceipt?: Record<string, unknown>;
   verification?: Record<string, unknown>;
   failure?: Record<string, unknown>;
+  /** The provider's cleanup statement as the backend verified and stored it, when it has one: `{ state, attestation: { payload, signature } }`. */
+  providerCleanup?: { state?: string; attestation?: unknown } | null;
 }

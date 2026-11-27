@@ -211,9 +211,10 @@ export class KubusApiClient {
     return this.request(`/api/spatial/reconstruction-bridge/${encodeURIComponent(id)}/compute-job${queryString({ nodeId })}`);
   }
 
-  async appendReconstructionCandidate(id: string, offset: number, bytes: Buffer, nodeId: string): Promise<{ reconstruction: ManagedReconstruction; candidate: { state: string } }> {
-    const response = await this.binary(`/api/spatial/reconstruction-bridge/${encodeURIComponent(id)}/candidate/chunks/${offset}${queryString({ nodeId })}`, 'PUT', bytes);
-    return normalizeData(safeJson(response.toString('utf8'))) as { reconstruction: ManagedReconstruction; candidate: { state: string } };
+  /** One chunk of the full candidate, or of its lightweight companion with `variant: 'lightweight'`; the answer names the server's `receivedBytes`. */
+  async appendReconstructionCandidate(id: string, offset: number, bytes: Buffer, nodeId: string, variant?: 'lightweight'): Promise<{ reconstruction: ManagedReconstruction; candidate: { state: string; receivedBytes?: number } }> {
+    const response = await this.binary(`/api/spatial/reconstruction-bridge/${encodeURIComponent(id)}/candidate/chunks/${offset}${queryString({ nodeId, variant })}`, 'PUT', bytes);
+    return normalizeData(safeJson(response.toString('utf8'))) as { reconstruction: ManagedReconstruction; candidate: { state: string; receivedBytes?: number } };
   }
 
   /** One bounded binary exchange (a 4 MiB chunk either way), retried like JSON requests. */

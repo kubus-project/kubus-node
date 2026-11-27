@@ -7,7 +7,8 @@ import type { CaptureRecord, CaptureStore } from '../captures/captureStore.js';
 import type { Logger } from '../logging/logger.js';
 import type { WorkerAuthService } from '../spatial/workerAuth.js';
 import { longWorkerFetch, workerFailure } from '../spatial/workerClient.js';
-import { PRIVATE_OUTPUT_PROTOCOL } from './privateOutputTransport.js';
+import { PRIVATE_OUTPUT_PROTOCOL, SPATIAL_OUTPUT_PROTOCOL, spatialOutputShape, type PrivateOutputCommitment } from './privateOutputTransport.js';
+import { verifyProviderCleanupAttestation, type ProviderCleanupPayload } from './providerCleanupAttestation.js';
 import type { PrivatePayloadTransport } from './privatePayloadTransport.js';
 import type { RemoteComputeRuntime } from './remoteComputeRuntime.js';
 
@@ -17,8 +18,9 @@ import type { RemoteComputeRuntime } from './remoteComputeRuntime.js';
  * The backend binds each attempt to the walletless artist, the artwork and a source revision; this Node only sees
  * file digests and bytes. For each attempt it downloads and verifies the source files, prepares them on its own
  * worker (photos and clips to a masked, posed dataset, with per-input feedback), encrypts that dataset to an
- * eligible provider that supports `kubus.private-output/1`, verifies and stages the encrypted result, acknowledges
- * it, and uploads the signed variant as the artist's new private candidate. Raw photos and video never leave this
+ * eligible provider that supports `kubus.private-output/1` and `kubus.spatial-output/2`, verifies and stages the
+ * encrypted result, acknowledges it, and uploads the signed full variant (and the lightweight one, when the provider
+ * made it) as the artist's new private candidate. Raw photos and video never leave this
  * Node. Source copies stay until the backend's retention list says they may go (seven days after the last attempt).
  */
 
@@ -41,7 +43,35 @@ export interface ManagedRequesterDeps {
   intervalMs?: number;
 }
 
-interface LocalState { excludedProviders: string[]; captureId?: string; inputBytes?: number }
+/** What this Node knows of one provider job's cleanup statement. Only a verified statement is ever recorded as a result. */
+export interface ProviderCleanupRecord {
+  jobId: string;
+  providerNodeId: string;
+  finalState: string;
+  status: 'awaiting' | 'verified' | 'invalid' | 'unconfirmed';
+  attempts: number;
+  nextCheckAt?: string;
+  since: string;
+  code?: string;
+  attestation?: Pick<ProviderCleanupPayload, 'state' | 'items' | 'outputPins' | 'reason' | 'completedAt' | 'finalState'> & { verifiedAt: string };
+}
+
+interface LocalState {
+  excludedProviders: string[];
+  /** Providers whose result was the legacy raw-archive shape; they are excluded like any other and named in the final failure. */
+  outdatedProviders?: string[];
+  captureId?: string;
+  inputBytes?: number;
+  providerCleanups?: Record<string, ProviderCleanupRecord>;
+  /** What this requester reported for its own cleanup of the attempt (`complete` or `failed`). */
+  requesterCleanup?: 'complete' | 'failed';
+}
+
+/** The backend refuses a lightweight companion for a full file at or under this size; the full file serves as its own preview. */
+export const LIGHTWEIGHT_MAX_BYTES = 20 * 1024 * 1024;
+const ATTESTATION_RETRY_BASE_MS = 60_000;
+const ATTESTATION_RETRY_MAX_MS = 30 * 60_000;
+const ATTESTATION_GIVE_UP_MS = 48 * 60 * 60_000;
 
 const FINISHED_JOB = new Set(['FAILED', 'EXPIRED', 'DECLINED', 'DISPUTED', 'CANCELLED']);
 const EXTENSIONS: Record<string, string> = { jpeg: 'jpg', png: 'png', mp4: 'mp4', mov: 'mov' };
@@ -92,6 +122,7 @@ export class ManagedRequesterBridge {
     this.running = true;
     try {
       if (Date.now() - this.lastRetentionAt > 10 * 60_000) await this.purgeExpired(nodeId);
+      await this.collectAttestations(nodeId).catch(error => this.deps.logger.warn({ code: 'managed_requester_attestation_scan_failed', error: String((error as Error)?.message || error) }, 'provider cleanup attestation scan failed'));
       const attempt = await this.deps.api.claimReconstruction(nodeId);
       if (attempt) await this.advance(nodeId, attempt);
     } finally {
@@ -179,7 +210,7 @@ export class ManagedRequesterBridge {
     const outcome = await this.deps.prepare({ jobId: attempt.id, captureDirectory: set, outputDirectory: work, fileIds });
     if (!outcome.ok) {
       await this.deps.api.reconstructionCall(attempt.id, 'failure', { nodeId, code: outcome.code, feedback: this.feedback(outcome.inputs, outcome.details) });
-      await fs.rm(work, { recursive: true, force: true });
+      await this.finish(nodeId, attempt.id, state.captureId, async () => { await fs.rm(work, { recursive: true, force: true }); });
       return false;
     }
     // The capture that leaves this Node: capture.json and the masked dataset, nothing else.
@@ -242,7 +273,10 @@ export class ManagedRequesterBridge {
     const nodes = await this.deps.api.reconstructionCall<ComputeCandidate[]>(attempt.id, 'providers', {
       nodeId, inputBytes: state.inputBytes, excludeNodeIds: state.excludedProviders,
     });
-    const provider = (Array.isArray(nodes) ? nodes : []).find(node => node.privateOutputProtocol === PRIVATE_OUTPUT_PROTOCOL);
+    // Only a provider whose worker writes the full and lightweight variants (`kubus.spatial-output/2`) is eligible;
+    // one that does not report it is a legacy provider and would return the raw training file.
+    const provider = (Array.isArray(nodes) ? nodes : []).find(node =>
+      node.privateOutputProtocol === PRIVATE_OUTPUT_PROTOCOL && node.spatialOutputProtocol === SPATIAL_OUTPUT_PROTOCOL);
     if (!provider) {
       // Also renews the lease while no eligible provider has capacity.
       await this.progress(nodeId, attempt, 'waiting_for_node', 'waiting_for_node');
@@ -264,12 +298,25 @@ export class ManagedRequesterBridge {
     if (job.state === 'COMPLETED') return this.importCandidate(nodeId, attempt, job);
     if (job.state === 'OUTPUT_READY') {
       let accepted = true;
-      try { await this.deps.remote.stagePrivateOutput(job); } catch (error) {
+      let reason: string | undefined;
+      try {
+        await this.deps.remote.stagePrivateOutput(job);
+        // The commitment is signed and verified by the staging above; only now is its shape read.
+        const shape = this.outputShape(job);
+        if (shape.kind === 'legacy') { accepted = false; reason = 'provider_output_outdated'; }
+        else if (shape.kind === 'invalid') { accepted = false; reason = 'output_verification_failed'; }
+      } catch (error) {
         // A result that fails verification is disputed, never imported.
         accepted = false;
+        reason = 'output_verification_failed';
         this.deps.logger.warn({ code: 'managed_requester_output_rejected', jobId: job.id, error: String((error as { code?: string }).code || (error as Error).message) }, 'provider output failed verification');
       }
-      const receipt = await this.deps.remote.signedAcknowledgement(job, accepted, accepted ? undefined : 'output_verification_failed');
+      if (reason === 'provider_output_outdated') {
+        this.deps.logger.warn({ code: 'managed_requester_output_outdated', jobId: job.id, providerNodeId: job.providerNodeId }, 'provider returned the legacy raw output and is excluded');
+        const state = await this.readState(attempt.id);
+        await this.writeState(attempt.id, { ...state, outdatedProviders: Array.from(new Set([...(state.outdatedProviders ?? []), job.providerNodeId])) });
+      }
+      const receipt = await this.deps.remote.signedAcknowledgement(job, accepted, reason);
       const updated = await this.deps.api.reconstructionCall<RemoteComputeJob>(attempt.id, 'compute-job/acknowledge', { nodeId, accepted, receipt });
       if (updated.state === 'COMPLETED') return this.importCandidate(nodeId, attempt, updated);
       return this.providerLost(nodeId, attempt, updated);
@@ -283,51 +330,195 @@ export class ManagedRequesterBridge {
     const state = await this.readState(attempt.id);
     const excludedProviders = Array.from(new Set([...state.excludedProviders, job.providerNodeId]));
     await this.writeState(attempt.id, { ...state, excludedProviders });
+    await this.trackProviderJob(attempt.id, job);
     if (excludedProviders.length >= (this.deps.maxProviderAttempts ?? 3)) {
-      await this.deps.api.reconstructionCall(attempt.id, 'failure', { nodeId, code: 'no_provider_completed' });
-      await this.purgeWork(attempt.id, state.captureId);
+      // Every provider that was tried returned the legacy output: say that, not a generic loss.
+      const outdated = state.outdatedProviders ?? [];
+      const code = excludedProviders.every(id => outdated.includes(id)) ? 'provider_output_outdated' : 'no_provider_completed';
+      await this.deps.api.reconstructionCall(attempt.id, 'failure', { nodeId, code });
+      await this.finish(nodeId, attempt.id, state.captureId);
       return;
     }
     await this.progress(nodeId, attempt, 'waiting_for_node', 'provider_lost');
   }
 
-  /** Uploads the provider-signed variant as the artist's new private candidate, resuming at the server's offset. */
+  /** The shape of the signed commitment the provider sealed (call only after the commitment has been verified). */
+  private outputShape(job: RemoteComputeJob) {
+    const commitment = (job.providerReceipt?.payload as { privateOutput?: Pick<PrivateOutputCommitment, 'blobs'> } | undefined)?.privateOutput;
+    return commitment && Array.isArray(commitment.blobs) ? spatialOutputShape(commitment) : { kind: 'invalid' as const };
+  }
+
+  /**
+   * Uploads the provider-signed full variant, and the lightweight one when there is one, as the artist's new private
+   * candidate. Each file resumes at the server's own `receivedBytes`. Local files and the provider's input are released,
+   * and requester cleanup is reported, only once the server says the attempt is `ready`.
+   */
   private async importCandidate(nodeId: string, attempt: ManagedReconstruction, job: RemoteComputeJob): Promise<void> {
-    const { directory } = await this.deps.remote.stagePrivateOutput(job);
-    const role = ['spatial_archive', 'spatial_mobile', 'spatial_preview'].find(name => (job.providerReceipt?.payload as { privateOutput?: { blobs?: Array<{ role: string }> } } | undefined)?.privateOutput?.blobs?.some(blob => blob.role === name));
-    if (!role) throw Object.assign(new Error('private_output_variant_missing'), { code: 'private_output_variant_missing' });
-    const file = path.join(directory, role);
-    const { sha256, size } = await sha256File(file);
-    const created = await this.deps.api.reconstructionCall<{ reconstruction: ManagedReconstruction; candidate: { receivedBytes: number; state: string } }>(attempt.id, 'candidate', {
-      nodeId, fileName: 'reconstruction.ply', format: 'ply', sizeBytes: size, sha256,
+    const staged = await this.deps.remote.stagePrivateOutput(job);
+    const shape = this.outputShape(job);
+    // Never import what this requester did not acknowledge as accepted, nor a raw archive from a legacy provider.
+    if (shape.kind === 'legacy') return this.failImport(nodeId, attempt, job, 'provider_output_outdated');
+    if (shape.kind !== 'v2') return this.failImport(nodeId, attempt, job, 'provider_output_invalid');
+    const binding = (staged.record as { binding?: unknown } | undefined)?.binding;
+    const receipt = job.requesterReceipt as { payload?: { accepted?: unknown; jobId?: unknown; privateOutputBinding?: unknown } } | undefined;
+    if (job.state !== 'COMPLETED' || receipt?.payload?.accepted !== true || receipt.payload.jobId !== job.id ||
+        typeof binding !== 'string' || receipt.payload.privateOutputBinding !== binding) {
+      this.deps.logger.warn({ code: 'managed_requester_completed_unacknowledged', jobId: job.id }, 'a completed job is not backed by this requester\'s acknowledgement of the staged output');
+      return this.failImport(nodeId, attempt, job, 'provider_output_unverified');
+    }
+    const fullFile = path.join(staged.directory, 'spatial_mobile');
+    const full = await sha256File(fullFile);
+    let lightFile: string | undefined;
+    let light: { sha256: string; size: number } | undefined;
+    if (shape.lightweight) {
+      lightFile = path.join(staged.directory, 'spatial_preview');
+      light = await sha256File(lightFile);
+      if (light.size > LIGHTWEIGHT_MAX_BYTES) return this.failImport(nodeId, attempt, job, 'provider_output_invalid');
+      // The full file is within the limit: it is its own preview and the backend would refuse a companion.
+      if (full.size <= LIGHTWEIGHT_MAX_BYTES) { lightFile = undefined; light = undefined; }
+    }
+    const created = await this.deps.api.reconstructionCall<{ reconstruction?: ManagedReconstruction; candidate: { receivedBytes?: number; state: string; lightweight?: { receivedBytes?: number; state: string } | null } }>(attempt.id, 'candidate', {
+      nodeId, fileName: 'reconstruction.ply', format: 'ply', sizeBytes: full.size, sha256: full.sha256,
+      ...(light ? { lightweight: { fileName: 'reconstruction-light.ply', format: 'ply', sizeBytes: light.size, sha256: light.sha256 } } : {}),
     });
-    let received = created.candidate.receivedBytes || 0;
-    let finished = created.candidate.state === 'ready';
+    let reconstruction = created.reconstruction;
+    reconstruction = await this.upload(nodeId, attempt, fullFile, full.size, created.candidate, undefined) ?? reconstruction;
+    if (lightFile && light) {
+      reconstruction = await this.upload(nodeId, attempt, lightFile, light.size, created.candidate.lightweight ?? { state: 'uploading', receivedBytes: 0 }, 'lightweight') ?? reconstruction;
+    }
+    if (reconstruction?.state !== 'ready') {
+      // Not ready yet (a file is incomplete or the server has not finished): nothing is released; the next pass resumes.
+      throw Object.assign(new Error('candidate_not_ready'), { code: 'candidate_not_ready' });
+    }
+    await this.trackProviderJob(attempt.id, job);
+    const state = await this.readState(attempt.id);
+    await this.finish(nodeId, attempt.id, state.captureId, async () => { await this.deps.remote.releaseInput(job); });
+  }
+
+  /** Sends one file's missing bytes, each next offset being the one the server reports. Returns the last reconstruction view. */
+  private async upload(nodeId: string, attempt: ManagedReconstruction, file: string, size: number, start: { receivedBytes?: number; state: string }, variant: 'lightweight' | undefined): Promise<ManagedReconstruction | undefined> {
+    let received = Number.isSafeInteger(start.receivedBytes) ? start.receivedBytes as number : 0;
+    let finished = start.state === 'ready';
+    let last: ManagedReconstruction | undefined;
     const handle = await fs.open(file, 'r');
     try {
       while (!finished && received < size) {
         const length = Math.min(attempt.chunkSizeBytes, size - received);
         const buffer = Buffer.alloc(length);
         await handle.read(buffer, 0, length, received);
-        const result = await this.deps.api.appendReconstructionCandidate(attempt.id, received, buffer, nodeId);
-        received += length;
+        const result = await this.deps.api.appendReconstructionCandidate(attempt.id, received, buffer, nodeId, variant);
+        last = result.reconstruction;
+        const next = result.candidate.receivedBytes;
+        // The server's count decides where the next chunk starts; a count that did not advance would loop forever.
+        if (!Number.isSafeInteger(next) || (next as number) <= received || (next as number) > size) {
+          throw Object.assign(new Error('candidate_progress_unreadable'), { code: 'candidate_progress_unreadable' });
+        }
+        received = next as number;
         finished = result.candidate.state === 'ready';
       }
     } finally { await handle.close(); }
-    await this.deps.remote.releaseInput(job);
+    return last;
+  }
+
+  /** A result that cannot be imported ends the attempt as a provider failure; requester cleanup is still reported. */
+  private async failImport(nodeId: string, attempt: ManagedReconstruction, job: RemoteComputeJob, code: string): Promise<void> {
+    await this.trackProviderJob(attempt.id, job);
+    await this.deps.api.reconstructionCall(attempt.id, 'failure', { nodeId, code });
     const state = await this.readState(attempt.id);
-    await this.purgeWork(attempt.id, state.captureId);
-    await this.deps.api.reconstructionCall(attempt.id, 'cleanup', { nodeId, state: 'complete' }).catch(() => undefined);
+    await this.finish(nodeId, attempt.id, state.captureId, async () => { await this.deps.remote.releaseInput(job); });
   }
 
   private async cancel(nodeId: string, attempt: ManagedReconstruction): Promise<void> {
+    let release: (() => Promise<void>) | undefined;
     if (attempt.computeJobId) {
       const job = await this.deps.api.reconstructionCall<RemoteComputeJob>(attempt.id, 'compute-job/cancel', { nodeId });
-      await this.deps.remote.releaseInput(job).catch(error => this.deps.logger.warn({ code: 'managed_requester_input_release_failed', error: String((error as Error).message) }, 'encrypted input release requires retry'));
+      await this.trackProviderJob(attempt.id, job);
+      release = async () => { await this.deps.remote.releaseInput(job); };
     }
     const state = await this.readState(attempt.id);
-    await this.purgeWork(attempt.id, state.captureId);
     await this.deps.api.reconstructionCall(attempt.id, 'cancelled', { nodeId });
+    await this.finish(nodeId, attempt.id, state.captureId, release);
+  }
+
+  /**
+   * The attempt is over, whichever way it ended. Releases what this requester holds (the provider input pin, the
+   * prepared capture, every work file but the source copies and the attempt's own record), then reports the outcome of
+   * that cleanup (the staged provider result included). It is reported on every terminal path: ready, failed, needs more
+   * views and cancelled.
+   */
+  private async finish(nodeId: string, id: string, captureId: string | undefined, release?: () => Promise<void>): Promise<void> {
+    let outcome: 'complete' | 'failed' = 'complete';
+    try {
+      await release?.();
+    } catch (error) {
+      outcome = 'failed';
+      this.deps.logger.warn({ code: 'managed_requester_input_release_failed', error: String((error as Error).message) }, 'encrypted input release requires retry');
+    }
+    try {
+      // The provider's decrypted result, staged here to verify and import it, goes with the rest.
+      for (const jobId of Object.keys((await this.readState(id)).providerCleanups ?? {})) {
+        if (UUID.test(jobId)) await fs.rm(path.join(this.deps.dataRoot, 'private', 'remote-results', jobId), { recursive: true, force: true });
+      }
+      await this.purgeWork(id, captureId);
+    } catch (error) {
+      outcome = 'failed';
+      this.deps.logger.warn({ code: 'managed_requester_work_purge_failed', error: String((error as Error).message) }, 'requester work files remain for retention');
+    }
+    await this.writeState(id, { ...(await this.readState(id)), requesterCleanup: outcome }).catch(() => undefined);
+    await this.deps.api.reconstructionCall(id, 'cleanup', { nodeId, state: outcome })
+      .catch(error => this.deps.logger.warn({ code: 'managed_requester_cleanup_report_failed', error: String((error as Error).message) }, 'requester cleanup could not be reported'));
+  }
+
+  /**
+   * Remembers that a provider job ended and looks for the provider's cleanup statement. The statement arrives after the
+   * job is terminal, usually after this attempt has finished, so what is not there yet is looked for again later.
+   */
+  private async trackProviderJob(id: string, job: RemoteComputeJob): Promise<void> {
+    const state = await this.readState(id);
+    const records = { ...(state.providerCleanups ?? {}) };
+    records[job.id] ??= { jobId: job.id, providerNodeId: job.providerNodeId, finalState: job.state, status: 'awaiting', attempts: 0, since: new Date().toISOString() };
+    await this.writeState(id, { ...state, providerCleanups: records });
+    await this.recordAttestation(id, job);
+  }
+
+  /** Verifies the statement on a terminal job view against the provider's pinned key and records it; never trusts an unverified one. */
+  private async recordAttestation(id: string, job: RemoteComputeJob): Promise<void> {
+    const state = await this.readState(id);
+    const current = state.providerCleanups?.[job.id];
+    if (!current || current.status === 'verified' || current.status === 'invalid' || current.status === 'unconfirmed') return;
+    const attestation = job.providerCleanup?.attestation;
+    let next: ProviderCleanupRecord = { ...current, finalState: job.state };
+    if (attestation) {
+      try {
+        const payload = verifyProviderCleanupAttestation(job, attestation);
+        next = { ...next, status: 'verified', attestation: { state: payload.state, items: payload.items, outputPins: payload.outputPins, reason: payload.reason, completedAt: payload.completedAt, finalState: payload.finalState, verifiedAt: new Date().toISOString() } };
+      } catch (error) {
+        next = { ...next, status: 'invalid', code: String((error as { code?: string }).code || 'provider_cleanup_attestation_invalid') };
+        this.deps.logger.warn({ code: next.code, jobId: job.id }, 'provider cleanup attestation did not verify');
+      }
+    } else {
+      const attempts = current.attempts + 1;
+      const age = Date.now() - Date.parse(current.since);
+      next = age > ATTESTATION_GIVE_UP_MS
+        ? { ...next, status: 'unconfirmed', attempts, nextCheckAt: undefined }
+        : { ...next, attempts, nextCheckAt: new Date(Date.now() + Math.min(ATTESTATION_RETRY_MAX_MS, ATTESTATION_RETRY_BASE_MS * 2 ** Math.min(attempts - 1, 6))).toISOString() };
+    }
+    await this.writeState(id, { ...state, providerCleanups: { ...state.providerCleanups, [job.id]: next } });
+  }
+
+  /** Looks again for provider statements that had not arrived when an attempt finished. */
+  async collectAttestations(nodeId: string): Promise<void> {
+    const base = path.join(this.deps.dataRoot, 'private', 'reconstructions');
+    for (const id of await fs.readdir(base).catch(() => [] as string[])) {
+      if (!UUID.test(id)) continue;
+      const state = await this.readState(id);
+      for (const record of Object.values(state.providerCleanups ?? {})) {
+        if (record.status !== 'awaiting' || (record.nextCheckAt && Date.parse(record.nextCheckAt) > Date.now())) continue;
+        const job = await this.deps.api.getReconstructionComputeJob(id, nodeId).catch(() => null);
+        if (job && job.id === record.jobId) await this.recordAttestation(id, job);
+        else await this.recordAttestation(id, { ...(job ?? {}), id: record.jobId, providerNodeId: record.providerNodeId, state: record.finalState } as RemoteComputeJob);
+      }
+    }
   }
 
   /** Removes everything but the verified source copies, which retention removes later. */
@@ -335,7 +526,13 @@ export class ManagedRequesterBridge {
     if (captureId) await this.deps.captures.removeRemote(captureId).catch(() => undefined);
     const root = this.root(id);
     for (const entry of await fs.readdir(root).catch(() => [] as string[])) {
-      if (entry !== 'set') await fs.rm(path.join(root, entry), { recursive: true, force: true });
+      if (entry !== 'set' && entry !== 'state.json') await fs.rm(path.join(root, entry), { recursive: true, force: true });
+    }
+    // The attempt's record stays (provider statements, cleanup outcome) but no longer names a prepared capture.
+    const kept = await this.readState(id);
+    if (kept.captureId || kept.inputBytes !== undefined) {
+      const { captureId: _captureId, inputBytes: _inputBytes, ...rest } = kept;
+      await this.writeState(id, rest);
     }
   }
 }
