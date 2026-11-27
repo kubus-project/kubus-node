@@ -26,7 +26,7 @@ import { ProviderCleanupAttestor } from './providerCleanupAttestation.js';
 import { ManagedPins } from '../ipfs/managedPins.js';
 import { jobIdPattern } from '../jobs/ownedWorkDirectory.js';
 import {
-  PRIVATE_OUTPUT_PROTOCOL, openOutputBlob, outputCommitmentDigest, validatePrivateOutput, type PrivateOutputCommitment,
+  PRIVATE_OUTPUT_PROTOCOL, openOutputBlob, outputCommitmentDigest, validatePrivateOutput, verifyingOutput, type PrivateOutputCommitment,
 } from './privateOutputTransport.js';
 
 /** Whether a requester's encrypted input pin was really released. A pin whose release is switched off stays held. */
@@ -37,6 +37,10 @@ function isPrivateOutput(job: RemoteComputeJob): boolean {
 }
 
 function signedPrivateOutput(job: RemoteComputeJob): PrivateOutputCommitment {
+  return verifyingOutput(() => checkSignedPrivateOutput(job));
+}
+
+function checkSignedPrivateOutput(job: RemoteComputeJob): PrivateOutputCommitment {
   if (!jobIdPattern.test(job.id) || !job.outputManifestCid) throw localError(422, 'private_output_job_invalid');
   const receipt = job.providerReceipt as { payload?: Record<string, unknown>; signature?: unknown } | undefined;
   const payload = receipt?.payload;

@@ -6,7 +6,7 @@ import { create as createDigest } from 'multiformats/hashes/digest';
 import { CID } from 'multiformats/cid';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import {
-  assertSpatialOutputRoles, isOutputVerificationFailure, openOutputBlob, outputCommitmentDigest, PRIVATE_OUTPUT_PROTOCOL, sealOutputBlob, spatialOutputShape, validatePrivateOutput,
+  assertSpatialOutputRoles, isOutputVerificationFailure, OutputVerificationError, openOutputBlob, outputCommitmentDigest, PRIVATE_OUTPUT_PROTOCOL, sealOutputBlob, spatialOutputShape, validatePrivateOutput,
 } from '../src/compute/privateOutputTransport.js';
 
 const jobId = '3ef91af5-5335-4595-8e8a-0618d2c1c039';
@@ -178,5 +178,48 @@ describe('private output transport', () => {
       Object.assign(new Error('premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' }), new Error('fetch failed'), 'string', undefined,
     ];
     for (const error of transient) expect(isOutputVerificationFailure(error), String((error as Error)?.message ?? error)).toBe(false);
+  });
+});
+
+describe('key material the provider controls is a verification failure', () => {
+  async function commitmentWithEnvelopeKey(mutate: (key: string) => string) {
+    const requester = crypto.generateKeyPairSync('x25519');
+    const mobile = await artifact('spatial_mobile', Buffer.from('synthetic full'), requester.publicKey);
+    const manifest = await artifact('manifest', Buffer.from('{}'), requester.publicKey);
+    mobile.keyEnvelope = { ...mobile.keyEnvelope, ephemeralPublicKey: mutate(mobile.keyEnvelope.ephemeralPublicKey) };
+    return { requester, mobile, manifest, commitment: { schema: PRIVATE_OUTPUT_PROTOCOL, manifestCid: manifest.cid, blobs: [mobile, manifest] } };
+  }
+
+  test('a commitment whose envelope key is not valid SPKI DER (a raw OpenSSL error) is typed and classed as a verification failure', async () => {
+    const { commitment, manifest, mobile } = await commitmentWithEnvelopeKey(() => Buffer.from('not a der key at all').toString('base64'));
+    const failure = (() => { try { validatePrivateOutput(commitment, jobId, manifest.cid, [manifest.cid, mobile.cid]); } catch (error) { return error; } return null; })();
+    expect(failure).toBeInstanceOf(OutputVerificationError);
+    expect(isOutputVerificationFailure(failure)).toBe(true);
+    // The same bad key, as the bare error Node throws for it, carries no signal of its own.
+    expect(isOutputVerificationFailure(new Error('Failed to read asymmetric key'))).toBe(false);
+  });
+
+  test('a key of the wrong type, and one that opening cannot unwrap, are typed too', async () => {
+    const ed = crypto.generateKeyPairSync('ed25519').publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
+    const { commitment, manifest, mobile } = await commitmentWithEnvelopeKey(() => ed);
+    expect(() => validatePrivateOutput(commitment, jobId, manifest.cid, [manifest.cid, mobile.cid])).toThrow(OutputVerificationError);
+    // A valid envelope for somebody else: unwrapping fails on the tag, and so does a garbage ephemeral key at open time.
+    const requester = crypto.generateKeyPairSync('x25519');
+    const blob = await artifact('spatial_preview', Buffer.from('synthetic bytes'), requester.publicKey);
+    const broken = { ...blob, keyEnvelope: { ...blob.keyEnvelope, ephemeralPublicKey: Buffer.from('garbage').toString('base64') } };
+    const failure = await openOutputBlob({ blob: broken, kubo, recipientPrivateKey: requester.privateKey, jobId, destination: path.join(directory, 'never') })
+      .then(() => null, (error: unknown) => error);
+    expect(failure).toBeInstanceOf(OutputVerificationError);
+    expect(isOutputVerificationFailure(failure)).toBe(true);
+  });
+
+  test('an I/O error is not turned into a verification failure by the wrapping', async () => {
+    const requester = crypto.generateKeyPairSync('x25519');
+    const blob = await artifact('spatial_preview', Buffer.from('synthetic bytes'), requester.publicKey);
+    const down = { addFileStreamed: kubo.addFileStreamed, async catStream() { throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }); } };
+    const failure = await openOutputBlob({ blob, kubo: down, recipientPrivateKey: requester.privateKey, jobId, destination: path.join(directory, 'never') })
+      .then(() => null, (error: unknown) => error);
+    expect(failure).not.toBeNull();
+    expect(isOutputVerificationFailure(failure)).toBe(false);
   });
 });

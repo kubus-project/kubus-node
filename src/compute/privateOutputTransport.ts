@@ -37,6 +37,32 @@ export interface PrivateOutputCommitment {
 
 type KuboTransport = Pick<KuboClient, 'addFileStreamed' | 'catStream'>;
 
+/**
+ * A check of the provider's result failed: its signature, binding, commitment, key material, authentication tag, digest,
+ * size or manifest. This is the only kind of error that may be answered with a signed rejection. Raised by the steps that
+ * verify (never by fetching or storing), so the classification comes from where the failure happened, not from a message.
+ */
+export class OutputVerificationError extends Error {
+  readonly code: string;
+  readonly statusCode?: number;
+
+  constructor(cause: unknown) {
+    const { code, message, statusCode } = (cause && typeof cause === 'object' ? cause : {}) as { code?: unknown; message?: unknown; statusCode?: unknown };
+    const named = [code, message].find((value): value is string => typeof value === 'string' && /^[a-z][a-z0-9_]{2,80}$/.test(value));
+    super(named ?? 'private_output_key_invalid', { cause });
+    this.name = 'OutputVerificationError';
+    this.code = named ?? 'private_output_key_invalid';
+    if (typeof statusCode === 'number') this.statusCode = statusCode;
+  }
+}
+
+/** Runs a pure check of provider-controlled data; whatever it throws (including a bare OpenSSL error) is a verification failure. */
+export function verifyingOutput<T>(check: () => T): T {
+  try { return check(); } catch (error) {
+    throw error instanceof OutputVerificationError ? error : new OutputVerificationError(error);
+  }
+}
+
 const associatedData = (jobId: string, role: string) => `${PRIVATE_OUTPUT_PROTOCOL}:${jobId}:${role}`;
 const maxFor = (role: string) => role === 'manifest' ? MAX_MANIFEST_BYTES : MAX_OUTPUT_BYTES;
 const encode = (bytes: Buffer) => bytes.toString('base64');
@@ -97,6 +123,10 @@ function boundedBase64(value: unknown, size: number): value is string {
 }
 
 export function validatePrivateOutput(value: unknown, jobId: string, manifestCid: string, cids: readonly string[]): PrivateOutputCommitment {
+  return verifyingOutput(() => checkPrivateOutput(value, jobId, manifestCid, cids));
+}
+
+function checkPrivateOutput(value: unknown, jobId: string, manifestCid: string, cids: readonly string[]): PrivateOutputCommitment {
   const output = value as Partial<PrivateOutputCommitment> | null;
   if (!output || output.schema !== PRIVATE_OUTPUT_PROTOCOL || output.manifestCid !== manifestCid ||
       !Array.isArray(output.blobs) || output.blobs.length < 2 || output.blobs.length > ROLES.size) {
@@ -148,6 +178,7 @@ export const OUTPUT_FETCH_INACTIVITY_MS = 120_000;
  * rejection, which ends the provider's job for good; the second is retried later without acknowledging.
  */
 export function isOutputVerificationFailure(error: unknown): boolean {
+  if (error instanceof OutputVerificationError) return true;
   if (!error || typeof error !== 'object') return false;
   const { code, message, name } = error as { code?: unknown; message?: unknown; name?: unknown };
   const named = [code, message].filter((value): value is string => typeof value === 'string');
@@ -163,10 +194,14 @@ export async function openOutputBlob({
   jobId: string; destination: string; inactivityMs?: number;
 }): Promise<void> {
   const aad = associatedData(jobId, blob.role);
-  const dataKey = unwrapComputeKey(blob.keyEnvelope, recipientPrivateKey, `${aad}:${blob.cid}`);
-  const decipher = crypto.createDecipheriv('aes-256-gcm', dataKey, Buffer.from(blob.iv, 'base64'));
-  decipher.setAAD(Buffer.from(aad));
-  decipher.setAuthTag(Buffer.from(blob.authTag, 'base64'));
+  // The envelope and the cipher parameters are the provider's: a key that cannot be read or unwrapped is a wrong result.
+  const { dataKey, decipher } = verifyingOutput(() => {
+    const key = unwrapComputeKey(blob.keyEnvelope, recipientPrivateKey, `${aad}:${blob.cid}`);
+    const cipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(blob.iv, 'base64'));
+    cipher.setAAD(Buffer.from(aad));
+    cipher.setAuthTag(Buffer.from(blob.authTag, 'base64'));
+    return { dataKey: key, decipher: cipher };
+  });
   const temporary = `${destination}.${crypto.randomUUID()}.part`;
   const sealed = new DigestStream(blob.bytes);
   const plain = new DigestStream(blob.plaintextBytes);
