@@ -181,6 +181,67 @@ class JobControl:
         except OSError:
             pass
 
+    def ownership_file(self, job_id):
+        return self.marker(job_id).with_suffix(".owner")
+
+    def pend_hand_back(self, job_id, directory):
+        """Durably remember, before a job writes anything, that its tree must go back to the Node's user.
+
+        process_owned hands the tree back in its `finally`; a worker that is killed never gets there and leaves
+        root-owned files the unprivileged Node cannot delete (EACCES), which blocks its cleanup journal for good.
+        The record lets the replacement worker finish the hand-back at start. An I/O failure is logged, not raised;
+        a job id that is not a uuid raises ValueError like every other job-scoped record."""
+        target = self.ownership_file(job_id)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            temporary = target.with_suffix(".owner.tmp")
+            temporary.write_text(json.dumps({"directory": str(directory)}), encoding="utf-8")
+            os.replace(temporary, target)
+        except OSError as error:
+            log.warning("cannot record the ownership hand-back for job %s: %s", job_id, error)
+
+    def settle_hand_back(self, job_id, directory):
+        """Hand the job's tree back now (the job has ended) and forget the record."""
+        hand_back_ownership(directory)
+        try:
+            self.ownership_file(job_id).unlink()
+        except OSError:
+            pass
+
+    def finish_pending_hand_backs(self):
+        """At worker start, after reap_orphans: hand back the trees of jobs an earlier worker process died in.
+
+        A job whose training group could not be confirmed ended (listed in `self.unreaped`) keeps its record: that
+        group may still be writing, and the Node does not infer quiescence from this worker anyway. Returns the job
+        ids whose trees were handed back."""
+        done = []
+        try:
+            records = sorted(self.root.glob("*.owner"))
+        except OSError:
+            return done
+        for record in records:
+            job_id = record.name[:-len(".owner")]
+            if job_id + ".pgid" in self.unreaped:
+                continue
+            try:
+                directory = json.loads(record.read_text(encoding="utf-8"))["directory"]
+                if not isinstance(directory, str) or not directory:
+                    raise ValueError("directory")
+            except OSError as error:
+                log.warning("cannot read ownership hand-back record %s: %s", record.name, error)
+                continue
+            except (ValueError, KeyError, TypeError):
+                log.warning("dropping unreadable ownership hand-back record %s", record.name)
+                directory = None
+            if directory:
+                hand_back_ownership(directory)
+                done.append(job_id)
+            try:
+                record.unlink()
+            except OSError:
+                pass
+        return done
+
     def reap_orphans(self):
         """At worker start: end any training process group a previous worker process left behind.
 

@@ -240,5 +240,65 @@ class OrphanReapTests(unittest.TestCase):
         self.assertFalse(self.control.group_file(JOB).exists())
 
 
+
+class PendingHandBackTests(unittest.TestCase):
+    """A worker killed mid-job never reaches process_owned's `finally`; its replacement hands the tree back at start."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.control = JobControl(pathlib.Path(self.temp.name) / "control")
+        self.output = pathlib.Path(self.temp.name) / "jobs" / JOB
+
+    def root_written_tree(self):
+        (self.output / "training" / "dataset").mkdir(parents=True)
+        (self.output / "training" / "dataset" / "frame_00001.jpg").write_bytes(b"x")
+        os.chown(self.output, 12345, 23456)
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "needs root to create foreign-owned files")
+    def test_a_replacement_worker_hands_back_the_tree_of_a_job_its_predecessor_died_in(self):
+        self.root_written_tree()
+        self.control.pend_hand_back(JOB, self.output)
+        # The worker is killed here: no settle_hand_back. A new process starts with the same control directory.
+        restarted = JobControl(self.control.root)
+        restarted.reap_orphans()
+        self.assertEqual(restarted.finish_pending_hand_backs(), [JOB])
+        for path in [self.output / "training", self.output / "training" / "dataset", self.output / "training" / "dataset" / "frame_00001.jpg"]:
+            self.assertEqual((path.stat().st_uid, path.stat().st_gid), (12345, 23456), str(path))
+        self.assertFalse(restarted.ownership_file(JOB).exists())
+        self.assertEqual(restarted.finish_pending_hand_backs(), [])
+
+    def test_a_finished_job_leaves_no_record(self):
+        self.output.mkdir(parents=True)
+        self.control.pend_hand_back(JOB, self.output)
+        self.assertTrue(self.control.ownership_file(JOB).exists())
+        self.control.settle_hand_back(JOB, self.output)
+        self.assertFalse(self.control.ownership_file(JOB).exists())
+        self.assertEqual(JobControl(self.control.root).finish_pending_hand_backs(), [])
+
+    def test_a_job_whose_training_group_was_not_confirmed_ended_keeps_its_record(self):
+        self.output.mkdir(parents=True)
+        self.control.pend_hand_back(JOB, self.output)
+        self.control.unreaped = [JOB + ".pgid"]
+        self.assertEqual(self.control.finish_pending_hand_backs(), [])
+        self.assertTrue(self.control.ownership_file(JOB).exists())
+
+    def test_an_unreadable_record_is_dropped_without_raising(self):
+        self.control.root.mkdir(parents=True)
+        self.control.ownership_file(JOB).write_text("{not json", encoding="utf-8")
+        self.assertEqual(self.control.finish_pending_hand_backs(), [])
+        self.assertFalse(self.control.ownership_file(JOB).exists())
+
+    def test_a_missing_control_directory_or_job_tree_is_not_an_error(self):
+        self.assertEqual(self.control.finish_pending_hand_backs(), [])
+        self.control.pend_hand_back(JOB, self.output)
+        self.assertEqual(self.control.finish_pending_hand_backs(), [JOB])
+        self.assertFalse(self.control.ownership_file(JOB).exists())
+
+    def test_the_record_rejects_a_job_id_that_is_not_a_uuid(self):
+        with self.assertRaises(ValueError):
+            self.control.pend_hand_back("../../etc", self.output)
+
+
 if __name__ == "__main__":
     unittest.main()

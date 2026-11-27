@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 
 from gpu_tier import classify_vram_tier
-from job_control import JobControl, JobCancelled, hand_back_ownership
+from job_control import JobControl, JobCancelled
 from face_gate import PROVIDER_FACE_REVIEW_CODE, flagged_images
 from face_mask import FaceMaskingError, masking_provenance, missing_review_files
 from photo_pipeline import prepare_photo_dataset
@@ -32,6 +32,8 @@ WORKER_INSTANCE_ID = str(uuid.uuid4())
 control = JobControl("/var/lib/kubus-node/private/worker-control")
 # Before this process serves anything: end a training process group an earlier worker process left running.
 control.reap_orphans()
+# Then give the Node back the job trees an earlier worker process died in (root-owned files it cannot delete).
+control.finish_pending_hand_backs()
 # Reported in /health: true when this worker ended every training group its predecessors left (worker 13 onward, and
 # none stayed alive). The Node infers "the replaced worker's processes are gone" only from a worker that says so.
 REAPS_ORPHANS = not control.unreaped
@@ -200,11 +202,13 @@ def wants_floater_crop(request: ProcessRequest) -> bool:
 
 
 def process_owned(request: ProcessRequest):
+    # Recorded first, so a replacement worker can finish the hand-back if this process is killed mid-job.
+    control.pend_hand_back(request.jobId, request.outputDirectory)
     try:
         return run_reconstruction(request)
     finally:
         # Success, failure or cancellation: the Node must be able to delete what this root process wrote.
-        hand_back_ownership(request.outputDirectory)
+        control.settle_hand_back(request.jobId, request.outputDirectory)
 
 
 def require_review_files(output: pathlib.Path, masked: dict | None) -> None:
