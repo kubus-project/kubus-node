@@ -7,7 +7,7 @@ import type { KuboClient } from '../ipfs/kuboClient.js';
 import { localError } from '../localApi/pairingService.js';
 import type { LocalStore } from '../state/localStore.js';
 import type { ComputeIdentityService } from './computeIdentity.js';
-import { ManagedPins } from '../ipfs/managedPins.js';
+import { ManagedPins, canonicalPinCid } from '../ipfs/managedPins.js';
 
 import { encryptionPublicKey, wrapComputeKey, unwrapComputeKey, type ComputeKeyEnvelope } from './computeKeyEnvelope.js';
 export type { ComputeKeyEnvelope } from './computeKeyEnvelope.js';
@@ -32,10 +32,22 @@ async function walkFiles(root: string): Promise<Array<{ path: string; bytes: Buf
   return output;
 }
 
+/** Whether a key envelope context is `<nodeId>:<cid>` for exactly this provider and input (the CID compared in canonical form). */
+function contextNames(context: unknown, expected: { nodeId: string; inputCid: string }): boolean {
+  if (typeof context !== 'string' || !expected.nodeId || !expected.inputCid || !context.startsWith(`${expected.nodeId}:`)) return false;
+  try { return canonicalPinCid(context.slice(expected.nodeId.length + 1)) === canonicalPinCid(expected.inputCid); } catch { return false; }
+}
+
 export class PrivatePayloadTransport {
   constructor(private readonly deps: { captures: CaptureStore; kubo: KuboClient; store: LocalStore; identity: ComputeIdentityService; dataRoot: string; maxInputBytes: number }) {}
 
-  async encryptCapture(captureId: string, providerNodeId: string, providerPublicKey: string): Promise<{ inputCid: string; inputBytes: number; inputHash: string; inputKeyEnvelope: ComputeKeyEnvelope; jobSpec: Record<string, unknown> }> {
+  /**
+   * Encrypts a stored capture for one provider and pins the ciphertext. `options.pinOwner` lets the caller choose the pin's
+   * owner (it must be a `requester-input:` owner), so a caller that records the owner first can find and release the pin
+   * if the process dies before it learns the CID.
+   */
+  async encryptCapture(captureId: string, providerNodeId: string, providerPublicKey: string, options: { pinOwner?: string } = {}): Promise<{ inputCid: string; inputBytes: number; inputHash: string; inputKeyEnvelope: ComputeKeyEnvelope; jobSpec: Record<string, unknown> }> {
+    if (options.pinOwner !== undefined && !/^requester-input:[0-9a-f-]{36}$/i.test(options.pinOwner)) throw localError(400, 'requester_input_owner_invalid');
     let providerEncryptionKey: crypto.KeyObject;
     try {
       providerEncryptionKey = encryptionPublicKey(providerPublicKey);
@@ -62,7 +74,7 @@ export class PrivatePayloadTransport {
     if (encrypted.byteLength > this.deps.maxInputBytes) throw localError(413, 'remote_compute_input_too_large');
     const added = await this.deps.kubo.addBytes(encrypted, `${captureId}.kubusenc`, { pin: false });
     if (!added.Hash) throw localError(502, 'encrypted_input_cid_missing');
-    const pinOwner = `requester-input:${crypto.randomUUID()}`;
+    const pinOwner = options.pinOwner ?? `requester-input:${crypto.randomUUID()}`;
     await this.deps.store.update((state) => { (state.privateComputeCids ??= {})[added.Hash!] = { role: 'encrypted_input', createdAt: new Date().toISOString(), pinOwner, submissionState: 'prepared' }; });
     await new ManagedPins(this.deps.kubo, this.deps.store).acquire(added.Hash, pinOwner);
     const context = `${providerNodeId}:${added.Hash}`;
@@ -71,7 +83,13 @@ export class PrivatePayloadTransport {
     return { inputCid: added.Hash, inputBytes: encrypted.byteLength, inputHash, inputKeyEnvelope: envelope, jobSpec: { captureSchema: 'kubus.capture/1', encryptedPayloadSchema: 'kubus.encrypted-payload/1', sourceBytes: rawBytes, fileCount: files.length } };
   }
 
-  async decryptToDirectory(encrypted: Uint8Array, envelope: ComputeKeyEnvelope, outputDirectory: string, expectedHash: string): Promise<void> {
+  /**
+   * Decrypts a job input into `outputDirectory`. `expected` is the provider's own node id and the job's input CID: the
+   * key envelope's context must name exactly them (`<nodeId>:<cid>`), so an envelope wrapped for another provider or for
+   * another input is refused before anything is unwrapped.
+   */
+  async decryptToDirectory(encrypted: Uint8Array, envelope: ComputeKeyEnvelope, outputDirectory: string, expectedHash: string, expected: { nodeId: string; inputCid: string }): Promise<void> {
+    if (!contextNames(envelope?.context, expected)) throw localError(422, 'encrypted_payload_context_mismatch');
     const bytes = Buffer.from(encrypted);
     if (crypto.createHash('sha256').update(bytes).digest('hex') !== expectedHash) throw localError(422, 'encrypted_payload_hash_mismatch');
     const first = bytes.indexOf(10); const second = bytes.indexOf(10, first + 1);

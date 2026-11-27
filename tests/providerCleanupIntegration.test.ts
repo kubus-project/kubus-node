@@ -48,7 +48,7 @@ async function fixture(
   });
   const pinRm = vi.fn(async () => undefined);
   const decrypt = vi.fn(
-    async (_encrypted: unknown, _envelope: unknown, directory: string) => {
+    async (_encrypted: unknown, _envelope: unknown, directory: string, _hash?: string, _expected?: { nodeId: string; inputCid: string }) => {
       await fs.mkdir(directory, { recursive: true });
       await fs.writeFile(path.join(directory, 'partial-private'), 'synthetic');
       if (failure === 'decrypt') throw new Error('synthetic decrypt failure');
@@ -147,6 +147,12 @@ it.each(['download', 'decrypt', 'create'] as const)(
     );
   },
 );
+it('the provider decrypts an input only against its own node id and the job input CID', async () => {
+  const { poll, decrypt } = await fixture();
+  await poll();
+  expect(decrypt).toHaveBeenCalledTimes(1);
+  expect(decrypt.mock.calls[0]![4]).toEqual({ nodeId: 'synthetic-node', inputCid: syntheticCid('synthetic-ciphertext') });
+});
 it('a failed ownership journal prevents download and decryption', async () => {
   const { poll, store, pinAdd, decrypt } = await fixture();
   vi.spyOn(store, 'update').mockRejectedValueOnce(

@@ -29,6 +29,9 @@ import {
   PRIVATE_OUTPUT_PROTOCOL, openOutputBlob, outputCommitmentDigest, validatePrivateOutput, type PrivateOutputCommitment,
 } from './privateOutputTransport.js';
 
+/** Whether a requester's encrypted input pin was really released. A pin whose release is switched off stays held. */
+export interface InputReleaseOutcome { released: boolean; reason?: string }
+
 function isPrivateOutput(job: RemoteComputeJob): boolean {
   return (job.canonicalJobSpec?.processing as { outputMode?: unknown } | undefined)?.outputMode === PRIVATE_OUTPUT_PROTOCOL;
 }
@@ -410,20 +413,46 @@ export class RemoteComputeRuntime {
   }
 
   /** Releases the requester's encrypted input pin once the job is over; also used by the managed requester. */
-  async releaseInput(job: RemoteComputeJob): Promise<void> {
-    await this.releaseRequesterInput(job);
+  async releaseInput(job: RemoteComputeJob): Promise<InputReleaseOutcome> {
+    const outcome = await this.releaseRequesterInput(job);
     await this.updateRecord(job.id, 'requester', job.state);
+    return outcome;
   }
 
   /**
    * Releases an encrypted input pin that no job holds (prepared for a provider, never sent, or replaced). Idempotent: an
    * input that is already released, or has no managed owner, is left alone.
    */
-  async releaseUnusedInput(inputCid: string): Promise<void> {
+  async releaseUnusedInput(inputCid: string): Promise<InputReleaseOutcome> {
     const record = this.deps.store.snapshot().privateComputeCids?.[inputCid];
-    if (!record || record.role !== 'encrypted_input' || !record.pinOwner || record.releasedAt) return;
-    await new ManagedPins(this.deps.kubo, this.deps.store, { allowUnpin: this.deps.config.managedPinReleaseEnabled === true }).release(inputCid, record.pinOwner);
-    await this.deps.store.update((state) => { const item = state.privateComputeCids?.[inputCid]; if (item) item.releasedAt = new Date().toISOString(); });
+    if (!record || record.role !== 'encrypted_input' || !record.pinOwner || record.releasedAt) return { released: true };
+    return this.releaseInputPin(inputCid, record.pinOwner);
+  }
+
+  /**
+   * Releases every encrypted input pinned under `owner`. A requester that chose the owner before it encrypted (and then
+   * died before it learned the CID) finds the pin again this way. Not released while any of them is still held.
+   */
+  async releaseInputsOwnedBy(owner: string): Promise<InputReleaseOutcome> {
+    let pending: InputReleaseOutcome | undefined;
+    for (const [cid, record] of Object.entries(this.deps.store.snapshot().privateComputeCids || {})) {
+      if (record.role !== 'encrypted_input' || record.pinOwner !== owner || record.releasedAt) continue;
+      const outcome = await this.releaseInputPin(cid, owner);
+      if (!outcome.released) pending ??= outcome;
+    }
+    return pending ?? { released: true };
+  }
+
+  /**
+   * Releases this owner's hold on an input pin and records it as released only when that happened. With pin release
+   * switched off (the default) the owner's claim is dropped but the pin is not removed, and the CID stays announced:
+   * that is reported as not released, never as done.
+   */
+  private async releaseInputPin(cid: string, owner: string): Promise<InputReleaseOutcome> {
+    const result = await new ManagedPins(this.deps.kubo, this.deps.store, { allowUnpin: this.deps.config.managedPinReleaseEnabled === true }).release(cid, owner);
+    if (result.reason === 'pin_release_activation_required') return { released: false, reason: result.reason };
+    await this.deps.store.update((state) => { const item = state.privateComputeCids?.[cid]; if (item) item.releasedAt = new Date().toISOString(); });
+    return { released: true };
   }
 
   async cancelRequesterJob(jobId: string, authorization: string): Promise<RemoteComputeJob> {
@@ -617,7 +646,7 @@ export class RemoteComputeRuntime {
         this.providerCleanup.assertPreparing(job.id);
         const encrypted = await this.deps.kubo.cat(job.inputCid);
         this.providerCleanup.assertPreparing(job.id);
-        await this.deps.transport.decryptToDirectory(encrypted, job.inputKeyEnvelope as unknown as ComputeKeyEnvelope, directory, job.inputHash);
+        await this.deps.transport.decryptToDirectory(encrypted, job.inputKeyEnvelope as unknown as ComputeKeyEnvelope, directory, job.inputHash, { nodeId, inputCid: job.inputCid });
         this.providerCleanup.assertPreparing(job.id);
         const capture = await this.readRemoteCapture(captureId, directory);
         await this.deps.captures.registerRemote(capture);
@@ -693,14 +722,13 @@ export class RemoteComputeRuntime {
     }
   }
 
-  private async releaseRequesterInput(job: RemoteComputeJob): Promise<void> {
+  private async releaseRequesterInput(job: RemoteComputeJob): Promise<InputReleaseOutcome> {
     if (!['COMPLETED', 'DISPUTED', 'FAILED', 'CANCELLED', 'EXPIRED', 'DECLINED'].includes(job.state)) {
       throw localError(409, 'remote_compute_not_terminal');
     }
     const owner = this.deps.store.snapshot().privateComputeCids?.[job.inputCid]?.pinOwner;
-    if (!owner) return; // Legacy/manual ownership requires a separate migration.
-    await new ManagedPins(this.deps.kubo, this.deps.store, { allowUnpin: this.deps.config.managedPinReleaseEnabled === true }).release(job.inputCid, owner);
-    await this.deps.store.update((state) => { const item = state.privateComputeCids?.[job.inputCid]; if (item) item.releasedAt = new Date().toISOString(); });
+    if (!owner) return { released: true }; // Legacy/manual ownership requires a separate migration.
+    return this.releaseInputPin(job.inputCid, owner);
   }
 
   private async readRemoteCapture(id: string, directory: string): Promise<CaptureRecord> {

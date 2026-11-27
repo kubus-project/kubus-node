@@ -138,11 +138,29 @@ async function* chunks(body: ReadableStream<Uint8Array>): AsyncIterable<Uint8Arr
   } finally { reader.releaseLock(); }
 }
 
+/** A blob download is stopped when no bytes arrive for this long. A fixed total time cut off honest slow providers. */
+export const OUTPUT_FETCH_INACTIVITY_MS = 120_000;
+
+/**
+ * Whether an error from opening a sealed result means the result itself is wrong (a signature, binding, commitment,
+ * authentication tag, digest, size, manifest or variant check failed), as opposed to this Node failing to fetch or
+ * store it (Kubo down, a stalled or slow transfer, a full disk). Only the first kind may be answered with a signed
+ * rejection, which ends the provider's job for good; the second is retried later without acknowledging.
+ */
+export function isOutputVerificationFailure(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const { code, message, name } = error as { code?: unknown; message?: unknown; name?: unknown };
+  const named = [code, message].filter((value): value is string => typeof value === 'string');
+  if (named.some(value => /^(?:private_output_|spatial_manifest_|compute_envelope_|compute_encryption_key_)/.test(value))) return true;
+  if (typeof message === 'string' && /unable to authenticate data/i.test(message)) return true;
+  return name === 'SyntaxError';
+}
+
 export async function openOutputBlob({
-  blob, kubo, recipientPrivateKey, jobId, destination,
+  blob, kubo, recipientPrivateKey, jobId, destination, inactivityMs = OUTPUT_FETCH_INACTIVITY_MS,
 }: {
   blob: PrivateOutputBlob; kubo: KuboTransport; recipientPrivateKey: crypto.KeyObject;
-  jobId: string; destination: string;
+  jobId: string; destination: string; inactivityMs?: number;
 }): Promise<void> {
   const aad = associatedData(jobId, blob.role);
   const dataKey = unwrapComputeKey(blob.keyEnvelope, recipientPrivateKey, `${aad}:${blob.cid}`);
@@ -153,18 +171,28 @@ export async function openOutputBlob({
   const sealed = new DigestStream(blob.bytes);
   const plain = new DigestStream(blob.plaintextBytes);
   let download: Awaited<ReturnType<KuboTransport['catStream']>> | undefined;
+  // The limit is on silence, not on the whole transfer: a blob of hundreds of megabytes from a slow provider keeps
+  // going as long as bytes keep arriving, and a transfer that stalls (or never starts) stops after `inactivityMs`.
+  const controller = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  const watch = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => controller.abort(Object.assign(new Error('output_fetch_stalled'), { code: 'output_fetch_stalled' })), inactivityMs);
+  };
+  const activity = new Transform({ transform(chunk, _encoding, done) { watch(); done(null, chunk); } });
   try {
-    const signal = AbortSignal.timeout(120_000);
-    download = await kubo.catStream(blob.cid, undefined, signal);
-    await pipeline(Readable.from(chunks(download.body)), sealed, decipher, plain,
+    watch();
+    download = await kubo.catStream(blob.cid, undefined, controller.signal);
+    await pipeline(Readable.from(chunks(download.body)), activity, sealed, decipher, plain,
       createWriteStream(temporary, { mode: 0o600, flags: 'wx' }),
-      { signal });
+      { signal: controller.signal });
     if (sealed.size !== blob.bytes || plain.size !== blob.plaintextBytes ||
         sealed.digest() !== blob.sha256 || plain.digest() !== blob.plaintextSha256) {
       throw new Error('private_output_digest_mismatch');
     }
     await fs.rename(temporary, destination);
   } finally {
+    clearTimeout(timer);
     download?.cancel();
     await fs.rm(temporary, { force: true });
     dataKey.fill(0);

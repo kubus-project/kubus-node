@@ -6,7 +6,7 @@ import { create as createDigest } from 'multiformats/hashes/digest';
 import { CID } from 'multiformats/cid';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import {
-  assertSpatialOutputRoles, openOutputBlob, outputCommitmentDigest, PRIVATE_OUTPUT_PROTOCOL, sealOutputBlob, spatialOutputShape, validatePrivateOutput,
+  assertSpatialOutputRoles, isOutputVerificationFailure, openOutputBlob, outputCommitmentDigest, PRIVATE_OUTPUT_PROTOCOL, sealOutputBlob, spatialOutputShape, validatePrivateOutput,
 } from '../src/compute/privateOutputTransport.js';
 
 const jobId = '3ef91af5-5335-4595-8e8a-0618d2c1c039';
@@ -115,5 +115,68 @@ describe('private output transport', () => {
     for (const roles of [['spatial_archive'], ['spatial_preview'], ['spatial_mobile', 'spatial_archive'], ['spatial_mobile', 'spatial_mobile'], []]) {
       expect(() => assertSpatialOutputRoles(roles)).toThrow('worker_output_roles_invalid');
     }
+  });
+
+  describe('fetching a sealed blob', () => {
+    /** A Kubo whose stream hands out `parts` one at a time, `gapMs` apart; with `stall` it goes silent after the last part. */
+    function slowKubo(data: Buffer, parts: number, gapMs: number, stall = false) {
+      return {
+        addFileStreamed: kubo.addFileStreamed,
+        async catStream(_cid: string, _range?: unknown, signal?: AbortSignal) {
+          const size = Math.ceil(data.length / parts);
+          let sent = 0;
+          return {
+            body: new ReadableStream<Uint8Array>({
+              async pull(controller) {
+                if (sent >= data.length) { if (stall) await new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason ?? new Error('aborted')))); else controller.close(); return; }
+                await new Promise(resolve => setTimeout(resolve, gapMs));
+                controller.enqueue(data.subarray(sent, sent + size));
+                sent += size;
+              },
+            }),
+            cancel() {},
+          };
+        },
+      };
+    }
+
+    test('a download that keeps moving is never cut off by a fixed total time', async () => {
+      const requester = crypto.generateKeyPairSync('x25519');
+      const blob = await artifact('spatial_mobile', Buffer.alloc(4000, 7), requester.publicKey);
+      const sealedBytes = blocks.get(blob.cid)!;
+      const destination = path.join(directory, 'moving');
+      // Eight parts 40 ms apart take about 320 ms in all, well over the 150 ms inactivity limit.
+      await openOutputBlob({ blob, kubo: slowKubo(sealedBytes, 8, 40), recipientPrivateKey: requester.privateKey, jobId, destination, inactivityMs: 150 });
+      expect(await fs.readFile(destination)).toEqual(Buffer.alloc(4000, 7));
+    });
+
+    test('a download that goes silent is stopped as a transient failure, not as a verification failure', async () => {
+      const requester = crypto.generateKeyPairSync('x25519');
+      const blob = await artifact('spatial_mobile', Buffer.alloc(4000, 7), requester.publicKey);
+      const destination = path.join(directory, 'stalled');
+      const failure = await openOutputBlob({ blob, kubo: slowKubo(blocks.get(blob.cid)!.subarray(0, 100), 1, 5, true), recipientPrivateKey: requester.privateKey, jobId, destination, inactivityMs: 80 })
+        .then(() => null, (error: unknown) => error);
+      expect(failure).not.toBeNull();
+      expect(isOutputVerificationFailure(failure)).toBe(false);
+      await expect(fs.stat(destination)).rejects.toMatchObject({ code: 'ENOENT' });
+    });
+  });
+
+  test('only a result that is wrong counts as a verification failure; I/O and timeouts do not', async () => {
+    const wrong = [
+      Object.assign(new Error('private_output_signature_invalid'), { code: 'private_output_signature_invalid', statusCode: 422 }),
+      Object.assign(new Error('private_output_signature_binding_invalid'), { code: 'private_output_signature_binding_invalid' }),
+      new Error('private_output_digest_mismatch'), new Error('private_output_size_limit'), new Error('private_output_binding_invalid'),
+      Object.assign(new Error('private_output_variant_binding_invalid'), { code: 'private_output_variant_binding_invalid' }),
+      new Error('spatial_manifest_variant_invalid'), new SyntaxError('Unexpected token'), new Error('Unsupported state or unable to authenticate data'),
+      new Error('compute_envelope_context_invalid'),
+    ];
+    for (const error of wrong) expect(isOutputVerificationFailure(error), String(error.message)).toBe(true);
+    const transient = [
+      Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' }), Object.assign(new Error('boom'), { code: 'ECONNREFUSED' }),
+      new Error('Kubo cat failed with HTTP 500'), new DOMException('The operation was aborted due to timeout', 'TimeoutError'),
+      Object.assign(new Error('premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' }), new Error('fetch failed'), 'string', undefined,
+    ];
+    for (const error of transient) expect(isOutputVerificationFailure(error), String((error as Error)?.message ?? error)).toBe(false);
   });
 });
