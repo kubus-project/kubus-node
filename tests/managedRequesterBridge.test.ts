@@ -1116,12 +1116,27 @@ describe('face review gate', () => {
     expect(actions().slice(-2)).toEqual(['failure', 'cleanup']);
   });
 
-  test('a provider that refused the dataset for a face review ends the attempt for good: no other provider is tried', async () => {
+  /** The stored dataset's record now carries a flag (with the per-input feedback), as the requester's own check will see it. */
+  async function flagStored() {
+    const record = { ...flaggedRecord(), inputs: [
+      { input: 'photos/11111111-1111-4111-8111-111111111111.jpg', usable: true, usableViews: 1, faceReview: 2 },
+      { input: 'videos/22222222-2222-4222-8222-222222222222.mp4', usable: true, usableViews: 5 },
+    ] };
+    await fs.writeFile(path.join(root(), 'capture', 'dataset', 'prepared.json'), JSON.stringify(record));
+  }
+
+  test('a provider refusal that the requester own check confirms ends the attempt for good, with the flagged files as feedback: no other provider is tried', async () => {
     const { bridge, api, remote, transport } = makeBridge();
     await bridge.advance(nodeId, attempt());
+    await flagStored();
     api.getReconstructionComputeJob.mockResolvedValueOnce({ ...job('FAILED'), failure: { code: 'provider_face_review_required' } });
     await bridge.advance(nodeId, processing());
-    expect(calls.find(call => call.action === 'failure')!.body).toMatchObject({ code: 'face_review_required' });
+    const failure = calls.find(call => call.action === 'failure')!.body as { code: string; feedback: { inputs: Array<Record<string, unknown>> } };
+    expect(failure.code).toBe('face_review_required');
+    expect(failure.feedback.inputs).toEqual([
+      { fileId: '11111111-1111-4111-8111-111111111111', usable: false, usableViews: 1, reason: 'face_review' },
+      { fileId: '22222222-2222-4222-8222-222222222222', usable: true, usableViews: 5 },
+    ]);
     expect(actions().slice(-2)).toEqual(['failure', 'cleanup']);
     expect(actions().filter(action => action === 'providers')).toHaveLength(1);
     expect(transport.encryptCapture).toHaveBeenCalledTimes(1);
@@ -1136,10 +1151,33 @@ describe('face review gate', () => {
       await resetAttempt();
       const { bridge, api } = makeBridge();
       await bridge.advance(nodeId, attempt());
+      await flagStored();
       api.getReconstructionComputeJob.mockResolvedValueOnce({ ...job('FAILED'), failure });
       await bridge.advance(nodeId, processing());
       expect(calls.find(call => call.action === 'failure')!.body, JSON.stringify(failure)).toMatchObject({ code: 'face_review_required' });
     }
+  });
+
+  test('a provider that reports a face review the requester cannot confirm is just a lost provider: it is excluded and the next is tried', async () => {
+    const { bridge, api, transport } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    api.getReconstructionComputeJob.mockResolvedValueOnce({ ...job('FAILED'), failure: { code: 'provider_face_review_required' } });
+    await bridge.advance(nodeId, processing());
+    // The local dataset is clean, so the refusal says nothing about the artist's files.
+    expect(calls.find(call => call.action === 'failure')).toBeUndefined();
+    expect(calls.at(-1)!.body).toMatchObject({ state: 'waiting_for_node', stage: 'provider_lost' });
+    expect((await stateFile()).excludedProviders).toEqual([providerA]);
+    expect(transport.encryptCapture).toHaveBeenCalledTimes(1);
+  });
+
+  test('when the requester cannot verify its own record any more, a provider refusal stays terminal (fail closed)', async () => {
+    const { bridge, api } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    await fs.writeFile(path.join(root(), 'capture', 'dataset', 'prepared.json'), '{"faceMasking": ');
+    api.getReconstructionComputeJob.mockResolvedValueOnce({ ...job('FAILED'), failure: { code: 'provider_face_review_required' } });
+    await bridge.advance(nodeId, processing());
+    expect(calls.find(call => call.action === 'failure')!.body).toMatchObject({ code: 'face_review_required' });
+    expect((await stateFile()).excludedProviders ?? []).toEqual([]);
   });
 
   test('any other provider failure still excludes that provider and tries the next', async () => {
@@ -1455,6 +1493,37 @@ describe('retention purge', () => {
     await expect(fs.stat(root())).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  test('with pin release switched off the raw sources are still deleted at retention; only the record stays, unacknowledged, with the CID for a later retry', async () => {
+    const { bridge, api, remote } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    expect((await fs.stat(path.join(root(), 'set', 'photos', '11111111-1111-4111-8111-111111111111.jpg'))).isFile()).toBe(true);
+    expect((await stateFile()).heldInputs).toEqual(['bafyinput1']);
+    api.reconstructionRetention.mockResolvedValue({ purge: [reconstructionId] });
+    remote.releaseUnusedInput.mockResolvedValue({ released: false, reason: 'pin_release_activation_required' });
+    // Every pass gives the same answer: not acknowledged, and the artist's raw photos and clips are gone after the first.
+    for (let pass = 0; pass < 2; pass += 1) {
+      expect(await bridge.purgeExpired(nodeId)).toEqual([]);
+      await expect(fs.stat(path.join(root(), 'set'))).rejects.toMatchObject({ code: 'ENOENT' });
+      expect((await stateFile()).heldInputs).toEqual(['bafyinput1']);
+    }
+    expect(api.ackReconstructionRetention).not.toHaveBeenCalled();
+    // Once the pin can be released the attempt is purged and acknowledged as before.
+    remote.releaseUnusedInput.mockResolvedValue(undefined);
+    expect(await bridge.purgeExpired(nodeId)).toEqual([reconstructionId]);
+    await expect(fs.stat(root())).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(api.ackReconstructionRetention).toHaveBeenCalledWith(nodeId, [reconstructionId]);
+  });
+
+  test('a release that threw also leaves no raw sources behind', async () => {
+    const { bridge, api, remote } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    api.reconstructionRetention.mockResolvedValueOnce({ purge: [reconstructionId] });
+    remote.releaseUnusedInput.mockRejectedValueOnce(new Error('kubo offline'));
+    expect(await bridge.purgeExpired(nodeId)).toEqual([]);
+    await expect(fs.stat(path.join(root(), 'set'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await stateFile()).heldInputs).toEqual(['bafyinput1']);
+  });
+
   test('a release that throws is kept and not acknowledged', async () => {
     const { bridge, api, remote } = await finished();
     const state = await stateFile();
@@ -1475,6 +1544,8 @@ describe('retention purge', () => {
     expect(await bridge.purgeExpired(nodeId)).toEqual([other]);
     expect(api.ackReconstructionRetention).toHaveBeenCalledWith(nodeId, [other]);
     expect(await fs.readFile(path.join(root(), 'state.json'), 'utf8')).toBe('{"half');
+    // Whatever else it holds is unknown, but the raw sources are known and past retention.
+    await expect(fs.stat(path.join(root(), 'set'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   test('an attempt that was already purged is acknowledged (the earlier acknowledgement was lost)', async () => {

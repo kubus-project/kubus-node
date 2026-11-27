@@ -243,12 +243,26 @@ export class ManagedRequesterBridge {
     try { state = await this.readState(id); } catch (error) {
       if ((error as { code?: string })?.code !== 'reconstruction_state_unreadable') throw error;
       // What it holds (pins, staged results) cannot be known: it is left for review, neither purged nor acknowledged.
+      // The raw sources are known and past retention, so they go regardless.
       this.deps.logger.warn({ code: 'reconstruction_state_unreadable', reconstructionId: id }, 'attempt record cannot be read; not purged');
+      await this.removeSources(id);
       return false;
     }
-    if ((await this.cleanupAttempt(id, state)) !== 'complete') return false;
+    const outcome = await this.cleanupAttempt(id, state).catch(error => {
+      this.deps.logger.warn({ code: 'managed_requester_purge_cleanup_failed', reconstructionId: id, error: String((error as Error)?.message || error) }, 'attempt cleanup failed during purge');
+      return 'failed' as CleanupOutcome;
+    });
+    // The artist's raw photos and clips are deleted at retention whatever else is still held: a pin that cannot be released
+    // (release switched off, Kubo down) keeps only the record, with the CID, unacknowledged, so the next pass retries it.
+    await this.removeSources(id);
+    if (outcome !== 'complete') return false;
     await fs.rm(directory, { recursive: true, force: true });
     return true;
+  }
+
+  /** Deletes the verified raw source copies of an attempt (the `set` directory); the record and everything else stay. */
+  private async removeSources(id: string): Promise<void> {
+    await fs.rm(path.join(this.root(id), 'set'), { recursive: true, force: true });
   }
 
   /**
@@ -751,17 +765,29 @@ export class ManagedRequesterBridge {
     }
     if (FINISHED_JOB.has(job.state)) {
       // The provider's worker refused the dataset for a face review: the dataset must not go to anyone else either.
-      if (providerFailureCode(job) === PROVIDER_FACE_REVIEW) return this.faceReviewRefused(nodeId, attempt, job);
+      if (providerFailureCode(job) === PROVIDER_FACE_REVIEW) {
+        // The requester passed its own gate on this dataset before sending it, so a refusal it cannot confirm says something
+        // about the provider, not the artist's files: that provider is lost like any other. Only a flagged (or no longer
+        // verifiable) local record ends the attempt.
+        const gate = await this.faceGate(path.join(this.root(attempt.id), 'capture', 'dataset'));
+        if (gate.kind === 'clean') {
+          this.deps.logger.warn({ code: 'managed_requester_provider_face_review_unconfirmed', jobId: job.id, providerNodeId: job.providerNodeId }, 'a provider reported a face review that the local dataset does not show; it is treated as lost');
+          return this.providerLost(nodeId, attempt, job);
+        }
+        return this.faceReviewRefused(nodeId, attempt, job, gate.kind === 'flagged');
+      }
       return this.providerLost(nodeId, attempt, job);
     }
     await this.progress(nodeId, attempt, 'processing', job.state === 'RUNNING' ? 'training' : 'provider_accepting');
   }
 
-  /** A provider refused the prepared dataset for a face review: terminal. No provider is excluded and none is tried next. */
-  private async faceReviewRefused(nodeId: string, attempt: ManagedReconstruction, job: RemoteComputeJob): Promise<void> {
+  /** A provider refused a dataset the requester's own check also flags (or can no longer verify): terminal. No provider is excluded and none is tried next. */
+  private async faceReviewRefused(nodeId: string, attempt: ManagedReconstruction, job: RemoteComputeJob, flagged: boolean): Promise<void> {
     this.deps.logger.warn({ code: 'managed_requester_provider_face_review_required', jobId: job.id, providerNodeId: job.providerNodeId }, 'a provider refused the dataset for a face review; the attempt ends');
     await this.trackProviderJob(attempt.id, job);
-    await this.deps.api.reconstructionCall(attempt.id, 'failure', { nodeId, code: 'face_review_required' });
+    // A flagged local record names the files to look at; one that cannot be read any more has nothing to say about them.
+    const feedback = flagged ? this.feedback(this.faceReviewInputs(await this.storedInputs(attempt)), {}) : undefined;
+    await this.deps.api.reconstructionCall(attempt.id, 'failure', { nodeId, code: 'face_review_required', ...(feedback ? { feedback } : {}) });
     const state = await this.readState(attempt.id);
     await this.finish(nodeId, attempt.id, state.captureId, job);
   }
