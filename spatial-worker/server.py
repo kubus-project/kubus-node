@@ -21,13 +21,14 @@ from face_mask import FaceMaskingError, masking_provenance, missing_review_files
 from photo_pipeline import prepare_photo_dataset
 from scene_frame import analyse_dataset
 from source_set import prepare_source_set, read_prepared_record, write_prepared_record
+from splat_variants import OUTPUT_PROTOCOL, OUTPUT_VARIANTS, convert_export
 from video_pipeline import WorkerError, prepare_video_dataset
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 WORKER_AUTH_KEY_PATH = os.environ.get("WORKER_AUTH_KEY_PATH", "/var/lib/kubus-node/worker-auth.key")
 
 
-WORKER_VERSION = "kubus-spatial-worker/10"
+WORKER_VERSION = "kubus-spatial-worker/11"
 WORKER_INSTANCE_ID = str(uuid.uuid4())
 control = JobControl("/var/lib/kubus-node/private/worker-control")
 
@@ -88,6 +89,10 @@ def health() -> dict[str, Any]:
         # The images face masking flags carry `file` (and a frame's `seconds`) in `needsLook.items`, so the Node can keep
         # a masked copy for the operator to look at before the job's working directory is removed.
         "faceReviewImages": True,
+        # A prepared (managed) job yields a full render derivative (`spatial_mobile`) and, when that is over the byte
+        # budget, a lightweight preview (`spatial_preview`); never the raw training PLY. See splat_variants.py.
+        "outputVariants": OUTPUT_VARIANTS,
+        "outputProtocol": OUTPUT_PROTOCOL,
         "version": WORKER_VERSION,
         "cleanupProtocol": 1,
         "workerInstanceId": WORKER_INSTANCE_ID,
@@ -345,16 +350,27 @@ def run_reconstruction(request: ProcessRequest):
     splats = ply_vertex_count(chosen)
     if splats is not None:
         provenance["splatCount"] = splats
-    candidates = [chosen]
-    result: dict[str, Any] = {
-        "variants": [{
+    if mode == "prepared":
+        # The raw `ns-export` PLY is a provider intermediate: it is never a variant and never leaves this work
+        # directory. A malformed export fails the job (`output_conversion_failed`); it is not shipped as is.
+        write_progress(output, "converting", {})
+        converted = convert_export(chosen, output)
+        variants = converted["variants"]
+        lightweight = converted["lightweight"]
+        viewer_defaults = {"quality": "mobile"}
+    else:
+        variants = [{
             "role": "spatial_archive",
-            "path": str(candidates[-1].relative_to(output)),
+            "path": str(chosen.relative_to(output)),
             "mimeType": "application/octet-stream",
             "format": "ply",
             "storageClass": "cold",
-        }],
-        "viewerDefaults": {"quality": "archive"},
+        }]
+        lightweight = None
+        viewer_defaults = {"quality": "archive"}
+    result: dict[str, Any] = {
+        "variants": variants,
+        "viewerDefaults": viewer_defaults,
         "processing": {
             "protocol": "kubus.spatial-job/1",
             "workerVersion": WORKER_VERSION,
@@ -366,6 +382,9 @@ def run_reconstruction(request: ProcessRequest):
             },
         },
     }
+    if mode == "prepared":
+        # `null` when the full file is already within the budget and serves as its own preview.
+        result["processing"]["lightweight"] = lightweight
     if analysis:
         result["transform"] = {"matrix": analysis["matrix"], "matrixOrder": "column-major", "up": analysis["up"], "method": analysis["orientation"]["method"], "rotationApplied": analysis["orientation"]["rotationApplied"]}
         result["processing"]["orientation"] = analysis["orientation"]
