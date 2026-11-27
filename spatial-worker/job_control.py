@@ -102,8 +102,11 @@ def launch(record_path, command):
 
 
 class JobControl:
-    def __init__(self, root):
+    def __init__(self, root, tree_root=None):
         self.root = pathlib.Path(root)
+        # When set, a recorded job tree is handed back only if it lies under this directory (the replay at start
+        # trusts nothing it reads back from disk beyond the same containment the request path enforces).
+        self.tree_root = pathlib.Path(tree_root).resolve() if tree_root else None
         self.lock = threading.RLock()
         self.active = {}
         # Record names (.pgid, .owner) of earlier jobs that start-up recovery could not settle: a training group not
@@ -191,14 +194,24 @@ class JobControl:
 
         process_owned hands the tree back in its `finally`; a worker that is killed never gets there and leaves
         root-owned files the unprivileged Node cannot delete (EACCES), which blocks its cleanup journal for good.
-        The record lets the replacement worker finish the hand-back at start. An I/O failure is logged, not raised;
-        a job id that is not a uuid raises ValueError like every other job-scoped record."""
+        The record lets the replacement worker finish the hand-back at start. It is flushed to disk (file, then the
+        directory entry) before this returns, like the cancellation tombstone, so a host crash cannot leave an empty
+        record that start-up would drop. An I/O failure is logged, not raised; a job id that is not a uuid raises
+        ValueError like every other job-scoped record."""
         target = self.ownership_file(job_id)
         try:
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             temporary = target.with_suffix(".owner.tmp")
-            temporary.write_text(json.dumps({"directory": str(directory)}), encoding="utf-8")
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"directory": str(directory)}))
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(temporary, target)
+            folder = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(folder)
+            finally:
+                os.close(folder)
         except OSError as error:
             log.warning("cannot record the ownership hand-back for job %s: %s", job_id, error)
 
@@ -243,6 +256,9 @@ class JobControl:
             except (ValueError, KeyError, TypeError):
                 log.warning("dropping unreadable ownership hand-back record %s", record.name)
                 directory = None
+            if directory and not self.contains(directory):
+                log.warning("dropping ownership hand-back record %s: %r is outside %s", record.name, directory, self.tree_root)
+                directory = None
             if directory:
                 hand_back_ownership(directory)
                 done.append(job_id)
@@ -251,6 +267,16 @@ class JobControl:
             except OSError:
                 pass
         return done
+
+    def contains(self, directory):
+        """Whether a recorded job directory may be handed back: always when no tree root is configured."""
+        if self.tree_root is None:
+            return True
+        try:
+            resolved = pathlib.Path(directory).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return resolved != self.tree_root and self.tree_root in resolved.parents
 
     def reap_orphans(self):
         """At worker start: end any training process group a previous worker process left behind.
@@ -351,23 +377,29 @@ def hand_back_ownership(directory):
     root make that deletion fail with EACCES, which blocks the whole cleanup
     journal (and with it every later job). Best effort and symlink-safe: it
     never follows a link and never raises.
+
+    The Node user can rename directories while this walks. Every directory is therefore held open by file
+    descriptor and every entry is changed relative to it (fchownat without following links), so a directory swapped
+    for a symlink after it was listed cannot redirect the change; nothing is addressed by a path that could be
+    re-resolved.
     """
-    root = pathlib.Path(directory)
     try:
-        # lstat: a directory replaced by a symlink after a crash must not make this chown the link's target.
-        info = root.lstat()
+        # O_NOFOLLOW: a directory replaced by a symlink after a crash must not make this chown the link's target.
+        top = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError:
         return
-    if stat.S_ISLNK(info.st_mode) or os.geteuid() != 0 or info.st_uid == 0:
-        return
-
-    def own(path):
-        try:
-            os.lchown(path, info.st_uid, info.st_gid)
-        except OSError:
-            pass
-
-    own(root)
-    for base, directories, files in os.walk(root, followlinks=False):
-        for name in directories + files:
-            own(os.path.join(base, name))
+    try:
+        info = os.fstat(top)
+        if os.geteuid() != 0 or info.st_uid == 0:
+            return
+        os.chown(top, info.st_uid, info.st_gid)
+        for _, directories, files, descriptor in os.fwalk(".", dir_fd=top, follow_symlinks=False):
+            for name in directories + files:
+                try:
+                    os.chown(name, info.st_uid, info.st_gid, dir_fd=descriptor, follow_symlinks=False)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    finally:
+        os.close(top)

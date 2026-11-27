@@ -143,6 +143,34 @@ class ServerGateTests(unittest.TestCase):
             directory = self.request.outputDirectory
             self.assertEqual(events, [("pend", JOB, directory), "run", ("settle", JOB, directory)], outcome)
 
+    def test_a_job_outside_the_shared_runtime_is_rejected_without_a_record_or_a_hand_back(self):
+        events = []
+        previous = (self.server.control, self.server.run_reconstruction)
+        self.server.control = self.fake_control(events)
+        self.server.run_reconstruction = lambda request: events.append("run")
+        escaped = self.request.model_copy(update={"outputDirectory": "/var/lib/kubus-node/../../etc"})
+        try:
+            self.server.process_owned(escaped)
+        finally:
+            self.server.control, self.server.run_reconstruction = previous
+        self.assertEqual(events, ["run"])
+
+    def test_the_recorded_directory_is_the_resolved_path_inside_the_shared_runtime(self):
+        events = []
+        previous = (self.server.control, self.server.run_reconstruction)
+        self.server.control = self.fake_control(events)
+        self.server.run_reconstruction = lambda request: events.append("run")
+        dotted = self.request.model_copy(update={"outputDirectory": "/var/lib/kubus-node/x/../b"})
+        try:
+            self.server.process_owned(dotted)
+        finally:
+            self.server.control, self.server.run_reconstruction = previous
+        resolved = str(pathlib.Path("/var/lib/kubus-node/b").resolve())
+        self.assertEqual(events, [("pend", JOB, resolved), "run", ("settle", JOB, resolved)])
+
+    def test_the_replay_at_start_is_confined_to_the_shared_runtime(self):
+        self.assertEqual(self.server.control.tree_root, self.server.SHARED_ROOT)
+
     def test_health_reports_the_cleanup_protocol_and_the_current_instance_id(self):
         previous = self.server.gpu_info
         self.server.gpu_info = lambda: {"available": False}

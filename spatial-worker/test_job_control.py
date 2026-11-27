@@ -1,9 +1,11 @@
+import json
 import pathlib
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import os
 from job_control import JobControl, JobCancelled, hand_back_ownership
 
@@ -40,6 +42,55 @@ class HandBackOwnershipTests(unittest.TestCase):
             link.symlink_to(target)
             hand_back_ownership(link)
             self.assertEqual((target / "inner.txt").stat().st_uid, 0)
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "needs root to create foreign-owned files")
+    def test_a_directory_swapped_for_a_symlink_while_the_walk_is_running_cannot_redirect_the_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = pathlib.Path(temp) / "job"
+            (output / "sub").mkdir(parents=True)
+            (output / "sub" / "shadow").write_text("inside")
+            os.chown(output, 12345, 23456)
+            outside = pathlib.Path(temp) / "etc"
+            outside.mkdir()
+            (outside / "shadow").write_text("outside")
+            real_fwalk = os.fwalk
+
+            def swapping(*args, **kwargs):
+                for entry in real_fwalk(*args, **kwargs):
+                    if os.path.basename(entry[0]) == "sub" and not (output / "sub.moved").exists():
+                        # The Node user renames the directory the walk just listed and plants a link in its place.
+                        os.rename(output / "sub", output / "sub.moved")
+                        (output / "sub").symlink_to(outside)
+                    yield entry
+
+            with unittest.mock.patch.object(os, "fwalk", swapping):
+                hand_back_ownership(output)
+            self.assertEqual((outside / "shadow").stat().st_uid, 0)
+            self.assertEqual(outside.stat().st_uid, 0)
+            # The directory that was actually listed still got handed back, through its descriptor.
+            self.assertEqual((output / "sub.moved" / "shadow").stat().st_uid, 12345)
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "needs root to create foreign-owned files")
+    def test_every_change_is_made_relative_to_an_open_directory_without_following_links(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = pathlib.Path(temp) / "job"
+            (output / "a" / "b").mkdir(parents=True)
+            (output / "a" / "b" / "f").write_bytes(b"x")
+            os.chown(output, 12345, 23456)
+            real_chown = os.chown
+            calls = []
+
+            def recording(path, uid, gid, *, dir_fd=None, follow_symlinks=True):
+                calls.append((path, dir_fd, follow_symlinks))
+                return real_chown(path, uid, gid, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+            with unittest.mock.patch.object(os, "chown", recording):
+                hand_back_ownership(output)
+            entries = [call for call in calls if isinstance(call[0], str)]
+            self.assertEqual(sorted(call[0] for call in entries), ["a", "b", "f"])
+            for path, dir_fd, follow_symlinks in entries:
+                self.assertIsNotNone(dir_fd, path)
+                self.assertIs(follow_symlinks, False, path)
 
     def test_missing_directory_is_not_an_error(self):
         hand_back_ownership("/nonexistent/kubus-job")
@@ -278,6 +329,43 @@ class PendingHandBackTests(unittest.TestCase):
             self.assertEqual((path.stat().st_uid, path.stat().st_gid), (12345, 23456), str(path))
         self.assertFalse(restarted.ownership_file(JOB).exists())
         self.assertEqual(restarted.finish_pending_hand_backs(), [])
+
+    def test_the_record_is_flushed_to_disk_before_the_job_may_write_anything(self):
+        self.output.mkdir(parents=True)
+        events = []
+        real_fsync, real_replace = os.fsync, os.replace
+        with unittest.mock.patch.object(os, "fsync", lambda fd: (events.append("fsync"), real_fsync(fd))[1]), \
+                unittest.mock.patch.object(os, "replace", lambda a, b: (events.append("replace"), real_replace(a, b))[1]):
+            self.control.pend_hand_back(JOB, self.output)
+        # The file contents are on disk before the rename publishes them; the directory entry is flushed after it.
+        self.assertEqual(events, ["fsync", "replace", "fsync"])
+        self.assertEqual(json.loads(self.control.ownership_file(JOB).read_text(encoding="utf-8")), {"directory": str(self.output)})
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "needs root to create foreign-owned files")
+    def test_a_record_pointing_outside_the_configured_tree_root_is_dropped_not_replayed(self):
+        inside_root = pathlib.Path(self.temp.name) / "jobs"
+        elsewhere = pathlib.Path(self.temp.name) / "elsewhere"
+        elsewhere.mkdir()
+        os.chown(elsewhere, 12345, 23456)
+        (elsewhere / "f").write_bytes(b"x")
+        control = JobControl(self.control.root, tree_root=inside_root)
+        control.pend_hand_back(JOB, elsewhere)
+        self.assertEqual(control.finish_pending_hand_backs(), [])
+        self.assertFalse(control.ownership_file(JOB).exists())
+        self.assertEqual((elsewhere / "f").stat().st_uid, 0)
+        # A tree inside the root is still handed back.
+        self.root_written_tree()
+        control.pend_hand_back(JOB, self.output)
+        self.assertEqual(control.finish_pending_hand_backs(), [JOB])
+        self.assertEqual((self.output / "training" / "dataset" / "frame_00001.jpg").stat().st_uid, 12345)
+
+    def test_the_tree_root_itself_and_paths_outside_it_are_not_contained(self):
+        control = JobControl(self.control.root, tree_root=self.temp.name)
+        self.assertFalse(control.contains(self.temp.name))
+        self.assertFalse(control.contains(pathlib.Path(self.temp.name).parent))
+        self.assertFalse(control.contains(pathlib.Path(self.temp.name) / ".." / "x"))
+        self.assertTrue(control.contains(pathlib.Path(self.temp.name) / "jobs" / JOB))
+        self.assertTrue(JobControl(self.control.root).contains("/anywhere"))
 
     def test_a_finished_job_leaves_no_record(self):
         self.output.mkdir(parents=True)

@@ -29,7 +29,8 @@ WORKER_AUTH_KEY_PATH = os.environ.get("WORKER_AUTH_KEY_PATH", "/var/lib/kubus-no
 
 WORKER_VERSION = "kubus-spatial-worker/13"
 WORKER_INSTANCE_ID = str(uuid.uuid4())
-control = JobControl("/var/lib/kubus-node/private/worker-control")
+SHARED_ROOT = pathlib.Path("/var/lib/kubus-node").resolve()
+control = JobControl("/var/lib/kubus-node/private/worker-control", tree_root=SHARED_ROOT)
 
 
 def recover_after_restart(job_control: JobControl) -> bool:
@@ -211,13 +212,18 @@ def wants_floater_crop(request: ProcessRequest) -> bool:
 
 
 def process_owned(request: ProcessRequest):
+    try:
+        output = str(ensure_child(SHARED_ROOT, request.outputDirectory))
+    except HTTPException:
+        # Outside the shared runtime: run_reconstruction rejects it; nothing is recorded or handed back for it.
+        return run_reconstruction(request)
     # Recorded first, so a replacement worker can finish the hand-back if this process is killed mid-job.
-    control.pend_hand_back(request.jobId, request.outputDirectory)
+    control.pend_hand_back(request.jobId, output)
     try:
         return run_reconstruction(request)
     finally:
         # Success, failure or cancellation: the Node must be able to delete what this root process wrote.
-        control.settle_hand_back(request.jobId, request.outputDirectory)
+        control.settle_hand_back(request.jobId, output)
 
 
 def require_review_files(output: pathlib.Path, masked: dict | None) -> None:
@@ -258,9 +264,8 @@ def prepare_only(runner, capture: pathlib.Path, output: pathlib.Path, progress, 
 def run_reconstruction(request: ProcessRequest):
     if not torch.cuda.is_available():
         raise HTTPException(status_code=503, detail="gpu_unsupported")
-    shared_root = pathlib.Path("/var/lib/kubus-node").resolve()
-    capture = ensure_child(shared_root, request.captureDirectory)
-    output = ensure_child(shared_root, request.outputDirectory)
+    capture = ensure_child(SHARED_ROOT, request.captureDirectory)
+    output = ensure_child(SHARED_ROOT, request.outputDirectory)
     if request.type != "spatial.reconstruct":
         raise HTTPException(status_code=422, detail="job_type_not_supported_by_worker")
     mode = request.input.get("mode") or "frames"
