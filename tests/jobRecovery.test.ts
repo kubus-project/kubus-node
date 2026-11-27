@@ -64,3 +64,41 @@ it('start leaves a recently written face-review folder alone (the other process 
  await jobs.start();
  expect((await fs.stat(fresh)).isDirectory()).toBe(true);
 });
+
+const restartedInstance = '44444444-4444-4444-8444-444444444444';
+function workerRestartedMock() {
+ return vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+   if (String(url).endsWith('/health')) return new Response(JSON.stringify({status: 'ready', cleanupProtocol: 1, workerInstanceId: restartedInstance}));
+   const body = JSON.parse(String(init?.body));
+   if (body.workerInstanceId === instance) return new Response(JSON.stringify({detail: 'worker_instance_changed'}), {status: 409});
+   return new Response(JSON.stringify({jobId: id, workerInstanceId: restartedInstance, cleanupProtocol: 1, quiescent: true}));
+ });
+}
+it('worker killed mid-job and restarted with a new id: restart cleans the work directory, journals worker_restarted and accepts new jobs', async () => {
+ const {jobs, target, recovered} = await fixture();
+ workerRestartedMock();
+ await jobs.start();
+ expect(jobs.get(id)).toMatchObject({state: 'failed', error: {code: 'interrupted_requires_retry'}});
+ expect(recovered.snapshot().jobCleanup?.[id]).toMatchObject({state: 'complete', removed: true, reason: 'worker_restarted'});
+ await expect(fs.stat(target)).rejects.toMatchObject({code: 'ENOENT'});
+ expect(jobs.health()).toMatchObject({cleanupBlocked: 0});
+ // Past the cleanup gate: the stub capture store is what refuses now, not worker_cleanup_pending.
+ const probe = Object.assign(new Error('probe'), {code: 'capture_probe'});
+ (jobs as unknown as {deps: {captureStore: unknown}}).deps.captureStore = {get: () => { throw probe; }};
+ await expect(jobs.create('spatial.reconstruct', {captureId: 'synthetic'})).rejects.toMatchObject({code: 'capture_probe'});
+});
+it('worker unreachable after a crash keeps the work directory and still refuses new jobs', async () => {
+ const {jobs, target} = await fixture();
+ vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('ECONNREFUSED'));
+ await jobs.start();
+ expect((await fs.stat(target)).isDirectory()).toBe(true);
+ expect(jobs.health()).toMatchObject({cleanupBlocked: 1});
+ await expect(jobs.create('spatial.reconstruct', {captureId: 'synthetic'})).rejects.toMatchObject({code: 'worker_cleanup_pending'});
+});
+it('same worker instance reporting not quiescent keeps the work directory and still refuses new jobs', async () => {
+ const {jobs, target} = await fixture();
+ vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({detail: 'worker_not_quiescent'}), {status: 503}));
+ await jobs.start();
+ expect((await fs.stat(target)).isDirectory()).toBe(true);
+ await expect(jobs.create('spatial.reconstruct', {captureId: 'synthetic'})).rejects.toMatchObject({code: 'worker_cleanup_pending'});
+});

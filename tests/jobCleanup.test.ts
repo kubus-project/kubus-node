@@ -86,3 +86,60 @@ it('retries failed filesystem removal without falsely completing retention', asy
   expect(store.snapshot().jobCleanup?.[id]?.state).toBe('blocked'); rm.mockRestore();
   await cleanup.reconcile(id); await expect(fs.stat(target)).rejects.toMatchObject({ code: 'ENOENT' });
 });
+
+const restarted = '44444444-4444-4444-8444-444444444444';
+/** A worker that was restarted: it refuses the recorded instance id, reports a new one, and acknowledges a cancel for it. */
+function restartedWorker(options: { health?: () => Response; secondCancel?: (body: Record<string, unknown>) => Response } = {}) {
+  const calls: string[] = [];
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+    const address = String(url); calls.push(address.replace('http://worker.invalid', ''));
+    if (address.endsWith('/health')) return options.health?.() ?? new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, workerInstanceId: restarted }));
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    if (body.workerInstanceId === instance) return new Response(JSON.stringify({ detail: 'worker_instance_changed' }), { status: 409 });
+    return options.secondCancel?.(body) ?? new Response(JSON.stringify({ jobId: id, workerInstanceId: restarted, cleanupProtocol: 1, quiescent: true }));
+  });
+  return calls;
+}
+it('a worker restarted with a new instance id lets cleanup finish and journals worker_restarted', async () => {
+  const { cleanup, target, store } = await fixture(); await cleanup.markWorkerAttempt(id, instance);
+  const calls = restartedWorker();
+  await cleanup.reconcile(id);
+  expect(calls).toEqual(['/v1/jobs/cancel', '/health', '/v1/jobs/cancel']);
+  await expect(fs.stat(target)).rejects.toMatchObject({ code: 'ENOENT' });
+  expect(store.snapshot().jobCleanup?.[id]).toMatchObject({ state: 'complete', removed: true, reason: 'worker_restarted', replacedWorkerInstanceId: instance });
+});
+it('a restarted worker whose health cannot be read keeps cleanup blocked', async () => {
+  const { cleanup, target, store } = await fixture(); await cleanup.markWorkerAttempt(id, instance);
+  restartedWorker({ health: () => new Response('down', { status: 503 }) });
+  await expect(cleanup.reconcile(id)).rejects.toThrow('worker_quiescence_unverified');
+  expect((await fs.stat(target)).isDirectory()).toBe(true);
+  expect(store.snapshot().jobCleanup?.[id]).toMatchObject({ state: 'blocked' });
+});
+it('an instance-changed answer is not trusted when the worker still reports the recorded instance', async () => {
+  const { cleanup, target, store } = await fixture(); await cleanup.markWorkerAttempt(id, instance);
+  restartedWorker({ health: () => new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, workerInstanceId: instance })) });
+  await expect(cleanup.reconcile(id)).rejects.toThrow('worker_quiescence_unverified');
+  expect((await fs.stat(target)).isDirectory()).toBe(true);
+  expect(store.snapshot().jobCleanup?.[id]?.state).toBe('blocked');
+});
+it('a restarted worker that will not acknowledge the cancel for its own instance keeps cleanup blocked', async () => {
+  const { cleanup, target } = await fixture(); await cleanup.markWorkerAttempt(id, instance);
+  restartedWorker({ secondCancel: () => new Response(JSON.stringify({ detail: 'worker_not_quiescent' }), { status: 503 }) });
+  await expect(cleanup.reconcile(id)).rejects.toThrow('worker_quiescence_unverified');
+  expect((await fs.stat(target)).isDirectory()).toBe(true);
+});
+it('an unreachable worker (network error on the first cancel) keeps cleanup blocked', async () => {
+  const { cleanup, target, store } = await fixture(); await cleanup.markWorkerAttempt(id, instance);
+  vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('ECONNREFUSED'));
+  await expect(cleanup.reconcile(id)).rejects.toThrow();
+  expect((await fs.stat(target)).isDirectory()).toBe(true);
+  expect(store.snapshot().jobCleanup?.[id]?.state).toBe('blocked');
+});
+it('the same instance reporting not quiescent keeps cleanup blocked and never asks for health', async () => {
+  const { cleanup, target, store } = await fixture(); await cleanup.markWorkerAttempt(id, instance);
+  const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ detail: 'worker_not_quiescent' }), { status: 503 }));
+  await expect(cleanup.reconcile(id)).rejects.toThrow('worker_quiescence_unverified');
+  expect(fetch).toHaveBeenCalledTimes(1);
+  expect((await fs.stat(target)).isDirectory()).toBe(true);
+  expect(store.snapshot().jobCleanup?.[id]?.state).toBe('blocked');
+});
