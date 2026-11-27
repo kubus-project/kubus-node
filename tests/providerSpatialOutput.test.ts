@@ -90,7 +90,11 @@ async function runRemoteJob(variants: Array<{ role: string; name: string }>, opt
     privateOutputRequesterPublicKey: requester.publicKey.export({ format: 'der', type: 'spki' }).toString('base64'),
   });
   for (let waited = 0; waited < 4000 && !['completed', 'failed'].includes(jobs.get(job.id).state); waited += 10) await new Promise(resolve => setTimeout(resolve, 10));
-  await new Promise(resolve => setTimeout(resolve, 20));
+  // The state turns final before run()'s finally block reconciles cleanup, which deletes the job's work files under
+  // `dir`; wait for the runtime to drain so afterEach's rm does not race it (ENOTEMPTY on Windows under load).
+  const tasks = (jobs as unknown as { tasks: Map<string, Promise<void>> }).tasks;
+  await Promise.allSettled([...tasks.values()]);
+  for (let waited = 0; waited < 4000 && tasks.size > 0; waited += 10) await new Promise(resolve => setTimeout(resolve, 10));
   return { job: jobs.get(job.id), store };
 }
 
