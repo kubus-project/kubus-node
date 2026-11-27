@@ -5,7 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { KubusApiError } from '../src/backend/kubusApiClient.js';
 import type { ManagedReconstruction, RemoteComputeJob } from '../src/backend/models.js';
-import { LIGHTWEIGHT_MAX_BYTES, ManagedRequesterBridge, workerPrepare, type PrepareOutcome } from '../src/compute/managedRequesterBridge.js';
+import { DEFAULT_LEASE_RENEW_MS, LIGHTWEIGHT_MAX_BYTES, ManagedRequesterBridge, workerCancelPrepare, workerPrepare, type ManagedRequesterDeps, type PrepareOutcome } from '../src/compute/managedRequesterBridge.js';
 import { PRIVATE_OUTPUT_PROTOCOL, SPATIAL_OUTPUT_PROTOCOL } from '../src/compute/privateOutputTransport.js';
 import { PROVIDER_CLEANUP_SCHEMA, cleanupAttestationMessage, type ProviderCleanupPayload } from '../src/compute/providerCleanupAttestation.js';
 
@@ -41,6 +41,11 @@ let ackProvider = providerA;
 /** A stand-in for the backend's draft store: what it has received of each artifact, and when the attempt is ready. */
 let server: { full?: Variant; lightweight?: Variant; created: number; failNextAppend?: boolean; shortfall?: number };
 let attestation: { payload: ProviderCleanupPayload; signature: string } | null;
+/** What the worker wrote into dataset/prepared.json; `null` writes no file. Clean by default: masking ran and nothing is flagged. */
+let preparedRecord: Record<string, unknown> | null;
+const cleanLook = { images: 0, weakExcluded: 0, largeBelowCertain: 0, items: [] as unknown[] };
+const cleanRecord = () => ({ schema: 'kubus.prepared-dataset/1', faceMasking: { photos: { ran: true, needsLook: { ...cleanLook } }, video: { ran: true, needsLook: { ...cleanLook } } } });
+const flaggedRecord = () => ({ schema: 'kubus.prepared-dataset/1', faceMasking: { photos: { ran: true, needsLook: { images: 1, weakExcluded: 0, largeBelowCertain: 1, items: [{ image: 7, largeBelowCertain: 1, file: 'dataset/images/photo_00006.jpg' }] } }, video: { ran: true, needsLook: { ...cleanLook } } } });
 
 function attempt(overrides: Partial<ManagedReconstruction> = {}): ManagedReconstruction {
   return {
@@ -82,11 +87,12 @@ function view() {
   return attempt({ state: ready ? 'ready' : 'importing' });
 }
 
-function makeBridge(prepare?: PrepareOutcome) {
+function makeBridge(prepare?: PrepareOutcome, extra: Partial<ManagedRequesterDeps> = {}) {
   prepareOutcome = prepare ?? null;
   const api = {
     claimReconstruction: vi.fn(async () => null as ManagedReconstruction | null),
     reconstructionRetention: vi.fn(async () => ({ purge: [] as string[] })),
+    ackReconstructionRetention: vi.fn(async (_nodeId: string, _ids: string[]) => ({ acknowledged: _ids.length })),
     readReconstructionChunk: vi.fn(async (_id: string, fileId: string, offset: number) => sources.get(fileId)!.subarray(offset, offset + 16)),
     getReconstructionComputeJob: vi.fn(async () => job()),
     appendReconstructionCandidate: vi.fn(async (_id: string, offset: number, bytes: Buffer, _nodeId: string, variant?: 'lightweight') => {
@@ -138,8 +144,9 @@ function makeBridge(prepare?: PrepareOutcome) {
       return { directory: staged, record: { binding: BINDING } };
     }),
     signedAcknowledgement: vi.fn(async (_job: RemoteComputeJob, accepted: boolean, reason?: string) => ({ payload: { accepted, reason }, signature: 'sig' })),
-    releaseInput: vi.fn(async () => undefined),
-    releaseUnusedInput: vi.fn(async (_cid: string) => undefined),
+    releaseInput: vi.fn(async (_job?: RemoteComputeJob): Promise<{ released: boolean; reason?: string } | undefined> => undefined),
+    releaseUnusedInput: vi.fn(async (_cid: string): Promise<{ released: boolean; reason?: string } | undefined> => undefined),
+    releaseInputsOwnedBy: vi.fn(async (_owner: string): Promise<{ released: boolean; reason?: string } | undefined> => undefined),
   };
   const prepareFn = vi.fn(async ({ outputDirectory }: { outputDirectory: string }): Promise<PrepareOutcome> => {
     if (prepareOutcome) return prepareOutcome;
@@ -147,11 +154,12 @@ function makeBridge(prepare?: PrepareOutcome) {
     await fs.mkdir(path.join(dataset, 'images'), { recursive: true });
     await fs.writeFile(path.join(dataset, 'images', 'photo_00000.jpg'), 'masked');
     await fs.writeFile(path.join(dataset, 'transforms.json'), '{"frames":[{"file_path":"images/photo_00000.jpg"}]}');
-    await fs.writeFile(path.join(dataset, 'prepared.json'), '{"schema":"kubus.prepared-dataset/1"}');
+    if (preparedRecord) await fs.writeFile(path.join(dataset, 'prepared.json'), JSON.stringify(preparedRecord));
     return { ok: true, datasetDirectory: dataset, inputs: [], sfm: { registeredViews: 30, submittedViews: 34 } };
   });
-  const bridge = new ManagedRequesterBridge({ api: api as never, nodeId: () => nodeId, dataRoot, prepare: prepareFn, captures: captures as never, transport: transport as never, remote: remote as never, logger });
-  return { bridge, api, captures, transport, remote, prepareFn };
+  const cancelPrepare = vi.fn(async (_jobId: string) => undefined);
+  const bridge = new ManagedRequesterBridge({ api: api as never, nodeId: () => nodeId, dataRoot, prepare: prepareFn, cancelPrepare, captures: captures as never, transport: transport as never, remote: remote as never, logger, ...extra });
+  return { bridge, api, captures, transport, remote, prepareFn, cancelPrepare };
 }
 
 function signedAttestation(overrides: Partial<ProviderCleanupPayload> = {}, key = providerKeys.privateKey): { payload: ProviderCleanupPayload; signature: string } {
@@ -177,6 +185,7 @@ beforeEach(async () => {
   ackProvider = providerA;
   server = { created: 0 };
   attestation = null;
+  preparedRecord = cleanRecord();
 });
 
 afterEach(async () => { await fs.rm(dataRoot, { recursive: true, force: true }); });
@@ -199,7 +208,7 @@ describe('managed requester bridge', () => {
     const [record] = captures.registerRemote.mock.calls[0] as unknown as [{ kind: string; directory: string }];
     expect(record.kind).toBe('prepared');
     expect((await fs.readdir(record.directory)).sort()).toEqual(['capture.json', 'dataset']);
-    expect(transport.encryptCapture).toHaveBeenCalledWith(`managed-${reconstructionId}`, providerA, 'key');
+    expect(transport.encryptCapture).toHaveBeenCalledWith(`managed-${reconstructionId}`, providerA, 'key', expect.objectContaining({ pinOwner: expect.stringMatching(/^requester-input:/) }));
     const created = calls.find(call => call.action === 'compute-job')!;
     expect(created.body).toMatchObject({ providerNodeId: providerA, jobSpec: { outputMode: PRIVATE_OUTPUT_PROTOCOL, inputMode: 'prepared' } });
   });
@@ -238,7 +247,7 @@ describe('managed requester bridge', () => {
     providers = [{ nodeId: providerB, encryptionPublicKey: 'key-b', privateOutputProtocol: PRIVATE_OUTPUT_PROTOCOL, spatialOutputProtocol: SPATIAL_OUTPUT_PROTOCOL }];
     const reads = api.readReconstructionChunk.mock.calls.length;
     await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
-    expect(transport.encryptCapture).toHaveBeenCalledWith(`managed-${reconstructionId}`, providerB, 'key-b');
+    expect(transport.encryptCapture).toHaveBeenCalledWith(`managed-${reconstructionId}`, providerB, 'key-b', expect.anything());
     expect(api.readReconstructionChunk.mock.calls.length).toBe(reads);
     expect(prepareFn).toHaveBeenCalledTimes(1);
   });
@@ -316,7 +325,8 @@ describe('managed requester bridge', () => {
     const { bridge, api } = makeBridge();
     await fs.mkdir(path.join(root(), 'set'), { recursive: true });
     api.reconstructionRetention.mockResolvedValueOnce({ purge: [reconstructionId, '../escape'] });
-    expect(await bridge.purgeExpired(nodeId)).toEqual([reconstructionId, '../escape']);
+    // Only a real attempt id is purged (and acknowledged); anything else the backend lists is ignored.
+    expect(await bridge.purgeExpired(nodeId)).toEqual([reconstructionId]);
     await expect(fs.stat(root())).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });
@@ -708,7 +718,7 @@ describe('encrypted input reuse', () => {
     await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
     expect(remote.releaseUnusedInput).toHaveBeenCalledTimes(1);
     expect(remote.releaseUnusedInput).toHaveBeenCalledWith('bafyinput1');
-    expect(transport.encryptCapture).toHaveBeenLastCalledWith(`managed-${reconstructionId}`, providerB, 'key-b');
+    expect(transport.encryptCapture).toHaveBeenLastCalledWith(`managed-${reconstructionId}`, providerB, 'key-b', expect.anything());
     expect(jobCalls().at(-1)!.body).toMatchObject({ providerNodeId: providerB, inputCid: 'bafyinput2' });
     expect(await pending()).toBeUndefined();
   });
@@ -720,7 +730,7 @@ describe('encrypted input reuse', () => {
     providers = [providerOf(providerA, 'rotated-key')];
     await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
     expect(transport.encryptCapture).toHaveBeenCalledTimes(2);
-    expect(transport.encryptCapture).toHaveBeenLastCalledWith(`managed-${reconstructionId}`, providerA, 'rotated-key');
+    expect(transport.encryptCapture).toHaveBeenLastCalledWith(`managed-${reconstructionId}`, providerA, 'rotated-key', expect.anything());
     expect(remote.releaseUnusedInput).toHaveBeenCalledWith('bafyinput1');
     expect(jobCalls().at(-1)!.body).toMatchObject({ providerNodeId: providerA, inputCid: 'bafyinput2' });
   });
@@ -893,15 +903,34 @@ describe('encrypted input reuse', () => {
   });
 
   describe('the attempt record', () => {
+    const garbage = '{"excludedProviders":[],"captureId":"managed-9b6f6f0e-2d3c-4b8a-9a52-6c';
+
     test('is never replaced by an empty one when it cannot be read: nothing is prepared or encrypted over it', async () => {
-      const { bridge, api, captures, transport } = makeBridge();
+      const { bridge, api, captures, transport, prepareFn } = makeBridge();
       failJobCalls(api, 1);
       await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
-      await fs.writeFile(path.join(root(), 'state.json'), '{"excludedProviders":[],"captureId":"managed-9b6f6f0e-2d3c-4b8a-9a52-6c');
+      await fs.writeFile(path.join(root(), 'state.json'), garbage);
       const registered = captures.registerRemote.mock.calls.length;
-      await expect(bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }))).rejects.toMatchObject({ code: 'reconstruction_state_unreadable' });
+      await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
       expect(captures.registerRemote.mock.calls.length).toBe(registered);
       expect(transport.encryptCapture).toHaveBeenCalledTimes(1);
+      expect(prepareFn).toHaveBeenCalledTimes(1);
+      // The unreadable record itself is left in place for review.
+      expect(await fs.readFile(path.join(root(), 'state.json'), 'utf8')).toBe(garbage);
+    });
+
+    test('is reported to the backend as a failed attempt instead of wedging every later claim', async () => {
+      const { bridge, api } = makeBridge();
+      failJobCalls(api, 1);
+      await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+      await fs.writeFile(path.join(root(), 'state.json'), garbage);
+      await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+      // The platform failed, not the capture: a code an operator may retry.
+      expect(calls.at(-1)).toMatchObject({ action: 'failure', body: { nodeId, code: 'requester_unavailable' } });
+      expect(warned()).toHaveBeenCalledWith(expect.objectContaining({ code: 'reconstruction_state_unreadable' }), expect.any(String));
+      // When even the report fails, the pass fails (and is tried again), rather than the attempt being forgotten.
+      api.reconstructionCall.mockRejectedValueOnce(new KubusApiError('backend down', 503, { success: false }));
+      await expect(bridge.advance(nodeId, attempt({ state: 'processing', computeJobId: jobId }))).rejects.toThrow('backend down');
     });
 
     test('is written through a temporary file that does not stay behind', async () => {
@@ -984,6 +1013,561 @@ describe('encrypted input reuse', () => {
   });
 });
 
+const warned = () => (logger as unknown as { warn: ReturnType<typeof vi.fn> }).warn;
+const resetAttempt = async () => { calls = []; await fs.rm(path.join(dataRoot, 'private'), { recursive: true, force: true }); };
+
+describe('face review gate', () => {
+  const flaggedInputs = [
+    { fileId: '11111111-1111-4111-8111-111111111111', usable: true, usableViews: 1, reason: null, faceReview: 2 },
+    { fileId: '22222222-2222-4222-8222-222222222222', usable: true, usableViews: 5, reason: null },
+  ];
+  /** Prepare writes a dataset (with `preparedRecord`) and returns these inputs. */
+  function makeFlagged(inputs = flaggedInputs) {
+    const made = makeBridge();
+    made.prepareFn.mockImplementation(async ({ outputDirectory }: { outputDirectory: string }): Promise<PrepareOutcome> => {
+      const dataset = path.join(outputDirectory, 'dataset');
+      await fs.mkdir(path.join(dataset, 'images'), { recursive: true });
+      await fs.writeFile(path.join(dataset, 'images', 'photo_00000.jpg'), 'masked');
+      await fs.writeFile(path.join(dataset, 'transforms.json'), '{}');
+      if (preparedRecord) await fs.writeFile(path.join(dataset, 'prepared.json'), JSON.stringify(preparedRecord));
+      return { ok: true, datasetDirectory: dataset, inputs, sfm: { registeredViews: 30, submittedViews: 34 } };
+    });
+    return made;
+  }
+
+  test('a dataset with an image flagged for a human look never leaves the Node: no capture, no encryption, no provider', async () => {
+    preparedRecord = flaggedRecord();
+    const { bridge, captures, transport } = makeFlagged();
+    await bridge.advance(nodeId, attempt());
+    expect(transport.encryptCapture).not.toHaveBeenCalled();
+    expect(captures.registerRemote).not.toHaveBeenCalled();
+    expect(actions()).not.toContain('providers');
+    expect(actions()).not.toContain('compute-job');
+    expect(actions().slice(-2)).toEqual(['failure', 'cleanup']);
+    // The per-file feedback names the flagged source file with the reason `face_review`; the other file is as it was.
+    const failure = calls.find(call => call.action === 'failure')!.body as { code: string; feedback: { inputs: Array<Record<string, unknown>> } };
+    expect(failure.code).toBe('face_review_required');
+    expect(failure.feedback.inputs).toEqual([
+      { fileId: '11111111-1111-4111-8111-111111111111', usable: false, usableViews: 1, reason: 'face_review' },
+      { fileId: '22222222-2222-4222-8222-222222222222', usable: true, usableViews: 5 },
+    ]);
+    // The masked dataset does not stay behind: only the sources and the attempt's record do.
+    expect((await fs.readdir(root())).sort()).toEqual(['set', 'state.json']);
+    expect(calls.at(-1)!.body).toEqual({ nodeId, state: 'complete' });
+  });
+
+  test('a flag of any kind stops it, in a video part too, and a truncated list counts', async () => {
+    for (const record of [
+      { photos: { ran: true, needsLook: { ...cleanLook, weakExcluded: 1 } } },
+      { photos: { ran: true, needsLook: { ...cleanLook } }, video: { ran: true, needsLook: { ...cleanLook, images: 2, items: [{}, {}] } } },
+      { video: { ran: true, needsLook: { ...cleanLook, itemsTruncated: true } } },
+    ]) {
+      await resetAttempt();
+      preparedRecord = { schema: 'kubus.prepared-dataset/1', faceMasking: record };
+      const { bridge, transport } = makeFlagged();
+      await bridge.advance(nodeId, attempt());
+      expect(calls.find(call => call.action === 'failure')!.body).toMatchObject({ code: 'face_review_required' });
+      expect(transport.encryptCapture).not.toHaveBeenCalled();
+    }
+  });
+
+  test('a clean record goes on to a provider as before', async () => {
+    const { bridge, transport } = makeFlagged();
+    await bridge.advance(nodeId, attempt());
+    expect(transport.encryptCapture).toHaveBeenCalledTimes(1);
+    expect(actions()).not.toContain('failure');
+  });
+
+  test('a record that is missing, or does not show that masking ran, is refused and never sent', async () => {
+    for (const record of [null, { schema: 'kubus.prepared-dataset/1' }, { schema: 'kubus.prepared-dataset/1', faceMasking: null }, { schema: 'kubus.prepared-dataset/1', faceMasking: {} },
+      { schema: 'kubus.prepared-dataset/1', faceMasking: { photos: { ran: true } } }]) {
+      await resetAttempt();
+      preparedRecord = record;
+      const { bridge, transport } = makeFlagged();
+      await bridge.advance(nodeId, attempt());
+      expect(calls.find(call => call.action === 'failure')!.body, JSON.stringify(record)).toMatchObject({ code: 'face_masking_failed' });
+      expect(transport.encryptCapture).not.toHaveBeenCalled();
+    }
+  });
+
+  test('a record that is not JSON is refused too', async () => {
+    const { bridge, transport, prepareFn } = makeBridge();
+    prepareFn.mockImplementation(async ({ outputDirectory }: { outputDirectory: string }): Promise<PrepareOutcome> => {
+      const dataset = path.join(outputDirectory, 'dataset');
+      await fs.mkdir(dataset, { recursive: true });
+      await fs.writeFile(path.join(dataset, 'prepared.json'), '{"faceMasking": ');
+      return { ok: true, datasetDirectory: dataset, inputs: [], sfm: {} };
+    });
+    await bridge.advance(nodeId, attempt());
+    expect(calls.find(call => call.action === 'failure')!.body).toMatchObject({ code: 'face_masking_failed' });
+    expect(transport.encryptCapture).not.toHaveBeenCalled();
+  });
+
+  test('a prepared capture from an earlier version is checked again before it is encrypted', async () => {
+    const { bridge, transport } = makeBridge();
+    providers = [];
+    await bridge.advance(nodeId, attempt());
+    // Prepared and registered while no provider was eligible; the stored dataset now carries a flag.
+    await fs.writeFile(path.join(root(), 'capture', 'dataset', 'prepared.json'), JSON.stringify(flaggedRecord()));
+    providers = [{ nodeId: providerA, encryptionPublicKey: 'key', privateOutputProtocol: PRIVATE_OUTPUT_PROTOCOL, spatialOutputProtocol: SPATIAL_OUTPUT_PROTOCOL }];
+    await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+    expect(transport.encryptCapture).not.toHaveBeenCalled();
+    expect(calls.find(call => call.action === 'failure')!.body).toMatchObject({ code: 'face_review_required' });
+    expect(actions().slice(-2)).toEqual(['failure', 'cleanup']);
+  });
+
+  test('a provider that refused the dataset for a face review ends the attempt for good: no other provider is tried', async () => {
+    const { bridge, api, remote, transport } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    api.getReconstructionComputeJob.mockResolvedValueOnce({ ...job('FAILED'), failure: { code: 'provider_face_review_required' } });
+    await bridge.advance(nodeId, processing());
+    expect(calls.find(call => call.action === 'failure')!.body).toMatchObject({ code: 'face_review_required' });
+    expect(actions().slice(-2)).toEqual(['failure', 'cleanup']);
+    expect(actions().filter(action => action === 'providers')).toHaveLength(1);
+    expect(transport.encryptCapture).toHaveBeenCalledTimes(1);
+    // The provider's input pin is released and its cleanup statement is still looked for.
+    expect(remote.releaseInput).toHaveBeenCalledWith(expect.objectContaining({ state: 'FAILED' }));
+    expect((await stateFile()).providerCleanups[jobId]).toMatchObject({ providerNodeId: providerA, status: 'awaiting' });
+    expect((await stateFile()).excludedProviders ?? []).toEqual([]);
+  });
+
+  test('the provider failure code is read from the job view wherever the backend puts it', async () => {
+    for (const failure of [{ code: 'provider_face_review_required' }, { metadata: { code: 'provider_face_review_required' } }, { reason: 'provider_face_review_required' }]) {
+      await resetAttempt();
+      const { bridge, api } = makeBridge();
+      await bridge.advance(nodeId, attempt());
+      api.getReconstructionComputeJob.mockResolvedValueOnce({ ...job('FAILED'), failure });
+      await bridge.advance(nodeId, processing());
+      expect(calls.find(call => call.action === 'failure')!.body, JSON.stringify(failure)).toMatchObject({ code: 'face_review_required' });
+    }
+  });
+
+  test('any other provider failure still excludes that provider and tries the next', async () => {
+    const { bridge, api } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    api.getReconstructionComputeJob.mockResolvedValueOnce({ ...job('FAILED'), failure: { code: 'worker_failed' } });
+    await bridge.advance(nodeId, processing());
+    expect(calls.find(call => call.action === 'failure')).toBeUndefined();
+    expect(calls.at(-1)!.body).toMatchObject({ state: 'waiting_for_node', stage: 'provider_lost' });
+  });
+});
+
+describe('transient failures are not verification failures', () => {
+  test('a result that cannot be fetched or stored is retried on a later pass without acknowledging anything', async () => {
+    const { bridge, remote } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    for (const error of [Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' }), new Error('Kubo cat failed with HTTP 503'),
+      new DOMException('The operation was aborted due to timeout', 'TimeoutError'), Object.assign(new Error('output_fetch_stalled'), { code: 'output_fetch_stalled' })]) {
+      remote.stagePrivateOutput.mockRejectedValueOnce(error);
+      await expect(bridge.advance(nodeId, processing())).rejects.toBe(error);
+    }
+    // Nothing was signed, nothing was sent: the job is not disputed and no provider is excluded.
+    expect(remote.signedAcknowledgement).not.toHaveBeenCalled();
+    expect(actions()).not.toContain('compute-job/acknowledge');
+    expect((await stateFile()).excludedProviders).toEqual([]);
+    // The next pass fetches it and goes on.
+    await bridge.advance(nodeId, processing());
+    expect(remote.signedAcknowledgement).toHaveBeenCalledWith(expect.objectContaining({ state: 'OUTPUT_READY' }), true, undefined);
+    expect(calls.find(call => call.action === 'candidate')).toBeDefined();
+  });
+
+  test('a result that is wrong is still rejected with a signed, final answer', async () => {
+    for (const error of [Object.assign(new Error('x'), { code: 'private_output_signature_invalid' }), new Error('private_output_digest_mismatch'), new Error('Unsupported state or unable to authenticate data'), new Error('spatial_manifest_variant_invalid')]) {
+      await resetAttempt();
+      const { bridge, remote } = makeBridge();
+      await bridge.advance(nodeId, attempt());
+      remote.stagePrivateOutput.mockRejectedValueOnce(error);
+      await bridge.advance(nodeId, processing());
+      expect(remote.signedAcknowledgement, error.message).toHaveBeenCalledWith(expect.anything(), false, 'output_verification_failed');
+    }
+  });
+});
+
+describe('lease renewal while preparing', () => {
+  const slow = (ms: number) => async ({ outputDirectory }: { outputDirectory: string }): Promise<PrepareOutcome> => {
+    await new Promise(resolve => setTimeout(resolve, ms));
+    const dataset = path.join(outputDirectory, 'dataset');
+    await fs.mkdir(path.join(dataset, 'images'), { recursive: true });
+    await fs.writeFile(path.join(dataset, 'prepared.json'), JSON.stringify(cleanRecord()));
+    return { ok: true, datasetDirectory: dataset, inputs: [], sfm: { registeredViews: 30, submittedViews: 34 } };
+  };
+  const posing = () => calls.filter(call => call.action === 'progress' && call.body.stage === 'solving_poses');
+
+  test('a long prepare renews the lease on an interval, not just at its start and end', async () => {
+    const { bridge, prepareFn } = makeBridge(undefined, { leaseRenewMs: 20 });
+    prepareFn.mockImplementation(slow(130));
+    await bridge.advance(nodeId, attempt());
+    // One report when the stage starts, and renewals on top of it while the worker runs.
+    expect(posing().length).toBeGreaterThanOrEqual(4);
+    // The timer does not outlive the prepare.
+    const settled = posing().length;
+    await new Promise(resolve => setTimeout(resolve, 80));
+    expect(posing().length).toBe(settled);
+  });
+
+  test('a renewal that fails is logged and does not fail the prepare', async () => {
+    const { bridge, prepareFn, api } = makeBridge(undefined, { leaseRenewMs: 20 });
+    prepareFn.mockImplementation(slow(100));
+    const original = api.reconstructionCall.getMockImplementation()!;
+    let renewals = 0;
+    api.reconstructionCall.mockImplementation(async (id: string, action: string, body: Record<string, unknown>) => {
+      if (action === 'progress' && body.stage === 'solving_poses') { renewals += 1; if (renewals > 1) throw new KubusApiError('unavailable', 503, { success: false }); }
+      return original(id, action, body);
+    });
+    await bridge.advance(nodeId, attempt());
+    expect(renewals).toBeGreaterThan(1);
+    expect(warned()).toHaveBeenCalledWith(expect.objectContaining({ code: 'managed_requester_lease_renewal_failed' }), expect.any(String));
+    expect(actions()).toContain('compute-job');
+  });
+
+  test('a cancel the backend reports during the prepare is acted on once it ends', async () => {
+    const { bridge, prepareFn, api } = makeBridge(undefined, { leaseRenewMs: 20 });
+    prepareFn.mockImplementation(slow(80));
+    const original = api.reconstructionCall.getMockImplementation()!;
+    api.reconstructionCall.mockImplementation(async (id: string, action: string, body: Record<string, unknown>) => {
+      if (action === 'progress' && ['solving_poses', 'prepared'].includes(String(body.stage))) return { ...attempt({ state: 'preparing' }), cancelRequested: true };
+      return original(id, action, body);
+    });
+    await bridge.advance(nodeId, attempt());
+    expect(actions()).not.toContain('providers');
+    expect(actions().slice(-2)).toEqual(['cancelled', 'cleanup']);
+  });
+
+  test('the renewal interval defaults to under the five minutes the contract allows', () => {
+    expect(DEFAULT_LEASE_RENEW_MS).toBeLessThanOrEqual(5 * 60_000);
+  });
+});
+
+describe('a prepare that was cut off by a restart', () => {
+  const prepareJobIds = (prepareFn: ReturnType<typeof makeBridge>['prepareFn']) => prepareFn.mock.calls.map(call => (call[0] as unknown as { jobId: string }).jobId);
+
+  test('each prepare run has its own worker job id, never the reconstruction id', async () => {
+    const { bridge, prepareFn } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    const [id] = prepareJobIds(prepareFn);
+    expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(id).not.toBe(reconstructionId);
+    // Finished: nothing is left to cancel on a later pass.
+    expect((await stateFile()).prepareJobId).toBeUndefined();
+  });
+
+  test('a prepare that ended without an answer is cancelled on the worker before its directory is touched, then runs again', async () => {
+    const first = makeBridge();
+    first.prepareFn.mockRejectedValueOnce(Object.assign(new Error('fetch failed'), { code: 'ECONNRESET' }));
+    await expect(first.bridge.advance(nodeId, attempt())).rejects.toThrow('fetch failed');
+    const [orphan] = prepareJobIds(first.prepareFn);
+    expect((await stateFile()).prepareJobId).toBe(orphan);
+    // A leftover of the orphaned run in the work directory.
+    await fs.mkdir(path.join(root(), 'prepare-1', 'dataset'), { recursive: true });
+    await fs.writeFile(path.join(root(), 'prepare-1', 'dataset', 'orphan'), 'x');
+    // The restarted Node.
+    const second = makeBridge();
+    const order: string[] = [];
+    second.cancelPrepare.mockImplementation(async () => { order.push(`cancel:${await fs.stat(path.join(root(), 'prepare-1', 'dataset', 'orphan')).then(() => 'dir-present', () => 'dir-gone')}`); });
+    await second.bridge.advance(nodeId, attempt());
+    expect(second.cancelPrepare).toHaveBeenCalledTimes(1);
+    expect(second.cancelPrepare).toHaveBeenCalledWith(orphan);
+    expect(order).toEqual(['cancel:dir-present']);
+    const [fresh] = prepareJobIds(second.prepareFn);
+    expect(fresh).not.toBe(orphan);
+    expect(actions()).toContain('compute-job');
+    expect((await stateFile()).prepareJobId).toBeUndefined();
+  });
+
+  test('when the worker cannot be asked to cancel, the work directory is left alone and the pass is retried later', async () => {
+    const first = makeBridge();
+    first.prepareFn.mockRejectedValueOnce(new Error('fetch failed'));
+    await expect(first.bridge.advance(nodeId, attempt())).rejects.toThrow();
+    await fs.mkdir(path.join(root(), 'prepare-1', 'dataset'), { recursive: true });
+    await fs.writeFile(path.join(root(), 'prepare-1', 'dataset', 'orphan'), 'x');
+    const second = makeBridge();
+    second.cancelPrepare.mockRejectedValueOnce(new Error('worker_not_quiescent'));
+    await expect(second.bridge.advance(nodeId, attempt())).rejects.toThrow('worker_not_quiescent');
+    expect(second.prepareFn).not.toHaveBeenCalled();
+    expect(await fs.readFile(path.join(root(), 'prepare-1', 'dataset', 'orphan'), 'utf8')).toBe('x');
+    // The next pass asks again.
+    await second.bridge.advance(nodeId, attempt());
+    expect(second.cancelPrepare).toHaveBeenCalledTimes(2);
+    expect(second.prepareFn).toHaveBeenCalledTimes(1);
+  });
+
+  test('a typed prepare failure is an answer: nothing is left to cancel', async () => {
+    const { bridge, cancelPrepare } = makeBridge({ ok: false, code: 'sfm_failed', details: {}, inputs: [] });
+    await bridge.advance(nodeId, attempt());
+    expect((await stateFile()).prepareJobId).toBeUndefined();
+    expect(cancelPrepare).not.toHaveBeenCalled();
+  });
+});
+
+describe('the encrypted input is never orphaned by a crash', () => {
+  test('the pin owner is recorded before encrypting and handed to the transport', async () => {
+    const { bridge, transport } = makeBridge();
+    let recorded: string | undefined;
+    transport.encryptCapture.mockImplementationOnce((async (...args: unknown[]) => {
+      recorded = (await stateFile()).encryptingOwner;
+      expect((args[3] as { pinOwner: string }).pinOwner).toBe(recorded);
+      return { inputCid: 'bafyinput1', inputBytes: 11, inputHash: 'e'.repeat(64), inputKeyEnvelope: { context: 'envelope-1' }, jobSpec: { fileCount: 3 } };
+    }) as never);
+    await bridge.advance(nodeId, attempt());
+    expect(recorded).toMatch(/^requester-input:[0-9a-f-]{36}$/);
+    // Once the descriptor is stored the owner is not "in flight" any more.
+    expect((await stateFile()).encryptingOwner).toBeUndefined();
+  });
+
+  test('a crash between encrypting and storing the descriptor releases that pin before encrypting again', async () => {
+    const first = makeBridge();
+    first.transport.encryptCapture.mockRejectedValueOnce(new Error('process died'));
+    await expect(first.bridge.advance(nodeId, attempt())).rejects.toThrow('process died');
+    const owner = (await stateFile()).encryptingOwner as string;
+    expect(owner).toMatch(/^requester-input:/);
+    const second = makeBridge();
+    await second.bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+    expect(second.remote.releaseInputsOwnedBy).toHaveBeenCalledWith(owner);
+    const [, , , options] = second.transport.encryptCapture.mock.calls[0] as unknown as [string, string, string, { pinOwner: string }];
+    expect(options.pinOwner).not.toBe(owner);
+    expect((await stateFile()).unusedInputs ?? []).toEqual([]);
+    expect((await stateFile()).encryptingOwner).toBeUndefined();
+  });
+
+  test('an owner whose pin cannot be released yet stays on the retry list and is reported as not clean', async () => {
+    const first = makeBridge();
+    first.transport.encryptCapture.mockRejectedValueOnce(new Error('process died'));
+    await expect(first.bridge.advance(nodeId, attempt())).rejects.toThrow();
+    const owner = (await stateFile()).encryptingOwner as string;
+    const second = makeBridge();
+    second.remote.releaseInputsOwnedBy.mockRejectedValueOnce(new Error('kubo offline'));
+    await second.bridge.advance(nodeId, attempt({ state: 'waiting_for_node', cancelRequested: true }));
+    expect((await stateFile()).unusedInputs).toEqual([owner]);
+    expect(calls.at(-1)).toMatchObject({ action: 'cleanup', body: { state: 'failed' } });
+  });
+});
+
+describe('requester cleanup is only complete when the pin was released', () => {
+  test('a job input whose pin release is switched off is not reported as complete, and is retried', async () => {
+    const { bridge, remote } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    remote.releaseInput.mockResolvedValueOnce({ released: false, reason: 'pin_release_activation_required' });
+    await bridge.advance(nodeId, processing());
+    expect(calls.at(-1)).toMatchObject({ action: 'cleanup', body: { state: 'pending' } });
+    expect((await stateFile()).unusedInputs).toEqual(['bafyinput']);
+    expect((await stateFile()).requesterCleanup).toBe('pending');
+    // Pin release is switched on later: the sweep releases it and reports the cleanup complete.
+    await bridge.sweep(nodeId);
+    expect(remote.releaseUnusedInput).toHaveBeenCalledWith('bafyinput');
+    expect(calls.at(-1)).toMatchObject({ action: 'cleanup', body: { state: 'complete' } });
+    expect((await stateFile()).unusedInputs ?? []).toEqual([]);
+    expect((await stateFile()).requesterCleanup).toBe('complete');
+    // Nothing more to do on later sweeps.
+    const reported = calls.length;
+    await bridge.sweep(nodeId);
+    expect(calls.length).toBe(reported);
+  });
+
+  test('an unused input held because release is switched off is pending, not failed and not complete', async () => {
+    const { bridge, api, remote } = makeBridge();
+    const original = api.reconstructionCall.getMockImplementation()!;
+    let left = 1;
+    api.reconstructionCall.mockImplementation(async (id: string, action: string, body: Record<string, unknown>) => {
+      if (action === 'compute-job' && left > 0) { left -= 1; throw new KubusApiError('unavailable', 503, { success: false }); }
+      return original(id, action, body);
+    });
+    await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+    remote.releaseUnusedInput.mockResolvedValue({ released: false, reason: 'pin_release_activation_required' });
+    await bridge.advance(nodeId, attempt({ state: 'waiting_for_node', cancelRequested: true }));
+    expect(calls.at(-1)).toMatchObject({ action: 'cleanup', body: { state: 'pending' } });
+  });
+
+  test('a release that threw is a failed cleanup, which a later sweep retries even though no pass claims the attempt again', async () => {
+    const { bridge, remote } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    remote.releaseInput.mockRejectedValueOnce(new Error('kubo offline'));
+    await bridge.advance(nodeId, processing());
+    expect(calls.at(-1)).toMatchObject({ action: 'cleanup', body: { state: 'failed' } });
+    expect((await stateFile()).unusedInputs).toEqual(['bafyinput']);
+    remote.releaseUnusedInput.mockRejectedValueOnce(new Error('kubo offline'));
+    await bridge.sweep(nodeId);
+    expect(calls.at(-1)).toMatchObject({ action: 'cleanup', body: { state: 'failed' } });
+    expect((await stateFile()).unusedInputs).toEqual(['bafyinput']);
+    await bridge.sweep(nodeId);
+    expect(calls.at(-1)).toMatchObject({ action: 'cleanup', body: { state: 'complete' } });
+  });
+});
+
+describe('retention purge', () => {
+  const stagedDir = (id = jobId) => path.join(dataRoot, 'private', 'remote-results', id);
+
+  /** An attempt that finished (ready): it left a record with the provider job, and a staged result is put back. */
+  async function finished() {
+    const made = makeBridge();
+    await made.bridge.advance(nodeId, attempt());
+    await made.bridge.advance(nodeId, processing());
+    await fs.mkdir(stagedDir(), { recursive: true });
+    await fs.writeFile(path.join(stagedDir(), 'spatial_mobile'), 'plaintext reconstruction');
+    return made;
+  }
+
+  test('removes the attempt root, the staged results and the capture record, then acknowledges the purge to the backend', async () => {
+    const { bridge, api, captures } = await finished();
+    api.reconstructionRetention.mockResolvedValueOnce({ purge: [reconstructionId] });
+    expect(await bridge.purgeExpired(nodeId)).toEqual([reconstructionId]);
+    await expect(fs.stat(root())).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.stat(stagedDir())).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(captures.removeRemote).toHaveBeenCalledWith(`managed-${reconstructionId}`);
+    expect(api.ackReconstructionRetention).toHaveBeenCalledWith(nodeId, [reconstructionId]);
+  });
+
+  test('a staged result the attempt never recorded as finished (a crash while verifying) is removed too', async () => {
+    const { bridge, api, remote } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    remote.stagePrivateOutput.mockImplementationOnce(async () => { await fs.mkdir(stagedDir(), { recursive: true }); throw new Error('process died'); });
+    await expect(bridge.advance(nodeId, processing())).rejects.toThrow('process died');
+    expect((await stateFile()).stagedJobs).toEqual([jobId]);
+    api.reconstructionRetention.mockResolvedValueOnce({ purge: [reconstructionId] });
+    await bridge.purgeExpired(nodeId);
+    await expect(fs.stat(stagedDir())).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  test('releases the input pins the attempt still owns before it acknowledges, job-held ones included', async () => {
+    const { bridge, api, remote } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    // The job was created from this input: it is recorded as held, whatever happens to the attempt afterwards.
+    expect((await stateFile()).heldInputs).toEqual(['bafyinput1']);
+    api.reconstructionRetention.mockResolvedValueOnce({ purge: [reconstructionId] });
+    await bridge.purgeExpired(nodeId);
+    expect(remote.releaseUnusedInput).toHaveBeenCalledWith('bafyinput1');
+    expect(api.ackReconstructionRetention).toHaveBeenCalledWith(nodeId, [reconstructionId]);
+    await expect(fs.stat(root())).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  test('an attempt whose pin cannot be released yet is kept and not acknowledged, and is tried again on the next purge', async () => {
+    const { bridge, api, remote } = await finished();
+    const state = await stateFile();
+    await fs.writeFile(path.join(root(), 'state.json'), JSON.stringify({ ...state, unusedInputs: ['bafyleft'] }));
+    api.reconstructionRetention.mockResolvedValue({ purge: [reconstructionId] });
+    remote.releaseUnusedInput.mockResolvedValueOnce({ released: false, reason: 'pin_release_activation_required' });
+    expect(await bridge.purgeExpired(nodeId)).toEqual([]);
+    expect(api.ackReconstructionRetention).not.toHaveBeenCalled();
+    expect((await fs.stat(path.join(root(), 'state.json'))).isFile()).toBe(true);
+    // The staged result and the capture are gone regardless: only the unreleased pin keeps the record.
+    await expect(fs.stat(stagedDir())).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await bridge.purgeExpired(nodeId)).toEqual([reconstructionId]);
+    expect(api.ackReconstructionRetention).toHaveBeenCalledWith(nodeId, [reconstructionId]);
+    await expect(fs.stat(root())).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  test('a release that throws is kept and not acknowledged', async () => {
+    const { bridge, api, remote } = await finished();
+    const state = await stateFile();
+    await fs.writeFile(path.join(root(), 'state.json'), JSON.stringify({ ...state, unusedInputs: ['bafyleft'] }));
+    api.reconstructionRetention.mockResolvedValueOnce({ purge: [reconstructionId] });
+    remote.releaseUnusedInput.mockRejectedValueOnce(new Error('kubo offline'));
+    expect(await bridge.purgeExpired(nodeId)).toEqual([]);
+    expect(api.ackReconstructionRetention).not.toHaveBeenCalled();
+    expect((await fs.stat(root())).isDirectory()).toBe(true);
+  });
+
+  test('an unreadable record is neither purged nor acknowledged, and does not stop the others', async () => {
+    const other = '1b6f6f0e-2d3c-4b8a-9a52-6c1f3e0d7a22';
+    await fs.mkdir(path.join(dataRoot, 'private', 'reconstructions', other, 'set'), { recursive: true });
+    const { bridge, api } = await finished();
+    await fs.writeFile(path.join(root(), 'state.json'), '{"half');
+    api.reconstructionRetention.mockResolvedValueOnce({ purge: [reconstructionId, other] });
+    expect(await bridge.purgeExpired(nodeId)).toEqual([other]);
+    expect(api.ackReconstructionRetention).toHaveBeenCalledWith(nodeId, [other]);
+    expect(await fs.readFile(path.join(root(), 'state.json'), 'utf8')).toBe('{"half');
+  });
+
+  test('an attempt that was already purged is acknowledged (the earlier acknowledgement was lost)', async () => {
+    const { bridge, api } = makeBridge();
+    api.reconstructionRetention.mockResolvedValueOnce({ purge: [reconstructionId] });
+    expect(await bridge.purgeExpired(nodeId)).toEqual([reconstructionId]);
+    expect(api.ackReconstructionRetention).toHaveBeenCalledWith(nodeId, [reconstructionId]);
+  });
+
+  test('a failed acknowledgement is logged, not thrown: the backend lists the attempt again next time', async () => {
+    const { bridge, api } = await finished();
+    api.reconstructionRetention.mockResolvedValueOnce({ purge: [reconstructionId] });
+    api.ackReconstructionRetention.mockRejectedValueOnce(new KubusApiError('unavailable', 503, { success: false }));
+    await expect(bridge.purgeExpired(nodeId)).resolves.toEqual([reconstructionId]);
+    expect(warned()).toHaveBeenCalledWith(expect.objectContaining({ code: 'managed_requester_retention_ack_failed' }), expect.any(String));
+  });
+
+  test('ids that are not attempt ids are never touched or acknowledged, and acknowledgements go out in batches of 100', async () => {
+    const { bridge, api } = makeBridge();
+    const ids = Array.from({ length: 120 }, (_, index) => `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`);
+    api.reconstructionRetention.mockResolvedValueOnce({ purge: [...ids, '../escape'] });
+    const purged = await bridge.purgeExpired(nodeId);
+    expect(purged).toEqual(ids);
+    expect(api.ackReconstructionRetention.mock.calls.map(call => call[1].length)).toEqual([100, 20]);
+  });
+});
+
+describe('attempts that can no longer be claimed', () => {
+  const stagedDir = () => path.join(dataRoot, 'private', 'remote-results', jobId);
+  const HOUR = 60 * 60_000;
+  const rewrite = async (change: Record<string, unknown>) => fs.writeFile(path.join(root(), 'state.json'), JSON.stringify({ ...(await stateFile()), ...change }));
+
+  /** A mid-import attempt (result staged, a job-held input) that the requester then stopped advancing. */
+  async function abandoned() {
+    const made = makeBridge(undefined, { abandonedAfterMs: 6 * HOUR });
+    await made.bridge.advance(nodeId, attempt());
+    await fs.mkdir(stagedDir(), { recursive: true });
+    await fs.writeFile(path.join(stagedDir(), 'spatial_mobile'), 'plaintext reconstruction');
+    await rewrite({ stagedJobs: [jobId] });
+    return made;
+  }
+  const age = (ms: number) => rewrite({ lastAdvancedAt: new Date(Date.now() - ms).toISOString() });
+
+  test('after hours without a pass, its staged plaintext result, capture, pins and work files are removed and the cleanup is reported', async () => {
+    const { bridge, remote, captures } = await abandoned();
+    await age(7 * HOUR);
+    const before = calls.length;
+    await bridge.sweep(nodeId);
+    await expect(fs.stat(stagedDir())).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(remote.releaseUnusedInput).toHaveBeenCalledWith('bafyinput1');
+    expect(captures.removeRemote).toHaveBeenCalledWith(`managed-${reconstructionId}`);
+    expect((await fs.readdir(root())).sort()).toEqual(['set', 'state.json']);
+    expect(calls.slice(before).at(-1)).toMatchObject({ action: 'cleanup', body: { state: 'complete' } });
+    expect((await stateFile()).requesterCleanup).toBe('complete');
+    // Reported once.
+    const reported = calls.length;
+    await bridge.sweep(nodeId);
+    expect(calls.length).toBe(reported);
+  });
+
+  test('an attempt that was advanced recently is never swept', async () => {
+    const { bridge, remote } = await abandoned();
+    await age(HOUR);
+    await bridge.sweep(nodeId);
+    expect((await fs.stat(stagedDir())).isDirectory()).toBe(true);
+    expect(remote.releaseUnusedInput).not.toHaveBeenCalled();
+  });
+
+  test('an attempt that already reported its cleanup is not swept again', async () => {
+    const { bridge } = await abandoned();
+    await rewrite({ requesterCleanup: 'complete', lastAdvancedAt: new Date(Date.now() - 20 * HOUR).toISOString() });
+    await bridge.sweep(nodeId);
+    expect((await fs.stat(stagedDir())).isDirectory()).toBe(true);
+  });
+
+  test('the sweep reports pending when a pin could not be released yet, and tries again later', async () => {
+    const { bridge, remote } = await abandoned();
+    await age(7 * HOUR);
+    remote.releaseUnusedInput.mockResolvedValueOnce({ released: false, reason: 'pin_release_activation_required' });
+    const before = calls.length;
+    await bridge.sweep(nodeId);
+    expect(calls.slice(before).at(-1)).toMatchObject({ action: 'cleanup', body: { state: 'pending' } });
+    await bridge.sweep(nodeId);
+    expect(calls.at(-1)).toMatchObject({ action: 'cleanup', body: { state: 'complete' } });
+  });
+
+  test('a pass stamps the attempt so that an active one is not mistaken for abandoned', async () => {
+    const { bridge } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    expect(Date.now() - Date.parse((await stateFile()).lastAdvancedAt)).toBeLessThan(5000);
+  });
+});
+
 describe('worker prepare stage', () => {
   test('maps typed feedback back to backend file ids and always asks for masking', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
@@ -999,6 +1583,65 @@ describe('worker prepare stage', () => {
       expect(outcome).toEqual({ ok: false, code: 'sfm_failed', details: expect.objectContaining({ submittedViews: 9 }),
         inputs: [{ fileId: 'file-b', usable: false, usableViews: 0, reason: 'frames_too_blurry' }] });
     } finally { fetchMock.mockRestore(); }
+  });
+
+  test('carries the per-input count of images flagged for a face review, and binds its token to this exact request', async () => {
+    const issue = vi.fn(async () => 'token');
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async url => {
+      if (String(url).endsWith('/health')) return new Response(JSON.stringify({ status: 'ready', inputModes: ['source_set'], faceMasking: true, workerInstanceId: 'w1' }));
+      return new Response(JSON.stringify({ prepared: { path: 'dataset', sfm: { registeredViews: 30 }, inputs: [
+        { input: 'photos/a.jpg', usable: true, usableViews: 1, faceReview: 3 }, { input: 'photos/b.jpg', usable: true, usableViews: 1, faceReview: 0 }, { input: 'videos/c.mp4', usable: true, usableViews: 4 }] } }));
+    });
+    try {
+      const prepare = workerPrepare({ workerUrl: 'http://worker', workerAuth: { issue } as never });
+      const outcome = await prepare({ jobId: jobId, captureDirectory: '/data/set', outputDirectory: '/data/out', fileIds: new Map([['photos/a.jpg', 'file-a'], ['photos/b.jpg', 'file-b'], ['videos/c.mp4', 'file-c']]) });
+      expect(outcome).toMatchObject({ ok: true, inputs: [
+        { fileId: 'file-a', usable: true, usableViews: 1, faceReview: 3 }, { fileId: 'file-b', usable: true, usableViews: 1 }, { fileId: 'file-c', usable: true, usableViews: 4 }] });
+      expect((outcome as { inputs: Array<Record<string, unknown>> }).inputs[1]).not.toHaveProperty('faceReview');
+      expect(issue).toHaveBeenCalledWith(jobId, 'spatial.reconstruct', {
+        purpose: 'process', captureDirectory: '/data/set', outputDirectory: '/data/out', input: { mode: 'source_set', maskFaces: { photos: true, video: true } },
+      });
+    } finally { fetchMock.mockRestore(); }
+  });
+
+  describe('stopping a prepare run on the worker', () => {
+    const health = () => new Response(JSON.stringify({ status: 'ready', workerInstanceId: 'w1' }));
+
+    test('asks the worker to cancel the job with a cancel-only token and waits for its quiescent receipt', async () => {
+      const issue = vi.fn(async () => 'token');
+      const requests: Array<{ url: string; body?: Record<string, unknown> }> = [];
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+        requests.push({ url: String(url), body: init?.body ? JSON.parse(String(init.body)) : undefined });
+        if (String(url).endsWith('/health')) return health();
+        return new Response(JSON.stringify({ jobId, quiescent: true, cleanupProtocol: 1, workerInstanceId: 'w1' }));
+      });
+      try {
+        await workerCancelPrepare({ workerUrl: 'http://worker', workerAuth: { issue } as never })(jobId);
+        expect(requests.at(-1)).toEqual({ url: 'http://worker/v1/jobs/cancel', body: { jobId, type: 'spatial.reconstruct', workerInstanceId: 'w1' } });
+        expect(issue).toHaveBeenCalledWith(jobId, 'spatial.reconstruct', { purpose: 'cancel' });
+      } finally { fetchMock.mockRestore(); }
+    });
+
+    test('throws unless the worker confirms the right job is quiescent', async () => {
+      for (const receipt of [{ jobId: 'other', quiescent: true, cleanupProtocol: 1, workerInstanceId: 'w1' }, { jobId, quiescent: false, cleanupProtocol: 1, workerInstanceId: 'w1' },
+        { jobId, quiescent: true, cleanupProtocol: 2, workerInstanceId: 'w1' }, { jobId, quiescent: true, cleanupProtocol: 1, workerInstanceId: 'w2' }]) {
+        const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async url => (String(url).endsWith('/health') ? health() : new Response(JSON.stringify(receipt))));
+        try {
+          await expect(workerCancelPrepare({ workerUrl: 'http://worker', workerAuth: { issue: async () => 'token' } as never })(jobId)).rejects.toMatchObject({ code: 'worker_quiescence_unverified' });
+        } finally { fetchMock.mockRestore(); }
+      }
+      const failing = vi.spyOn(globalThis, 'fetch').mockImplementation(async url => (String(url).endsWith('/health') ? health() : new Response('{}', { status: 503 })));
+      try {
+        await expect(workerCancelPrepare({ workerUrl: 'http://worker', workerAuth: { issue: async () => 'token' } as never })(jobId)).rejects.toMatchObject({ code: 'worker_quiescence_unverified' });
+      } finally { failing.mockRestore(); }
+    });
+
+    test('throws when the worker cannot be reached', async () => {
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('connect ECONNREFUSED'));
+      try {
+        await expect(workerCancelPrepare({ workerUrl: 'http://worker', workerAuth: { issue: async () => 'token' } as never })(jobId)).rejects.toThrow('ECONNREFUSED');
+      } finally { fetchMock.mockRestore(); }
+    });
   });
 
   test('refuses a worker that cannot prepare source sets', async () => {

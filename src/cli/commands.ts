@@ -27,7 +27,7 @@ import { WorkerAuthService } from '../spatial/workerAuth.js';
 import { ComputeIdentityService } from '../compute/computeIdentity.js';
 import { PrivatePayloadTransport } from '../compute/privatePayloadTransport.js';
 import { RemoteComputeRuntime } from '../compute/remoteComputeRuntime.js';
-import { ManagedRequesterBridge, workerPrepare } from '../compute/managedRequesterBridge.js';
+import { ManagedRequesterBridge, workerCancelPrepare, workerPrepare } from '../compute/managedRequesterBridge.js';
 import { NodeSignalingClient } from '../webrtc/nodeSignalingClient.js';
 import { startSetupServer } from '../gui/setupServer.js';
 import { PermissionUpdateService } from '../setup/permissionUpdate.js';
@@ -222,7 +222,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
       if (config.managedRequesterEnabled && config.spatialWorkerUrl) {
         new ManagedRequesterBridge({
           api, nodeId: () => store.snapshot().nodeId, dataRoot: config.localDataPath,
-          prepare: workerPrepare({ workerUrl: config.spatialWorkerUrl, workerAuth }), captures, transport: privateTransport,
+          prepare: workerPrepare({ workerUrl: config.spatialWorkerUrl, workerAuth }), cancelPrepare: workerCancelPrepare({ workerUrl: config.spatialWorkerUrl, workerAuth }), captures, transport: privateTransport,
           remote: remoteCompute, logger,
         }).start();
       }

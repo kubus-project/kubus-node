@@ -197,6 +197,11 @@ export class KubusApiClient {
     return this.request(`/api/spatial/reconstruction-bridge/retention${queryString({ nodeId })}`);
   }
 
+  /** Tells the backend that the local copies of these attempts (root, staged results, input pins) are gone; at most 100 ids. */
+  ackReconstructionRetention(nodeId: string, ids: string[]): Promise<{ acknowledged: number }> {
+    return this.request('/api/spatial/reconstruction-bridge/retention/ack', { method: 'POST', body: { nodeId, ids } });
+  }
+
   readReconstructionChunk(id: string, fileId: string, offset: number, nodeId: string): Promise<Buffer> {
     return this.binary(`/api/spatial/reconstruction-bridge/${encodeURIComponent(id)}/files/${encodeURIComponent(fileId)}/chunks/${offset}${queryString({ nodeId })}`, 'GET');
   }

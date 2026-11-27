@@ -35,6 +35,15 @@ describe('KubusApiClient', () => {
     ]);
   });
 
+  it('acknowledges purged reconstruction copies with the node id and the attempt ids', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ success: true, data: { acknowledged: 2 } })));
+    const client = new KubusApiClient({ baseUrl: 'http://api.test', auth: new BearerAuthProvider('secret'), retries: 0 });
+    await expect(client.ackReconstructionRetention('node-1', ['rec-1', 'rec-2'])).resolves.toEqual({ acknowledged: 2 });
+    expect(fetchMock).toHaveBeenCalledWith('http://api.test/api/spatial/reconstruction-bridge/retention/ack', expect.objectContaining({
+      method: 'POST', body: JSON.stringify({ nodeId: 'node-1', ids: ['rec-1', 'rec-2'] }), headers: expect.objectContaining({ Authorization: 'Bearer secret' }),
+    }));
+  });
+
   it('does not retry validation failures', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ success: false, error: 'bad' }), { status: 400 }));
     const client = new KubusApiClient({ baseUrl: 'http://api.test', auth: new BearerAuthProvider('secret'), retries: 2 });
