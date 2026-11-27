@@ -411,13 +411,16 @@ export class ManagedRequesterBridge {
         await handle.read(buffer, 0, length, received);
         const result = await this.deps.api.appendReconstructionCandidate(attempt.id, received, buffer, nodeId, variant);
         last = result.reconstruction;
-        const next = result.candidate.receivedBytes;
+        // The backend answers every chunk with the full draft at the top level and the companion under `lightweight`.
+        const progress = variant === 'lightweight' ? result.candidate.lightweight : result.candidate;
+        if (!progress) throw Object.assign(new Error('candidate_progress_unreadable'), { code: 'candidate_progress_unreadable' });
+        const next = progress.receivedBytes;
         // The server's count decides where the next chunk starts; a count that did not advance would loop forever.
         if (!Number.isSafeInteger(next) || (next as number) <= received || (next as number) > size) {
           throw Object.assign(new Error('candidate_progress_unreadable'), { code: 'candidate_progress_unreadable' });
         }
         received = next as number;
-        finished = result.candidate.state === 'ready';
+        finished = progress.state === 'ready';
       }
     } finally { await handle.close(); }
     return last;

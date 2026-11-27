@@ -99,7 +99,9 @@ function makeBridge(prepare?: PrepareOutcome) {
       if (target.received === target.size) target.state = 'ready';
       // A shortfall stands for a server that has not finished the second artifact by the time the pass ends.
       if (server.shortfall && which === 'lightweight' && target.state === 'ready') { target.state = 'uploading'; }
-      return { reconstruction: view(), candidate: dto(target) };
+      // Same shape as the backend bridge (spatialReconstructionService.appendCandidate): the full draft at the top
+      // level and the companion under `lightweight`, whichever variant the chunk was for.
+      return { reconstruction: view(), candidate: { ...dto(server.full!), lightweight: server.lightweight ? dto(server.lightweight) : null } };
     }),
     reconstructionCall: vi.fn(async (_id: string, action: string, body: Record<string, unknown>) => {
       calls.push({ action, body });
@@ -389,7 +391,7 @@ describe('full and lightweight delivery', () => {
     api.appendReconstructionCandidate.mockImplementationOnce(async (_id, offset, bytes) => {
       appended.push({ variant: 'full', offset, bytes: Buffer.from(bytes) });
       server.full!.received = 40;
-      return { reconstruction: view(), candidate: { state: 'uploading', receivedBytes: 40 } };
+      return { reconstruction: view(), candidate: { state: 'uploading', receivedBytes: 40, lightweight: null } };
     });
     await bridge.advance(nodeId, processing());
     expect(appended.map(item => item.offset)).toEqual([0, 40]);
@@ -397,7 +399,7 @@ describe('full and lightweight delivery', () => {
 
   test('a server count that does not advance stops the upload instead of looping', async () => {
     const { bridge, api } = await prepared();
-    api.appendReconstructionCandidate.mockResolvedValue({ reconstruction: view(), candidate: { state: 'uploading', receivedBytes: 0 } });
+    api.appendReconstructionCandidate.mockResolvedValue({ reconstruction: view(), candidate: { state: 'uploading', receivedBytes: 0, lightweight: null } });
     await expect(bridge.advance(nodeId, processing())).rejects.toMatchObject({ code: 'candidate_progress_unreadable' });
     expect(api.appendReconstructionCandidate).toHaveBeenCalledTimes(1);
     expect(actions()).not.toContain('cleanup');
