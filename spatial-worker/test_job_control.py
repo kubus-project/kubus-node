@@ -29,6 +29,18 @@ class HandBackOwnershipTests(unittest.TestCase):
             # The symlink target is never touched.
             self.assertEqual(outside.stat().st_uid, 0)
 
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "needs root to create foreign-owned files")
+    def test_a_top_directory_replaced_by_a_symlink_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = pathlib.Path(temp) / "target"
+            target.mkdir()
+            os.chown(target, 12345, 23456)
+            (target / "inner.txt").write_bytes(b"x")
+            link = pathlib.Path(temp) / "job"
+            link.symlink_to(target)
+            hand_back_ownership(link)
+            self.assertEqual((target / "inner.txt").stat().st_uid, 0)
+
     def test_missing_directory_is_not_an_error(self):
         hand_back_ownership("/nonexistent/kubus-job")
 
@@ -240,7 +252,6 @@ class OrphanReapTests(unittest.TestCase):
         self.assertFalse(self.control.group_file(JOB).exists())
 
 
-
 class PendingHandBackTests(unittest.TestCase):
     """A worker killed mid-job never reaches process_owned's `finally`; its replacement hands the tree back at start."""
 
@@ -288,6 +299,22 @@ class PendingHandBackTests(unittest.TestCase):
         self.control.ownership_file(JOB).write_text("{not json", encoding="utf-8")
         self.assertEqual(self.control.finish_pending_hand_backs(), [])
         self.assertFalse(self.control.ownership_file(JOB).exists())
+
+    def test_a_record_that_cannot_be_read_keeps_the_worker_from_promising_quiescence(self):
+        self.control.root.mkdir(parents=True)
+        # A directory where the record should be: reading it raises an OSError, as a failing disk would.
+        self.control.ownership_file(JOB).mkdir()
+        self.assertEqual(self.control.finish_pending_hand_backs(), [])
+        self.assertEqual(self.control.unreaped, [JOB + ".owner"])
+        self.assertTrue(self.control.ownership_file(JOB).exists())
+
+    def test_a_temporary_record_left_by_a_kill_during_the_write_is_removed_at_start(self):
+        self.control.root.mkdir(parents=True)
+        stale = self.control.ownership_file(JOB).with_suffix(".owner.tmp")
+        stale.write_text("{", encoding="utf-8")
+        self.assertEqual(self.control.finish_pending_hand_backs(), [])
+        self.assertFalse(stale.exists())
+        self.assertEqual(self.control.unreaped, [])
 
     def test_a_missing_control_directory_or_job_tree_is_not_an_error(self):
         self.assertEqual(self.control.finish_pending_hand_backs(), [])

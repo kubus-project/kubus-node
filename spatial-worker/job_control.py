@@ -7,6 +7,7 @@ import pathlib
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -105,7 +106,8 @@ class JobControl:
         self.root = pathlib.Path(root)
         self.lock = threading.RLock()
         self.active = {}
-        # Record names of earlier training groups that reap_orphans could not confirm ended.
+        # Record names (.pgid, .owner) of earlier jobs that start-up recovery could not settle: a training group not
+        # confirmed ended, or a hand-back record that could not be read.
         self.unreaped = []
 
     def marker(self, job_id):
@@ -215,6 +217,12 @@ class JobControl:
         group may still be writing, and the Node does not infer quiescence from this worker anyway. Returns the job
         ids whose trees were handed back."""
         done = []
+        # A worker killed between writing and renaming a record leaves a temporary file; the job had written nothing yet.
+        try:
+            for stale in self.root.glob("*.owner.tmp"):
+                stale.unlink(missing_ok=True)
+        except OSError:
+            pass
         try:
             records = sorted(self.root.glob("*.owner"))
         except OSError:
@@ -228,7 +236,9 @@ class JobControl:
                 if not isinstance(directory, str) or not directory:
                     raise ValueError("directory")
             except OSError as error:
+                # Not settled: the tree may still be root-owned, so the Node must not infer quiescence from this worker.
                 log.warning("cannot read ownership hand-back record %s: %s", record.name, error)
+                self.unreaped.append(record.name)
                 continue
             except (ValueError, KeyError, TypeError):
                 log.warning("dropping unreadable ownership hand-back record %s", record.name)
@@ -344,10 +354,11 @@ def hand_back_ownership(directory):
     """
     root = pathlib.Path(directory)
     try:
-        info = root.stat()
+        # lstat: a directory replaced by a symlink after a crash must not make this chown the link's target.
+        info = root.lstat()
     except OSError:
         return
-    if os.geteuid() != 0 or info.st_uid == 0:
+    if stat.S_ISLNK(info.st_mode) or os.geteuid() != 0 or info.st_uid == 0:
         return
 
     def own(path):

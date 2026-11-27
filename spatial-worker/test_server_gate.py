@@ -97,6 +97,52 @@ class ServerGateTests(unittest.TestCase):
         receipt = asyncio.run(self.server.cancel(self.cancel_request(self.server.WORKER_INSTANCE_ID), token(purpose="cancel")))
         self.assertEqual(receipt, {"jobId": JOB, "quiescent": True, "cleanupProtocol": 1, "workerInstanceId": self.server.WORKER_INSTANCE_ID})
 
+    def fake_control(self, events, unreaped=()):
+        class Fake:
+            pass
+
+        fake = Fake()
+        fake.unreaped = list(unreaped)
+        fake.reap_orphans = lambda: events.append("reap")
+        fake.finish_pending_hand_backs = lambda: events.append("finish")
+        fake.pend_hand_back = lambda job, directory: events.append(("pend", job, directory))
+        fake.settle_hand_back = lambda job, directory: events.append(("settle", job, directory))
+        return fake
+
+    def test_start_up_recovery_reaps_orphans_before_it_hands_trees_back(self):
+        events = []
+        self.assertIs(self.server.recover_after_restart(self.fake_control(events)), True)
+        self.assertEqual(events, ["reap", "finish"])
+        self.assertIs(self.server.recover_after_restart(self.fake_control([], unreaped=["x.owner"])), False)
+
+    def test_the_module_runs_start_up_recovery_on_its_own_control_before_serving(self):
+        source = pathlib.Path(self.server.__file__).read_text(encoding="utf-8")
+        self.assertIn("REAPS_ORPHANS = recover_after_restart(control)", source)
+
+    def test_a_job_is_recorded_for_hand_back_before_it_runs_and_settled_after_whatever_its_outcome(self):
+        for outcome in ("returns", "raises"):
+            events = []
+            previous = (self.server.control, self.server.run_reconstruction)
+            self.server.control = self.fake_control(events)
+
+            def run(request, events=events, outcome=outcome):
+                events.append("run")
+                if outcome == "raises":
+                    raise RuntimeError("worker failed")
+                return {"ok": True}
+
+            self.server.run_reconstruction = run
+            try:
+                if outcome == "raises":
+                    with self.assertRaises(RuntimeError):
+                        self.server.process_owned(self.request)
+                else:
+                    self.server.process_owned(self.request)
+            finally:
+                self.server.control, self.server.run_reconstruction = previous
+            directory = self.request.outputDirectory
+            self.assertEqual(events, [("pend", JOB, directory), "run", ("settle", JOB, directory)], outcome)
+
     def test_health_reports_the_cleanup_protocol_and_the_current_instance_id(self):
         previous = self.server.gpu_info
         self.server.gpu_info = lambda: {"available": False}
