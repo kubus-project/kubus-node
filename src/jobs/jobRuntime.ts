@@ -800,9 +800,10 @@ export class JobRuntime {
         temporaryDirectory: outputDirectory,
         kubo: this.deps.kubo,
       } : null;
-    // A remote job returns the render derivative and at most a lightweight preview; a worker that still returns the
-    // raw training file (`spatial_archive`) must not have it sealed and signed for the requester.
-    if (privateTarget) assertSpatialOutputRoles(validated.map(({ item }) => item.role));
+    // A prepared (managed) job returns the render derivative and at most a lightweight preview; a worker that still
+    // returns the raw training file (`spatial_archive`) must not have it sealed and signed for the requester. Any other
+    // private-output job (frames, photos, video) keeps its single archive: the worker only splits prepared output.
+    if (privateTarget && capture.kind === 'prepared') assertSpatialOutputRoles(validated.map(({ item }) => item.role));
     if (privateTarget && maskingNeedsLookCounts(derivation?.faceMasking).images > 0) {
       throw new Error('remote_face_review_required');
     }

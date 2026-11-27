@@ -207,8 +207,9 @@ export class KubusApiClient {
     return this.request(`/api/spatial/reconstruction-bridge/${encodeURIComponent(id)}/${action}`, { method: 'POST', body });
   }
 
-  getReconstructionComputeJob(id: string, nodeId: string): Promise<RemoteComputeJob> {
-    return this.request(`/api/spatial/reconstruction-bridge/${encodeURIComponent(id)}/compute-job${queryString({ nodeId })}`);
+  /** The attempt's current provider job, or the named earlier one with `jobId` (a backend that ignores it answers with the current job). */
+  getReconstructionComputeJob(id: string, nodeId: string, jobId?: string): Promise<RemoteComputeJob> {
+    return this.request(`/api/spatial/reconstruction-bridge/${encodeURIComponent(id)}/compute-job${queryString({ nodeId, jobId })}`);
   }
 
   /** One chunk of the full candidate, or of its lightweight companion with `variant: 'lightweight'`; the answer names the server's `receivedBytes`. */

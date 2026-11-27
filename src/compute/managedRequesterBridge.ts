@@ -52,6 +52,9 @@ export interface ProviderCleanupRecord {
   attempts: number;
   nextCheckAt?: string;
   since: string;
+  /** What verifies the provider's statement later, taken from the job view while the job was this attempt's current one. */
+  inputHash?: string;
+  providerSigningPublicKey?: string;
   code?: string;
   attestation?: Pick<ProviderCleanupPayload, 'state' | 'items' | 'outputPins' | 'reason' | 'completedAt' | 'finalState'> & { verifiedAt: string };
 }
@@ -476,7 +479,11 @@ export class ManagedRequesterBridge {
   private async trackProviderJob(id: string, job: RemoteComputeJob): Promise<void> {
     const state = await this.readState(id);
     const records = { ...(state.providerCleanups ?? {}) };
-    records[job.id] ??= { jobId: job.id, providerNodeId: job.providerNodeId, finalState: job.state, status: 'awaiting', attempts: 0, since: new Date().toISOString() };
+    records[job.id] ??= {
+      jobId: job.id, providerNodeId: job.providerNodeId, finalState: job.state, status: 'awaiting', attempts: 0, since: new Date().toISOString(),
+      ...(typeof job.inputHash === 'string' ? { inputHash: job.inputHash } : {}),
+      ...(typeof job.verification?.providerSigningPublicKey === 'string' ? { providerSigningPublicKey: job.verification.providerSigningPublicKey } : {}),
+    };
     await this.writeState(id, { ...state, providerCleanups: records });
     await this.recordAttestation(id, job);
   }
@@ -485,38 +492,59 @@ export class ManagedRequesterBridge {
   private async recordAttestation(id: string, job: RemoteComputeJob): Promise<void> {
     const state = await this.readState(id);
     const current = state.providerCleanups?.[job.id];
-    if (!current || current.status === 'verified' || current.status === 'invalid' || current.status === 'unconfirmed') return;
+    if (!current || current.status === 'invalid' || current.status === 'unconfirmed') return;
+    // A verified `complete` statement is final. A verified `failed` one may be replaced by the provider's later
+    // statement (the contract allows it once the step that failed has been done), so it keeps being looked at.
+    const replaceable = current.status === 'verified' && current.attestation?.state === 'failed';
+    if (current.status === 'verified' && !replaceable) return;
     const attestation = job.providerCleanup?.attestation;
     let next: ProviderCleanupRecord = { ...current, finalState: job.state };
+    let changed = false;
     if (attestation) {
       try {
         const payload = verifyProviderCleanupAttestation(job, attestation);
-        next = { ...next, status: 'verified', attestation: { state: payload.state, items: payload.items, outputPins: payload.outputPins, reason: payload.reason, completedAt: payload.completedAt, finalState: payload.finalState, verifiedAt: new Date().toISOString() } };
+        // A replacement never goes back in time, and the same statement again is nothing new.
+        const stale = replaceable && Date.parse(payload.completedAt) <= Date.parse(current.attestation!.completedAt);
+        if (!stale) {
+          changed = true;
+          next = { ...next, status: 'verified', nextCheckAt: payload.state === 'failed' ? new Date(Date.now() + ATTESTATION_RETRY_BASE_MS).toISOString() : undefined, attestation: { state: payload.state, items: payload.items, outputPins: payload.outputPins, reason: payload.reason, completedAt: payload.completedAt, finalState: payload.finalState, verifiedAt: new Date().toISOString() } };
+        }
       } catch (error) {
-        next = { ...next, status: 'invalid', code: String((error as { code?: string }).code || 'provider_cleanup_attestation_invalid') };
-        this.deps.logger.warn({ code: next.code, jobId: job.id }, 'provider cleanup attestation did not verify');
+        const code = String((error as { code?: string }).code || 'provider_cleanup_attestation_invalid');
+        this.deps.logger.warn({ code, jobId: job.id }, 'provider cleanup attestation did not verify');
+        // A replacement that does not verify leaves the statement that did verify in place.
+        if (!replaceable) { changed = true; next = { ...next, status: 'invalid', code }; }
       }
-    } else {
+    }
+    if (!changed) {
+      // Nothing new verified: keep looking with backoff, and stop at the end of the window.
       const attempts = current.attempts + 1;
       const age = Date.now() - Date.parse(current.since);
-      next = age > ATTESTATION_GIVE_UP_MS
-        ? { ...next, status: 'unconfirmed', attempts, nextCheckAt: undefined }
-        : { ...next, attempts, nextCheckAt: new Date(Date.now() + Math.min(ATTESTATION_RETRY_MAX_MS, ATTESTATION_RETRY_BASE_MS * 2 ** Math.min(attempts - 1, 6))).toISOString() };
+      if (age > ATTESTATION_GIVE_UP_MS) next = { ...next, attempts, nextCheckAt: undefined, ...(replaceable ? {} : { status: 'unconfirmed' as const }) };
+      else next = { ...next, attempts, nextCheckAt: new Date(Date.now() + Math.min(ATTESTATION_RETRY_MAX_MS, ATTESTATION_RETRY_BASE_MS * 2 ** Math.min(attempts - 1, 6))).toISOString() };
     }
     await this.writeState(id, { ...state, providerCleanups: { ...state.providerCleanups, [job.id]: next } });
   }
 
-  /** Looks again for provider statements that had not arrived when an attempt finished. */
+  /** Looks again for provider statements that had not arrived when an attempt finished, or that may still be replaced. */
   async collectAttestations(nodeId: string): Promise<void> {
     const base = path.join(this.deps.dataRoot, 'private', 'reconstructions');
     for (const id of await fs.readdir(base).catch(() => [] as string[])) {
       if (!UUID.test(id)) continue;
       const state = await this.readState(id);
       for (const record of Object.values(state.providerCleanups ?? {})) {
-        if (record.status !== 'awaiting' || (record.nextCheckAt && Date.parse(record.nextCheckAt) > Date.now())) continue;
-        const job = await this.deps.api.getReconstructionComputeJob(id, nodeId).catch(() => null);
-        if (job && job.id === record.jobId) await this.recordAttestation(id, job);
-        else await this.recordAttestation(id, { ...(job ?? {}), id: record.jobId, providerNodeId: record.providerNodeId, state: record.finalState } as RemoteComputeJob);
+        const age = Date.now() - Date.parse(record.since);
+        const watching = record.status === 'awaiting' || (record.status === 'verified' && record.attestation?.state === 'failed' && age <= ATTESTATION_GIVE_UP_MS);
+        if (!watching || (record.nextCheckAt && Date.parse(record.nextCheckAt) > Date.now())) continue;
+        // Asked for by job id: an earlier, excluded provider job is no longer the attempt's current one.
+        const fetched = await this.deps.api.getReconstructionComputeJob(id, nodeId, record.jobId).catch(() => null);
+        const view = fetched && fetched.id === record.jobId ? fetched : null;
+        // Verified against what was pinned while the job was current, never against a view of a different job.
+        const verification = { ...(view?.verification ?? {}), ...(record.providerSigningPublicKey ? { providerSigningPublicKey: record.providerSigningPublicKey } : {}) };
+        await this.recordAttestation(id, {
+          ...(view ?? {}), id: record.jobId, providerNodeId: record.providerNodeId, state: record.finalState,
+          ...(record.inputHash ? { inputHash: record.inputHash } : {}), verification,
+        } as RemoteComputeJob);
       }
     }
   }

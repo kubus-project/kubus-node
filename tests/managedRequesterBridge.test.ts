@@ -590,6 +590,67 @@ describe('provider cleanup attestation on the requester', () => {
   });
 });
 
+describe('provider cleanup attestation replacement and earlier jobs', () => {
+  const failedStatement = { state: 'failed' as const, items: { decryptedInput: 'deleted' as const, workDirectory: 'deleted' as const, plaintextOutputs: 'deleted' as const, sealedOutputs: 'failed' as const }, outputPins: 'failed' as const, reason: 'sealed_outputs_not_cleaned' };
+
+  async function makeDue(id = jobId) {
+    const state = await stateFile();
+    state.providerCleanups[id].nextCheckAt = new Date(Date.now() - 1000).toISOString();
+    await fs.writeFile(path.join(root(), 'state.json'), JSON.stringify(state));
+  }
+
+  test('a failed statement later replaced by a complete one is recorded as complete', async () => {
+    attestation = signedAttestation(failedStatement);
+    const { bridge } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    await bridge.advance(nodeId, processing());
+    expect((await stateFile()).providerCleanups[jobId]).toMatchObject({ status: 'verified', attestation: { state: 'failed' } });
+    await makeDue();
+    attestation = signedAttestation({ completedAt: '2026-11-27T11:00:00.000Z' });
+    jobState = 'COMPLETED';
+    await bridge.collectAttestations(nodeId);
+    expect((await stateFile()).providerCleanups[jobId]).toMatchObject({ status: 'verified', attestation: { state: 'complete', completedAt: '2026-11-27T11:00:00.000Z' } });
+    // A complete statement is final: a later scan neither asks again nor lets a failed one displace it.
+    const record = (await stateFile()).providerCleanups[jobId];
+    expect(record.nextCheckAt).toBeUndefined();
+  });
+
+  test('a replacement that does not verify, or is older, leaves the verified failed statement in place', async () => {
+    attestation = signedAttestation({ ...failedStatement, completedAt: '2026-11-27T10:00:00.000Z' });
+    const { bridge } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    await bridge.advance(nodeId, processing());
+    jobState = 'COMPLETED';
+    for (const bad of [signedAttestation({ completedAt: '2026-11-27T11:00:00.000Z' }, crypto.generateKeyPairSync('ed25519').privateKey), signedAttestation({ completedAt: '2026-11-27T08:00:00.000Z' })]) {
+      await makeDue();
+      attestation = bad;
+      await bridge.collectAttestations(nodeId);
+      expect((await stateFile()).providerCleanups[jobId]).toMatchObject({ status: 'verified', attestation: { state: 'failed', completedAt: '2026-11-27T10:00:00.000Z' } });
+    }
+  });
+
+  test('the statement of an earlier, excluded provider job is asked for by its job id and verified against the key pinned for it', async () => {
+    const earlier = '5b1f4f0e-6a43-4c64-9c7e-2d8f3f6a9a10';
+    const { bridge, api } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    await bridge.advance(nodeId, processing());
+    const state = await stateFile();
+    state.providerCleanups[earlier] = { jobId: earlier, providerNodeId: providerA, finalState: 'FAILED', status: 'awaiting', attempts: 1, since: new Date().toISOString(), inputHash: 'a'.repeat(64), providerSigningPublicKey: providerKey };
+    await fs.writeFile(path.join(root(), 'state.json'), JSON.stringify(state));
+    // A backend that ignores the job id answers with the current job: nothing is verified from it.
+    await bridge.collectAttestations(nodeId);
+    expect(api.getReconstructionComputeJob).toHaveBeenLastCalledWith(reconstructionId, nodeId, earlier);
+    expect((await stateFile()).providerCleanups[earlier]).toMatchObject({ status: 'awaiting', attempts: 2 });
+    await makeDue(earlier);
+    const statement = signedAttestation({ jobId: earlier, finalState: 'FAILED' });
+    api.getReconstructionComputeJob.mockImplementation((async (_id: string, _node: string, requested?: string) => requested === earlier
+      ? { ...job('FAILED'), id: earlier, verification: undefined, providerCleanup: { state: 'complete', attestation: statement } }
+      : job()) as never);
+    await bridge.collectAttestations(nodeId);
+    expect((await stateFile()).providerCleanups[earlier]).toMatchObject({ status: 'verified', attestation: { state: 'complete', finalState: 'FAILED' } });
+  });
+});
+
 describe('worker prepare stage', () => {
   test('maps typed feedback back to backend file ids and always asks for masking', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {

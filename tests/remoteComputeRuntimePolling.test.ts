@@ -327,4 +327,30 @@ describe('RemoteComputeRuntime provider polling (Part 11 / Part 40)', () => {
     await vi.advanceTimersByTimeAsync(60000);
     expect(calls).toBe(callsAtStop);
   });
+
+  it('treats a DISPUTED job as ended for the provider: it is fetched, cleaned up, released and attested', async () => {
+    const jobId = '3ef91af5-5335-4595-8e8a-0618d2c1c039';
+    const disputed = { id: jobId, state: 'DISPUTED', providerNodeId: 'node-1' };
+    const asked: string[][] = [];
+    const { runtime } = buildRuntime(async () => ({ jobs: [disputed] }), {
+      initialState: { remoteJobs: { [jobId]: { backendJobId: jobId, role: 'provider', state: 'OUTPUT_READY', cleanup: { requested: false, plaintext: 'pending' } } } },
+    });
+    const inner = runtime as unknown as {
+      deps: { api: { getProviderComputeJobs: (nodeId: string, states: string[]) => Promise<{ jobs: unknown[] }> } };
+      providerCleanup: { request: (id: string) => Promise<unknown> };
+      attestor: { attest: (job: unknown) => Promise<void> };
+      releaseEncryptedOutput: (id: string) => Promise<void>;
+      pollProvider: () => Promise<number>;
+    };
+    const original = inner.deps.api.getProviderComputeJobs;
+    inner.deps.api.getProviderComputeJobs = async (nodeId, states) => { asked.push(states); return original(nodeId, states); };
+    const request = vi.spyOn(inner.providerCleanup, 'request').mockResolvedValue(undefined);
+    const attest = vi.spyOn(inner.attestor, 'attest').mockResolvedValue(undefined);
+    const release = vi.spyOn(inner, 'releaseEncryptedOutput').mockResolvedValue(undefined);
+    await inner.pollProvider();
+    expect(asked[0]).toContain('DISPUTED');
+    expect(request).toHaveBeenCalledWith(jobId);
+    expect(release).toHaveBeenCalledWith(jobId);
+    expect(attest).toHaveBeenCalledWith(disputed);
+  });
 });

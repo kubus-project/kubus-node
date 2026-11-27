@@ -28,17 +28,40 @@ function captureFiles() {
     { path: 'frames.json', contentBase64: Buffer.from(JSON.stringify({ schema: 'kubus.capture.frames/1', frames })).toString('base64') }];
 }
 
+/** A masked, posed dataset as a managed requester packs it. */
+function preparedFiles() {
+  const jpg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString('base64');
+  const frames = Array.from({ length: MIN_VIEWS_FOR_RECONSTRUCTION }, (_, index) => ({ file_path: `images/${index}.jpg`, transform_matrix: [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]] }));
+  const json = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64');
+  return [...frames.map(frame => ({ path: `dataset/${frame.file_path}`, contentBase64: jpg })),
+    { path: 'dataset/transforms.json', contentBase64: json({ frames }) },
+    { path: 'dataset/prepared.json', contentBase64: json({ schema: 'kubus.prepared-dataset/1' }) }];
+}
+
+/** The way a provider registers the decrypted dataset of a managed requester's job. */
+async function registerPrepared(dir: string, captures: CaptureStore) {
+  const directory = path.join(dir, 'private', 'remote-jobs', remoteJobId, 'capture');
+  for (const file of preparedFiles()) {
+    await fs.mkdir(path.dirname(path.join(directory, file.path)), { recursive: true });
+    await fs.writeFile(path.join(directory, file.path), Buffer.from(file.contentBase64, 'base64'));
+  }
+  return captures.registerRemote({ id: `remote-${remoteJobId}`, schema: 'kubus.capture/1', state: 'stored', private: true, artworkId: 'art-1', capturedAt: new Date().toISOString(),
+    createdAt: new Date().toISOString(), sizeBytes: 1, fileCount: preparedFiles().length, directory, kind: 'prepared' });
+}
+
 /** A provider-side job whose worker answers with `variants`, sealed to a requester key; returns the finished job. */
-async function runRemoteJob(variants: Array<{ role: string; name: string }>) {
+async function runRemoteJob(variants: Array<{ role: string; name: string }>, options: { prepared?: boolean } = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-provider-output-')); dirs.push(dir);
   const store = new LocalStore(path.join(dir, 'state.json')); await store.load();
   const captures = new CaptureStore(dir, store);
-  const capture = await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: captureFiles() });
+  const capture = options.prepared ? await registerPrepared(dir, captures) :
+    await captures.create({ schema: 'kubus.capture/1', artworkId: 'art-1', capturedAt: new Date().toISOString(), metadata: { intrinsics: true }, files: captureFiles() });
+  expect(capture.kind).toBe(options.prepared ? 'prepared' : undefined);
   const requester = crypto.generateKeyPairSync('x25519');
   const mime = 'application/octet-stream';
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-    if (url.endsWith('/health')) return new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, workerInstanceId: '44444444-4444-4444-8444-444444444444', gpu: { available: true, name: 'RTX' }, capabilities: ['spatial.reconstruct'], outputProtocol: 'kubus.spatial-output/2' }));
+    if (url.endsWith('/health')) return new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, workerInstanceId: '44444444-4444-4444-8444-444444444444', gpu: { available: true, name: 'RTX' }, capabilities: ['spatial.reconstruct'], outputProtocol: 'kubus.spatial-output/2', inputModes: ['frames', 'prepared'] }));
     if (url.endsWith('/v1/jobs/cancel')) return new Response(JSON.stringify({ ...JSON.parse(String(init?.body)), cleanupProtocol: 1, quiescent: true }));
     if (url.endsWith('/v1/process')) {
       const body = JSON.parse(String(init?.body ?? '{}'));
@@ -71,7 +94,7 @@ async function runRemoteJob(variants: Array<{ role: string; name: string }>) {
 
 describe('provider output of a managed reconstruction', () => {
   it('seals the full derivative and the lightweight as two blobs beside the manifest, pinned under the job owner', async () => {
-    const { job, store } = await runRemoteJob([{ role: 'spatial_mobile', name: 'reconstruction.ply' }, { role: 'spatial_preview', name: 'reconstruction-light.ply' }]);
+    const { job, store } = await runRemoteJob([{ role: 'spatial_mobile', name: 'reconstruction.ply' }, { role: 'spatial_preview', name: 'reconstruction-light.ply' }], { prepared: true });
     expect(job.state).toBe('completed');
     const commitment = (job.output as { privateOutput: PrivateOutputCommitment }).privateOutput;
     expect(commitment.blobs.map(blob => blob.role).sort()).toEqual(['manifest', 'spatial_mobile', 'spatial_preview']);
@@ -84,16 +107,23 @@ describe('provider output of a managed reconstruction', () => {
   });
 
   it('a full derivative alone is a valid result (no lightweight when it fits the budget)', async () => {
-    const { job } = await runRemoteJob([{ role: 'spatial_mobile', name: 'reconstruction.ply' }]);
+    const { job } = await runRemoteJob([{ role: 'spatial_mobile', name: 'reconstruction.ply' }], { prepared: true });
     expect(job.state).toBe('completed');
     const commitment = (job.output as { privateOutput: PrivateOutputCommitment }).privateOutput;
     expect(commitment.blobs.map(blob => blob.role).sort()).toEqual(['manifest', 'spatial_mobile']);
   });
 
   it('a worker that still returns the raw archive fails the job and seals nothing', async () => {
-    const { job, store } = await runRemoteJob([{ role: 'spatial_archive', name: 'reconstruction.ply' }]);
+    const { job, store } = await runRemoteJob([{ role: 'spatial_archive', name: 'reconstruction.ply' }], { prepared: true });
     expect(job.state).toBe('failed');
     expect(job.error?.code).toBe('worker_output_roles_invalid');
     expect(Object.keys(store.snapshot().privateComputeCids ?? {})).toEqual([]);
+  });
+
+  it('a user-initiated private-output job on a posed-frames capture keeps its single archive and is sealed', async () => {
+    const { job } = await runRemoteJob([{ role: 'spatial_archive', name: 'reconstruction.ply' }]);
+    expect(job.state).toBe('completed');
+    const commitment = (job.output as { privateOutput: PrivateOutputCommitment }).privateOutput;
+    expect(commitment.blobs.map(blob => blob.role).sort()).toEqual(['manifest', 'spatial_archive']);
   });
 });

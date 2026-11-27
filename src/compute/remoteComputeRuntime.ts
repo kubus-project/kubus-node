@@ -433,7 +433,7 @@ export class RemoteComputeRuntime {
     if (!nodeId) return POLL_INTERVAL_MS;
     this.polling = true;
     try {
-      const { jobs } = await this.deps.api.getProviderComputeJobs(nodeId, ['MATCHED', 'ACCEPTED', 'INPUT_READY', 'RUNNING', 'OUTPUT_READY', 'CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED']);
+      const { jobs } = await this.deps.api.getProviderComputeJobs(nodeId, ['MATCHED', 'ACCEPTED', 'INPUT_READY', 'RUNNING', 'OUTPUT_READY', 'CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED', 'DISPUTED']);
       for (const job of jobs) await this.handleProviderJob(job).catch((error) => this.failProviderJob(job, error));
       this.onPollSucceeded();
       await this.recordAuthorized();
@@ -531,8 +531,9 @@ export class RemoteComputeRuntime {
   private async handleProviderJob(job: RemoteComputeJob): Promise<void> {
     const nodeId = this.deps.store.snapshot().nodeId!;
     const existing = this.deps.store.snapshot().remoteJobs?.[job.id] as RemoteRuntimeRecord | undefined;
-    if (['CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED'].includes(job.state)) {
-      // Terminal only: the sealed result stays pinned until the requester has acknowledged it (COMPLETED) or the job ended.
+    if (['CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED', 'DISPUTED'].includes(job.state)) {
+      // Terminal only: the sealed result stays pinned until the requester has acknowledged it (COMPLETED) or the job ended
+      // (a DISPUTED job, whose output the requester rejected, is ended too).
       let failure: unknown;
       try { if (existing?.role === 'provider' && existing.cleanup) await this.providerCleanup.request(job.id); } catch (error) { failure = error; }
       try { if (existing?.role === 'provider') await this.releaseEncryptedOutput(job.id); } catch (error) { failure ??= error; }
