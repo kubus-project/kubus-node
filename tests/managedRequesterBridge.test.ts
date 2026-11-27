@@ -112,7 +112,8 @@ function makeBridge(prepare?: PrepareOutcome, extra: Partial<ManagedRequesterDep
     reconstructionCall: vi.fn(async (_id: string, action: string, body: Record<string, unknown>) => {
       calls.push({ action, body });
       if (action === 'progress') return attempt({ state: body.state as ManagedReconstruction['state'] });
-      if (action === 'providers') return providers;
+      // Like the backend, never offers a provider the request excludes.
+      if (action === 'providers') return providers.filter(item => !((body.excludeNodeIds as string[] | undefined) ?? []).includes(item.nodeId));
       if (action === 'compute-job') return { computeJobId: job().id };
       if (action === 'compute-job/acknowledge') return job(body.accepted ? 'COMPLETED' : 'DISPUTED', ackProvider);
       if (action === 'compute-job/cancel') return job('CANCELLED');
@@ -1736,5 +1737,153 @@ describe('worker prepare stage', () => {
       await expect(prepare({ jobId: reconstructionId, captureDirectory: '/a', outputDirectory: '/b', fileIds: new Map() }))
         .rejects.toMatchObject({ code: 'worker_source_set_unsupported' });
     } finally { fetchMock.mockRestore(); }
+  });
+});
+
+describe('a lost provider is excluded for a while, not for the whole attempt', () => {
+  const MINUTE = 60_000;
+  const lostJobIds = ['a1111111-1111-4111-8111-111111111111', 'a2222222-2222-4222-8222-222222222222', 'a3333333-3333-4333-8333-333333333333'];
+  const providersCalls = () => calls.filter(call => call.action === 'providers').map(call => call.body.excludeNodeIds);
+  const created = () => calls.filter(call => call.action === 'compute-job').length;
+  const waiting = () => attempt({ state: 'waiting_for_node' });
+  let clock: number;
+  beforeEach(() => { clock = Date.parse('2026-11-28T10:00:00.000Z'); vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(clock); });
+  afterEach(() => { vi.useRealTimers(); });
+  const later = (ms: number) => { clock += ms; vi.setSystemTime(clock); };
+  const lose = async (bridge: ReturnType<typeof makeBridge>['bridge'], api: ReturnType<typeof makeBridge>['api'], id: string, state = 'EXPIRED') => {
+    api.getReconstructionComputeJob.mockResolvedValueOnce({ ...job(state), id });
+    await bridge.advance(nodeId, processing());
+  };
+
+  test('one provider that timed out is left out for the cooldown, then matched again, and the attempt completes', async () => {
+    const { bridge, api } = makeBridge(undefined, { providerExclusionMs: 10 * MINUTE });
+    await bridge.advance(nodeId, attempt());
+    expect(created()).toBe(1);
+    await lose(bridge, api, lostJobIds[0]!);
+    expect(calls.at(-1)!.body).toMatchObject({ state: 'waiting_for_node', stage: 'provider_lost' });
+    // Inside the cooldown the provider is named to the backend as excluded and no job is made.
+    later(2 * MINUTE);
+    await bridge.advance(nodeId, waiting());
+    expect(providersCalls().at(-1)).toEqual([providerA]);
+    expect(created()).toBe(1);
+    expect(calls.filter(call => call.action === 'progress').at(-1)!.body).toMatchObject({ state: 'waiting_for_node' });
+    // After it, the same provider is offered again and the new job goes to it.
+    later(9 * MINUTE);
+    await bridge.advance(nodeId, waiting());
+    expect(providersCalls().at(-1)).toEqual([]);
+    expect(created()).toBe(2);
+    expect(calls.filter(call => call.action === 'compute-job').at(-1)!.body).toMatchObject({ providerNodeId: providerA });
+    // ... and it delivers: the attempt completes.
+    await bridge.advance(nodeId, processing());
+    expect(calls.find(call => call.action === 'candidate')).toBeDefined();
+    expect(actions().slice(-1)).toEqual(['cleanup']);
+    expect(calls.find(call => call.action === 'failure')).toBeUndefined();
+  });
+
+  test('the cooldown is KUBUS_MANAGED_PROVIDER_EXCLUSION_MS (default ten minutes)', async () => {
+    const { bridge, api } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    await lose(bridge, api, lostJobIds[0]!);
+    later(10 * MINUTE - 1000);
+    await bridge.advance(nodeId, waiting());
+    expect(providersCalls().at(-1)).toEqual([providerA]);
+    later(2000);
+    await bridge.advance(nodeId, waiting());
+    expect(providersCalls().at(-1)).toEqual([]);
+  });
+
+  test('three losses still end the attempt as no_provider_completed, also when it is the same provider each time', async () => {
+    const { bridge, api } = makeBridge(undefined, { providerExclusionMs: 10 * MINUTE });
+    await bridge.advance(nodeId, attempt());
+    await lose(bridge, api, lostJobIds[0]!);
+    later(11 * MINUTE);
+    await bridge.advance(nodeId, waiting());
+    await lose(bridge, api, lostJobIds[1]!, 'FAILED');
+    expect(calls.find(call => call.action === 'failure')).toBeUndefined();
+    later(11 * MINUTE);
+    await bridge.advance(nodeId, waiting());
+    await lose(bridge, api, lostJobIds[2]!, 'CANCELLED');
+    expect(actions().slice(-2)).toEqual(['failure', 'cleanup']);
+    expect(calls.at(-2)).toMatchObject({ action: 'failure', body: { code: 'no_provider_completed' } });
+  });
+
+  test('a loss reported twice for the same job counts once', async () => {
+    const { bridge, api } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    await lose(bridge, api, lostJobIds[0]!);
+    await lose(bridge, api, lostJobIds[0]!);
+    await lose(bridge, api, lostJobIds[0]!);
+    expect(calls.find(call => call.action === 'failure')).toBeUndefined();
+    expect((await stateFile()).providerLosses).toHaveLength(1);
+    expect((await stateFile()).excludedProviders).toEqual([providerA]);
+  });
+
+  test('a provider whose result was rejected stays excluded for the whole attempt', async () => {
+    const { bridge, api } = makeBridge(undefined, { providerExclusionMs: 10 * MINUTE });
+    await bridge.advance(nodeId, attempt());
+    await lose(bridge, api, lostJobIds[0]!, 'DISPUTED');
+    later(24 * 60 * MINUTE);
+    await bridge.advance(nodeId, waiting());
+    expect(providersCalls().at(-1)).toEqual([providerA]);
+    expect(created()).toBe(1);
+  });
+
+  test('a provider that returned the legacy output stays excluded for the whole attempt', async () => {
+    blobRoles = ['manifest', 'spatial_archive']; resultFiles = { spatial_mobile: result, spatial_preview: null, spatial_archive: result };
+    const { bridge } = makeBridge(undefined, { providerExclusionMs: 10 * MINUTE });
+    await bridge.advance(nodeId, attempt());
+    await bridge.advance(nodeId, processing());
+    expect((await stateFile()).outdatedProviders).toEqual([providerA]);
+    later(24 * 60 * MINUTE);
+    await bridge.advance(nodeId, waiting());
+    expect(providersCalls().at(-1)).toEqual([providerA]);
+  });
+
+  test('a record from before the cooldown (excludedProviders only) loads: the cooldown starts when it is first seen, and is saved', async () => {
+    const { bridge } = makeBridge(undefined, { providerExclusionMs: 10 * MINUTE });
+    await bridge.advance(nodeId, attempt());
+    const legacy = await stateFile();
+    delete legacy.providerLosses;
+    await fs.writeFile(path.join(root(), 'state.json'), JSON.stringify({ ...legacy, excludedProviders: [providerA, providerB] }));
+    await bridge.advance(nodeId, waiting());
+    expect(providersCalls().at(-1)).toEqual([providerA, providerB]);
+    const saved = await stateFile();
+    expect(saved.providerLosses).toEqual([
+      { jobId: `legacy:${providerA}`, providerNodeId: providerA, at: new Date(clock).toISOString() },
+      { jobId: `legacy:${providerB}`, providerNodeId: providerB, at: new Date(clock).toISOString() },
+    ]);
+    later(11 * MINUTE);
+    await bridge.advance(nodeId, waiting());
+    expect(providersCalls().at(-1)).toEqual([]);
+  });
+
+  test('losses carried over from an older record count toward the limit, and its outdated providers stay excluded', async () => {
+    const { bridge, api } = makeBridge(undefined, { providerExclusionMs: 10 * MINUTE });
+    await bridge.advance(nodeId, attempt());
+    const legacy = await stateFile();
+    delete legacy.providerLosses;
+    await fs.writeFile(path.join(root(), 'state.json'), JSON.stringify({ ...legacy, excludedProviders: [providerB, '99999999-9999-4999-8999-999999999999'], outdatedProviders: [providerB] }));
+    later(24 * 60 * MINUTE);
+    await bridge.advance(nodeId, waiting());
+    // The outdated one is excluded for good; the other one's cooldown started when it was first seen here.
+    expect(providersCalls().at(-1)).toEqual([providerB, '99999999-9999-4999-8999-999999999999']);
+    later(11 * MINUTE);
+    await bridge.advance(nodeId, waiting());
+    expect(providersCalls().at(-1)).toEqual([providerB]);
+    // Two carried-over losses plus this one make three.
+    await lose(bridge, api, lostJobIds[0]!);
+    expect(calls.at(-2)).toMatchObject({ action: 'failure', body: { code: 'no_provider_completed' } });
+  });
+
+  test('the face-review refusal confirmed by the requester still ends the attempt without excluding anyone', async () => {
+    const { bridge, api } = makeBridge();
+    await bridge.advance(nodeId, attempt());
+    await fs.writeFile(path.join(root(), 'capture', 'dataset', 'prepared.json'), JSON.stringify({ ...flaggedRecord(), inputs: [] }));
+    api.getReconstructionComputeJob.mockResolvedValueOnce({ ...job('FAILED'), failure: { code: 'provider_face_review_required' } });
+    await bridge.advance(nodeId, processing());
+    expect(calls.find(call => call.action === 'failure')!.body).toMatchObject({ code: 'face_review_required' });
+    const state = await stateFile();
+    expect(state.excludedProviders ?? []).toEqual([]);
+    expect(state.providerLosses ?? []).toEqual([]);
   });
 });

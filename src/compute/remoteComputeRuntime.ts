@@ -59,6 +59,17 @@ function checkSignedPrivateOutput(job: RemoteComputeJob): PrivateOutputCommitmen
   return validatePrivateOutput(payload.privateOutput, job.id, job.outputManifestCid, job.outputCids);
 }
 
+/** Backend states in which a provider job is over; the provider record takes the state the backend reports. */
+const PROVIDER_TERMINAL_STATES = ['CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED', 'DISPUTED'];
+/** Record states that hold one of the provider's capacity slots (`maxConcurrency + maxQueueDepth`). */
+const PROVIDER_CAPACITY_STATES = ['PREPARING', 'ACCEPTED', 'INPUT_READY', 'RUNNING'];
+/**
+ * A capacity-holding record whose job the backend no longer lists is released once its job lease ended this long ago.
+ * The backend expires every non-final job at its lease end, so a job that is neither listed nor within its lease is gone.
+ */
+const ABSENT_RECORD_GRACE_MS = 10 * 60_000;
+/** The same for a record from before the journal existed: no lease is known, so only a record this old is released. */
+const ABSENT_LEGACY_RECORD_MS = 7 * 24 * 60 * 60_000;
 const POLL_INTERVAL_MS = 5000;
 const POLL_MAX_BACKOFF_MS = 60000;
 /** Re-emit a "still failing" summary at most this often, instead of one warning per tick. */
@@ -480,6 +491,9 @@ export class RemoteComputeRuntime {
     this.polling = true;
     try {
       const { jobs } = await this.deps.api.getProviderComputeJobs(nodeId, ['MATCHED', 'ACCEPTED', 'INPUT_READY', 'RUNNING', 'OUTPUT_READY', 'CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED', 'DISPUTED']);
+      // What the backend reports comes first: a record that still says RUNNING for a job that ended holds a capacity slot
+      // the handling below would count against a job it is about to accept.
+      await this.reconcileProviderRecords(jobs);
       for (const job of jobs) await this.handleProviderJob(job).catch((error) => this.failProviderJob(job, error));
       this.onPollSucceeded();
       await this.recordAuthorized();
@@ -577,10 +591,14 @@ export class RemoteComputeRuntime {
   private async handleProviderJob(job: RemoteComputeJob): Promise<void> {
     const nodeId = this.deps.store.snapshot().nodeId!;
     const existing = this.deps.store.snapshot().remoteJobs?.[job.id] as RemoteRuntimeRecord | undefined;
-    if (['CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED', 'DISPUTED'].includes(job.state)) {
+    if (PROVIDER_TERMINAL_STATES.includes(job.state)) {
       // Terminal only: the sealed result stays pinned until the requester has acknowledged it (COMPLETED) or the job ended
       // (a DISPUTED job, whose output the requester rejected, is ended too).
       let failure: unknown;
+      // The record states what the backend says about the job, whether or not the cleanup below succeeds: the cleanup
+      // journal keeps its own state (and `plaintextBlocked` still stops a new acceptance while it is pending), but the
+      // record must not keep a slot for a job that is over.
+      try { await this.recordTerminalState(job); } catch (error) { failure = error; }
       try { if (existing?.role === 'provider' && existing.cleanup) await this.providerCleanup.request(job.id); } catch (error) { failure = error; }
       try { if (existing?.role === 'provider') await this.releaseEncryptedOutput(job.id); } catch (error) { failure ??= error; }
       // The statement says what the journals say, so a failed step is stated as failed rather than left unsaid.
@@ -615,7 +633,7 @@ export class RemoteComputeRuntime {
       const settings = this.settings();
       const active = Object.values(this.deps.store.snapshot().remoteJobs || {}).filter((item) => {
         const record = item as RemoteRuntimeRecord;
-        return record.role === 'provider' && ['PREPARING', 'ACCEPTED', 'INPUT_READY', 'RUNNING'].includes(record.state);
+        return record.role === 'provider' && PROVIDER_CAPACITY_STATES.includes(record.state);
       }).length;
       if (Number(job.inputBytes || 0) > settings.maxAcceptedInputBytes) {
         await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'DECLINED', metadata: { code: 'provider_input_too_large' } });
@@ -699,6 +717,53 @@ export class RemoteComputeRuntime {
     await this.deps.api.submitProviderComputeOutput(job.id, { nodeId, outputManifestCid, outputCids, receipt: { payload, signature } });
     await this.cleanupProvider(job, record);
     await this.updateRecord(job.id, 'provider', 'OUTPUT_READY');
+  }
+
+  /** Gives a provider record the terminal state the backend reports for its job. Idempotent: an unchanged state is not written again. */
+  private async recordTerminalState(job: RemoteComputeJob): Promise<void> {
+    const record = this.deps.store.snapshot().remoteJobs?.[job.id] as RemoteRuntimeRecord | undefined;
+    if (record?.role !== 'provider' || record.state === job.state) return;
+    await this.updateRecord(job.id, 'provider', job.state);
+  }
+
+  /**
+   * Brings provider records in line with the backend's complete list of this Node's jobs (every state is requested), so
+   * a record left behind by an older version, or by a job the backend ended while this Node could not say so, stops
+   * counting against capacity. Cleanup journals are never touched: only `state` moves, and the cleanup loop keeps its
+   * own obligations.
+   *  - A record whose job is listed as ended takes that state.
+   *  - A capacity-holding record whose job is not listed at all, and whose lease ended more than a grace period ago, is
+   *    marked EXPIRED: the backend expires every live job at its lease end, so such a job can only be gone.
+   */
+  private async reconcileProviderRecords(jobs: RemoteComputeJob[]): Promise<void> {
+    const listed = new Set<string>();
+    for (const job of jobs) {
+      listed.add(job.id);
+      if (!PROVIDER_TERMINAL_STATES.includes(job.state)) continue;
+      await this.recordTerminalState(job).catch(() => this.deps.logger.warn({ code: 'provider_record_state_not_saved', jobId: job.id }, 'provider job record could not be updated'));
+    }
+    const now = Date.now();
+    for (const item of Object.values(this.deps.store.snapshot().remoteJobs || {})) {
+      const record = item as RemoteRuntimeRecord;
+      if (record.role !== 'provider' || !PROVIDER_CAPACITY_STATES.includes(record.state) || listed.has(record.backendJobId)) continue;
+      const leaseEnd = record.cleanup ? Date.parse(record.cleanup.expiresAt) : Number.NaN;
+      const stale = Number.isFinite(leaseEnd)
+        ? now - leaseEnd > ABSENT_RECORD_GRACE_MS
+        : now - Date.parse(record.updatedAt) > ABSENT_LEGACY_RECORD_MS;
+      if (!stale) continue;
+      try {
+        await this.deps.store.update((state) => {
+          const current = state.remoteJobs?.[record.backendJobId] as RemoteRuntimeRecord | undefined;
+          if (!current || current.role !== 'provider' || !PROVIDER_CAPACITY_STATES.includes(current.state)) return;
+          current.state = 'EXPIRED';
+          current.reconciled = 'absent_past_lease';
+          current.updatedAt = new Date().toISOString();
+        });
+        this.deps.logger.warn({ code: 'provider_record_released', jobId: record.backendJobId, previousState: record.state }, 'a provider job the backend no longer lists was released from the capacity this Node counts');
+      } catch {
+        this.deps.logger.warn({ code: 'provider_record_state_not_saved', jobId: record.backendJobId }, 'provider job record could not be updated');
+      }
+    }
   }
 
   private async failProviderJob(job: RemoteComputeJob, error: unknown): Promise<void> {

@@ -43,6 +43,11 @@ export interface ManagedRequesterDeps {
   remote: Pick<RemoteComputeRuntime, 'signedAcknowledgement' | 'stagePrivateOutput' | 'releaseInput' | 'releaseUnusedInput' | 'releaseInputsOwnedBy'>;
   logger: Logger;
   maxProviderAttempts?: number;
+  /**
+   * How long a provider whose job for an attempt ended without a result is left out of matching for that attempt
+   * (`KUBUS_MANAGED_PROVIDER_EXCLUSION_MS`, default ten minutes). Every such loss still counts toward `maxProviderAttempts`.
+   */
+  providerExclusionMs?: number;
   intervalMs?: number;
   /** How often a long prepare renews the attempt's lease (the contract asks for at least every five minutes). */
   leaseRenewMs?: number;
@@ -84,8 +89,21 @@ export interface PendingJobInput {
   jobSpec: Record<string, unknown>;
 }
 
+/** One provider job of an attempt that ended without a result. Every loss counts toward the attempt's limit; most also exclude the provider for a while. */
+export interface ProviderLoss {
+  jobId: string;
+  providerNodeId: string;
+  /** When the loss was recorded; the cooldown runs from here. Absent on a loss carried over from an older record, until the next matching pass stamps it. */
+  at?: string;
+  /** The provider's result was rejected: it stays excluded for the attempt instead of for the cooldown. */
+  permanent?: boolean;
+}
+
 interface LocalState {
+  /** Distinct providers lost in this attempt. Kept for older records and readers; `providerLosses` is what counts and what excludes. */
   excludedProviders: string[];
+  /** Every provider job of this attempt that was lost, once per job. Absent in a record from before the cooldown; `lossesOf` reads both. */
+  providerLosses?: ProviderLoss[];
   /** The encrypted input prepared for the provider this attempt is sending to; absent once a job holds it. */
   pendingInput?: PendingJobInput;
   /**
@@ -126,6 +144,7 @@ const SWEEP_EVERY_MS = 60_000;
 const ACK_BATCH = 100;
 /** The provider worker refused a dataset flagged for a face review; the requester's attempt ends, no other provider is tried. */
 const PROVIDER_FACE_REVIEW = 'provider_face_review_required';
+export const DEFAULT_PROVIDER_EXCLUSION_MS = 10 * 60_000;
 type CleanupOutcome = 'complete' | 'pending' | 'failed';
 const WORSE: Record<CleanupOutcome, number> = { complete: 0, pending: 1, failed: 2 };
 const worse = (a: CleanupOutcome, b: CleanupOutcome): CleanupOutcome => (WORSE[b] > WORSE[a] ? b : a);
@@ -592,7 +611,7 @@ export class ManagedRequesterBridge {
       return;
     }
     const nodes = await this.deps.api.reconstructionCall<ComputeCandidate[]>(attempt.id, 'providers', {
-      nodeId, inputBytes: state.inputBytes, excludeNodeIds: state.excludedProviders,
+      nodeId, inputBytes: state.inputBytes, excludeNodeIds: await this.excludedNow(attempt.id, state),
     });
     // Only a provider whose worker writes the full and lightweight variants (`kubus.spatial-output/2`) is eligible;
     // one that does not report it is a legacy provider and would return the raw training file.
@@ -748,6 +767,36 @@ export class ManagedRequesterBridge {
     }
   }
 
+  /**
+   * The providers left out of matching right now: one whose result was rejected or came in the legacy shape stays out for
+   * the attempt; one that was merely lost (it never accepted, failed, expired, or was cancelled) is out only until the
+   * cooldown has run, so a single healthy provider that restarted can be matched again. A loss carried over from an
+   * older record has no time yet: its cooldown starts the first time it is seen here, and that is saved.
+   */
+  private async excludedNow(id: string, state: LocalState): Promise<string[]> {
+    const losses = this.lossesOf(state);
+    if (losses.some(loss => !loss.at && !loss.permanent && !(state.outdatedProviders ?? []).includes(loss.providerNodeId))) {
+      const stamped = new Date().toISOString();
+      for (const loss of losses) loss.at ??= stamped;
+      await this.writeState(id, { ...state, providerLosses: losses });
+    }
+    const window = this.deps.providerExclusionMs ?? DEFAULT_PROVIDER_EXCLUSION_MS;
+    const now = Date.now();
+    const outdated = state.outdatedProviders ?? [];
+    return Array.from(new Set(losses
+      .filter(loss => loss.permanent || outdated.includes(loss.providerNodeId) || !loss.at || now - Date.parse(loss.at) < window)
+      .map(loss => loss.providerNodeId)));
+  }
+
+  /** The attempt's lost provider jobs: the recorded ones, plus any provider an older record excluded that has none. */
+  private lossesOf(state: LocalState): ProviderLoss[] {
+    const losses = (state.providerLosses ?? []).map(loss => ({ ...loss }));
+    for (const providerNodeId of state.excludedProviders ?? []) {
+      if (!losses.some(loss => loss.providerNodeId === providerNodeId)) losses.push({ jobId: `legacy:${providerNodeId}`, providerNodeId });
+    }
+    return losses;
+  }
+
   /** Follows the provider's job; a lost or failed provider returns the attempt to matching with that node excluded. */
   private async follow(nodeId: string, attempt: ManagedReconstruction): Promise<void> {
     const job = await this.deps.api.getReconstructionComputeJob(attempt.id, nodeId);
@@ -817,13 +866,18 @@ export class ManagedRequesterBridge {
     // Pin release switched off: the pin stays, so it is listed and retried instead of being forgotten.
     if (released && released.released === false) await this.list(attempt.id, job.inputCid);
     const state = await this.readState(attempt.id);
-    const excludedProviders = Array.from(new Set([...state.excludedProviders, job.providerNodeId]));
-    await this.writeState(attempt.id, { ...state, excludedProviders });
+    // One entry per job, so a pass repeated after a crash does not count the same loss twice.
+    const losses = this.lossesOf(state);
+    if (!losses.some(loss => loss.jobId === job.id && loss.providerNodeId === job.providerNodeId)) {
+      losses.push({ jobId: job.id, providerNodeId: job.providerNodeId, at: new Date().toISOString(), ...(job.state === 'DISPUTED' ? { permanent: true } : {}) });
+    }
+    const excludedProviders = Array.from(new Set(losses.map(loss => loss.providerNodeId)));
+    await this.writeState(attempt.id, { ...state, excludedProviders, providerLosses: losses });
     await this.trackProviderJob(attempt.id, job);
-    if (excludedProviders.length >= (this.deps.maxProviderAttempts ?? 3)) {
+    if (losses.length >= (this.deps.maxProviderAttempts ?? 3)) {
       // Every provider that was tried returned the legacy output: say that, not a generic loss.
       const outdated = state.outdatedProviders ?? [];
-      const code = excludedProviders.every(id => outdated.includes(id)) ? 'provider_output_outdated' : 'no_provider_completed';
+      const code = losses.every(loss => outdated.includes(loss.providerNodeId)) ? 'provider_output_outdated' : 'no_provider_completed';
       await this.deps.api.reconstructionCall(attempt.id, 'failure', { nodeId, code });
       await this.finish(nodeId, attempt.id, state.captureId);
       return;

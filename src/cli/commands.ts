@@ -232,7 +232,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
         new ManagedRequesterBridge({
           api, nodeId: () => store.snapshot().nodeId, dataRoot: config.localDataPath,
           prepare: workerPrepare({ workerUrl: config.spatialWorkerUrl, workerAuth }), cancelPrepare: workerCancelPrepare({ workerUrl: config.spatialWorkerUrl, workerAuth }), captures, transport: privateTransport,
-          remote: remoteCompute, logger,
+          remote: remoteCompute, logger, providerExclusionMs: config.managedProviderExclusionMs,
         }).start();
       }
       // The signaling namespace authorizes the durable node id against the

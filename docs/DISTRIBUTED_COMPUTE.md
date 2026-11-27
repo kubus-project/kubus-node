@@ -15,6 +15,14 @@ REQUESTED -> MATCHED -> ACCEPTED -> INPUT_READY -> RUNNING
 
 Legal terminal paths are `DECLINED`, `EXPIRED`, `FAILED`, `CANCELLED`, and `DISPUTED`. The backend enforces transitions and actor authorization. Provider acceptance is explicit. The lease binds job/requester/provider, canonical spec and hash, input CID/hash, expiry and protocol. Expired leases cannot create rewards.
 
+### Provider capacity records
+
+A provider Node decides whether to accept a `MATCHED` job from its own records: the jobs it holds in `PREPARING`, `ACCEPTED`, `INPUT_READY` or `RUNNING` must stay below `REMOTE_COMPUTE_MAX_CONCURRENCY + REMOTE_COMPUTE_MAX_QUEUE_DEPTH` (1 + 2 by default), otherwise the job is declined with `provider_capacity_full`.
+
+- **A record takes the state the backend reports.** When the backend lists a job as `CANCELLED`, `FAILED`, `EXPIRED`, `DECLINED`, `COMPLETED` or `DISPUTED`, the Node's record of it takes that state, whether or not the local cleanup and the release of the sealed output succeed. The cleanup journal keeps its own state: a failed cleanup stays `blocked` and retried, and `provider_cleanup_pending` still declines new jobs while plaintext may remain. Before 0.8.9 the record stayed in its old state (for example `RUNNING`), so three cancelled or failed jobs left a Node declining every new job as `provider_capacity_full` until its state file was edited.
+- **Jobs the backend no longer lists.** The Node asks for every state, so a missing job is a job the backend has dropped. A record still holding a slot whose job is not listed and whose lease (`expiresAt`) ended more than ten minutes ago is marked `EXPIRED` (`reconciled: absent_past_lease`); a record from before the cleanup journal, with no lease on record, is released after seven days. Only the record state changes: a pending cleanup obligation is kept and carried out as before. Nothing is reconciled from a poll that failed.
+- **On start.** Records an older version left behind are reconciled by the first successful poll, before the next job is accepted; nothing needs to be edited by hand.
+
 ## Private data plane
 
 The requester creates a stable capture package, compresses it, encrypts it with a random AES-256-GCM data key, and adds only ciphertext to Kubo. X25519 shared secret plus HKDF-SHA-256 derives an AES-256-GCM wrapping key for the selected provider. The backend relays the CID and sealed key envelope; it does not receive the raw key or plaintext bytes.
@@ -61,9 +69,17 @@ For each attempt it:
 2. Prepares the set on its own worker in the `source_set` input mode: photos and any number of clips, faces always masked, COLMAP poses, stopping before training. Typed failures such as `sfm_failed` or `frames_too_blurry` go back to the artist with per-file usable-view counts.
 3. Packs only `capture.json` and the masked dataset as a `prepared` capture. That kind holds no file under `photos/` or `video/`, so the media-capture refusal above still holds for raw media.
 4. Matches a provider that advertises `kubus.private-output/1` and `kubus.spatial-output/2`, encrypts the capture to that provider, and has the backend create the job. The canonical spec carries the attempt's source binding.
-5. Follows the job. A verified, staged result is acknowledged and uploaded as the artist's new private candidate (the full file, and the lightweight one when there is one; see below). A result that fails verification is disputed, and so is a legacy result (`provider_output_outdated`). A failed, expired or disputed job releases the encrypted input and excludes that provider. After three providers the attempt fails as `no_provider_completed`.
+5. Follows the job. A verified, staged result is acknowledged and uploaded as the artist's new private candidate (the full file, and the lightweight one when there is one; see below). A result that fails verification is disputed, and so is a legacy result (`provider_output_outdated`). A failed, expired, declined or cancelled job releases the encrypted input and leaves that provider out of matching for the attempt for a cooldown (see below); a disputed one (and a provider that returned the legacy output) stays out for the whole attempt. Every lost provider job counts toward the limit: after three the attempt fails as `no_provider_completed` (or `provider_output_outdated` when every one returned the legacy output).
 6. When the artist cancels, cancels the provider job, releases the input and confirms.
 7. On every way an attempt can end (ready, failed, needs more views, cancelled) releases what it holds and reports its own cleanup (`cleanup { state }`). On `ready` that happens only after the backend says both artifacts arrived.
+
+### Lost providers and the cooldown
+
+A provider whose job for an attempt ended without a result (it never accepted before the timeout, failed, expired, was declined or cancelled) is named in `excludeNodeIds` when the requester asks the backend for providers, but only for `KUBUS_MANAGED_PROVIDER_EXCLUSION_MS` (default 600000, ten minutes) after the loss. A single healthy provider that restarted or timed out once can therefore be matched again for the same attempt; before, it was excluded for the whole attempt and the attempt waited in `waiting_for_node` for ever. A provider whose result the requester rejected (`DISPUTED`), or that returned the legacy output, stays excluded for the whole attempt, and a face-review refusal the requester confirms still ends the attempt without excluding anyone.
+
+The cooldown does not change the limit. The attempt records each lost provider job once in `providerLosses` (job, provider, time, and whether the exclusion is permanent) and fails as `no_provider_completed` at `maxProviderAttempts` (three) losses, counting every lost job, so the same provider lost three times fails the attempt like three different providers do. `excludedProviders` (the distinct lost providers) is still written. An attempt record from before the cooldown has only `excludedProviders`: each of those providers counts as one loss, and its cooldown starts the first time the record is read after the upgrade. The setting is read from the requester Node's environment; `0` means no cooldown.
+
+The backend applies its own rule on top: `POST .../providers` leaves out any provider whose job for the attempt is `EXPIRED` whatever the requester sends (its heartbeat can stay fresh for minutes after it stopped working). Until the backend bounds that rule too, a provider lost as `EXPIRED` (the accept timeout) is not offered again for that attempt and the cooldown only helps for the other loss states.
 
 ### Face review, verification, cleanup (fix wave 2)
 

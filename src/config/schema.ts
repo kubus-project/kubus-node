@@ -50,6 +50,8 @@ export interface AppConfig {
   remoteComputePaused: boolean;
   /** Kubus-operated pilot requester: claims browser reconstruction attempts from the backend bridge. Off by default. */
   managedRequesterEnabled?: boolean;
+  /** How long the managed requester leaves a lost provider out of matching for the same attempt. Default ten minutes. */
+  managedProviderExclusionMs?: number;
   remoteComputeMaxConcurrency: number;
   remoteComputeMaxQueueDepth: number;
   remoteComputeMaxInputBytes: number;

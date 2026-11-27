@@ -153,6 +153,7 @@ export function parseEnv(env: NodeJS.ProcessEnv = process.env): AppConfig {
     offerRemoteCompute: boolEnv(env, 'OFFER_REMOTE_COMPUTE', false),
     remoteComputePaused: boolEnv(env, 'REMOTE_COMPUTE_PAUSED', false),
     managedRequesterEnabled: boolEnv(env, 'KUBUS_MANAGED_REQUESTER', false),
+    managedProviderExclusionMs: parseOptionalIntEnv(env, 'KUBUS_MANAGED_PROVIDER_EXCLUSION_MS', 10 * 60 * 1000, 0),
     remoteComputeMaxConcurrency: parseOptionalIntEnv(env, 'REMOTE_COMPUTE_MAX_CONCURRENCY', 1, 1),
     remoteComputeMaxQueueDepth: parseOptionalIntEnv(env, 'REMOTE_COMPUTE_MAX_QUEUE_DEPTH', 2, 1),
     remoteComputeMaxInputBytes: parseOptionalBytesEnv(env, 'REMOTE_COMPUTE_MAX_INPUT_BYTES', 20 * 1024 * 1024 * 1024),

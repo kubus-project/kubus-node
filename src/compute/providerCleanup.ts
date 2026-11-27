@@ -28,6 +28,8 @@ export interface RemoteRuntimeRecord {
   role: 'requester' | 'provider';
   state: string;
   updatedAt: string;
+  /** Set when this Node, not the backend, moved the state: the job was no longer listed once its lease had ended. */
+  reconciled?: 'absent_past_lease';
   cleanup?: ProviderCleanupState;
 }
 
