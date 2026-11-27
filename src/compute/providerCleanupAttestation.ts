@@ -215,10 +215,14 @@ export class ProviderCleanupAttestor {
     const decryptedInput: CleanupItemStatus = !record ? 'not_present'
       : record.cleanup?.plaintext === 'complete' ? (record.cleanup.decryptedInputRemoved === false ? 'not_present' : 'deleted') : 'failed';
     let workDirectory: CleanupItemStatus = 'not_present';
+    // Quiescence is normally proven by the worker that ran the job. A cleaned job whose worker was replaced is
+    // inferred instead (the old process is gone), so say so rather than reporting it as an ordinary delete.
+    let restartedWorker = false;
     for (const child of children) {
       const journal = child.id ? state.jobCleanup?.[child.id] : undefined;
       const status: CleanupItemStatus = !journal ? (child.startedAt ? 'failed' : 'not_present')
         : journal.state !== 'complete' ? 'failed' : (journal.removed === false ? 'not_present' : 'deleted');
+      if (status === 'deleted' && journal?.reason === 'worker_restarted') restartedWorker = true;
       if (status === 'failed' || workDirectory === 'failed') workDirectory = 'failed';
       else if (status === 'deleted') workDirectory = 'deleted';
     }
@@ -234,7 +238,7 @@ export class ProviderCleanupAttestor {
     const timed = (value?: string) => (value && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : null);
     return {
       items, outputPins, state: resultState,
-      reason: resultState === 'complete' ? null : failedKey ? `${failedKey.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`)}_not_cleaned` : 'output_pins_not_released',
+      reason: resultState === 'complete' ? (restartedWorker ? 'worker_restarted' : null) : failedKey ? `${failedKey.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`)}_not_cleaned` : 'output_pins_not_released',
       receivedAt: timed(record?.cleanup?.receivedAt) ?? timed(job.createdAt) ?? new Date(this.now()).toISOString(),
       workerStartedAt: timed(children.map(child => child.startedAt).filter(Boolean).sort()[0]),
       workerFinishedAt: timed(children.map(child => child.completedAt).filter(Boolean).sort().at(-1)),

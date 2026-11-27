@@ -250,6 +250,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   });
   await waitForShutdown({ stop: async () => {
     startupAbort.abort();
+    jobs.stopCleanupRetry();
     // Backend requests have their own timeouts. A request completing after
     // shutdown cannot activate services because recovery checks the signal.
     // This wait was 10s, which is Docker's entire stop grace period on its own,

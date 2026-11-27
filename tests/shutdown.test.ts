@@ -3,7 +3,8 @@ import { existsSync, promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { acquireRuntimeLease } from '../src/runtime/runtimeLease.js';
 import { SHUTDOWN_DEADLINE_MS, SHUTDOWN_STEP_BUDGET_MS, STARTUP_ABORT_GRACE_MS, waitForShutdown } from '../src/cli/commands.js';
 
@@ -15,6 +16,11 @@ import { SHUTDOWN_DEADLINE_MS, SHUTDOWN_STEP_BUDGET_MS, STARTUP_ABORT_GRACE_MS, 
 // runtime.
 
 const never = () => new Promise<void>(() => {});
+
+// The child-process tests below must not depend on the directory vitest was started from.
+const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+const sourceUrl = (relative: string) => pathToFileURL(path.join(repoRoot, relative)).href;
+const tsxLoader = pathToFileURL(createRequire(import.meta.url).resolve('tsx')).href;
 
 describe('shutdown', () => {
   it('finishes inside Docker default grace period even when a step hangs forever', async () => {
@@ -192,8 +198,8 @@ describe('shutdown releases the runtime writer lease', () => {
   it('a real forced process.exit with a stalled step leaves no lease file behind', async () => {
     const { state, leaseFile, lease } = await leased();
     await lease.release();
-    const commands = pathToFileURL(path.resolve('src/cli/commands.ts')).href;
-    const leaseModule = pathToFileURL(path.resolve('src/runtime/runtimeLease.ts')).href;
+    const commands = sourceUrl('src/cli/commands.ts');
+    const leaseModule = sourceUrl('src/runtime/runtimeLease.ts');
     const code = `import { waitForShutdown } from ${JSON.stringify(commands)}; import { acquireRuntimeLease } from ${JSON.stringify(leaseModule)};
 const lease = await acquireRuntimeLease(${JSON.stringify(state)});
 process.once('exit', lease.releaseSync);
@@ -201,7 +207,7 @@ const done = waitForShutdown({ stop: () => new Promise(() => {}) }, null, undefi
 setImmediate(() => process.emit('SIGTERM'));
 void done;
 setInterval(() => {}, 1000);`;
-    const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', code], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, ['--import', tsxLoader, '--input-type=module', '-e', code], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
     let error = '';
     child.stderr.on('data', (chunk) => { error += String(chunk); });
     const status = await new Promise<number | null>((resolve) => { child.once('exit', (value) => resolve(value)); });
@@ -211,4 +217,42 @@ setInterval(() => {}, 1000);`;
     const next = await acquireRuntimeLease(state);
     await next.release();
   }, 20000);
+
+  // runCli itself must arm the exit hook for the long-running commands: a startup that fails after the lease was
+  // taken, and an explicit process.exit(75), both end without the waitForShutdown path.
+  it.each([
+    ['a start that fails after taking the lease (natural exit)', 'start', ''],
+    ['a gui command that ends in process.exit(75)', 'gui', 'process.exitCode = 75; setTimeout(() => process.exit(75), 0);'],
+  ])('runCli leaves no lease file behind after %s', async (_name, command, tail) => {
+    const { state, leaseFile, lease } = await leased();
+    await lease.release();
+    // A state file the runtime cannot read: runCli takes the lease, then fails loading it.
+    await fs.writeFile(state, '{broken');
+    const env = {
+      ...process.env,
+      KUBUS_NODE_CONFIG_PATH: path.join(path.dirname(state), 'missing-config.env'),
+      KUBUS_API_BASE_URL: 'http://127.0.0.1:1', KUBUS_OPERATOR_TOKEN: 'synthetic-token', KUBUS_OPERATOR_WALLET: 'synthetic-wallet',
+      KUBUS_NODE_LABEL: 'synthetic', KUBUS_NODE_ENDPOINT_URL: 'http://127.0.0.1:1', IPFS_RPC_URL: 'http://127.0.0.1:1',
+      IPFS_GATEWAY_URL: 'http://127.0.0.1:1', LOCAL_STATE_PATH: state, NODE_ENV: 'test', LOG_LEVEL: 'silent',
+      HEARTBEAT_INTERVAL_MS: '5000', CID_SYNC_INTERVAL_MS: '30000', COMMITMENT_INTERVAL_MS: '30000',
+      STATUS_INTERVAL_MS: '10000', MAX_PINNED_CIDS: '10', CID_CLASS_FILTERS: 'hot,warm',
+    };
+    const code = `import { runCli } from ${JSON.stringify(sourceUrl('src/cli/commands.ts'))};
+import { promises as fs } from 'node:fs';
+const leaseFile = ${JSON.stringify(leaseFile)};
+let heldWhileRunning = false;
+try { await runCli([${JSON.stringify(command)}]); } catch (error) { heldWhileRunning = await fs.stat(leaseFile).then(() => true, () => false); console.log('RUNCLI_ERROR ' + (error && error.message)); }
+console.log('LEASE_HELD_AFTER_FAILURE ' + heldWhileRunning);
+${tail}`;
+    const child = spawn(process.execPath, ['--import', tsxLoader, '--input-type=module', '-e', code], { cwd: repoRoot, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = ''; let error = '';
+    child.stdout.on('data', (chunk) => { output += String(chunk); });
+    child.stderr.on('data', (chunk) => { error += String(chunk); });
+    const status = await new Promise<number | null>((resolve) => { child.once('exit', (value) => resolve(value)); });
+    // The lease really was taken before the failure (otherwise the test proves nothing)...
+    expect(output).toContain('LEASE_HELD_AFTER_FAILURE true');
+    expect(status).toBe(tail ? 75 : 0);
+    // ...and the exit hook runCli armed removed it.
+    expect(await exists(leaseFile), error).toBe(false);
+  }, 30000);
 });

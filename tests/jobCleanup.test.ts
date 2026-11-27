@@ -143,3 +143,39 @@ it('the same instance reporting not quiescent keeps cleanup blocked and never as
   expect((await fs.stat(target)).isDirectory()).toBe(true);
   expect(store.snapshot().jobCleanup?.[id]?.state).toBe('blocked');
 });
+
+it('a 409 that is not worker_instance_changed is not treated as a restart and never asks for health', async () => {
+  const { cleanup, target, store } = await fixture(); await cleanup.markWorkerAttempt(id, instance);
+  const calls = restartedWorker();
+  vi.mocked(globalThis.fetch).mockImplementation(async url => {
+    calls.push(String(url).replace('http://worker.invalid', ''));
+    return new Response(JSON.stringify({ detail: 'worker_busy' }), { status: 409 });
+  });
+  calls.length = 0;
+  await expect(cleanup.reconcile(id)).rejects.toThrow('worker_quiescence_unverified');
+  expect(calls).toEqual(['/v1/jobs/cancel']);
+  expect((await fs.stat(target)).isDirectory()).toBe(true);
+  expect(store.snapshot().jobCleanup?.[id]?.state).toBe('blocked');
+});
+it.each([
+  ['a cleanup protocol other than 1', { status: 'ready', cleanupProtocol: 2, workerInstanceId: restarted }],
+  ['no cleanup protocol (an older worker)', { status: 'ready', workerInstanceId: restarted }],
+  ['an instance id that is not a well-formed identifier', { status: 'ready', cleanupProtocol: 1, workerInstanceId: '../escape' }],
+  ['an instance id that is not a string', { status: 'ready', cleanupProtocol: 1, workerInstanceId: 7 }],
+  ['no instance id', { status: 'ready', cleanupProtocol: 1 }],
+])('health with %s does not prove a restart, so cleanup stays blocked', async (_name, health) => {
+  const { cleanup, target, store } = await fixture(); await cleanup.markWorkerAttempt(id, instance);
+  const calls = restartedWorker({ health: () => new Response(JSON.stringify(health)) });
+  await expect(cleanup.reconcile(id)).rejects.toThrow('worker_quiescence_unverified');
+  // Only the first cancel and the health read: the new instance is never asked to tombstone anything.
+  expect(calls).toEqual(['/v1/jobs/cancel', '/health']);
+  expect((await fs.stat(target)).isDirectory()).toBe(true);
+  expect(store.snapshot().jobCleanup?.[id]).toMatchObject({ state: 'blocked' });
+  expect(store.snapshot().jobCleanup?.[id]?.reason).toBe('cleanup_retry_required');
+});
+it('health that is not JSON does not prove a restart', async () => {
+  const { cleanup, target } = await fixture(); await cleanup.markWorkerAttempt(id, instance);
+  restartedWorker({ health: () => new Response('<html>proxy error</html>') });
+  await expect(cleanup.reconcile(id)).rejects.toThrow('worker_quiescence_unverified');
+  expect((await fs.stat(target)).isDirectory()).toBe(true);
+});

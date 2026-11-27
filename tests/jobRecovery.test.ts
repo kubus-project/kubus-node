@@ -102,3 +102,68 @@ it('same worker instance reporting not quiescent keeps the work directory and st
  expect((await fs.stat(target)).isDirectory()).toBe(true);
  await expect(jobs.create('spatial.reconstruct', {captureId: 'synthetic'})).rejects.toMatchObject({code: 'worker_cleanup_pending'});
 });
+
+async function settled(done: () => boolean) {
+ for (const deadline = Date.now() + 5000; Date.now() < deadline && !done();) await new Promise<void>(resolve => setImmediate(resolve));
+ expect(done()).toBe(true);
+}
+function probeCaptureStore(jobs: JobRuntime) {
+ const probe = Object.assign(new Error('probe'), {code: 'capture_probe'});
+ (jobs as unknown as {deps: {captureStore: unknown}}).deps.captureStore = {get: () => { throw probe; }};
+}
+it('a worker that was still restarting when the job failed: the next job request retries cleanup instead of refusing for good', async () => {
+ const {jobs, target, recovered} = await fixture();
+ vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('ECONNREFUSED'));
+ await jobs.start(); jobs.stopCleanupRetry();
+ expect(jobs.health()).toMatchObject({cleanupBlocked: 1});
+ // The worker is up again, as a new instance.
+ workerRestartedMock();
+ probeCaptureStore(jobs);
+ await expect(jobs.create('spatial.reconstruct', {captureId: 'synthetic'})).rejects.toMatchObject({code: 'capture_probe'});
+ expect(recovered.snapshot().jobCleanup?.[id]).toMatchObject({state: 'complete', reason: 'worker_restarted'});
+ await expect(fs.stat(target)).rejects.toMatchObject({code: 'ENOENT'});
+});
+it('a worker that is still down when a job is requested keeps refusing it', async () => {
+ const {jobs, target} = await fixture();
+ vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('ECONNREFUSED'));
+ await jobs.start(); jobs.stopCleanupRetry();
+ await expect(jobs.create('spatial.reconstruct', {captureId: 'synthetic'})).rejects.toMatchObject({code: 'worker_cleanup_pending'});
+ expect((await fs.stat(target)).isDirectory()).toBe(true);
+});
+it('blocked cleanup retries by itself on a bounded timer and finishes once the restarted worker answers, with no request needed', async () => {
+ const {jobs, target, recovered} = await fixture();
+ vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('ECONNREFUSED'));
+ vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+ try {
+  await jobs.start();
+  expect(jobs.health()).toMatchObject({cleanupBlocked: 1});
+  // First retry: the worker is still down, so it stays blocked and the next retry is armed.
+  await vi.advanceTimersByTimeAsync(5_000);
+  await settled(() => vi.getTimerCount() > 0);
+  expect(jobs.health()).toMatchObject({cleanupBlocked: 1});
+  workerRestartedMock();
+  await vi.advanceTimersByTimeAsync(15_000);
+  await settled(() => recovered.snapshot().jobCleanup?.[id]?.state === 'complete');
+  expect(recovered.snapshot().jobCleanup?.[id]).toMatchObject({reason: 'worker_restarted', removed: true});
+  await expect(fs.stat(target)).rejects.toMatchObject({code: 'ENOENT'});
+  // Nothing left blocked: no further retry is armed.
+  expect(vi.getTimerCount()).toBe(0);
+ } finally { jobs.stopCleanupRetry(); vi.useRealTimers(); }
+});
+it('the retry timer gives up after its last attempt and does not run forever', async () => {
+ const {jobs} = await fixture();
+ const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('ECONNREFUSED'));
+ vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+ try {
+  await jobs.start();
+  for (let attempt = 1; attempt <= 6; attempt++) {
+   await vi.advanceTimersByTimeAsync(600_000);
+   await settled(() => fetch.mock.calls.length >= 1 + attempt && (attempt === 6 || vi.getTimerCount() > 0));
+  }
+  await vi.advanceTimersByTimeAsync(600_000);
+  for (const until = Date.now() + 300; Date.now() < until;) await new Promise<void>(resolve => setImmediate(resolve));
+  expect(vi.getTimerCount()).toBe(0);
+  // One failed attempt at start plus six scheduled retries.
+  expect(fetch).toHaveBeenCalledTimes(7);
+ } finally { jobs.stopCleanupRetry(); vi.useRealTimers(); }
+});

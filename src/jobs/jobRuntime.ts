@@ -83,6 +83,8 @@ const WORKER_STAGES: Record<string, { stage: JobStage; message: string } | undef
   masking_faces: { stage: 'preparing_photos', message: 'Masking faces before reconstruction' },
 };
 const PROGRESS_POLL_MS = 2000;
+/** Backoff for retrying blocked job cleanup while the Node stays up (a restarting worker answers within about a minute). */
+const CLEANUP_RETRY_DELAYS_MS = [5_000, 15_000, 45_000, 120_000, 300_000, 600_000];
 const PROVENANCE_MAX_BYTES = 8 * 1024;
 const MASKING_PART_KEYS = ['source', 'attestation', 'detector', 'model', 'weightsSha256', 'weightsPinned', 'scoreThreshold', 'licence', 'opencv', 'images', 'photoImages', 'regions', 'imagesWithRegions', 'manualAdded', 'manualExcluded'] as const;
 
@@ -281,6 +283,7 @@ export class JobRuntime {
   private running = new Map<string, AbortController>();
   private dispatching = false;
   private readonly cleanup: JobCleanup;
+  private cleanupRetryTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly tasks = new Map<string, Promise<void>>();
   /** Tail of the in-flight reconstruction request per capture id. */
   private readonly captureLocks = new Map<string, Promise<void>>();
@@ -322,12 +325,43 @@ export class JobRuntime {
   }
 
   async reconcileCleanup(): Promise<void> {
+    await this.reconcileRecords(state => state !== 'complete');
+    this.scheduleCleanupRetry();
+  }
+
+  private async reconcileRecords(wanted: (state: string) => boolean): Promise<void> {
     for (const [id, record] of Object.entries(this.deps.store.snapshot().jobCleanup || {})) {
-      if (record.state === 'complete') continue;
+      if (!wanted(record.state)) continue;
       await this.cleanup.reconcile(id).catch(() => {
         this.deps.logger.warn({ jobId: id, code: 'cleanup_retry_required' }, 'spatial cleanup remains pending');
       });
     }
+  }
+
+  private hasBlockedCleanup(): boolean {
+    return Object.values(this.deps.store.snapshot().jobCleanup || {}).some(record => record.state === 'blocked');
+  }
+
+  /**
+   * A worker that crashed is usually still restarting when the job's own cleanup runs, so that one attempt fails and
+   * the journal goes blocked. Retry on a growing, bounded schedule so a Node that stays up recovers once the worker is
+   * back; after the last attempt, creating a job or POST /local/v1/jobs/cleanup still retries on demand.
+   */
+  private scheduleCleanupRetry(attempt = 0): void {
+    if (this.cleanupRetryTimer || attempt >= CLEANUP_RETRY_DELAYS_MS.length || !this.hasBlockedCleanup()) return;
+    this.cleanupRetryTimer = setTimeout(() => {
+      this.cleanupRetryTimer = undefined;
+      void this.reconcileRecords(state => state === 'blocked')
+        .catch(() => undefined)
+        .finally(() => this.scheduleCleanupRetry(attempt + 1));
+    }, CLEANUP_RETRY_DELAYS_MS[attempt]);
+    this.cleanupRetryTimer.unref();
+  }
+
+  /** Stops the background cleanup retry (shutdown and tests). */
+  stopCleanupRetry(): void {
+    if (this.cleanupRetryTimer) clearTimeout(this.cleanupRetryTimer);
+    this.cleanupRetryTimer = undefined;
   }
 
   /** Quiescence is stronger than a terminal database state or an HTTP abort. */
@@ -354,8 +388,10 @@ export class JobRuntime {
   }
 
   async create(type: JobType, input: Record<string, unknown>): Promise<LocalJob> {
-    if (Object.values(this.deps.store.snapshot().jobCleanup || {}).some(record => record.state === 'blocked')) {
-      throw localError(409, 'worker_cleanup_pending');
+    if (this.hasBlockedCleanup()) {
+      // The worker may be back since the cleanup last failed; ask again before refusing.
+      await this.reconcileRecords(state => state === 'blocked');
+      if (this.hasBlockedCleanup()) throw localError(409, 'worker_cleanup_pending');
     }
     // Network assignments retain participation authorization. A backend outage
     // must not revoke an owner's ability to process their own local capture.
@@ -716,6 +752,7 @@ export class JobRuntime {
       await this.cleanup.reconcile(id).catch(() => {
         this.deps.logger.warn({ jobId: id, code: 'cleanup_retry_required' }, 'spatial cleanup remains pending');
       });
+      this.scheduleCleanupRetry();
     }
   }
 
