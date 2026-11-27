@@ -30,7 +30,9 @@ try {
   run(binary, ['doctor', '--json'], install);
   run(binary, ['setup', '--check', '--json'], install);
 } finally {
-  await rm(install, { recursive: true, force: true });
+  // Windows runners can hold freshly installed files briefly (EBUSY on rmdir, seen in CI with no CLI process left);
+  // Node's own retry for exactly that case. Cleanup of this temp directory only; the contract checks above are unchanged.
+  await rm(install, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });
 }
 console.log(`npm package contract passed: ${tarball}`);
 
