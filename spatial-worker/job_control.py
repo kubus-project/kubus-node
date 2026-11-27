@@ -110,7 +110,8 @@ class JobControl:
         self.lock = threading.RLock()
         self.active = {}
         # Record names (.pgid, .owner) of earlier jobs that start-up recovery could not settle: a training group not
-        # confirmed ended, or a hand-back record that could not be read.
+        # confirmed ended, a hand-back record that could not be read, or a record directory that could not be listed
+        # (named by its glob).
         self.unreaped = []
 
     def marker(self, job_id):
@@ -238,7 +239,10 @@ class JobControl:
             pass
         try:
             records = sorted(self.root.glob("*.owner"))
-        except OSError:
+        except OSError as error:
+            # The records cannot be listed, so none were replayed: the trees may still be root-owned.
+            log.warning("cannot list ownership hand-back records in %s: %s", self.root, error)
+            self.unreaped.append("*.owner")
             return done
         for record in records:
             job_id = record.name[:-len(".owner")]
@@ -293,7 +297,10 @@ class JobControl:
         self.unreaped = []
         try:
             records = sorted(self.root.glob("*.pgid"))
-        except OSError:
+        except OSError as error:
+            # The records cannot be listed, so no group was checked: one may still be running.
+            log.warning("cannot list training group records in %s: %s", self.root, error)
+            self.unreaped.append("*.pgid")
             return reaped
         for record in records:
             try:

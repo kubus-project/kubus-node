@@ -396,6 +396,22 @@ class PendingHandBackTests(unittest.TestCase):
         self.assertEqual(self.control.unreaped, [JOB + ".owner"])
         self.assertTrue(self.control.ownership_file(JOB).exists())
 
+    def test_a_control_directory_that_cannot_be_listed_keeps_the_worker_from_promising_quiescence(self):
+        from unittest import mock
+        self.control.root.mkdir(parents=True)
+        self.control.pend_hand_back(JOB, self.output)
+        with mock.patch("job_control.pathlib.Path.glob", side_effect=OSError("I/O error")):
+            self.assertEqual(self.control.finish_pending_hand_backs(), [])
+        self.assertEqual(self.control.unreaped, ["*.owner"])
+        self.assertTrue(self.control.ownership_file(JOB).exists())
+
+    def test_a_control_directory_that_cannot_be_listed_is_reported_by_the_orphan_reaper_too(self):
+        from unittest import mock
+        self.control.root.mkdir(parents=True)
+        with mock.patch("job_control.pathlib.Path.glob", side_effect=OSError("I/O error")):
+            self.assertEqual(self.control.reap_orphans(), [])
+        self.assertEqual(self.control.unreaped, ["*.pgid"])
+
     def test_a_temporary_record_left_by_a_kill_during_the_write_is_removed_at_start(self):
         self.control.root.mkdir(parents=True)
         stale = self.control.ownership_file(JOB).with_suffix(".owner.tmp")
