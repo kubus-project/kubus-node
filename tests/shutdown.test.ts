@@ -195,14 +195,14 @@ describe('shutdown releases the runtime writer lease', () => {
     await vi.waitFor(() => expect(forceExit).toHaveBeenCalledTimes(1), { timeout: 3000 });
   });
 
-  it('a real forced process.exit with a stalled step leaves no lease file behind', async () => {
+  it('a real forced process.exit with a stalled step leaves no lease file behind (the forced-exit wrapper alone releases it)', async () => {
     const { state, leaseFile, lease } = await leased();
     await lease.release();
     const commands = sourceUrl('src/cli/commands.ts');
     const leaseModule = sourceUrl('src/runtime/runtimeLease.ts');
     const code = `import { waitForShutdown } from ${JSON.stringify(commands)}; import { acquireRuntimeLease } from ${JSON.stringify(leaseModule)};
 const lease = await acquireRuntimeLease(${JSON.stringify(state)});
-process.once('exit', lease.releaseSync);
+// No 'exit' hook here: only the release inside the forced-exit wrapper can remove the lease.
 const done = waitForShutdown({ stop: () => new Promise(() => {}) }, null, undefined, null, undefined, { deadlineMs: 200, stepBudgetMs: 40, releaseLease: lease.releaseSync });
 setImmediate(() => process.emit('SIGTERM'));
 void done;

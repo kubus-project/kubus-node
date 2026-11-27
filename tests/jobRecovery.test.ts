@@ -150,6 +150,43 @@ it('blocked cleanup retries by itself on a bounded timer and finishes once the r
   expect(vi.getTimerCount()).toBe(0);
  } finally { jobs.stopCleanupRetry(); vi.useRealTimers(); }
 });
+it('a hung worker holds a job request for a few seconds at most, and concurrent requests share the one attempt', async () => {
+ const {jobs, target} = await fixture();
+ vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('ECONNREFUSED'));
+ await jobs.start(); jobs.stopCleanupRetry();
+ // From here the worker accepts connections and never answers (the real fetch would wait for its 20 s timeout).
+ const hung = vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise<Response>(() => undefined));
+ hung.mockClear();
+ vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+ try {
+  const first = expect(jobs.create('spatial.reconstruct', {captureId: 'synthetic'})).rejects.toMatchObject({code: 'worker_cleanup_pending'});
+  const second = expect(jobs.create('spatial.reconstruct', {captureId: 'synthetic'})).rejects.toMatchObject({code: 'worker_cleanup_pending'});
+  await vi.advanceTimersByTimeAsync(3_000);
+  await Promise.all([first, second]);
+  // One cancel in flight for the one blocked record, however many requests arrived.
+  expect(hung).toHaveBeenCalledTimes(1);
+  expect((await fs.stat(target)).isDirectory()).toBe(true);
+ } finally { vi.useRealTimers(); }
+});
+it('stopCleanupRetry is final: a retry that is already running does not arm another timer when it ends', async () => {
+ const {jobs} = await fixture();
+ vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('ECONNREFUSED'));
+ vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+ try {
+  await jobs.start();
+  expect(vi.getTimerCount()).toBe(1);
+  let release: (response: Response) => void = () => undefined;
+  const inFlight = vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise<Response>(resolve => { release = resolve; }));
+  inFlight.mockClear();
+  await vi.advanceTimersByTimeAsync(5_000);
+  await settled(() => inFlight.mock.calls.length === 1);
+  jobs.stopCleanupRetry();
+  release(new Response(JSON.stringify({detail: 'worker_not_quiescent'}), {status: 503}));
+  for (const until = Date.now() + 300; Date.now() < until;) await new Promise<void>(resolve => setImmediate(resolve));
+  expect(jobs.health()).toMatchObject({cleanupBlocked: 1});
+  expect(vi.getTimerCount()).toBe(0);
+ } finally { jobs.stopCleanupRetry(); vi.useRealTimers(); }
+});
 it('the retry timer gives up after its last attempt and does not run forever', async () => {
  const {jobs} = await fixture();
  const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('ECONNREFUSED'));

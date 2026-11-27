@@ -27,9 +27,11 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 WORKER_AUTH_KEY_PATH = os.environ.get("WORKER_AUTH_KEY_PATH", "/var/lib/kubus-node/worker-auth.key")
 
 
-WORKER_VERSION = "kubus-spatial-worker/12"
+WORKER_VERSION = "kubus-spatial-worker/13"
 WORKER_INSTANCE_ID = str(uuid.uuid4())
 control = JobControl("/var/lib/kubus-node/private/worker-control")
+# Before this process serves anything: end a training process group an earlier worker process left running.
+control.reap_orphans()
 # Every token nonce this worker accepted, until the token expires: a captured header is good once.
 TOKEN_NONCES = NonceCache()
 

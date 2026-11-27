@@ -1,4 +1,4 @@
-import { promises as fs, readFileSync, unlinkSync } from 'node:fs';
+import { promises as fs, linkSync, readFileSync, renameSync, unlinkSync } from 'node:fs';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -49,6 +49,24 @@ export interface RuntimeLease {
   releaseSync(): void;
 }
 
+/**
+ * Removes the lease file only if it holds `nonce`, and never deletes a file it has not first read. The file is moved
+ * aside atomically (rename), inspected, and only then unlinked, so there is no gap between "it is ours" and "delete
+ * whatever is at the path". A file that turns out not to be ours (or not readable) is put back with link(), which
+ * cannot overwrite a newer lease. Synchronous so it can run immediately before process.exit; never throws.
+ */
+function releaseOwned(file: string, nonce: string): void {
+  const aside = `${file}.${nonce}.release`;
+  try { renameSync(file, aside); } catch { return; /* already gone */ }
+  try {
+    let ours = false;
+    try { ours = (JSON.parse(readFileSync(aside, 'utf8')) as Owner)?.nonce === nonce; } catch { /* unreadable: not ours to remove */ }
+    if (!ours) { try { linkSync(aside, file); } catch { /* a newer lease exists, or the path is unusable */ } }
+  } finally {
+    try { unlinkSync(aside); } catch { /* nothing left to remove */ }
+  }
+}
+
 /** What an operator needs when a lease cannot be proven stale: the recovery that is safe, and the one that is not. */
 function leaseRefusal(file: string): Error {
   return new Error(`runtime_writer_already_active_or_unverified: another Node process holds ${file}, or died without releasing it ` +
@@ -68,16 +86,8 @@ export async function acquireRuntimeLease(stateFile: string): Promise<RuntimeLea
   try {
     for (let attempt = 0; attempt < 3; attempt++) {
       try { await fs.link(temporary, file); return {
-        release: async () => {
-          const actual = await readOwner(file).catch(() => null);
-          if (actual?.nonce === owner.nonce) await fs.unlink(file);
-        },
-        releaseSync: () => {
-          try {
-            const actual = JSON.parse(readFileSync(file, 'utf8')) as Owner;
-            if (actual?.nonce === owner.nonce) unlinkSync(file);
-          } catch { /* already gone, replaced or unreadable: nothing of ours to remove */ }
-        },
+        release: async () => releaseOwned(file, owner.nonce),
+        releaseSync: () => releaseOwned(file, owner.nonce),
       }; } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       }

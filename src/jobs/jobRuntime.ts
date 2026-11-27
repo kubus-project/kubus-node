@@ -85,6 +85,8 @@ const WORKER_STAGES: Record<string, { stage: JobStage; message: string } | undef
 const PROGRESS_POLL_MS = 2000;
 /** Backoff for retrying blocked job cleanup while the Node stays up (a restarting worker answers within about a minute). */
 const CLEANUP_RETRY_DELAYS_MS = [5_000, 15_000, 45_000, 120_000, 300_000, 600_000];
+/** How long a job request waits for an inline cleanup retry before it is refused with worker_cleanup_pending. */
+const CREATE_CLEANUP_WAIT_MS = 3_000;
 const PROVENANCE_MAX_BYTES = 8 * 1024;
 const MASKING_PART_KEYS = ['source', 'attestation', 'detector', 'model', 'weightsSha256', 'weightsPinned', 'scoreThreshold', 'licence', 'opencv', 'images', 'photoImages', 'regions', 'imagesWithRegions', 'manualAdded', 'manualExcluded'] as const;
 
@@ -284,6 +286,7 @@ export class JobRuntime {
   private dispatching = false;
   private readonly cleanup: JobCleanup;
   private cleanupRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  private cleanupRetryStopped = false;
   private readonly tasks = new Map<string, Promise<void>>();
   /** Tail of the in-flight reconstruction request per capture id. */
   private readonly captureLocks = new Map<string, Promise<void>>();
@@ -348,7 +351,7 @@ export class JobRuntime {
    * back; after the last attempt, creating a job or POST /local/v1/jobs/cleanup still retries on demand.
    */
   private scheduleCleanupRetry(attempt = 0): void {
-    if (this.cleanupRetryTimer || attempt >= CLEANUP_RETRY_DELAYS_MS.length || !this.hasBlockedCleanup()) return;
+    if (this.cleanupRetryStopped || this.cleanupRetryTimer || attempt >= CLEANUP_RETRY_DELAYS_MS.length || !this.hasBlockedCleanup()) return;
     this.cleanupRetryTimer = setTimeout(() => {
       this.cleanupRetryTimer = undefined;
       void this.reconcileRecords(state => state === 'blocked')
@@ -358,8 +361,16 @@ export class JobRuntime {
     this.cleanupRetryTimer.unref();
   }
 
-  /** Stops the background cleanup retry (shutdown and tests). */
+  private async retryBlockedCleanup(): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const attempt = this.reconcileRecords(state => state === 'blocked').catch(() => undefined);
+    const bound = new Promise<void>(resolve => { timer = setTimeout(resolve, CREATE_CLEANUP_WAIT_MS); timer.unref(); });
+    try { await Promise.race([attempt, bound]); } finally { if (timer) clearTimeout(timer); }
+  }
+
+  /** Stops the background cleanup retry for good (shutdown and tests); a reconcile still in flight cannot re-arm it. */
   stopCleanupRetry(): void {
+    this.cleanupRetryStopped = true;
     if (this.cleanupRetryTimer) clearTimeout(this.cleanupRetryTimer);
     this.cleanupRetryTimer = undefined;
   }
@@ -389,8 +400,10 @@ export class JobRuntime {
 
   async create(type: JobType, input: Record<string, unknown>): Promise<LocalJob> {
     if (this.hasBlockedCleanup()) {
-      // The worker may be back since the cleanup last failed; ask again before refusing.
-      await this.reconcileRecords(state => state === 'blocked');
+      // The worker may be back since the cleanup last failed; ask again before refusing. A hung worker must not hold
+      // the request for the whole fetch timeout: wait a short, bounded time. The attempt carries on in the
+      // background (one per record, shared with every other caller), and a later request sees its result.
+      await this.retryBlockedCleanup();
       if (this.hasBlockedCleanup()) throw localError(409, 'worker_cleanup_pending');
     }
     // Network assignments retain participation authorization. A backend outage

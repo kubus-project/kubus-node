@@ -100,5 +100,78 @@ class JobControlTests(unittest.TestCase):
         self.assertNotIn(JOB, self.control.active)
 
 
+@unittest.skipUnless(pathlib.Path("/proc/self/stat").exists(), "needs Linux /proc")
+class OrphanReapTests(unittest.TestCase):
+    """A replacement worker ends a training process group its predecessor left behind (a supervisor restarting only uvicorn)."""
+
+    def setUp(self):
+        import subprocess
+        self.subprocess = subprocess
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.control = JobControl(pathlib.Path(self.temp.name) / "control")
+        self.children = []
+        self.addCleanup(self.kill_children)
+
+    def kill_children(self):
+        for child in self.children:
+            try:
+                os.killpg(child.pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+            child.wait()
+
+    def spawn(self):
+        # A session leader that also starts a grandchild, as the training script does.
+        child = self.subprocess.Popen([sys.executable, "-c",
+            "import subprocess,sys,time;subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);time.sleep(60)"],
+            start_new_session=True)
+        self.children.append(child)
+        time.sleep(.5)
+        return child
+
+    def members(self, group):
+        from job_control import proc_fields
+        return [entry for entry in os.listdir("/proc") if entry.isdigit() and (proc_fields(int(entry)) or (None, 0, False))[0] == group and proc_fields(int(entry))[2]]
+
+    def test_a_group_left_by_a_dead_worker_is_ended_including_its_children(self):
+        child = self.spawn()
+        self.control.record_group(JOB, child)
+        self.assertGreaterEqual(len(self.members(child.pid)), 2)
+        reaped = JobControl(self.control.root).reap_orphans()
+        child.wait(timeout=5)
+        self.assertEqual(reaped, [child.pid])
+        time.sleep(.3)
+        self.assertEqual([m for m in self.members(child.pid) if m != str(child.pid)], [])
+        self.assertFalse(self.control.group_file(JOB).exists())
+
+    def test_a_record_from_another_boot_or_for_a_reused_pid_kills_nothing(self):
+        import json
+        child = self.spawn()
+        self.control.record_group(JOB, child)
+        record = json.loads(self.control.group_file(JOB).read_text())
+        for change in ({"boot": "another-boot"}, {"start": record["start"] + 1000}):
+            with self.subTest(change=change):
+                self.control.group_file(JOB).write_text(json.dumps({**record, **change}))
+                self.assertEqual(JobControl(self.control.root).reap_orphans(), [])
+                self.assertIsNone(child.poll())
+                self.assertFalse(self.control.group_file(JOB).exists())
+
+    def test_a_finished_run_leaves_no_record_and_a_missing_directory_is_fine(self):
+        with self.control.job(JOB):
+            self.control.run(JOB, [sys.executable, "-c", "print('synthetic')"], timeout=5)
+        self.assertFalse(self.control.group_file(JOB).exists())
+        self.assertEqual(JobControl(pathlib.Path(self.temp.name) / "never-created").reap_orphans(), [])
+
+    def test_a_record_whose_processes_are_already_gone_is_cleared(self):
+        child = self.spawn()
+        self.control.record_group(JOB, child)
+        os.killpg(child.pid, 9)
+        child.wait()
+        time.sleep(.3)
+        self.assertEqual(JobControl(self.control.root).reap_orphans(), [])
+        self.assertFalse(self.control.group_file(JOB).exists())
+
+
 if __name__ == "__main__":
     unittest.main()

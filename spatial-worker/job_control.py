@@ -1,5 +1,6 @@
 """Job-scoped cancellation. Tombstones prevent late requests recreating files."""
 import contextlib
+import json
 import os
 import pathlib
 import re
@@ -11,6 +12,58 @@ import time
 
 class JobCancelled(Exception):
     pass
+
+
+def boot_id():
+    try:
+        return pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+def proc_fields(pid):
+    """(session, start time in clock ticks, running) of a process from /proc, or None when it is gone or /proc is absent.
+
+    `running` is False for a zombie: it has ended and only waits to be collected."""
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    # The command name is parenthesised and may contain spaces; the fields after it are space separated.
+    rest = stat[stat.rindex(")") + 2:].split()
+    try:
+        return int(rest[3]), int(rest[19]), rest[0] != "Z"
+    except (IndexError, ValueError):
+        return None
+
+
+def process_start_time(pid):
+    fields = proc_fields(pid)
+    return fields[1] if fields else None
+
+
+def group_alive_and_ours(group, start):
+    """True when processes of session `group` exist and cannot be a later user of that process id.
+
+    The session leader's pid cannot be reused while any member of its session lives. If the leader is alive its start
+    time must match the recorded one; members of the session must have started no earlier than the leader did."""
+    leader = proc_fields(group)
+    if leader is not None and (leader[0] != group or leader[1] != start):
+        return False
+    found = leader is not None and leader[2]
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.isdigit() or int(entry) == group:
+            continue
+        fields = proc_fields(int(entry))
+        if fields and fields[0] == group:
+            if fields[1] < start:
+                return False
+            found = found or fields[2]
+    return found
 
 
 class JobControl:
@@ -51,6 +104,7 @@ class JobControl:
                                        stderr=subprocess.PIPE, text=True,
                                        start_new_session=True)
             item["process"] = process
+            self.record_group(job_id, process)
         try:
             out, err = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -60,9 +114,59 @@ class JobControl:
         finally:
             with self.lock:
                 item["process"] = None
+                self.forget_group(job_id)
         if self.marker(job_id).exists():
             raise JobCancelled()
         return subprocess.CompletedProcess(command, process.returncode, out, err)
+
+    def group_file(self, job_id):
+        return self.root / (job_id + ".pgid")
+
+    def record_group(self, job_id, process):
+        """Remember the training process group so a replacement worker can end it if this one dies first."""
+        start = process_start_time(process.pid)
+        if start is None:
+            return
+        try:
+            self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            target = self.group_file(job_id)
+            temporary = target.with_suffix(".pgid.tmp")
+            temporary.write_text(json.dumps({"pgid": process.pid, "start": start, "boot": boot_id()}), encoding="utf-8")
+            os.replace(temporary, target)
+        except OSError:
+            pass
+
+    def forget_group(self, job_id):
+        try:
+            self.group_file(job_id).unlink()
+        except OSError:
+            pass
+
+    def reap_orphans(self):
+        """At worker start: end any training process group a previous worker process left behind.
+
+        A worker that restarts without its container (a supervisor restarting only uvicorn) would otherwise leave
+        the training child, which runs in its own session, writing into a job directory the Node is about to
+        delete. The Node treats a new worker instance id as proof the old process is gone; this makes it true.
+        Returns the process group ids that were ended."""
+        reaped = []
+        try:
+            records = sorted(self.root.glob("*.pgid"))
+        except OSError:
+            return reaped
+        for record in records:
+            try:
+                data = json.loads(record.read_text(encoding="utf-8"))
+                if data.get("boot") == boot_id() and group_alive_and_ours(int(data["pgid"]), int(data["start"])):
+                    os.killpg(int(data["pgid"]), signal.SIGKILL)
+                    reaped.append(int(data["pgid"]))
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                pass
+            try:
+                record.unlink()
+            except OSError:
+                pass
+        return reaped
 
     @staticmethod
     def terminate(process):

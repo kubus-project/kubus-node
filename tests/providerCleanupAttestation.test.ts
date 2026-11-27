@@ -50,14 +50,14 @@ function job(state = 'COMPLETED', extra: Record<string, unknown> = {}): RemoteCo
 }
 
 /** The local journals of a provider that took the job, ran it, cleaned up and released its sealed outputs. */
-async function tidyProvider(overrides: { sealedReleased?: boolean; plaintext?: 'complete' | 'blocked'; workJournal?: 'complete' | 'blocked'; journalReason?: string } = {}) {
+async function tidyProvider(overrides: { sealedReleased?: boolean; plaintext?: 'complete' | 'blocked'; workJournal?: 'complete' | 'blocked'; journalReason?: string; workRemoved?: boolean } = {}) {
   const cid = canonicalPinCid(syntheticCid('sealed-1'));
   await store.update(state => {
     state.remoteJobs = { [jobId]: { backendJobId: jobId, role: 'provider', state: 'OUTPUT_READY', updatedAt: '', localJobId: localId,
       cleanup: { version: 1, inputCid: 'bafyinput', expiresAt: '2030-01-01T00:00:00.000Z', requested: true, plaintext: overrides.plaintext ?? 'complete',
         inputPinReleasePending: false, receivedAt: '2026-11-27T09:01:00.000Z', decryptedInputRemoved: true } } };
     state.jobs = { [localId]: { id: localId, input: { remoteComputeJobId: jobId }, state: 'completed', startedAt: '2026-11-27T09:02:00.000Z', completedAt: '2026-11-27T09:30:00.000Z' } };
-    state.jobCleanup = { [localId]: { version: 1, jobId: localId, type: 'spatial.reconstruct', state: overrides.workJournal ?? 'complete', workerAttempted: true, removed: true, updatedAt: '', ...(overrides.journalReason ? { reason: overrides.journalReason } : {}) } };
+    state.jobCleanup = { [localId]: { version: 1, jobId: localId, type: 'spatial.reconstruct', state: overrides.workJournal ?? 'complete', workerAttempted: true, removed: overrides.workRemoved ?? true, updatedAt: '', ...(overrides.journalReason ? { reason: overrides.journalReason } : {}) } };
     state.privateComputeCids = { [cid]: { jobId, role: 'private_output', createdAt: '', pinOwner: `provider-output:${jobId}`, ...(overrides.sealedReleased === false ? {} : { releasedAt: '2026-11-27T09:40:00.000Z' }) } };
     state.managedPins = { [cid]: { cid, ownership: 'created', owners: {}, state: overrides.sealedReleased === false ? 'release_pending' : 'released', updatedAt: '' } };
   });
@@ -180,6 +180,14 @@ describe('provider cleanup attestor', () => {
     const body = submit.mock.calls[0]![1] as { attestation: { payload: ProviderCleanupPayload; signature: string } };
     expect(body.attestation.payload).toMatchObject({ state: 'complete', reason: 'worker_restarted', items: { workDirectory: 'deleted', plaintextOutputs: 'deleted' } });
     expect(verifyProviderCleanupAttestation(job('COMPLETED'), body.attestation).reason).toBe('worker_restarted');
+  });
+
+  it('worker_restarted is attested even when the work directory was already gone (nothing removed)', async () => {
+    await tidyProvider({ journalReason: 'worker_restarted', workRemoved: false });
+    const submit = vi.fn(async (_id: string, _body: unknown) => ({}));
+    await attestor(submit).attest(job('COMPLETED'));
+    const body = submit.mock.calls[0]![1] as { attestation: { payload: ProviderCleanupPayload; signature: string } };
+    expect(body.attestation.payload).toMatchObject({ state: 'complete', reason: 'worker_restarted', items: { workDirectory: 'not_present' } });
   });
 
   it('plaintext that is still blocked or a work directory still being cleaned is stated as failed, never as deleted', async () => {

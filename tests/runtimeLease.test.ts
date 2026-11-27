@@ -149,6 +149,26 @@ it('releaseSync leaves a lease alone when the nonce is not its own', async () =>
   expect(await fs.readFile(leaseFile, 'utf8')).toBe('{broken');
   await fs.rm(leaseFile);
 });
+it('a release never leaves a moved-aside file behind and puts back a lease that is not its own with the same identity', async () => {
+  const { root, file } = await fixture();
+  const lease = await acquireRuntimeLease(file);
+  const leaseFile = `${file}.runtime-lease`;
+  const owner = JSON.parse(await fs.readFile(leaseFile, 'utf8'));
+  const other = JSON.stringify({ ...owner, nonce: `${owner.nonce}-other-writer` });
+  await fs.rm(leaseFile);
+  await fs.writeFile(leaseFile, other);
+  const before = await fs.stat(leaseFile);
+  await lease.release();
+  lease.releaseSync();
+  const after = await fs.stat(leaseFile);
+  expect(await fs.readFile(leaseFile, 'utf8')).toBe(other);
+  expect(after.ino).toBe(before.ino);
+  expect((await fs.readdir(root)).filter(name => name.endsWith('.release'))).toEqual([]);
+  await fs.rm(leaseFile);
+  const next = await acquireRuntimeLease(file);
+  await next.release();
+  expect((await fs.readdir(root)).filter(name => name.endsWith('.release') || name.endsWith('.tmp'))).toEqual([]);
+});
 it('names the lease file and the safe recovery when a start is refused', async () => {
   const { file } = await fixture();
   const lease = await acquireRuntimeLease(file);

@@ -222,7 +222,7 @@ export class ProviderCleanupAttestor {
       const journal = child.id ? state.jobCleanup?.[child.id] : undefined;
       const status: CleanupItemStatus = !journal ? (child.startedAt ? 'failed' : 'not_present')
         : journal.state !== 'complete' ? 'failed' : (journal.removed === false ? 'not_present' : 'deleted');
-      if (status === 'deleted' && journal?.reason === 'worker_restarted') restartedWorker = true;
+      if (journal?.state === 'complete' && journal.reason === 'worker_restarted') restartedWorker = true;
       if (status === 'failed' || workDirectory === 'failed') workDirectory = 'failed';
       else if (status === 'deleted') workDirectory = 'deleted';
     }
