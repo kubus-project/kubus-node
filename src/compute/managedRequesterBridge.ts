@@ -81,6 +81,8 @@ interface LocalState {
   excludedProviders: string[];
   /** The encrypted input prepared for the provider this attempt is sending to; absent once a job holds it. */
   pendingInput?: PendingJobInput;
+  /** Input CIDs no job holds whose pin release failed (or was never finished); each is retried until it releases. */
+  unusedInputs?: string[];
   /** Providers whose result was the legacy raw-archive shape; they are excluded like any other and named in the final failure. */
   outdatedProviders?: string[];
   captureId?: string;
@@ -182,12 +184,30 @@ export class ManagedRequesterBridge {
   }
 
   private async readState(id: string): Promise<LocalState> {
-    try { return JSON.parse(await fs.readFile(path.join(this.root(id), 'state.json'), 'utf8')) as LocalState; } catch { return { excludedProviders: [] }; }
+    let raw: string;
+    try { raw = await fs.readFile(path.join(this.root(id), 'state.json'), 'utf8'); } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return { excludedProviders: [] };
+      throw error;
+    }
+    // A record that cannot be read is never treated as a new attempt: it names the prepared capture and the unused input
+    // pin, and starting over would orphan both. The file is left in place for review.
+    try { return JSON.parse(raw) as LocalState; } catch {
+      throw Object.assign(new Error('reconstruction_state_unreadable'), { code: 'reconstruction_state_unreadable' });
+    }
   }
 
   private async writeState(id: string, state: LocalState): Promise<void> {
     await fs.mkdir(this.root(id), { recursive: true, mode: 0o700 });
-    await fs.writeFile(path.join(this.root(id), 'state.json'), JSON.stringify(state), { mode: 0o600 });
+    // Written next to the record and renamed over it, so a crash never leaves half a record behind.
+    const target = path.join(this.root(id), 'state.json');
+    const temporary = `${target}.${process.pid}.tmp`;
+    try {
+      await fs.writeFile(temporary, JSON.stringify(state), { mode: 0o600 });
+      await fs.rename(temporary, target);
+    } catch (error) {
+      await fs.rm(temporary, { force: true }).catch(() => undefined);
+      throw error;
+    }
   }
 
   /** Downloads every snapshot file once, verifying size and digest; a resumed attempt keeps verified files. */
@@ -305,9 +325,9 @@ export class ManagedRequesterBridge {
       await this.progress(nodeId, attempt, 'waiting_for_node', 'waiting_for_node');
       return;
     }
-    const encrypted = await this.inputFor(attempt.id, state, provider);
+    const encrypted = await this.inputFor(nodeId, attempt.id, state, provider);
     await this.deps.api.reconstructionCall(attempt.id, 'compute-job', {
-      nodeId, providerNodeId: provider.nodeId, type: 'spatial.reconstruct',
+      nodeId, providerNodeId: encrypted.providerNodeId, type: 'spatial.reconstruct',
       requirements: { qualityTier: 'standard', iterationTier: 'standard' },
       inputCid: encrypted.inputCid, inputBytes: encrypted.inputBytes, inputHash: encrypted.inputHash, inputKeyEnvelope: encrypted.inputKeyEnvelope,
       jobSpec: { ...encrypted.jobSpec, outputMode: PRIVATE_OUTPUT_PROTOCOL, inputMode: 'prepared' },
@@ -320,14 +340,21 @@ export class ManagedRequesterBridge {
 
   /**
    * The encrypted input for this provider: the stored one when it was made for the same capture, provider and provider
-   * key, otherwise a new one, after the stored one (made for something else, never sent) has been released.
+   * key, otherwise a new one, after the stored one (made for something else) has been released. A stored input is only
+   * "never sent" when the backend has no job holding it: a request whose answer was lost still created the job, so
+   * before releasing, the attempt's job is asked for. When one holds the stored input it is returned as it is (its
+   * `providerNodeId` is the job's provider) and the repeated request binds the same job to the attempt.
    */
-  private async inputFor(id: string, state: LocalState, provider: ComputeCandidate): Promise<PendingJobInput> {
+  private async inputFor(nodeId: string, id: string, state: LocalState, provider: ComputeCandidate): Promise<PendingJobInput> {
+    await this.retryUnusedInputs(id);
     const stored = state.pendingInput;
     if (stored && stored.captureId === state.captureId && stored.providerNodeId === provider.nodeId && stored.providerEncryptionPublicKey === provider.encryptionPublicKey) return stored;
     if (stored) {
-      await this.deps.remote.releaseUnusedInput(stored.inputCid);
-      await this.writeState(id, { ...(await this.readState(id)), pendingInput: undefined });
+      if (await this.jobHoldingInput(nodeId, id, stored.inputCid)) return stored;
+      // Moved to the retry list before the release is tried, so a failing release neither blocks matching nor loses the pin.
+      const current = await this.readState(id);
+      await this.writeState(id, { ...current, pendingInput: undefined, unusedInputs: Array.from(new Set([...(current.unusedInputs ?? []), stored.inputCid])) });
+      await this.releaseListed(id, stored.inputCid);
     }
     const made = await this.deps.transport.encryptCapture(state.captureId!, provider.nodeId, provider.encryptionPublicKey);
     const input: PendingJobInput = {
@@ -339,10 +366,45 @@ export class ManagedRequesterBridge {
     return input;
   }
 
-  /** Forgets the stored input once a job holds it; `onlyCid` leaves a different, still unused one alone. */
-  private async clearPendingInput(id: string, onlyCid?: string): Promise<void> {
+  /**
+   * The attempt's provider job when it was created from this input, otherwise null. Also null for a backend that has no
+   * job for the attempt (404). Any other failure propagates: whether a job holds the input is then unknown, and an
+   * input is released only when it is known that none does.
+   */
+  private async jobHoldingInput(nodeId: string, id: string, inputCid: string): Promise<RemoteComputeJob | null> {
+    let held: RemoteComputeJob | null | undefined;
+    try { held = await this.deps.api.getReconstructionComputeJob(id, nodeId); } catch (error) {
+      if (error instanceof KubusApiError && error.status === 404) return null;
+      throw error;
+    }
+    return held && typeof held.inputCid === 'string' && held.inputCid === inputCid ? held : null;
+  }
+
+  /** Releases one listed unused input; a failure is logged and the CID stays listed for the next try. Returns whether it is released. */
+  private async releaseListed(id: string, inputCid: string): Promise<boolean> {
+    try {
+      await this.deps.remote.releaseUnusedInput(inputCid);
+    } catch (error) {
+      this.deps.logger.warn({ code: 'managed_requester_input_release_failed', error: String((error as { code?: string }).code || (error as Error).message) }, 'unused encrypted input release requires retry');
+      return false;
+    }
     const state = await this.readState(id);
-    if (!state.pendingInput || (onlyCid && state.pendingInput.inputCid !== onlyCid)) return;
+    await this.writeState(id, { ...state, unusedInputs: (state.unusedInputs ?? []).filter(cid => cid !== inputCid) });
+    return true;
+  }
+
+  /** Tries every listed unused input again; returns false while any is still held. */
+  private async retryUnusedInputs(id: string): Promise<boolean> {
+    let clean = true;
+    for (const cid of (await this.readState(id)).unusedInputs ?? []) if (!(await this.releaseListed(id, cid))) clean = false;
+    return clean;
+  }
+
+  /** Forgets the stored input once a job holds it; only the input with this CID is forgotten, and a missing CID forgets nothing. */
+  private async clearPendingInput(id: string, onlyCid: string | undefined): Promise<void> {
+    if (typeof onlyCid !== 'string' || !onlyCid) return;
+    const state = await this.readState(id);
+    if (!state.pendingInput || state.pendingInput.inputCid !== onlyCid) return;
     await this.writeState(id, { ...state, pendingInput: undefined });
   }
 
@@ -489,7 +551,9 @@ export class ManagedRequesterBridge {
 
   private async cancel(nodeId: string, attempt: ManagedReconstruction): Promise<void> {
     let release: (() => Promise<void>) | undefined;
-    if (attempt.computeJobId) {
+    // A request whose answer was lost may have created a job the attempt does not name yet: it is cancelled like any other.
+    const pending = attempt.computeJobId ? undefined : (await this.readState(attempt.id)).pendingInput;
+    if (attempt.computeJobId || (pending && await this.jobHoldingInput(nodeId, attempt.id, pending.inputCid))) {
       const job = await this.deps.api.reconstructionCall<RemoteComputeJob>(attempt.id, 'compute-job/cancel', { nodeId });
       await this.trackProviderJob(attempt.id, job);
       release = async () => { await this.deps.remote.releaseInput(job); };
@@ -515,11 +579,16 @@ export class ManagedRequesterBridge {
     }
     try {
       // An input prepared for a provider but never held by a job has no job to release it: release it here.
+      // A job the backend created from it (the answer was lost) owns it and releases it with the job, not here.
       const unused = (await this.readState(id)).pendingInput;
       if (unused) {
-        await this.deps.remote.releaseUnusedInput(unused.inputCid);
-        await this.clearPendingInput(id);
+        if (await this.jobHoldingInput(nodeId, id, unused.inputCid)) await this.clearPendingInput(id, unused.inputCid);
+        else {
+          const current = await this.readState(id);
+          await this.writeState(id, { ...current, pendingInput: undefined, unusedInputs: Array.from(new Set([...(current.unusedInputs ?? []), unused.inputCid])) });
+        }
       }
+      if (!(await this.retryUnusedInputs(id))) throw new Error('unused_input_release_pending');
     } catch (error) {
       outcome = 'failed';
       this.deps.logger.warn({ code: 'managed_requester_input_release_failed', error: String((error as Error).message) }, 'unused encrypted input release requires retry');
@@ -598,7 +667,8 @@ export class ManagedRequesterBridge {
     const base = path.join(this.deps.dataRoot, 'private', 'reconstructions');
     for (const id of await fs.readdir(base).catch(() => [] as string[])) {
       if (!UUID.test(id)) continue;
-      const state = await this.readState(id);
+      // An attempt record that cannot be read is skipped (and left for review), not allowed to stop the other attempts' scan.
+      const state = await this.readState(id).catch(() => ({ excludedProviders: [] }) as LocalState);
       for (const record of Object.values(state.providerCleanups ?? {})) {
         const age = Date.now() - Date.parse(record.since);
         const watching = record.status === 'awaiting' || (record.status === 'verified' && record.attestation?.state === 'failed' && age <= ATTESTATION_GIVE_UP_MS);

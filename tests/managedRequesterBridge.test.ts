@@ -749,6 +749,171 @@ describe('encrypted input reuse', () => {
     expect(await pending()).toBeUndefined();
   });
 
+  describe('a request whose answer was lost may still have created the job', () => {
+    /** The backend commits the job and then the answer is lost: the call runs, and the caller sees a failure. */
+    function loseResponses(api: ReturnType<typeof makeBridge>['api'], count: number) {
+      const original = api.reconstructionCall.getMockImplementation()!;
+      let left = count;
+      api.reconstructionCall.mockImplementation(async (id: string, action: string, body: Record<string, unknown>) => {
+        const out = await original(id, action, body);
+        if (action === 'compute-job' && left > 0) { left -= 1; throw new KubusApiError('response lost', 503, { success: false }); }
+        return out;
+      });
+    }
+    /** The job the backend created from the first input, as the Node sees it when it asks. */
+    const bound = (cid = 'bafyinput1') => ({ ...job('MATCHED' as never, providerA), inputCid: cid }) as RemoteComputeJob;
+    const notFound = () => new KubusApiError('no job', 404, { success: false });
+
+    test('a provider change does not unpin the input of a job the backend already created, and the same job is bound', async () => {
+      const { bridge, api, transport, remote } = makeBridge();
+      loseResponses(api, 1);
+      await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('response lost');
+      api.getReconstructionComputeJob.mockResolvedValue(bound());
+      providers = [providerOf(providerB, 'key-b'), providerOf(providerA)];
+      await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+      expect(remote.releaseUnusedInput).not.toHaveBeenCalled();
+      expect(transport.encryptCapture).toHaveBeenCalledTimes(1);
+      expect(jobCalls()).toHaveLength(2);
+      expect(jobCalls().at(-1)!.body).toMatchObject({ providerNodeId: providerA, inputCid: 'bafyinput1' });
+      expect(await pending()).toBeUndefined();
+    });
+
+    test('an input no job holds (the backend has no job for the attempt) is still released on a provider change', async () => {
+      const { bridge, api, remote } = makeBridge();
+      failJobCalls(api, 1);
+      await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+      api.getReconstructionComputeJob.mockRejectedValue(notFound());
+      providers = [providerOf(providerB, 'key-b')];
+      await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+      expect(remote.releaseUnusedInput).toHaveBeenCalledWith('bafyinput1');
+      expect(jobCalls().at(-1)!.body).toMatchObject({ providerNodeId: providerB, inputCid: 'bafyinput2' });
+    });
+
+    test('when the backend cannot say whether a job holds the input, nothing is released and nothing new is encrypted', async () => {
+      const { bridge, api, transport, remote } = makeBridge();
+      failJobCalls(api, 1);
+      await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+      api.getReconstructionComputeJob.mockRejectedValue(new KubusApiError('down', 503, { success: false }));
+      providers = [providerOf(providerB, 'key-b')];
+      await expect(bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }))).rejects.toThrow('down');
+      expect(remote.releaseUnusedInput).not.toHaveBeenCalled();
+      expect(transport.encryptCapture).toHaveBeenCalledTimes(1);
+      expect(await pending()).toMatchObject({ inputCid: 'bafyinput1' });
+    });
+
+    test('a cancel in that window cancels the job the backend holds and releases its input as the job input', async () => {
+      const { bridge, api, remote } = makeBridge();
+      loseResponses(api, 1);
+      await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('response lost');
+      api.getReconstructionComputeJob.mockResolvedValue(bound());
+      await bridge.advance(nodeId, attempt({ state: 'waiting_for_node', cancelRequested: true }));
+      expect(actions().slice(-3)).toEqual(['compute-job/cancel', 'cancelled', 'cleanup']);
+      expect(remote.releaseInput).toHaveBeenCalledTimes(1);
+      expect(remote.releaseUnusedInput).not.toHaveBeenCalled();
+      expect(calls.at(-1)!.body).toEqual({ nodeId, state: 'complete' });
+      expect(await pending()).toBeUndefined();
+    });
+
+    test('an attempt that ends while a job holds the stored input never releases it as an unused one', async () => {
+      const { bridge, api, remote } = makeBridge();
+      loseResponses(api, 1);
+      await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('response lost');
+      api.getReconstructionComputeJob.mockResolvedValue(bound());
+      await bridge.advance(nodeId, attempt({ state: 'processing', computeJobId: jobId }));
+      // follow() found the job holding the input and cleared the descriptor.
+      expect(await pending()).toBeUndefined();
+      expect(remote.releaseUnusedInput).not.toHaveBeenCalled();
+    });
+
+    test('a job view without an input CID does not clear the stored descriptor', async () => {
+      const { bridge, api } = makeBridge();
+      failJobCalls(api, 1);
+      await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+      api.getReconstructionComputeJob.mockResolvedValue({ ...job('RUNNING'), inputCid: undefined } as unknown as RemoteComputeJob);
+      await bridge.advance(nodeId, attempt({ state: 'processing', computeJobId: jobId }));
+      expect(await pending()).toMatchObject({ inputCid: 'bafyinput1' });
+    });
+  });
+
+  describe('a stored input that cannot be released', () => {
+    test('does not stop matching: the next provider is tried and the pin stays on a retry list', async () => {
+      const { bridge, api, transport, remote } = makeBridge();
+      failJobCalls(api, 1);
+      await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+      remote.releaseUnusedInput.mockRejectedValueOnce(Object.assign(new Error('pin_release_outcome_requires_review'), { code: 'pin_release_outcome_requires_review' }));
+      providers = [providerOf(providerB, 'key-b')];
+      await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+      expect(transport.encryptCapture).toHaveBeenCalledTimes(2);
+      expect(jobCalls().at(-1)!.body).toMatchObject({ providerNodeId: providerB, inputCid: 'bafyinput2' });
+      expect(await pending()).toBeUndefined();
+      expect((await stateFile()).unusedInputs).toEqual(['bafyinput1']);
+    });
+
+    test('is retried when the attempt ends, and reports the cleanup as failed while it still fails', async () => {
+      const { bridge, api, remote } = makeBridge();
+      failJobCalls(api, 1);
+      await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+      remote.releaseUnusedInput.mockRejectedValueOnce(new Error('kubo offline')).mockRejectedValueOnce(new Error('kubo offline'));
+      providers = [providerOf(providerB, 'key-b')];
+      await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+      await bridge.advance(nodeId, attempt({ state: 'waiting_for_node', cancelRequested: true }));
+      expect(calls.at(-1)).toMatchObject({ action: 'cleanup', body: { state: 'failed' } });
+      expect((await stateFile()).unusedInputs).toEqual(['bafyinput1']);
+      // A later pass (the pin can be released now) clears the list.
+      await bridge.advance(nodeId, attempt({ state: 'waiting_for_node', cancelRequested: true }));
+      expect(calls.at(-1)).toMatchObject({ action: 'cleanup', body: { state: 'complete' } });
+      expect((await stateFile()).unusedInputs ?? []).toEqual([]);
+    });
+
+    test('is retried on the next matching pass too', async () => {
+      const { bridge, api, remote } = makeBridge();
+      failJobCalls(api, 2);
+      await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+      remote.releaseUnusedInput.mockRejectedValueOnce(new Error('kubo offline'));
+      providers = [providerOf(providerB, 'key-b')];
+      await expect(bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }))).rejects.toThrow('unavailable');
+      expect(remote.releaseUnusedInput).toHaveBeenCalledTimes(1);
+      await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+      expect(remote.releaseUnusedInput).toHaveBeenCalledTimes(2);
+      expect((await stateFile()).unusedInputs ?? []).toEqual([]);
+    });
+  });
+
+  test('a stored input made for a different capture is released and encrypted again', async () => {
+    const { bridge, api, transport, remote } = makeBridge();
+    failJobCalls(api, 1);
+    await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+    const state = await stateFile();
+    state.pendingInput.captureId = 'managed-some-earlier-capture';
+    await fs.writeFile(path.join(root(), 'state.json'), JSON.stringify(state));
+    await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+    expect(remote.releaseUnusedInput).toHaveBeenCalledWith('bafyinput1');
+    expect(transport.encryptCapture).toHaveBeenCalledTimes(2);
+    expect(jobCalls().at(-1)!.body).toMatchObject({ inputCid: 'bafyinput2' });
+  });
+
+  describe('the attempt record', () => {
+    test('is never replaced by an empty one when it cannot be read: nothing is prepared or encrypted over it', async () => {
+      const { bridge, api, captures, transport } = makeBridge();
+      failJobCalls(api, 1);
+      await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+      await fs.writeFile(path.join(root(), 'state.json'), '{"excludedProviders":[],"captureId":"managed-9b6f6f0e-2d3c-4b8a-9a52-6c');
+      const registered = captures.registerRemote.mock.calls.length;
+      await expect(bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }))).rejects.toMatchObject({ code: 'reconstruction_state_unreadable' });
+      expect(captures.registerRemote.mock.calls.length).toBe(registered);
+      expect(transport.encryptCapture).toHaveBeenCalledTimes(1);
+    });
+
+    test('is written through a temporary file that does not stay behind', async () => {
+      const { bridge, api } = makeBridge();
+      failJobCalls(api, 1);
+      await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('unavailable');
+      const names = await fs.readdir(root());
+      expect(names.filter(name => name.includes('.tmp'))).toEqual([]);
+      expect(JSON.parse(await fs.readFile(path.join(root(), 'state.json'), 'utf8')).pendingInput.inputCid).toBe('bafyinput1');
+    });
+  });
+
   describe('terminal paths release an input no job holds', () => {
     /** A stored descriptor that no job uses, as left by a crash between encrypting and creating the job. */
     async function leave(cid = 'bafystale') {
@@ -813,7 +978,8 @@ describe('encrypted input reuse', () => {
       remote.releaseUnusedInput.mockRejectedValueOnce(new Error('kubo offline'));
       await bridge.advance(nodeId, attempt({ state: 'waiting_for_node', cancelRequested: true }));
       expect(calls.at(-1)).toMatchObject({ action: 'cleanup', body: { state: 'failed' } });
-      expect(await pending()).toMatchObject({ inputCid: 'bafyinput1' });
+      // The pin stays on the retry list (the descriptor itself is not needed once nothing will send it).
+      expect((await stateFile()).unusedInputs).toEqual(['bafyinput1']);
     });
   });
 });
