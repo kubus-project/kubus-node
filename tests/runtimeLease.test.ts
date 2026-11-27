@@ -125,3 +125,39 @@ it.each(['status', 'doctor'])('%s remains read-only while the runtime writer is 
   await expect(acquireRuntimeLease(file)).rejects.toThrow('runtime_writer_already_active_or_unverified');
   await lease.release();
 });
+it('releaseSync removes the lease it holds and is idempotent', async () => {
+  const { file } = await fixture();
+  const lease = await acquireRuntimeLease(file);
+  const leaseFile = `${file}.runtime-lease`;
+  lease.releaseSync();
+  await expect(fs.stat(leaseFile)).rejects.toMatchObject({ code: 'ENOENT' });
+  lease.releaseSync();
+  const next = await acquireRuntimeLease(file);
+  await next.release();
+});
+it('releaseSync leaves a lease alone when the nonce is not its own', async () => {
+  const { file } = await fixture();
+  const lease = await acquireRuntimeLease(file);
+  const leaseFile = `${file}.runtime-lease`;
+  const owner = JSON.parse(await fs.readFile(leaseFile, 'utf8'));
+  const replacement = JSON.stringify({ ...owner, nonce: `${owner.nonce}-other-writer` });
+  await fs.writeFile(leaseFile, replacement);
+  lease.releaseSync();
+  expect(await fs.readFile(leaseFile, 'utf8')).toBe(replacement);
+  await fs.writeFile(leaseFile, '{broken');
+  lease.releaseSync();
+  expect(await fs.readFile(leaseFile, 'utf8')).toBe('{broken');
+  await fs.rm(leaseFile);
+});
+it('names the lease file and the safe recovery when a start is refused', async () => {
+  const { file } = await fixture();
+  const lease = await acquireRuntimeLease(file);
+  const refusal = await acquireRuntimeLease(file).catch((error: Error) => error);
+  expect(refusal).toBeInstanceOf(Error);
+  const message = (refusal as Error).message;
+  expect(message).toMatch(/^runtime_writer_already_active_or_unverified/);
+  expect(message).toContain(`${path.resolve(file)}.runtime-lease`);
+  expect(message).toMatch(/delete that file/);
+  expect(message).toMatch(/Never delete it while/);
+  await lease.release();
+});

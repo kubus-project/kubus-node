@@ -87,6 +87,11 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   }
   const writerLease = await acquireRuntimeLease(config.localStatePath);
   const longRunning = command === 'start' || command === 'gui';
+  // A long-running process cannot release asynchronously on the way out: its shutdown is deadline-limited, may
+  // stall, and ends in process.exit or an empty event loop. A synchronous 'exit' hook runs on all of those, after
+  // the last line of this process's own code, so no write can follow the unlink. It is a no-op once the lease
+  // belongs to someone else, and a crash or SIGKILL still leaves the lease for the usual stale-owner proof.
+  if (longRunning) process.once('exit', writerLease.releaseSync);
   try {
   const store = new LocalStore(config.localStatePath);
   await store.load();
@@ -163,7 +168,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
       localhostOnly: !config.guiAllowRemote,
       tokenConfigured: Boolean(config.guiToken),
     }, null, 2));
-    await waitForShutdown(null, gui);
+    await waitForShutdown(null, gui, undefined, null, undefined, { releaseLease: writerLease.releaseSync });
     return;
   }
 
@@ -253,10 +258,10 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     await Promise.race([startup, new Promise<void>((resolve) => { setTimeout(resolve, STARTUP_ABORT_GRACE_MS).unref(); })]);
     await scheduler?.stop();
     await signaling?.stop();
-  } }, gui, remoteCompute, null, logger);
+  } }, gui, remoteCompute, null, logger, { releaseLease: writerLease.releaseSync });
   } finally {
-    // Long-running processes retain the lease until they are proven dead on
-    // restart. Teardown has deadlines and may still have in-flight work.
+    // Long-running processes release it from the synchronous exit hook and the shutdown waiter instead:
+    // teardown has deadlines and may still have in-flight work, so it is released only as the process exits.
     if (!longRunning) await writerLease.release();
   }
 }
@@ -333,10 +338,17 @@ export async function waitForShutdown(
     stepBudgetMs?: number;
     // Injectable so tests can observe the forced exit instead of being killed by it.
     forceExit?: () => void;
+    // Synchronous, run immediately before the process exits (forced exit included). Never run while a step is
+    // still being awaited, so a stalled step cannot outlive the lease it wrote under for more than the exit itself.
+    releaseLease?: () => void;
   } = {},
 ): Promise<void> {
   const deadlineMs = options.deadlineMs ?? SHUTDOWN_DEADLINE_MS;
-  const forceExit = options.forceExit ?? (() => process.exit(0));
+  const exitProcess = options.forceExit ?? (() => process.exit(0));
+  const forceExit = () => {
+    try { options.releaseLease?.(); } catch { /* the exit must not be blocked by a failed unlink */ }
+    exitProcess();
+  };
   const signal = await new Promise<string>((resolve) => {
     process.once('SIGINT', () => resolve('SIGINT'));
     process.once('SIGTERM', () => resolve('SIGTERM'));

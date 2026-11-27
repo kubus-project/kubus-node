@@ -1,4 +1,10 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { existsSync, promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
+import { acquireRuntimeLease } from '../src/runtime/runtimeLease.js';
 import { SHUTDOWN_DEADLINE_MS, SHUTDOWN_STEP_BUDGET_MS, STARTUP_ABORT_GRACE_MS, waitForShutdown } from '../src/cli/commands.js';
 
 // The Node agent was SIGKILLed on every stop (exit 137) because shutdown never
@@ -131,4 +137,78 @@ describe('shutdown', () => {
     expect(SHUTDOWN_DEADLINE_MS).toBeLessThanOrEqual(6000);
     expect(SHUTDOWN_STEP_BUDGET_MS).toBeLessThan(SHUTDOWN_DEADLINE_MS);
   });
+});
+
+describe('shutdown releases the runtime writer lease', () => {
+  const roots: string[] = [];
+  afterEach(async () => { for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true }); });
+  async function leased() {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'kubus-shutdown-lease-')); roots.push(root);
+    const state = path.join(root, 'state.json');
+    const lease = await acquireRuntimeLease(state);
+    return { state, leaseFile: `${state}.runtime-lease`, lease };
+  }
+  const exists = (file: string) => fs.stat(file).then(() => true, () => false);
+
+  it('releases on the normal SIGTERM path, in the same step as the exit', async () => {
+    const { leaseFile, lease } = await leased();
+    let goneAtExit = false;
+    const forceExit = vi.fn(() => { goneAtExit = !existsSync(leaseFile); });
+    const pending = waitForShutdown({ stop: async () => undefined }, null, undefined, null, undefined,
+      { deadlineMs: 2000, forceExit, releaseLease: lease.releaseSync });
+    process.emit('SIGTERM');
+    await pending;
+    // Teardown finished, but the process has not exited yet, so the lease is still held: no early release.
+    expect(await exists(leaseFile)).toBe(true);
+    await vi.waitFor(() => expect(forceExit).toHaveBeenCalledTimes(1), { timeout: 3000 });
+    expect(goneAtExit).toBe(true);
+    expect(await exists(leaseFile)).toBe(false);
+  });
+
+  it('releases when a shutdown step stalls and the forced exit fires', async () => {
+    const { leaseFile, lease } = await leased();
+    let goneAtExit = false;
+    const forceExit = vi.fn(() => { goneAtExit = !existsSync(leaseFile); });
+    const pending = waitForShutdown({ stop: never }, null, undefined, null, undefined,
+      { deadlineMs: 200, stepBudgetMs: 40, forceExit, releaseLease: lease.releaseSync });
+    process.emit('SIGTERM');
+    await pending;
+    // The stalled scheduler may still be running, so the lease stays until the exit itself.
+    expect(await exists(leaseFile)).toBe(true);
+    await vi.waitFor(() => expect(forceExit).toHaveBeenCalledTimes(1), { timeout: 3000 });
+    expect(goneAtExit).toBe(true);
+    expect(await exists(leaseFile)).toBe(false);
+  });
+
+  it('still exits when releasing the lease throws', async () => {
+    const forceExit = vi.fn();
+    const pending = waitForShutdown(null, null, undefined, null, undefined,
+      { deadlineMs: 200, forceExit, releaseLease: () => { throw new Error('EPERM'); } });
+    process.emit('SIGTERM');
+    await pending;
+    await vi.waitFor(() => expect(forceExit).toHaveBeenCalledTimes(1), { timeout: 3000 });
+  });
+
+  it('a real forced process.exit with a stalled step leaves no lease file behind', async () => {
+    const { state, leaseFile, lease } = await leased();
+    await lease.release();
+    const commands = pathToFileURL(path.resolve('src/cli/commands.ts')).href;
+    const leaseModule = pathToFileURL(path.resolve('src/runtime/runtimeLease.ts')).href;
+    const code = `import { waitForShutdown } from ${JSON.stringify(commands)}; import { acquireRuntimeLease } from ${JSON.stringify(leaseModule)};
+const lease = await acquireRuntimeLease(${JSON.stringify(state)});
+process.once('exit', lease.releaseSync);
+const done = waitForShutdown({ stop: () => new Promise(() => {}) }, null, undefined, null, undefined, { deadlineMs: 200, stepBudgetMs: 40, releaseLease: lease.releaseSync });
+setImmediate(() => process.emit('SIGTERM'));
+void done;
+setInterval(() => {}, 1000);`;
+    const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', code], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let error = '';
+    child.stderr.on('data', (chunk) => { error += String(chunk); });
+    const status = await new Promise<number | null>((resolve) => { child.once('exit', (value) => resolve(value)); });
+    expect(error).toBe('');
+    expect(status).toBe(0);
+    expect(await exists(leaseFile)).toBe(false);
+    const next = await acquireRuntimeLease(state);
+    await next.release();
+  }, 20000);
 });
