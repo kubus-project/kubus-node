@@ -79,7 +79,7 @@ A provider whose job for an attempt ended without a result (it never accepted be
 
 The cooldown does not change the limit. The attempt records each lost provider job once in `providerLosses` (job, provider, time, and whether the exclusion is permanent) and fails as `no_provider_completed` at `maxProviderAttempts` (three) losses, counting every lost job, so the same provider lost three times fails the attempt like three different providers do. `excludedProviders` (the distinct lost providers) is still written. An attempt record from before the cooldown has only `excludedProviders`: each of those providers counts as one loss, and its cooldown starts the first time the record is read after the upgrade. The setting is read from the requester Node's environment; `0` means no cooldown.
 
-The backend applies its own rule on top: `POST .../providers` leaves out any provider whose job for the attempt is `EXPIRED` whatever the requester sends (its heartbeat can stay fresh for minutes after it stopped working). Until the backend bounds that rule too, a provider lost as `EXPIRED` (the accept timeout) is not offered again for that attempt and the cooldown only helps for the other loss states.
+The backend applies its own rule on top: `POST .../providers` leaves out a provider whose job for the attempt went `EXPIRED` within `SPATIAL_PROVIDER_EXPIRED_EXCLUSION_SECONDS` (default 600, the same as the Node's cooldown), whatever the requester sends, because its heartbeat can stay fresh for minutes after it stopped working. After that, a provider lost to the accept timeout is offered again like any other recovered provider (backend 6e37b98 and later; an older backend excludes it for the whole attempt).
 
 ### Face review, verification, cleanup (fix wave 2)
 
