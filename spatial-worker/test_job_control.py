@@ -173,5 +173,59 @@ class OrphanReapTests(unittest.TestCase):
         self.assertFalse(self.control.group_file(JOB).exists())
 
 
+    def test_the_group_is_recorded_before_the_command_runs_and_names_the_command_itself(self):
+        import json
+        # The command reads its own record: it exists at its first instruction, so no gap follows the fork.
+        code = ("import json,os,sys;print(json.dumps({'pid':os.getpid(),'record':json.load(open(sys.argv[1]))}))")
+        with self.control.job(JOB):
+            completed = self.control.run(JOB, [sys.executable, "-c", code, str(self.control.group_file(JOB))], timeout=10)
+        seen = json.loads(completed.stdout)
+        self.assertEqual(seen["record"]["pgid"], seen["pid"])
+        self.assertFalse(self.control.group_file(JOB).exists())
+
+    def test_a_command_that_does_not_exist_still_raises_as_before(self):
+        with self.control.job(JOB):
+            with self.assertRaises(FileNotFoundError):
+                self.control.run(JOB, ["/no/such/training-binary"], timeout=5)
+        self.assertFalse(self.control.group_file(JOB).exists())
+
+    def test_a_group_that_cannot_be_signalled_keeps_its_record_and_is_reported(self):
+        from unittest import mock
+        child = self.spawn()
+        self.control.record_group(JOB, child)
+        reaper = JobControl(self.control.root)
+        with mock.patch("job_control.os.killpg", side_effect=PermissionError("denied")):
+            self.assertEqual(reaper.reap_orphans(), [])
+        self.assertTrue(self.control.group_file(JOB).exists())
+        self.assertEqual(reaper.unreaped, [JOB + ".pgid"])
+        self.assertIsNone(child.poll())
+
+    def test_a_group_still_alive_after_sigkill_keeps_its_record_and_is_reported(self):
+        from unittest import mock
+        child = self.spawn()
+        self.control.record_group(JOB, child)
+        reaper = JobControl(self.control.root)
+        with mock.patch("job_control.os.killpg"), mock.patch("job_control.REAP_WAIT_SECONDS", 0.2):
+            self.assertEqual(reaper.reap_orphans(), [])
+        self.assertTrue(self.control.group_file(JOB).exists())
+        self.assertEqual(reaper.unreaped, [JOB + ".pgid"])
+        # Once the group really is gone, the next start clears the record and reports nothing outstanding.
+        os.killpg(child.pid, 9)
+        child.wait()
+        time.sleep(.3)
+        again = JobControl(self.control.root)
+        self.assertEqual(again.reap_orphans(), [])
+        self.assertEqual(again.unreaped, [])
+        self.assertFalse(self.control.group_file(JOB).exists())
+
+    def test_an_unparseable_record_is_cleared_and_nothing_is_outstanding(self):
+        self.control.root.mkdir(parents=True, exist_ok=True)
+        self.control.group_file(JOB).write_text("not json")
+        reaper = JobControl(self.control.root)
+        self.assertEqual(reaper.reap_orphans(), [])
+        self.assertEqual(reaper.unreaped, [])
+        self.assertFalse(self.control.group_file(JOB).exists())
+
+
 if __name__ == "__main__":
     unittest.main()

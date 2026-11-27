@@ -1,13 +1,19 @@
 """Job-scoped cancellation. Tombstones prevent late requests recreating files."""
 import contextlib
 import json
+import logging
 import os
 import pathlib
 import re
+import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
+
+log = logging.getLogger("kubus.worker.job_control")
+REAP_WAIT_SECONDS = 5.0
 
 
 class JobCancelled(Exception):
@@ -66,11 +72,41 @@ def group_alive_and_ours(group, start):
     return found
 
 
+def write_group_record(target, pgid, start):
+    """Write the training-group record (id, start time, kernel boot id) atomically; False when it cannot be written."""
+    target = pathlib.Path(target)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = target.with_suffix(".pgid.tmp")
+        temporary.write_text(json.dumps({"pgid": pgid, "start": start, "boot": boot_id()}), encoding="utf-8")
+        os.replace(temporary, target)
+        return True
+    except OSError:
+        return False
+
+
+def launch(record_path, command):
+    """Runs in the new session, before the training command: record this process as the group leader, then exec.
+
+    exec keeps the process id and start time, so the record written here is already the training group's. It closes
+    the window in which a worker killed right after fork would leave a training process nobody recorded."""
+    start = process_start_time(os.getpid())
+    if start is not None:
+        write_group_record(record_path, os.getpid(), start)
+    try:
+        os.execvp(command[0], command)
+    except OSError as error:
+        print(f"{command[0]}: {error.strerror or error}", file=sys.stderr)
+        os._exit(127)
+
+
 class JobControl:
     def __init__(self, root):
         self.root = pathlib.Path(root)
         self.lock = threading.RLock()
         self.active = {}
+        # Record names of earlier training groups that reap_orphans could not confirm ended.
+        self.unreaped = []
 
     def marker(self, job_id):
         if not re.fullmatch(r"[0-9a-fA-F-]{36}", job_id):
@@ -100,7 +136,7 @@ class JobControl:
             item = self.active[job_id]
             if self.marker(job_id).exists():
                 raise JobCancelled()
-            process = subprocess.Popen(command, stdout=subprocess.PIPE,
+            process = subprocess.Popen(self.launcher(job_id, command), stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, text=True,
                                        start_new_session=True)
             item["process"] = process
@@ -119,22 +155,25 @@ class JobControl:
             raise JobCancelled()
         return subprocess.CompletedProcess(command, process.returncode, out, err)
 
+    def launcher(self, job_id, command):
+        """The command, run through `launch` so its group is recorded from its first instruction.
+
+        A command that cannot be found is passed through unchanged, so the caller still gets the FileNotFoundError
+        Popen raises for it."""
+        if not command or shutil.which(command[0]) is None:
+            return command
+        code = "import sys; sys.path.insert(0, sys.argv[1]); import job_control; job_control.launch(sys.argv[2], sys.argv[3:])"
+        here = str(pathlib.Path(__file__).resolve().parent)
+        return [sys.executable, "-c", code, here, str(self.group_file(job_id)), *command]
+
     def group_file(self, job_id):
         return self.root / (job_id + ".pgid")
 
     def record_group(self, job_id, process):
         """Remember the training process group so a replacement worker can end it if this one dies first."""
         start = process_start_time(process.pid)
-        if start is None:
-            return
-        try:
-            self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            target = self.group_file(job_id)
-            temporary = target.with_suffix(".pgid.tmp")
-            temporary.write_text(json.dumps({"pgid": process.pid, "start": start, "boot": boot_id()}), encoding="utf-8")
-            os.replace(temporary, target)
-        except OSError:
-            pass
+        if start is not None:
+            write_group_record(self.group_file(job_id), process.pid, start)
 
     def forget_group(self, job_id):
         try:
@@ -148,8 +187,13 @@ class JobControl:
         A worker that restarts without its container (a supervisor restarting only uvicorn) would otherwise leave
         the training child, which runs in its own session, writing into a job directory the Node is about to
         delete. The Node treats a new worker instance id as proof the old process is gone; this makes it true.
-        Returns the process group ids that were ended."""
+
+        A record is removed only once its group is confirmed gone (or was never ours to signal). A group that could
+        not be signalled, or that is still alive after SIGKILL (for example stuck in uninterruptible I/O), keeps its
+        record for the next start and is listed in `self.unreaped`, which /health reports so the Node does not infer
+        quiescence from this worker. Returns the process group ids that were ended."""
         reaped = []
+        self.unreaped = []
         try:
             records = sorted(self.root.glob("*.pgid"))
         except OSError:
@@ -157,11 +201,31 @@ class JobControl:
         for record in records:
             try:
                 data = json.loads(record.read_text(encoding="utf-8"))
-                if data.get("boot") == boot_id() and group_alive_and_ours(int(data["pgid"]), int(data["start"])):
-                    os.killpg(int(data["pgid"]), signal.SIGKILL)
-                    reaped.append(int(data["pgid"]))
-            except (OSError, ValueError, KeyError, TypeError, AttributeError):
-                pass
+                group, start = int(data["pgid"]), int(data["start"])
+                mine = data.get("boot") == boot_id() and group_alive_and_ours(group, start)
+            except OSError as error:
+                log.warning("cannot read training group record %s: %s", record.name, error)
+                self.unreaped.append(record.name)
+                continue
+            except (ValueError, KeyError, TypeError, AttributeError):
+                mine = False
+            if mine:
+                try:
+                    os.killpg(group, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError as error:
+                    log.warning("cannot end orphaned training group %s: %s", group, error)
+                    self.unreaped.append(record.name)
+                    continue
+                deadline = time.monotonic() + REAP_WAIT_SECONDS
+                while group_alive_and_ours(group, start) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if group_alive_and_ours(group, start):
+                    log.warning("orphaned training group %s is still alive after SIGKILL", group)
+                    self.unreaped.append(record.name)
+                    continue
+                reaped.append(group)
             try:
                 record.unlink()
             except OSError:

@@ -65,11 +65,16 @@ export class JobCleanup {
     return { ok: false, instanceChanged: response.status === 409 && receipt.detail === 'worker_instance_changed' };
   }
 
+  /**
+   * The id of the worker now answering, only when it is one that ends its predecessor's processes at start
+   * (`reapsOrphans`, worker 13 onward). A worker that cannot promise that may have a training process of the
+   * replaced instance still writing into the directory about to be removed, so its new id proves nothing.
+   */
   private async currentInstanceId(): Promise<string | undefined> {
     const response = await fetch(`${this.workerUrl}/health`, { signal: AbortSignal.timeout(20_000) });
     if (!response.ok) return undefined;
-    const health = await response.json().catch(() => ({})) as { cleanupProtocol?: unknown; workerInstanceId?: unknown };
-    return health.cleanupProtocol === 1 && typeof health.workerInstanceId === 'string' && jobIdPattern.test(health.workerInstanceId)
+    const health = await response.json().catch(() => ({})) as { cleanupProtocol?: unknown; workerInstanceId?: unknown; reapsOrphans?: unknown };
+    return health.cleanupProtocol === 1 && health.reapsOrphans === true && typeof health.workerInstanceId === 'string' && jobIdPattern.test(health.workerInstanceId)
       ? health.workerInstanceId : undefined;
   }
 

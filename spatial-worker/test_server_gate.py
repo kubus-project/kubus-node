@@ -105,6 +105,15 @@ class ServerGateTests(unittest.TestCase):
         self.assertEqual(health["cleanupProtocol"], 1)
         self.assertEqual(health["workerInstanceId"], self.server.WORKER_INSTANCE_ID)
         self.assertRegex(health["workerInstanceId"], r"^[0-9a-f-]{36}$")
+        # The Node infers "the replaced worker's processes are gone" only from a worker that promises this.
+        self.assertIs(health["reapsOrphans"], True)
+
+    def test_health_withholds_the_orphan_promise_when_an_earlier_group_could_not_be_ended(self):
+        previous = (self.server.gpu_info, self.server.REAPS_ORPHANS)
+        self.server.gpu_info = lambda: {"available": False}
+        self.server.REAPS_ORPHANS = False
+        self.addCleanup(lambda: (setattr(self.server, "gpu_info", previous[0]), setattr(self.server, "REAPS_ORPHANS", previous[1])))
+        self.assertIs(self.server.health()["reapsOrphans"], False)
 
 
 if __name__ == "__main__":

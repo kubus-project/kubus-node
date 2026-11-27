@@ -49,19 +49,24 @@ export interface RuntimeLease {
   releaseSync(): void;
 }
 
+function holdsNonce(file: string, nonce: string): boolean {
+  try { return (JSON.parse(readFileSync(file, 'utf8')) as Owner)?.nonce === nonce; } catch { return false; /* unreadable: not ours */ }
+}
+
 /**
- * Removes the lease file only if it holds `nonce`, and never deletes a file it has not first read. The file is moved
- * aside atomically (rename), inspected, and only then unlinked, so there is no gap between "it is ours" and "delete
- * whatever is at the path". A file that turns out not to be ours (or not readable) is put back with link(), which
- * cannot overwrite a newer lease. Synchronous so it can run immediately before process.exit; never throws.
+ * Removes the lease file only if it holds `nonce`. The file is read in place first: anything that is not ours (a
+ * newer lease, an unreadable file, nothing) is left exactly where it is, with no moment in which it is absent. Only
+ * when it is ours is it moved aside atomically (rename) and checked once more before the unlink, so a lease written
+ * between the read and the rename is put back with link(), which cannot overwrite an even newer one. That second
+ * case needs our own lease to have been reclaimed while this process is alive, which the stale-owner proof does not
+ * allow. Synchronous so it can run immediately before process.exit; never throws.
  */
 function releaseOwned(file: string, nonce: string): void {
+  if (!holdsNonce(file, nonce)) return;
   const aside = `${file}.${nonce}.release`;
   try { renameSync(file, aside); } catch { return; /* already gone */ }
   try {
-    let ours = false;
-    try { ours = (JSON.parse(readFileSync(aside, 'utf8')) as Owner)?.nonce === nonce; } catch { /* unreadable: not ours to remove */ }
-    if (!ours) { try { linkSync(aside, file); } catch { /* a newer lease exists, or the path is unusable */ } }
+    if (!holdsNonce(aside, nonce)) { try { linkSync(aside, file); } catch { /* a newer lease exists, or the path is unusable */ } }
   } finally {
     try { unlinkSync(aside); } catch { /* nothing left to remove */ }
   }

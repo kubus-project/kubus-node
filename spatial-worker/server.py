@@ -32,6 +32,9 @@ WORKER_INSTANCE_ID = str(uuid.uuid4())
 control = JobControl("/var/lib/kubus-node/private/worker-control")
 # Before this process serves anything: end a training process group an earlier worker process left running.
 control.reap_orphans()
+# Reported in /health: true when this worker ended every training group its predecessors left (worker 13 onward, and
+# none stayed alive). The Node infers "the replaced worker's processes are gone" only from a worker that says so.
+REAPS_ORPHANS = not control.unreaped
 # Every token nonce this worker accepted, until the token expires: a captured header is good once.
 TOKEN_NONCES = NonceCache()
 
@@ -77,6 +80,7 @@ def health() -> dict[str, Any]:
             "version": WORKER_VERSION,
             "cleanupProtocol": 1,
             "workerInstanceId": WORKER_INSTANCE_ID,
+            "reapsOrphans": REAPS_ORPHANS,
             "detail": "A CUDA-capable NVIDIA GPU is required for local reconstruction",
         }
     return {
@@ -101,6 +105,7 @@ def health() -> dict[str, Any]:
         # Tokens are single use and bound to the endpoint, the directories, the input mode and the masking request.
         "tokenProtocol": 2,
         "workerInstanceId": WORKER_INSTANCE_ID,
+        "reapsOrphans": REAPS_ORPHANS,
     }
 
 

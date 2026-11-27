@@ -87,6 +87,19 @@ const PROGRESS_POLL_MS = 2000;
 const CLEANUP_RETRY_DELAYS_MS = [5_000, 15_000, 45_000, 120_000, 300_000, 600_000];
 /** How long a job request waits for an inline cleanup retry before it is refused with worker_cleanup_pending. */
 const CREATE_CLEANUP_WAIT_MS = 3_000;
+/**
+ * How long start() waits for the cleanup of a previous run before it carries on. One cancel against a restarting
+ * worker can take 20 s (up to 60 s when its instance id changed), per record; nothing may serve meanwhile, and Docker
+ * stops a container after 10 s. The reconcile carries on in the background and job requests wait for it.
+ */
+const START_CLEANUP_WAIT_MS = 5_000;
+
+/** Resolves when `work` settles or after `ms`, whichever is first; never rejects and never holds the event loop. */
+async function waitUpTo(work: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bound = new Promise<void>(resolve => { timer = setTimeout(resolve, ms); timer.unref(); });
+  try { await Promise.race([work.catch(() => undefined), bound]); } finally { if (timer) clearTimeout(timer); }
+}
 const PROVENANCE_MAX_BYTES = 8 * 1024;
 const MASKING_PART_KEYS = ['source', 'attestation', 'detector', 'model', 'weightsSha256', 'weightsPinned', 'scoreThreshold', 'licence', 'opencv', 'images', 'photoImages', 'regions', 'imagesWithRegions', 'manualAdded', 'manualExcluded'] as const;
 
@@ -287,6 +300,8 @@ export class JobRuntime {
   private readonly cleanup: JobCleanup;
   private cleanupRetryTimer: ReturnType<typeof setTimeout> | undefined;
   private cleanupRetryStopped = false;
+  /** The cleanup start() began and did not wait out; set while it is still running. */
+  private startupCleanup: Promise<void> | undefined;
   private readonly tasks = new Map<string, Promise<void>>();
   /** Tail of the in-flight reconstruction request per capture id. */
   private readonly captureLocks = new Map<string, Promise<void>>();
@@ -320,7 +335,10 @@ export class JobRuntime {
         }
       }
     });
-    await this.reconcileCleanup();
+    const startup = this.reconcileCleanup().catch(() => undefined);
+    this.startupCleanup = startup;
+    void startup.finally(() => { if (this.startupCleanup === startup) this.startupCleanup = undefined; });
+    await waitUpTo(startup, START_CLEANUP_WAIT_MS);
     // Review copies of a record that was never written (a crash between the copy and the record) or no longer needs them.
     const swept = await sweepOrphanFaceReviews(this.deps.dataRoot, this.deps.store);
     if (swept.length) this.deps.logger.info({ removed: swept.length }, 'removed orphaned face-review copies');
@@ -362,10 +380,7 @@ export class JobRuntime {
   }
 
   private async retryBlockedCleanup(): Promise<void> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const attempt = this.reconcileRecords(state => state === 'blocked').catch(() => undefined);
-    const bound = new Promise<void>(resolve => { timer = setTimeout(resolve, CREATE_CLEANUP_WAIT_MS); timer.unref(); });
-    try { await Promise.race([attempt, bound]); } finally { if (timer) clearTimeout(timer); }
+    await waitUpTo(Promise.all([this.reconcileRecords(state => state === 'blocked'), this.startupCleanup]), CREATE_CLEANUP_WAIT_MS);
   }
 
   /** Stops the background cleanup retry for good (shutdown and tests); a reconcile still in flight cannot re-arm it. */
@@ -399,12 +414,12 @@ export class JobRuntime {
   }
 
   async create(type: JobType, input: Record<string, unknown>): Promise<LocalJob> {
-    if (this.hasBlockedCleanup()) {
+    if (this.hasBlockedCleanup() || this.startupCleanup) {
       // The worker may be back since the cleanup last failed; ask again before refusing. A hung worker must not hold
       // the request for the whole fetch timeout: wait a short, bounded time. The attempt carries on in the
       // background (one per record, shared with every other caller), and a later request sees its result.
       await this.retryBlockedCleanup();
-      if (this.hasBlockedCleanup()) throw localError(409, 'worker_cleanup_pending');
+      if (this.hasBlockedCleanup() || this.startupCleanup) throw localError(409, 'worker_cleanup_pending');
     }
     // Network assignments retain participation authorization. A backend outage
     // must not revoke an owner's ability to process their own local capture.

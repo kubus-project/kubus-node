@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { acquireRuntimeLease } from '../src/runtime/runtimeLease.js';
-import { SHUTDOWN_DEADLINE_MS, SHUTDOWN_STEP_BUDGET_MS, STARTUP_ABORT_GRACE_MS, waitForShutdown } from '../src/cli/commands.js';
+import { SHUTDOWN_DEADLINE_MS, SHUTDOWN_STEP_BUDGET_MS, STARTUP_ABORT_GRACE_MS, exitOnEarlySignal, waitForShutdown } from '../src/cli/commands.js';
 
 // The Node agent was SIGKILLed on every stop (exit 137) because shutdown never
 // completed and nothing bounded it. Docker's default grace period is 10s, so a
@@ -255,4 +255,61 @@ ${tail}`;
     // ...and the exit hook runCli armed removed it.
     expect(await exists(leaseFile), error).toBe(false);
   }, 30000);
+
+  // Startup runs before waitForShutdown installs its handlers. A SIGTERM then (docker stop while the journal is being
+  // cleaned against a restarting worker) used to kill the process without an 'exit' event, leaving the lease behind.
+  it('the early-signal exit ends the process through process.exit with the conventional codes, and can be removed', () => {
+    const exit = vi.fn();
+    const before: [number, number] = [process.listenerCount('SIGTERM'), process.listenerCount('SIGINT')];
+    const dispose = exitOnEarlySignal(exit);
+    expect([process.listenerCount('SIGTERM'), process.listenerCount('SIGINT')]).toEqual([before[0] + 1, before[1] + 1]);
+    // Call the handlers directly: emitting a signal here would also consume other tests' once() listeners.
+    (process.listeners('SIGTERM').at(-1) as () => void)();
+    (process.listeners('SIGINT').at(-1) as () => void)();
+    expect(exit.mock.calls).toEqual([[143], [130]]);
+    dispose();
+    expect([process.listenerCount('SIGTERM'), process.listenerCount('SIGINT')]).toEqual(before);
+  });
+
+  it('runCli leaves no lease file behind when SIGTERM arrives while startup is still cleaning up against a worker that never answers', async () => {
+    const { state, leaseFile, lease } = await leased();
+    await lease.release();
+    const env = {
+      ...process.env,
+      KUBUS_NODE_CONFIG_PATH: path.join(path.dirname(state), 'missing-config.env'),
+      KUBUS_API_BASE_URL: 'http://127.0.0.1:1', KUBUS_OPERATOR_TOKEN: 'synthetic-token', KUBUS_OPERATOR_WALLET: 'synthetic-wallet',
+      KUBUS_NODE_LABEL: 'synthetic', KUBUS_NODE_ENDPOINT_URL: 'http://127.0.0.1:1', IPFS_RPC_URL: 'http://127.0.0.1:1',
+      IPFS_GATEWAY_URL: 'http://127.0.0.1:1', LOCAL_STATE_PATH: state, NODE_ENV: 'test', LOG_LEVEL: 'silent',
+      HEARTBEAT_INTERVAL_MS: '5000', CID_SYNC_INTERVAL_MS: '30000', COMMITMENT_INTERVAL_MS: '30000',
+      STATUS_INTERVAL_MS: '10000', MAX_PINNED_CIDS: '10', CID_CLASS_FILTERS: 'hot,warm',
+      SPATIAL_WORKER_URL: 'http://127.0.0.1:1',
+    };
+    // A journal record whose job reached the worker, and a worker that accepts the connection and never answers: the
+    // cleanup inside jobs.start() is blocked on it. The signal is raised from inside the child once that is certain
+    // (a real signal cannot be sent to a Windows process without killing it).
+    const code = `import net from 'node:net';
+import { LocalStore } from ${JSON.stringify(sourceUrl('src/state/localStore.ts'))};
+import { runCli } from ${JSON.stringify(sourceUrl('src/cli/commands.ts'))};
+const id = '11111111-1111-4111-8111-111111111111';
+const store = new LocalStore(${JSON.stringify(state)}); await store.load();
+await store.update((s) => { (s.jobCleanup ??= {})[id] = { version: 1, jobId: id, type: 'spatial.reconstruct', state: 'pending', workerAttempted: true,
+  workerInstanceId: '22222222-2222-4222-8222-222222222222', updatedAt: new Date().toISOString() }; });
+const server = net.createServer((socket) => { socket.on('error', () => {}); console.log('WORKER_HIT'); setTimeout(() => process.emit('SIGTERM'), 150); });
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+process.env.SPATIAL_WORKER_URL = 'http://127.0.0.1:' + server.address().port;
+runCli(['start']).then(() => console.log('RUNCLI_RETURNED'), (error) => console.log('RUNCLI_ERROR ' + (error && error.message)));`;
+    const child = spawn(process.execPath, ['--import', tsxLoader, '--input-type=module', '-e', code], { cwd: repoRoot, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = ''; let error = '';
+    child.stdout.on('data', (chunk) => { output += String(chunk); });
+    child.stderr.on('data', (chunk) => { error += String(chunk); });
+    // Without the early handler nothing reacts to the signal and the 20 s cancel timeout runs; fail well before that.
+    const watchdog = setTimeout(() => child.kill('SIGKILL'), 15000);
+    const status = await new Promise<number | null>((resolve) => { child.once('exit', (value) => resolve(value)); });
+    clearTimeout(watchdog);
+    expect(output, error).toContain('WORKER_HIT');
+    expect(status, `${output}\n${error}`).toBe(143);
+    expect(await exists(leaseFile)).toBe(false);
+    const next = await acquireRuntimeLease(state);
+    await next.release();
+  }, 40000);
 });

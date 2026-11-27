@@ -93,7 +93,7 @@ function restartedWorker(options: { health?: () => Response; secondCancel?: (bod
   const calls: string[] = [];
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
     const address = String(url); calls.push(address.replace('http://worker.invalid', ''));
-    if (address.endsWith('/health')) return options.health?.() ?? new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, workerInstanceId: restarted }));
+    if (address.endsWith('/health')) return options.health?.() ?? new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, reapsOrphans: true, workerInstanceId: restarted }));
     const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     if (body.workerInstanceId === instance) return new Response(JSON.stringify({ detail: 'worker_instance_changed' }), { status: 409 });
     return options.secondCancel?.(body) ?? new Response(JSON.stringify({ jobId: id, workerInstanceId: restarted, cleanupProtocol: 1, quiescent: true }));
@@ -117,7 +117,7 @@ it('a restarted worker whose health cannot be read keeps cleanup blocked', async
 });
 it('an instance-changed answer is not trusted when the worker still reports the recorded instance', async () => {
   const { cleanup, target, store } = await fixture(); await cleanup.markWorkerAttempt(id, instance);
-  restartedWorker({ health: () => new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, workerInstanceId: instance })) });
+  restartedWorker({ health: () => new Response(JSON.stringify({ status: 'ready', cleanupProtocol: 1, reapsOrphans: true, workerInstanceId: instance })) });
   await expect(cleanup.reconcile(id)).rejects.toThrow('worker_quiescence_unverified');
   expect((await fs.stat(target)).isDirectory()).toBe(true);
   expect(store.snapshot().jobCleanup?.[id]?.state).toBe('blocked');
@@ -158,11 +158,14 @@ it('a 409 that is not worker_instance_changed is not treated as a restart and ne
   expect(store.snapshot().jobCleanup?.[id]?.state).toBe('blocked');
 });
 it.each([
-  ['a cleanup protocol other than 1', { status: 'ready', cleanupProtocol: 2, workerInstanceId: restarted }],
-  ['no cleanup protocol (an older worker)', { status: 'ready', workerInstanceId: restarted }],
-  ['an instance id that is not a well-formed identifier', { status: 'ready', cleanupProtocol: 1, workerInstanceId: '../escape' }],
-  ['an instance id that is not a string', { status: 'ready', cleanupProtocol: 1, workerInstanceId: 7 }],
-  ['no instance id', { status: 'ready', cleanupProtocol: 1 }],
+  ['a cleanup protocol other than 1', { status: 'ready', cleanupProtocol: 2, reapsOrphans: true, workerInstanceId: restarted }],
+  ['no cleanup protocol (an older worker)', { status: 'ready', reapsOrphans: true, workerInstanceId: restarted }],
+  ['no orphan-reaping promise (worker 12: a supervisor restart can leave its training child running)', { status: 'ready', cleanupProtocol: 1, workerInstanceId: restarted }],
+  ['a worker that could not end an earlier training group (reapsOrphans false)', { status: 'ready', cleanupProtocol: 1, reapsOrphans: false, workerInstanceId: restarted }],
+  ['a reapsOrphans that is not exactly true', { status: 'ready', cleanupProtocol: 1, reapsOrphans: 'yes', workerInstanceId: restarted }],
+  ['an instance id that is not a well-formed identifier', { status: 'ready', cleanupProtocol: 1, reapsOrphans: true, workerInstanceId: '../escape' }],
+  ['an instance id that is not a string', { status: 'ready', cleanupProtocol: 1, reapsOrphans: true, workerInstanceId: 7 }],
+  ['no instance id', { status: 'ready', cleanupProtocol: 1, reapsOrphans: true }],
 ])('health with %s does not prove a restart, so cleanup stays blocked', async (_name, health) => {
   const { cleanup, target, store } = await fixture(); await cleanup.markWorkerAttempt(id, instance);
   const calls = restartedWorker({ health: () => new Response(JSON.stringify(health)) });

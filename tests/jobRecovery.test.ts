@@ -68,7 +68,7 @@ it('start leaves a recently written face-review folder alone (the other process 
 const restartedInstance = '44444444-4444-4444-8444-444444444444';
 function workerRestartedMock() {
  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
-   if (String(url).endsWith('/health')) return new Response(JSON.stringify({status: 'ready', cleanupProtocol: 1, workerInstanceId: restartedInstance}));
+   if (String(url).endsWith('/health')) return new Response(JSON.stringify({status: 'ready', cleanupProtocol: 1, reapsOrphans: true, workerInstanceId: restartedInstance}));
    const body = JSON.parse(String(init?.body));
    if (body.workerInstanceId === instance) return new Response(JSON.stringify({detail: 'worker_instance_changed'}), {status: 409});
    return new Response(JSON.stringify({jobId: id, workerInstanceId: restartedInstance, cleanupProtocol: 1, quiescent: true}));
@@ -204,3 +204,22 @@ it('the retry timer gives up after its last attempt and does not run forever', a
   expect(fetch).toHaveBeenCalledTimes(7);
  } finally { jobs.stopCleanupRetry(); vi.useRealTimers(); }
 });
+it('start does not hold startup hostage to a worker that never answers, and job requests wait for that cleanup instead of racing it', async () => {
+ const {jobs, target} = await fixture();
+ const rejecters: Array<(error: Error) => void> = [];
+ const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise<Response>((_resolve, reject) => { rejecters.push(reject); }));
+ const startedAt = Date.now();
+ await jobs.start();
+ // Bounded by the start wait (5 s), not by the 20 s cancel timeout.
+ expect(Date.now() - startedAt).toBeLessThan(9000);
+ // (Retry timers of earlier tests' runtimes share this spy, so the call count is not asserted.)
+ expect(fetch).toHaveBeenCalled();
+ expect((await fs.stat(target)).isDirectory()).toBe(true);
+ // The cleanup is still in flight: a job request is refused as pending, not started alongside it.
+ await expect(jobs.create('spatial.reconstruct', {captureId: 'synthetic'})).rejects.toMatchObject({code: 'worker_cleanup_pending'});
+ // When the worker finally fails the attempt, the journal is blocked (and stays retried) rather than lost.
+ for (const reject of rejecters) reject(new Error('ECONNREFUSED'));
+ jobs.stopCleanupRetry();
+ await settled(() => jobs.health().cleanupBlocked === 1);
+ expect((await fs.stat(target)).isDirectory()).toBe(true);
+}, 30000);

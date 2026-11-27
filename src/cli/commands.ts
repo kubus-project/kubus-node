@@ -92,6 +92,9 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   // the last line of this process's own code, so no write can follow the unlink. It is a no-op once the lease
   // belongs to someone else, and a crash or SIGKILL still leaves the lease for the usual stale-owner proof.
   if (longRunning) process.once('exit', writerLease.releaseSync);
+  // Startup (journal cleanup against a restarting worker, GUI, capability refresh) can take a while and runs before
+  // waitForShutdown installs its handlers; without one, a SIGTERM during it kills the process with no 'exit' event.
+  const disposeEarlySignals = longRunning ? exitOnEarlySignal() : () => undefined;
   try {
   const store = new LocalStore(config.localStatePath);
   await store.load();
@@ -168,6 +171,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
       localhostOnly: !config.guiAllowRemote,
       tokenConfigured: Boolean(config.guiToken),
     }, null, 2));
+    disposeEarlySignals();
     await waitForShutdown(null, gui, undefined, null, undefined, { releaseLease: writerLease.releaseSync });
     return;
   }
@@ -248,6 +252,8 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
       logger.info({ nodeId: store.snapshot().nodeId }, 'kubus node started');
     },
   });
+  // waitForShutdown takes over signal handling (graceful, deadline-limited); the early exit must not also fire.
+  disposeEarlySignals();
   await waitForShutdown({ stop: async () => {
     startupAbort.abort();
     jobs.stopCleanupRetry();
@@ -264,6 +270,7 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     // Long-running processes release it from the synchronous exit hook and the shutdown waiter instead:
     // teardown has deadlines and may still have in-flight work, so it is released only as the process exits.
     if (!longRunning) await writerLease.release();
+    disposeEarlySignals();
   }
 }
 
@@ -327,6 +334,18 @@ const FORCED_EXIT_DELAY_MS = 500;
 // How long shutdown waits for an aborted startup to unwind before moving on.
 // Must stay inside a single step's budget or the scheduler step always stalls.
 export const STARTUP_ABORT_GRACE_MS = 1000;
+
+/**
+ * Until the graceful shutdown waiter is installed, SIGTERM/SIGINT end the process through process.exit, which runs
+ * the synchronous 'exit' hooks (the writer lease release) that Node's default signal disposition would skip. There is
+ * nothing to drain that early: startup work is abandoned and the next start redoes it from durable state.
+ * Returns a function that removes the handlers. `exit` is injectable for tests.
+ */
+export function exitOnEarlySignal(exit: (code: number) => void = (code) => process.exit(code)): () => void {
+  const handlers: Array<[NodeJS.Signals, () => void]> = [['SIGINT', () => exit(130)], ['SIGTERM', () => exit(143)]];
+  for (const [name, handler] of handlers) process.on(name, handler);
+  return () => { for (const [name, handler] of handlers) process.off(name, handler); };
+}
 
 export async function waitForShutdown(
   scheduler: { stop(): Promise<void> } | null,
