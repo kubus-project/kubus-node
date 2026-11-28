@@ -250,3 +250,17 @@ it('journals when the job was taken and whether a decrypted input directory was 
   await empty.cleanup.request(id);
   expect(record(empty.store).cleanup).toMatchObject({ plaintext: 'complete', decryptedInputRemoved: false });
 });
+it('journals a cleanup request once: asking again for the same job writes nothing and keeps updatedAt', async () => {
+  const { cleanup, target, store } = await fixture();
+  await cleanup.own(job());
+  await readable(target);
+  await cleanup.request(id);
+  const settled = record(store).updatedAt;
+  const update = vi.spyOn(store, 'update');
+  await cleanup.request(id);
+  await cleanup.request(id);
+  expect(update).not.toHaveBeenCalled();
+  expect(record(store).updatedAt).toBe(settled);
+  // An unowned job is still refused, and the refusal is not skipped by the shortcut.
+  await expect(cleanup.request(child)).rejects.toThrow('provider_cleanup_ownership_unverified');
+});

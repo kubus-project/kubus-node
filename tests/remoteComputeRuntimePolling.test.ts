@@ -353,4 +353,37 @@ describe('RemoteComputeRuntime provider polling (Part 11 / Part 40)', () => {
     expect(release).toHaveBeenCalledWith(jobId);
     expect(attest).toHaveBeenCalledWith(disputed);
   });
+
+  it('writes nothing for an ended job whose cleanup was already requested: repeated polls leave the store and updatedAt alone', async () => {
+    const jobId = '3ef91af5-5335-4595-8e8a-0618d2c1c039';
+    const ended = { id: jobId, state: 'COMPLETED', providerNodeId: 'node-1' };
+    const { runtime, persisted } = buildRuntime(async () => ({ jobs: [ended] }), {
+      initialState: { remoteJobs: { [jobId]: { backendJobId: jobId, role: 'provider', state: 'OUTPUT_READY', updatedAt: '2026-01-01T00:00:00.000Z', cleanup: { requested: false, plaintext: 'complete' } } } },
+    });
+    const inner = runtime as unknown as {
+      deps: { store: { update: (mutator: (state: Record<string, unknown>) => void) => Promise<unknown> } };
+      attestor: { attest: (job: unknown) => Promise<void> };
+      releaseEncryptedOutput: (id: string) => Promise<void>;
+      pollProvider: () => Promise<number>;
+    };
+    vi.spyOn(inner.attestor, 'attest').mockResolvedValue(undefined);
+    vi.spyOn(inner, 'releaseEncryptedOutput').mockResolvedValue(undefined);
+    const update = vi.spyOn(inner.deps.store, 'update');
+    const record = () => (persisted.remoteJobs as Record<string, { state: string; updatedAt: string; cleanup: { requested: boolean } }>)[jobId];
+
+    // The first poll is the real transition: the record takes the backend's terminal state and the request is journaled.
+    await inner.pollProvider();
+    expect(update).toHaveBeenCalled();
+    expect(record()).toMatchObject({ state: 'COMPLETED', cleanup: { requested: true } });
+    expect(record()?.updatedAt).not.toBe('2026-01-01T00:00:00.000Z');
+    const settledAt = record()?.updatedAt;
+
+    update.mockClear();
+    vi.setSystemTime(Date.now() + 60_000);
+    await inner.pollProvider();
+    vi.setSystemTime(Date.now() + 60_000);
+    await inner.pollProvider();
+    expect(update).not.toHaveBeenCalled();
+    expect(record()?.updatedAt).toBe(settledAt);
+  });
 });

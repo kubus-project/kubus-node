@@ -5,7 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { KubusApiError } from '../src/backend/kubusApiClient.js';
 import type { ManagedReconstruction, RemoteComputeJob } from '../src/backend/models.js';
-import { DEFAULT_LEASE_RENEW_MS, LIGHTWEIGHT_MAX_BYTES, ManagedRequesterBridge, workerCancelPrepare, workerPrepare, type ManagedRequesterDeps, type PrepareOutcome } from '../src/compute/managedRequesterBridge.js';
+import { DAILY_CAP_REMINDER_MS, DEFAULT_LEASE_RENEW_MS, LIGHTWEIGHT_MAX_BYTES, ManagedRequesterBridge, isRequesterDailyCapRefusal, workerCancelPrepare, workerPrepare, type ManagedRequesterDeps, type PrepareOutcome } from '../src/compute/managedRequesterBridge.js';
 import { PRIVATE_OUTPUT_PROTOCOL, SPATIAL_OUTPUT_PROTOCOL } from '../src/compute/privateOutputTransport.js';
 import { PROVIDER_CLEANUP_SCHEMA, cleanupAttestationMessage, type ProviderCleanupPayload } from '../src/compute/providerCleanupAttestation.js';
 
@@ -320,6 +320,72 @@ describe('managed requester bridge', () => {
     const { bridge, api } = makeBridge();
     api.reconstructionCall.mockRejectedValueOnce(new KubusApiError('cancel', 409, { success: false, code: 'SPATIAL_RECONSTRUCTION_CANCEL_REQUESTED' }));
     await expect(bridge.advance(nodeId, attempt())).resolves.toBeUndefined();
+  });
+
+  describe('daily compute-job cap', () => {
+    // The backend's error handler writes the code of computeError(..., 429, 'COMPUTE_RATE_LIMITED') as `errorCode`.
+    const capRefusal = () => new KubusApiError('Requester daily compute-job cap reached', 429, { success: false, error: 'Requester daily compute-job cap reached', errorCode: 'COMPUTE_RATE_LIMITED', errorId: 'e1' });
+    const capLogs = () => warned().mock.calls.filter(([fields]) => (fields as { code?: string }).code === 'managed_requester_daily_cap_reached');
+    const refuseJobs = (api: ReturnType<typeof makeBridge>['api'], error: () => Error) => {
+      const original = api.reconstructionCall.getMockImplementation()!;
+      api.reconstructionCall.mockImplementation(async (id: string, action: string, body: Record<string, unknown>) => {
+        if (action === 'compute-job') { calls.push({ action, body }); throw error(); }
+        return original(id, action, body);
+      });
+      return original;
+    };
+    beforeEach(() => { warned().mockClear(); });
+
+    test('a refusal for the cap ends the pass without an error and names the cap once, with no secret in the line', async () => {
+      const { bridge, api } = makeBridge();
+      refuseJobs(api, capRefusal);
+      await expect(bridge.advance(nodeId, attempt())).resolves.toBeUndefined();
+      expect(capLogs()).toHaveLength(1);
+      const [fields, message] = capLogs()[0] as [Record<string, unknown>, string];
+      expect(fields).toEqual({ code: 'managed_requester_daily_cap_reached', reconstructionId, status: 429, backendCode: 'COMPUTE_RATE_LIMITED' });
+      expect(message).toContain('COMPUTE_REQUESTER_DAILY_JOB_CAP');
+      expect(JSON.stringify(capLogs()[0])).not.toMatch(/token|bearer|authorization|bafyinput|envelope/i);
+    });
+
+    test('later ticks of the same wait stay at debug level, a reminder follows after the interval, and a created job resets it', async () => {
+      const { bridge, api } = makeBridge();
+      const original = refuseJobs(api, capRefusal);
+      const start = Date.now();
+      const clock = vi.spyOn(Date, 'now');
+      try {
+        await bridge.advance(nodeId, attempt());
+        for (let tick = 1; tick <= 5; tick += 1) {
+          clock.mockReturnValue(start + tick * 15_000);
+          await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+        }
+        expect(capLogs()).toHaveLength(1);
+        expect((logger as unknown as { debug: ReturnType<typeof vi.fn> }).debug).toHaveBeenCalledWith(expect.objectContaining({ code: 'managed_requester_daily_cap_reached' }), expect.any(String));
+        // After the reminder interval one more warning, which says how many refusals it stands for.
+        clock.mockReturnValue(start + DAILY_CAP_REMINDER_MS + 1000);
+        await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+        expect(capLogs()).toHaveLength(2);
+        expect(capLogs()[1]?.[0]).toMatchObject({ quietRefusals: 5 });
+        // Once a job is created the wait is over: a later cap refusal is a new entry and is warned at once.
+        api.reconstructionCall.mockImplementation(original);
+        clock.mockReturnValue(start + DAILY_CAP_REMINDER_MS + 2000);
+        await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+        refuseJobs(api, capRefusal);
+        clock.mockReturnValue(start + DAILY_CAP_REMINDER_MS + 3000);
+        await bridge.advance(nodeId, attempt({ state: 'waiting_for_node' }));
+        expect(capLogs()).toHaveLength(3);
+        expect(capLogs()[2]?.[0]).not.toHaveProperty('quietRefusals');
+      } finally { clock.mockRestore(); }
+    });
+
+    test('a 429 without the cap code, and any other failure of the call, still reaches the tick as an error', async () => {
+      const { bridge, api } = makeBridge();
+      refuseJobs(api, () => new KubusApiError('Rate limit exceeded', 429, { success: false, error: 'Rate limit exceeded' }));
+      await expect(bridge.advance(nodeId, attempt())).rejects.toThrow('Rate limit exceeded');
+      expect(isRequesterDailyCapRefusal(new KubusApiError('x', 500, { errorCode: 'COMPUTE_RATE_LIMITED' }))).toBe(false);
+      expect(isRequesterDailyCapRefusal(new Error('COMPUTE_RATE_LIMITED'))).toBe(false);
+      expect(isRequesterDailyCapRefusal(capRefusal())).toBe(true);
+      expect(capLogs()).toHaveLength(0);
+    });
   });
 
   test('retention removes the local copies of attempts the backend lists', async () => {

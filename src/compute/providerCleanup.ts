@@ -114,7 +114,11 @@ export class ProviderCleanup {
   }
 
   async request(id: string): Promise<void> {
-    await this.store.update((state) => {
+    // A request already journaled is not written again: the runtime asks once per poll for every ended job, and a
+    // rewrite would move `updatedAt` and save the whole state file each time without anything having changed.
+    const current = this.store.snapshot().remoteJobs?.[id] as RemoteRuntimeRecord | undefined;
+    const alreadyRequested = current?.role === 'provider' && current.cleanup?.requested === true;
+    if (!alreadyRequested) await this.store.update((state) => {
       const record = state.remoteJobs?.[id] as RemoteRuntimeRecord | undefined;
       if (!record?.cleanup || record.role !== 'provider')
         throw new Error('provider_cleanup_ownership_unverified');

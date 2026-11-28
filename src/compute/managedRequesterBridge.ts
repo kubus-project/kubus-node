@@ -177,6 +177,20 @@ function bridgeCode(error: unknown): string | undefined {
   return typeof details?.code === 'string' ? details.code : undefined;
 }
 
+/**
+ * True when the backend refused a compute job because the requester's daily cap is used up (a 429 whose body carries
+ * `COMPUTE_RATE_LIMITED`; the error handler writes the code as `errorCode`). Any other 429, such as the pre-auth limiter's,
+ * has no such code and stays a plain failure.
+ */
+export function isRequesterDailyCapRefusal(error: unknown): boolean {
+  if (!(error instanceof KubusApiError) || error.status !== 429) return false;
+  const body = error.details as { errorCode?: unknown; code?: unknown } | undefined;
+  return (body?.errorCode ?? body?.code) === 'COMPUTE_RATE_LIMITED';
+}
+
+/** A capped attempt is retried every tick; the warning is given when it enters the wait and then at most this often. */
+export const DAILY_CAP_REMINDER_MS = 30 * 60_000;
+
 async function sha256File(file: string): Promise<{ sha256: string; size: number }> {
   const hash = crypto.createHash('sha256');
   let size = 0;
@@ -189,6 +203,8 @@ export class ManagedRequesterBridge {
   private running = false;
   private lastRetentionAt = 0;
   private lastSweepAt = 0;
+  /** Per attempt: when the daily-cap warning was last given and how many refusals have followed it quietly. */
+  private readonly capWarned = new Map<string, { at: number; quiet: number }>();
 
   constructor(private readonly deps: ManagedRequesterDeps) {}
 
@@ -623,16 +639,42 @@ export class ManagedRequesterBridge {
       return;
     }
     const encrypted = await this.inputFor(nodeId, attempt.id, state, provider);
-    await this.deps.api.reconstructionCall(attempt.id, 'compute-job', {
-      nodeId, providerNodeId: encrypted.providerNodeId, type: 'spatial.reconstruct',
-      requirements: { qualityTier: 'standard', iterationTier: 'standard' },
-      inputCid: encrypted.inputCid, inputBytes: encrypted.inputBytes, inputHash: encrypted.inputHash, inputKeyEnvelope: encrypted.inputKeyEnvelope,
-      jobSpec: { ...encrypted.jobSpec, outputMode: PRIVATE_OUTPUT_PROTOCOL, inputMode: 'prepared' },
-      expiresInSeconds: 86400,
-    });
+    try {
+      await this.deps.api.reconstructionCall(attempt.id, 'compute-job', {
+        nodeId, providerNodeId: encrypted.providerNodeId, type: 'spatial.reconstruct',
+        requirements: { qualityTier: 'standard', iterationTier: 'standard' },
+        inputCid: encrypted.inputCid, inputBytes: encrypted.inputBytes, inputHash: encrypted.inputHash, inputKeyEnvelope: encrypted.inputKeyEnvelope,
+        jobSpec: { ...encrypted.jobSpec, outputMode: PRIVATE_OUTPUT_PROTOCOL, inputMode: 'prepared' },
+        expiresInSeconds: 86400,
+      });
+    } catch (error) {
+      // The cap is a wait, not a failure: the backend already shows the attempt as waiting and renewed its lease, the
+      // prepared input stays for the next try, and the next tick asks again.
+      if (!isRequesterDailyCapRefusal(error)) throw error;
+      this.noteDailyCap(attempt.id);
+      return;
+    }
+    this.capWarned.delete(attempt.id);
     // The job holds the input now (and releases it with the job); it is no longer an unused one.
     await this.clearPendingInput(attempt.id, encrypted.inputCid);
     attempt.state = 'processing';
+  }
+
+  /** Names the daily cap once per entry into the wait (and as a reminder), and keeps the repeats at debug level. */
+  private noteDailyCap(reconstructionId: string): void {
+    const now = Date.now();
+    for (const [id, seen] of this.capWarned) if (now - seen.at > 24 * 60 * 60_000) this.capWarned.delete(id);
+    const seen = this.capWarned.get(reconstructionId);
+    if (seen && now - seen.at < DAILY_CAP_REMINDER_MS) {
+      seen.quiet += 1;
+      this.deps.logger.debug({ code: 'managed_requester_daily_cap_reached', reconstructionId }, 'requester daily compute-job cap still reached');
+      return;
+    }
+    this.capWarned.set(reconstructionId, { at: now, quiet: 0 });
+    this.deps.logger.warn({
+      code: 'managed_requester_daily_cap_reached', reconstructionId, status: 429, backendCode: 'COMPUTE_RATE_LIMITED',
+      ...(seen ? { quietRefusals: seen.quiet } : {}),
+    }, 'requester daily compute-job cap reached (COMPUTE_REQUESTER_DAILY_JOB_CAP on the backend); the attempt waits and retries, a new job is created once the count drops or the cap is raised');
   }
 
   /** The per-input feedback the worker recorded in the stored dataset's `prepared.json`, mapped to the backend's file ids. */
