@@ -172,20 +172,23 @@ export function mapInputFeedback(raw: unknown, fileIds: Map<string, string>): In
   });
 }
 
+/**
+ * The typed code of a bridge refusal. The bridge router answers `{ success: false, code }` for every typed error (draft and
+ * compute-network errors alike, see spatialReconstructionBridge.js); `errorCode` is what the backend's general error handler
+ * writes and is read too, so a refusal that reaches that handler instead is still recognised.
+ */
 function bridgeCode(error: unknown): string | undefined {
-  const details = error instanceof KubusApiError ? error.details as { code?: unknown } | undefined : undefined;
-  return typeof details?.code === 'string' ? details.code : undefined;
+  const details = error instanceof KubusApiError ? error.details as { code?: unknown; errorCode?: unknown } | undefined : undefined;
+  const code = details?.code ?? details?.errorCode;
+  return typeof code === 'string' ? code : undefined;
 }
 
 /**
  * True when the backend refused a compute job because the requester's daily cap is used up (a 429 whose body carries
- * `COMPUTE_RATE_LIMITED`; the error handler writes the code as `errorCode`). Any other 429, such as the pre-auth limiter's,
- * has no such code and stays a plain failure.
+ * `COMPUTE_RATE_LIMITED`). Any other 429, such as the pre-auth limiter's, has no such code and stays a plain failure.
  */
 export function isRequesterDailyCapRefusal(error: unknown): boolean {
-  if (!(error instanceof KubusApiError) || error.status !== 429) return false;
-  const body = error.details as { errorCode?: unknown; code?: unknown } | undefined;
-  return (body?.errorCode ?? body?.code) === 'COMPUTE_RATE_LIMITED';
+  return error instanceof KubusApiError && error.status === 429 && bridgeCode(error) === 'COMPUTE_RATE_LIMITED';
 }
 
 /** A capped attempt is retried every tick; the warning is given when it enters the wait and then at most this often. */

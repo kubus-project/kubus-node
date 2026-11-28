@@ -322,9 +322,16 @@ describe('managed requester bridge', () => {
     await expect(bridge.advance(nodeId, attempt())).resolves.toBeUndefined();
   });
 
+  test('a cancel reported under the general error handler body shape also ends the pass quietly', async () => {
+    const { bridge, api } = makeBridge();
+    api.reconstructionCall.mockRejectedValueOnce(new KubusApiError('cancel', 409, { success: false, errorCode: 'SPATIAL_RECONSTRUCTION_CANCEL_REQUESTED', errorId: 'e1' }));
+    await expect(bridge.advance(nodeId, attempt())).resolves.toBeUndefined();
+  });
+
   describe('daily compute-job cap', () => {
-    // The backend's error handler writes the code of computeError(..., 429, 'COMPUTE_RATE_LIMITED') as `errorCode`.
-    const capRefusal = () => new KubusApiError('Requester daily compute-job cap reached', 429, { success: false, error: 'Requester daily compute-job cap reached', errorCode: 'COMPUTE_RATE_LIMITED', errorId: 'e1' });
+    // The bridge router answers every typed error as { success: false, code } (spatialReconstructionBridge.js), which is the
+    // live body of computeError(..., 429, 'COMPUTE_RATE_LIMITED'); the general error handler's `errorCode` is also accepted.
+    const capRefusal = () => new KubusApiError('Requester daily compute-job cap reached', 429, { success: false, code: 'COMPUTE_RATE_LIMITED' });
     const capLogs = () => warned().mock.calls.filter(([fields]) => (fields as { code?: string }).code === 'managed_requester_daily_cap_reached');
     const refuseJobs = (api: ReturnType<typeof makeBridge>['api'], error: () => Error) => {
       const original = api.reconstructionCall.getMockImplementation()!;
@@ -387,6 +394,7 @@ describe('managed requester bridge', () => {
       expect(isRequesterDailyCapRefusal(new KubusApiError('x', 500, { errorCode: 'COMPUTE_RATE_LIMITED' }))).toBe(false);
       expect(isRequesterDailyCapRefusal(new Error('COMPUTE_RATE_LIMITED'))).toBe(false);
       expect(isRequesterDailyCapRefusal(capRefusal())).toBe(true);
+      expect(isRequesterDailyCapRefusal(new KubusApiError('x', 429, { success: false, errorCode: 'COMPUTE_RATE_LIMITED', errorId: 'e1' }))).toBe(true);
       expect(capLogs()).toHaveLength(0);
     });
   });
