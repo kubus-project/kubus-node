@@ -76,6 +76,8 @@ export interface SpatialManifest {
     floaterCrop?: Record<string, unknown>;
     /** Whether and how faces in the source images were masked: detector, model checksum and counts, never coordinates. */
     faceMasking?: Record<string, unknown>;
+    /** The lightweight preview's method, splat counts, SH degree and byte budget; `null` when the full file is its own preview. */
+    lightweight?: Record<string, unknown> | null;
   };
   createdAt: string;
 }

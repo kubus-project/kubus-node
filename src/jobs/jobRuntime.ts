@@ -18,6 +18,7 @@ import { resolveWorkerOutputFile } from './workerOutput.js';
 import { JobCleanup } from './jobCleanup.js';
 import { ManagedPins } from '../ipfs/managedPins.js';
 import type { CapabilityRegistry } from '../capabilities/registry.js';
+import { PRIVATE_OUTPUT_PROTOCOL, assertSpatialOutputRoles, sealOutputBlob, validatePrivateOutput, type PrivateOutputBlob } from '../compute/privateOutputTransport.js';
 
 export type JobType = 'spatial.reconstruct' | 'spatial.optimize' | 'spatial.generate_preview';
 export type JobState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
@@ -82,6 +83,23 @@ const WORKER_STAGES: Record<string, { stage: JobStage; message: string } | undef
   masking_faces: { stage: 'preparing_photos', message: 'Masking faces before reconstruction' },
 };
 const PROGRESS_POLL_MS = 2000;
+/** Backoff for retrying blocked job cleanup while the Node stays up (a restarting worker answers within about a minute). */
+const CLEANUP_RETRY_DELAYS_MS = [5_000, 15_000, 45_000, 120_000, 300_000, 600_000];
+/** How long a job request waits for an inline cleanup retry before it is refused with worker_cleanup_pending. */
+const CREATE_CLEANUP_WAIT_MS = 3_000;
+/**
+ * How long start() waits for the cleanup of a previous run before it carries on. One cancel against a restarting
+ * worker can take 20 s (up to 60 s when its instance id changed), per record; nothing may serve meanwhile, and Docker
+ * stops a container after 10 s. The reconcile carries on in the background and job requests wait for it.
+ */
+const START_CLEANUP_WAIT_MS = 5_000;
+
+/** Resolves when `work` settles or after `ms`, whichever is first; never rejects and never holds the event loop. */
+async function waitUpTo(work: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bound = new Promise<void>(resolve => { timer = setTimeout(resolve, ms); timer.unref(); });
+  try { await Promise.race([work.catch(() => undefined), bound]); } finally { if (timer) clearTimeout(timer); }
+}
 const PROVENANCE_MAX_BYTES = 8 * 1024;
 const MASKING_PART_KEYS = ['source', 'attestation', 'detector', 'model', 'weightsSha256', 'weightsPinned', 'scoreThreshold', 'licence', 'opencv', 'images', 'photoImages', 'regions', 'imagesWithRegions', 'manualAdded', 'manualExcluded'] as const;
 
@@ -152,6 +170,16 @@ export function faceMaskingProvenance(capture: { kind?: string; faceMasking?: un
   // A posed-frame package (an app capture) is not masked by this step: its frames never pass through the worker's
   // intake. Say so in the record instead of leaving the question open.
   if (kind === 'frames') return { ran: false, reason: 'posed_frames_not_masked' };
+  if (kind === 'prepared') {
+    // Masked by the managed requester's worker before the dataset left it; the provider only carries its summary.
+    const record = (worker && typeof worker === 'object' ? (worker as Record<string, unknown>).preparedBy : undefined) as Record<string, unknown> | undefined;
+    const parts = (record?.faceMasking && typeof record.faceMasking === 'object' ? record.faceMasking : {}) as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const part of ['photos', 'video'] as const) {
+      if (parts[part]) out[part] = cleanMaskingPart({ ...(parts[part] as object), source: 'worker', attestation: 'requester_worker', weightsPinned: pinned(parts[part]) });
+    }
+    return Object.keys(out).length ? { ran: true, ...out } : { ran: false, reason: 'prepared_without_masking' };
+  }
   const masking = effectiveMasking(capture as Parameters<typeof effectiveMasking>[0]);
   const reported = (worker && typeof worker === 'object' ? (worker as Record<string, unknown>).faceMasking : undefined) as Record<string, unknown> | undefined;
   const out: Record<string, unknown> = {};
@@ -270,6 +298,10 @@ export class JobRuntime {
   private running = new Map<string, AbortController>();
   private dispatching = false;
   private readonly cleanup: JobCleanup;
+  private cleanupRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  private cleanupRetryStopped = false;
+  /** The cleanup start() began and did not wait out; set while it is still running. */
+  private startupCleanup: Promise<void> | undefined;
   private readonly tasks = new Map<string, Promise<void>>();
   /** Tail of the in-flight reconstruction request per capture id. */
   private readonly captureLocks = new Map<string, Promise<void>>();
@@ -303,7 +335,10 @@ export class JobRuntime {
         }
       }
     });
-    await this.reconcileCleanup();
+    const startup = this.reconcileCleanup().catch(() => undefined);
+    this.startupCleanup = startup;
+    void startup.finally(() => { if (this.startupCleanup === startup) this.startupCleanup = undefined; });
+    await waitUpTo(startup, START_CLEANUP_WAIT_MS);
     // Review copies of a record that was never written (a crash between the copy and the record) or no longer needs them.
     const swept = await sweepOrphanFaceReviews(this.deps.dataRoot, this.deps.store);
     if (swept.length) this.deps.logger.info({ removed: swept.length }, 'removed orphaned face-review copies');
@@ -311,12 +346,48 @@ export class JobRuntime {
   }
 
   async reconcileCleanup(): Promise<void> {
+    await this.reconcileRecords(state => state !== 'complete');
+    this.scheduleCleanupRetry();
+  }
+
+  private async reconcileRecords(wanted: (state: string) => boolean): Promise<void> {
     for (const [id, record] of Object.entries(this.deps.store.snapshot().jobCleanup || {})) {
-      if (record.state === 'complete') continue;
+      if (!wanted(record.state)) continue;
       await this.cleanup.reconcile(id).catch(() => {
         this.deps.logger.warn({ jobId: id, code: 'cleanup_retry_required' }, 'spatial cleanup remains pending');
       });
     }
+  }
+
+  private hasBlockedCleanup(): boolean {
+    return Object.values(this.deps.store.snapshot().jobCleanup || {}).some(record => record.state === 'blocked');
+  }
+
+  /**
+   * A worker that crashed is usually still restarting when the job's own cleanup runs, so that one attempt fails and
+   * the journal goes blocked. Retry on a growing, bounded schedule so a Node that stays up recovers once the worker is
+   * back; after the last attempt, creating a job or POST /local/v1/jobs/cleanup still retries on demand.
+   */
+  private scheduleCleanupRetry(attempt = 0): void {
+    if (this.cleanupRetryStopped || this.cleanupRetryTimer || attempt >= CLEANUP_RETRY_DELAYS_MS.length || !this.hasBlockedCleanup()) return;
+    this.cleanupRetryTimer = setTimeout(() => {
+      this.cleanupRetryTimer = undefined;
+      void this.reconcileRecords(state => state === 'blocked')
+        .catch(() => undefined)
+        .finally(() => this.scheduleCleanupRetry(attempt + 1));
+    }, CLEANUP_RETRY_DELAYS_MS[attempt]);
+    this.cleanupRetryTimer.unref();
+  }
+
+  private async retryBlockedCleanup(): Promise<void> {
+    await waitUpTo(Promise.all([this.reconcileRecords(state => state === 'blocked'), this.startupCleanup]), CREATE_CLEANUP_WAIT_MS);
+  }
+
+  /** Stops the background cleanup retry for good (shutdown and tests); a reconcile still in flight cannot re-arm it. */
+  stopCleanupRetry(): void {
+    this.cleanupRetryStopped = true;
+    if (this.cleanupRetryTimer) clearTimeout(this.cleanupRetryTimer);
+    this.cleanupRetryTimer = undefined;
   }
 
   /** Quiescence is stronger than a terminal database state or an HTTP abort. */
@@ -343,8 +414,12 @@ export class JobRuntime {
   }
 
   async create(type: JobType, input: Record<string, unknown>): Promise<LocalJob> {
-    if (Object.values(this.deps.store.snapshot().jobCleanup || {}).some(record => record.state === 'blocked')) {
-      throw localError(409, 'worker_cleanup_pending');
+    if (this.hasBlockedCleanup() || this.startupCleanup) {
+      // The worker may be back since the cleanup last failed; ask again before refusing. A hung worker must not hold
+      // the request for the whole fetch timeout: wait a short, bounded time. The attempt carries on in the
+      // background (one per record, shared with every other caller), and a later request sees its result.
+      await this.retryBlockedCleanup();
+      if (this.hasBlockedCleanup() || this.startupCleanup) throw localError(409, 'worker_cleanup_pending');
     }
     // Network assignments retain participation authorization. A backend outage
     // must not revoke an owner's ability to process their own local capture.
@@ -403,7 +478,8 @@ export class JobRuntime {
    * Photos masked before import need nothing here; posed frames are not masked by this step.
    */
   private maskingInput(captureId: string, mode: string, jobArtworkId: string | undefined): Record<string, unknown> {
-    if (mode === 'frames') return {};
+    // A prepared dataset was masked on the requester's worker before it was packed; there is nothing left to mask.
+    if (mode === 'frames' || mode === 'prepared') return {};
     const capture = this.deps.captureStore.get(captureId);
     // The default (masking for an artwork) is decided at import from the capture's artwork. A job that names an
     // artwork for a capture imported without one would bind a splat of unmasked images to that artwork.
@@ -643,7 +719,7 @@ export class JobRuntime {
         current.stage = first.stage; current.progress = null; current.updatedAt = new Date().toISOString();
         current.logs.push({ at: current.updatedAt, level: 'info', message: first.message });
       });
-      const authorization = await this.deps.workerAuth.issue(id, job.type);
+      const authorization = await this.deps.workerAuth.issue(id, job.type, { purpose: 'process', captureDirectory: workerCaptureDirectory, outputDirectory, input: job.input });
       if (controller.signal.aborted || this.get(id).state === 'cancelled') return;
       await this.cleanup.markWorkerAttempt(id, workerHealth.workerInstanceId);
       if (controller.signal.aborted || this.get(id).state === 'cancelled') return;
@@ -704,6 +780,7 @@ export class JobRuntime {
       await this.cleanup.reconcile(id).catch(() => {
         this.deps.logger.warn({ jobId: id, code: 'cleanup_retry_required' }, 'spatial cleanup remains pending');
       });
+      this.scheduleCleanupRetry();
     }
   }
 
@@ -781,14 +858,37 @@ export class JobRuntime {
       return { item, target: await resolveWorkerOutputFile(outputDirectory, item.path) };
     }));
     const variants: SpatialVariant[] = [];
+    const privateTarget = typeof job.input.privateOutputRequesterPublicKey === 'string' &&
+      typeof job.input.remoteComputeJobId === 'string' ? {
+        requesterPublicKey: job.input.privateOutputRequesterPublicKey,
+        jobId: job.input.remoteComputeJobId,
+        temporaryDirectory: outputDirectory,
+        kubo: this.deps.kubo,
+      } : null;
+    // A prepared (managed) job returns the render derivative and at most a lightweight preview; a worker that still
+    // returns the raw training file (`spatial_archive`) must not have it sealed and signed for the requester. Any other
+    // private-output job (frames, photos, video) keeps its single archive: the worker only splits prepared output.
+    if (privateTarget && capture.kind === 'prepared') assertSpatialOutputRoles(validated.map(({ item }) => item.role));
+    if (privateTarget && maskingNeedsLookCounts(derivation?.faceMasking).images > 0) {
+      throw Object.assign(new Error('remote_face_review_required'), { code: 'provider_face_review_required' });
+    }
+    const sealed: PrivateOutputBlob[] = [];
     const id = crypto.randomUUID();
-    const pinOwner = `spatial:${id}`;
+    const pinOwner = privateTarget ? `provider-output:${privateTarget.jobId}` : `spatial:${id}`;
     // Before anything is added to Kubo: the flagged masked images are kept for the operator's look, and a record
     // whose review could not be done is never made.
     const faceReview = await this.keepFaceReview(id, job, capture, outputDirectory, derivation?.faceMasking);
     try {
       const managed = new ManagedPins(this.deps.kubo, this.deps.store);
       for (const { item, target } of validated) {
+        if (privateTarget) {
+          const blob = await sealOutputBlob({ ...privateTarget, source: target, role: item.role });
+          sealed.push(blob);
+          await this.pinEncryptedOutput(blob, pinOwner, privateTarget.jobId);
+          variants.push({ role: item.role, cid: blob.cid, sizeBytes: blob.plaintextBytes,
+            mimeType: item.mimeType, format: item.format, storageClass: item.storageClass });
+          continue;
+        }
         // Streamed from disk: a Gaussian splat PLY can be hundreds of megabytes
         // and must never be held whole in Node's memory just to re-emit it as
         // multipart form data.
@@ -812,6 +912,17 @@ export class JobRuntime {
       if (!manifest.artworkId) throw new Error('spatial_artwork_required');
       validateSpatialManifest(manifest);
       const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+      if (privateTarget) {
+        const source = path.join(outputDirectory, `${id}.spatial.json`);
+        await fs.writeFile(source, manifestBytes, { mode: 0o600, flag: 'wx' });
+        const blob = await sealOutputBlob({ ...privateTarget, source, role: 'manifest' });
+        sealed.push(blob);
+        const commitment = validatePrivateOutput({
+          schema: PRIVATE_OUTPUT_PROTOCOL, manifestCid: blob.cid, blobs: sealed,
+        }, privateTarget.jobId, blob.cid, sealed.map(item => item.cid));
+        await this.pinEncryptedOutput(blob, pinOwner, privateTarget.jobId);
+        return { privateOutput: commitment };
+      }
       const added = await this.deps.kubo.addBytes(manifestBytes, `${id}.spatial.json`, { pin: false });
       if (!added.Hash) throw new Error('kubo_add_manifest_missing_cid');
       await managed.acquire(added.Hash, pinOwner);
@@ -821,8 +932,21 @@ export class JobRuntime {
       return record;
     } catch (error) {
       if (faceReview) await removeFaceReviewImages(this.deps.dataRoot, id);
+      if (privateTarget) {
+        const managed = new ManagedPins(this.deps.kubo, this.deps.store);
+        for (const blob of sealed) await managed.release(blob.cid, pinOwner).catch(() => undefined);
+      }
       throw error;
     }
+  }
+
+  private async pinEncryptedOutput(blob: PrivateOutputBlob, pinOwner: string, jobId: string): Promise<void> {
+    await this.deps.store.update(state => {
+      (state.privateComputeCids ??= {})[blob.cid] = {
+        role: 'private_output', jobId, pinOwner, createdAt: new Date().toISOString(),
+      };
+    });
+    await new ManagedPins(this.deps.kubo, this.deps.store).acquire(blob.cid, pinOwner);
   }
 
   /**

@@ -54,6 +54,12 @@ describe('parseEnv', () => {
     }
   });
 
+  it('reads the managed requester provider cooldown, ten minutes by default', () => {
+    expect(parseEnv(baseEnv).managedProviderExclusionMs).toBe(10 * 60 * 1000);
+    expect(parseEnv({ ...baseEnv, KUBUS_MANAGED_PROVIDER_EXCLUSION_MS: '90000' }).managedProviderExclusionMs).toBe(90000);
+    expect(() => parseEnv({ ...baseEnv, KUBUS_MANAGED_PROVIDER_EXCLUSION_MS: '-1' })).toThrow(/KUBUS_MANAGED_PROVIDER_EXCLUSION_MS/);
+  });
+
   it('fails clearly when required values are missing', () => {
     expect(() => parseEnv({ ...baseEnv, KUBUS_OPERATOR_TOKEN: '' })).toThrow(/KUBUS_OPERATOR_TOKEN/);
   });

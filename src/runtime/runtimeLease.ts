@@ -1,4 +1,4 @@
-import { promises as fs } from 'node:fs';
+import { promises as fs, linkSync, readFileSync, renameSync, unlinkSync } from 'node:fs';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -40,8 +40,48 @@ async function provenStopped(owner: Owner, current: Omit<Owner, 'version' | 'non
   return Boolean(owner.processStart && live.processStart && owner.processStart !== live.processStart);
 }
 
+export interface RuntimeLease {
+  release(): Promise<void>;
+  /**
+   * Synchronous release for the moment just before the process exits, where an async unlink would never run.
+   * Idempotent, and it unlinks only while the file still holds this lease's nonce.
+   */
+  releaseSync(): void;
+}
+
+function holdsNonce(file: string, nonce: string): boolean {
+  try { return (JSON.parse(readFileSync(file, 'utf8')) as Owner)?.nonce === nonce; } catch { return false; /* unreadable: not ours */ }
+}
+
+/**
+ * Removes the lease file only if it holds `nonce`. The file is read in place first: anything that is not ours (a
+ * newer lease, an unreadable file, nothing) is left exactly where it is, with no moment in which it is absent. Only
+ * when it is ours is it moved aside atomically (rename) and checked once more before the unlink, so a lease written
+ * between the read and the rename is put back with link(), which cannot overwrite an even newer one. That second
+ * case needs our own lease to have been reclaimed while this process is alive, which the stale-owner proof does not
+ * allow. Synchronous so it can run immediately before process.exit; never throws.
+ */
+function releaseOwned(file: string, nonce: string): void {
+  if (!holdsNonce(file, nonce)) return;
+  const aside = `${file}.${nonce}.release`;
+  try { renameSync(file, aside); } catch { return; /* already gone */ }
+  try {
+    if (!holdsNonce(aside, nonce)) { try { linkSync(aside, file); } catch { /* a newer lease exists, or the path is unusable */ } }
+  } finally {
+    try { unlinkSync(aside); } catch { /* nothing left to remove */ }
+  }
+}
+
+/** What an operator needs when a lease cannot be proven stale: the recovery that is safe, and the one that is not. */
+function leaseRefusal(file: string): Error {
+  return new Error(`runtime_writer_already_active_or_unverified: another Node process holds ${file}, or died without releasing it ` +
+    'and this process cannot prove that (a different host or container PID namespace is not observable). ' +
+    'If you have confirmed that the previous kubus node process and its spatial worker are stopped, delete that file and start again. ' +
+    'Never delete it while the previous process may still be running.');
+}
+
 /** Exclusive official runtime/maintenance writer. Diagnostic commands do not claim it. */
-export async function acquireRuntimeLease(stateFile: string): Promise<{ release(): Promise<void> }> {
+export async function acquireRuntimeLease(stateFile: string): Promise<RuntimeLease> {
   const file = `${path.resolve(stateFile)}.runtime-lease`;
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const current = await identity(); const owner: Owner = { version: 1, ...current, nonce: crypto.randomUUID() };
@@ -50,14 +90,14 @@ export async function acquireRuntimeLease(stateFile: string): Promise<{ release(
   try { await handle.writeFile(JSON.stringify(owner)); await handle.sync(); } finally { await handle.close(); }
   try {
     for (let attempt = 0; attempt < 3; attempt++) {
-      try { await fs.link(temporary, file); return { release: async () => {
-        const actual = await readOwner(file).catch(() => null);
-        if (actual?.nonce === owner.nonce) await fs.unlink(file);
-      } }; } catch (error) {
+      try { await fs.link(temporary, file); return {
+        release: async () => releaseOwned(file, owner.nonce),
+        releaseSync: () => releaseOwned(file, owner.nonce),
+      }; } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       }
       const existing = await readOwner(file);
-      if (!await provenStopped(existing, current)) throw new Error('runtime_writer_already_active_or_unverified');
+      if (!await provenStopped(existing, current)) throw leaseRefusal(file);
       // Serialize stale-owner reclamation. Every reaper reads the owner again
       // after claiming this guard, so it cannot delete a replacement live lease.
       const reaper = `${file}.reclaim`;

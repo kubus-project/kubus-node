@@ -394,6 +394,7 @@ describe('photo reconstruction job and spatial revisions', () => {
     expect(workerFailure({ detail: { code: 'photos_unreadable', message: 'm', details: { submittedPhotos: 5, usablePhotos: 2 } } }, 422).message).toBe('m (submittedPhotos=5, usablePhotos=2)');
     // The worker's own refusal to run a flagged-image job that could not be reviewed keeps its code.
     expect(workerFailure({ detail: { code: 'face_review_images_unavailable', message: 'm' } }, 500).code).toBe('face_review_images_unavailable');
+    expect(workerFailure({ detail: { code: 'output_conversion_failed', message: 'm' } }, 500).code).toBe('output_conversion_failed');
   });
 
   it('stores the worker transform and orientation in the manifest and numbers the first record 1', async () => {

@@ -27,6 +27,7 @@ import { WorkerAuthService } from '../spatial/workerAuth.js';
 import { ComputeIdentityService } from '../compute/computeIdentity.js';
 import { PrivatePayloadTransport } from '../compute/privatePayloadTransport.js';
 import { RemoteComputeRuntime } from '../compute/remoteComputeRuntime.js';
+import { ManagedRequesterBridge, workerCancelPrepare, workerPrepare } from '../compute/managedRequesterBridge.js';
 import { NodeSignalingClient } from '../webrtc/nodeSignalingClient.js';
 import { startSetupServer } from '../gui/setupServer.js';
 import { PermissionUpdateService } from '../setup/permissionUpdate.js';
@@ -86,6 +87,14 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
   }
   const writerLease = await acquireRuntimeLease(config.localStatePath);
   const longRunning = command === 'start' || command === 'gui';
+  // A long-running process cannot release asynchronously on the way out: its shutdown is deadline-limited, may
+  // stall, and ends in process.exit or an empty event loop. A synchronous 'exit' hook runs on all of those, after
+  // the last line of this process's own code, so no write can follow the unlink. It is a no-op once the lease
+  // belongs to someone else, and a crash or SIGKILL still leaves the lease for the usual stale-owner proof.
+  if (longRunning) process.once('exit', writerLease.releaseSync);
+  // Startup (journal cleanup against a restarting worker, GUI, capability refresh) can take a while and runs before
+  // waitForShutdown installs its handlers; without one, a SIGTERM during it kills the process with no 'exit' event.
+  const disposeEarlySignals = longRunning ? exitOnEarlySignal() : () => undefined;
   try {
   const store = new LocalStore(config.localStatePath);
   await store.load();
@@ -162,7 +171,8 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
       localhostOnly: !config.guiAllowRemote,
       tokenConfigured: Boolean(config.guiToken),
     }, null, 2));
-    await waitForShutdown(null, gui);
+    disposeEarlySignals();
+    await waitForShutdown(null, gui, undefined, null, undefined, { releaseLease: writerLease.releaseSync });
     return;
   }
 
@@ -218,6 +228,13 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
       scheduler = new Scheduler({ api, kubo, store, config, logger, gate: participationGate, identity: computeIdentity, capabilities, actionLock });
       scheduler.start();
       remoteCompute.start();
+      if (config.managedRequesterEnabled && config.spatialWorkerUrl) {
+        new ManagedRequesterBridge({
+          api, nodeId: () => store.snapshot().nodeId, dataRoot: config.localDataPath,
+          prepare: workerPrepare({ workerUrl: config.spatialWorkerUrl, workerAuth }), cancelPrepare: workerCancelPrepare({ workerUrl: config.spatialWorkerUrl, workerAuth }), captures, transport: privateTransport,
+          remote: remoteCompute, logger, providerExclusionMs: config.managedProviderExclusionMs,
+        }).start();
+      }
       // The signaling namespace authorizes the durable node id against the
       // operator token, so it can only start after registration. It remains
       // explicitly non-fatal: a signaling outage must not take down LAN access,
@@ -235,8 +252,11 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
       logger.info({ nodeId: store.snapshot().nodeId }, 'kubus node started');
     },
   });
+  // waitForShutdown takes over signal handling (graceful, deadline-limited); the early exit must not also fire.
+  disposeEarlySignals();
   await waitForShutdown({ stop: async () => {
     startupAbort.abort();
+    jobs.stopCleanupRetry();
     // Backend requests have their own timeouts. A request completing after
     // shutdown cannot activate services because recovery checks the signal.
     // This wait was 10s, which is Docker's entire stop grace period on its own,
@@ -245,11 +265,12 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
     await Promise.race([startup, new Promise<void>((resolve) => { setTimeout(resolve, STARTUP_ABORT_GRACE_MS).unref(); })]);
     await scheduler?.stop();
     await signaling?.stop();
-  } }, gui, remoteCompute, null, logger);
+  } }, gui, remoteCompute, null, logger, { releaseLease: writerLease.releaseSync });
   } finally {
-    // Long-running processes retain the lease until they are proven dead on
-    // restart. Teardown has deadlines and may still have in-flight work.
+    // Long-running processes release it from the synchronous exit hook and the shutdown waiter instead:
+    // teardown has deadlines and may still have in-flight work, so it is released only as the process exits.
     if (!longRunning) await writerLease.release();
+    disposeEarlySignals();
   }
 }
 
@@ -314,6 +335,18 @@ const FORCED_EXIT_DELAY_MS = 500;
 // Must stay inside a single step's budget or the scheduler step always stalls.
 export const STARTUP_ABORT_GRACE_MS = 1000;
 
+/**
+ * Until the graceful shutdown waiter is installed, SIGTERM/SIGINT end the process through process.exit, which runs
+ * the synchronous 'exit' hooks (the writer lease release) that Node's default signal disposition would skip. There is
+ * nothing to drain that early: startup work is abandoned and the next start redoes it from durable state.
+ * Returns a function that removes the handlers. `exit` is injectable for tests.
+ */
+export function exitOnEarlySignal(exit: (code: number) => void = (code) => process.exit(code)): () => void {
+  const handlers: Array<[NodeJS.Signals, () => void]> = [['SIGINT', () => exit(130)], ['SIGTERM', () => exit(143)]];
+  for (const [name, handler] of handlers) process.on(name, handler);
+  return () => { for (const [name, handler] of handlers) process.off(name, handler); };
+}
+
 export async function waitForShutdown(
   scheduler: { stop(): Promise<void> } | null,
   gui?: GuiServerHandle | null,
@@ -325,10 +358,17 @@ export async function waitForShutdown(
     stepBudgetMs?: number;
     // Injectable so tests can observe the forced exit instead of being killed by it.
     forceExit?: () => void;
+    // Synchronous, run immediately before the process exits (forced exit included). Never run while a step is
+    // still being awaited, so a stalled step cannot outlive the lease it wrote under for more than the exit itself.
+    releaseLease?: () => void;
   } = {},
 ): Promise<void> {
   const deadlineMs = options.deadlineMs ?? SHUTDOWN_DEADLINE_MS;
-  const forceExit = options.forceExit ?? (() => process.exit(0));
+  const exitProcess = options.forceExit ?? (() => process.exit(0));
+  const forceExit = () => {
+    try { options.releaseLease?.(); } catch { /* the exit must not be blocked by a failed unlink */ }
+    exitProcess();
+  };
   const signal = await new Promise<string>((resolve) => {
     process.once('SIGINT', () => resolve('SIGINT'));
     process.once('SIGTERM', () => resolve('SIGTERM'));

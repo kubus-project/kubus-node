@@ -209,7 +209,28 @@ export interface ComputeCandidate {
   signingPublicKey: string;
   protocolVersion: string;
   maxAcceptedInputBytes: number;
+  privateOutputProtocol?: string | null;
+  /** `kubus.spatial-output/2` for a provider whose worker writes the full and lightweight variants; absent means legacy. */
+  spatialOutputProtocol?: string | null;
   score: number;
+}
+
+/** One reconstruction attempt as the managed requester sees it: digests and sizes, never file names or the artist. */
+export interface ManagedReconstruction {
+  id: string;
+  artworkId: string;
+  attempt: number;
+  state: 'preparing' | 'waiting_for_node' | 'processing' | 'importing' | 'ready' | 'needs_more_views' | 'failed' | 'cancelled';
+  stage: string | null;
+  sourceRevision: number;
+  sourceDigest: string;
+  files: Array<{ id: string; format: 'jpeg' | 'png' | 'mp4' | 'mov'; sizeBytes: number; sha256: string }>;
+  chunkSizeBytes: number;
+  cancelRequested: boolean;
+  computeJobId: string | null;
+  providerNodeId: string | null;
+  candidateDraftId: string | null;
+  leaseExpiresAt: string | null;
 }
 
 export interface RemoteComputeJob {
@@ -235,4 +256,6 @@ export interface RemoteComputeJob {
   requesterReceipt?: Record<string, unknown>;
   verification?: Record<string, unknown>;
   failure?: Record<string, unknown>;
+  /** The provider's cleanup statement as the backend verified and stored it, when it has one: `{ state, attestation: { payload, signature } }`. */
+  providerCleanup?: { state?: string; attestation?: unknown } | null;
 }

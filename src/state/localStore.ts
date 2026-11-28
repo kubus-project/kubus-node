@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import type { ManagedPinRecord } from '../ipfs/managedPins.js';
 import type { JobCleanupRecord } from '../jobs/jobCleanup.js';
+import type { StoredCleanupAttestation } from '../compute/providerCleanupAttestation.js';
 import type {
   AvailabilityCommitment,
   AvailabilityEpoch,
@@ -81,6 +82,8 @@ export interface LocalState {
     createdAt: string;
   };
   remoteJobs?: Record<string, unknown>;
+  /** Provider cleanup attestations by compute job id: signed, kept until the backend accepts them. */
+  providerCleanupAttestations?: Record<string, StoredCleanupAttestation>;
   computeProviderSettings?: {
     enabled: boolean;
     paused: boolean;

@@ -7,17 +7,10 @@ import type { KuboClient } from '../ipfs/kuboClient.js';
 import { localError } from '../localApi/pairingService.js';
 import type { LocalStore } from '../state/localStore.js';
 import type { ComputeIdentityService } from './computeIdentity.js';
-import { ManagedPins } from '../ipfs/managedPins.js';
+import { ManagedPins, canonicalPinCid } from '../ipfs/managedPins.js';
 
-export interface ComputeKeyEnvelope {
-  algorithm: 'X25519-HKDF-SHA256-AES-256-GCM';
-  ephemeralPublicKey: string;
-  salt: string;
-  iv: string;
-  authTag: string;
-  wrappedKey: string;
-  context: string;
-}
+import { encryptionPublicKey, wrapComputeKey, unwrapComputeKey, type ComputeKeyEnvelope } from './computeKeyEnvelope.js';
+export type { ComputeKeyEnvelope } from './computeKeyEnvelope.js';
 
 interface PackedCapture { schema: 'kubus.private-capture/1'; capture: Record<string, unknown>; files: Array<{ path: string; contentBase64: string }> }
 
@@ -39,18 +32,25 @@ async function walkFiles(root: string): Promise<Array<{ path: string; bytes: Buf
   return output;
 }
 
-function keyObject(raw: string): crypto.KeyObject {
-  return crypto.createPublicKey({ key: Buffer.from(raw, 'base64'), format: 'der', type: 'spki' });
+/** Whether a key envelope context is `<nodeId>:<cid>` for exactly this provider and input (the CID compared in canonical form). */
+function contextNames(context: unknown, expected: { nodeId: string; inputCid: string }): boolean {
+  if (typeof context !== 'string' || !expected.nodeId || !expected.inputCid || !context.startsWith(`${expected.nodeId}:`)) return false;
+  try { return canonicalPinCid(context.slice(expected.nodeId.length + 1)) === canonicalPinCid(expected.inputCid); } catch { return false; }
 }
 
 export class PrivatePayloadTransport {
   constructor(private readonly deps: { captures: CaptureStore; kubo: KuboClient; store: LocalStore; identity: ComputeIdentityService; dataRoot: string; maxInputBytes: number }) {}
 
-  async encryptCapture(captureId: string, providerNodeId: string, providerPublicKey: string): Promise<{ inputCid: string; inputBytes: number; inputHash: string; inputKeyEnvelope: ComputeKeyEnvelope; jobSpec: Record<string, unknown> }> {
+  /**
+   * Encrypts a stored capture for one provider and pins the ciphertext. `options.pinOwner` lets the caller choose the pin's
+   * owner (it must be a `requester-input:` owner), so a caller that records the owner first can find and release the pin
+   * if the process dies before it learns the CID.
+   */
+  async encryptCapture(captureId: string, providerNodeId: string, providerPublicKey: string, options: { pinOwner?: string } = {}): Promise<{ inputCid: string; inputBytes: number; inputHash: string; inputKeyEnvelope: ComputeKeyEnvelope; jobSpec: Record<string, unknown> }> {
+    if (options.pinOwner !== undefined && !/^requester-input:[0-9a-f-]{36}$/i.test(options.pinOwner)) throw localError(400, 'requester_input_owner_invalid');
     let providerEncryptionKey: crypto.KeyObject;
     try {
-      providerEncryptionKey = keyObject(providerPublicKey);
-      if (providerEncryptionKey.asymmetricKeyType !== 'x25519') throw new Error();
+      providerEncryptionKey = encryptionPublicKey(providerPublicKey);
     } catch { throw localError(400, 'compute_provider_key_invalid'); }
     const capture = this.deps.captures.get(captureId);
     // Photo and video captures hold the raw, unmasked source of whatever was in
@@ -74,36 +74,29 @@ export class PrivatePayloadTransport {
     if (encrypted.byteLength > this.deps.maxInputBytes) throw localError(413, 'remote_compute_input_too_large');
     const added = await this.deps.kubo.addBytes(encrypted, `${captureId}.kubusenc`, { pin: false });
     if (!added.Hash) throw localError(502, 'encrypted_input_cid_missing');
-    const pinOwner = `requester-input:${crypto.randomUUID()}`;
+    const pinOwner = options.pinOwner ?? `requester-input:${crypto.randomUUID()}`;
     await this.deps.store.update((state) => { (state.privateComputeCids ??= {})[added.Hash!] = { role: 'encrypted_input', createdAt: new Date().toISOString(), pinOwner, submissionState: 'prepared' }; });
     await new ManagedPins(this.deps.kubo, this.deps.store).acquire(added.Hash, pinOwner);
     const context = `${providerNodeId}:${added.Hash}`;
-    const ephemeral = crypto.generateKeyPairSync('x25519');
-    const shared = crypto.diffieHellman({ privateKey: ephemeral.privateKey, publicKey: providerEncryptionKey });
-    const salt = crypto.randomBytes(32);
-    const wrappingKey = Buffer.from(crypto.hkdfSync('sha256', shared, salt, Buffer.from(context), 32));
-    const wrapIv = crypto.randomBytes(12);
-    const wrapCipher = crypto.createCipheriv('aes-256-gcm', wrappingKey, wrapIv);
-    wrapCipher.setAAD(Buffer.from(context));
-    const wrappedKey = Buffer.concat([wrapCipher.update(dataKey), wrapCipher.final()]);
-    const envelope: ComputeKeyEnvelope = { algorithm: 'X25519-HKDF-SHA256-AES-256-GCM', ephemeralPublicKey: exportPublic(ephemeral.publicKey), salt: salt.toString('base64'), iv: wrapIv.toString('base64'), authTag: wrapCipher.getAuthTag().toString('base64'), wrappedKey: wrappedKey.toString('base64'), context };
+    const envelope = wrapComputeKey(dataKey, providerEncryptionKey, context);
     const inputHash = crypto.createHash('sha256').update(encrypted).digest('hex');
     return { inputCid: added.Hash, inputBytes: encrypted.byteLength, inputHash, inputKeyEnvelope: envelope, jobSpec: { captureSchema: 'kubus.capture/1', encryptedPayloadSchema: 'kubus.encrypted-payload/1', sourceBytes: rawBytes, fileCount: files.length } };
   }
 
-  async decryptToDirectory(encrypted: Uint8Array, envelope: ComputeKeyEnvelope, outputDirectory: string, expectedHash: string): Promise<void> {
+  /**
+   * Decrypts a job input into `outputDirectory`. `expected` is the provider's own node id and the job's input CID: the
+   * key envelope's context must name exactly them (`<nodeId>:<cid>`), so an envelope wrapped for another provider or for
+   * another input is refused before anything is unwrapped.
+   */
+  async decryptToDirectory(encrypted: Uint8Array, envelope: ComputeKeyEnvelope, outputDirectory: string, expectedHash: string, expected: { nodeId: string; inputCid: string }): Promise<void> {
+    if (!contextNames(envelope?.context, expected)) throw localError(422, 'encrypted_payload_context_mismatch');
     const bytes = Buffer.from(encrypted);
     if (crypto.createHash('sha256').update(bytes).digest('hex') !== expectedHash) throw localError(422, 'encrypted_payload_hash_mismatch');
     const first = bytes.indexOf(10); const second = bytes.indexOf(10, first + 1);
     if (first < 0 || second < 0 || bytes.subarray(0, first).toString() !== 'KUBUSENC1') throw localError(422, 'encrypted_payload_invalid');
     const header = JSON.parse(bytes.subarray(first + 1, second).toString()) as { schema?: string; iv?: string; authTag?: string; plaintextHash?: string };
     if (header.schema !== 'kubus.encrypted-payload/1') throw localError(422, 'encrypted_payload_schema_invalid');
-    const ephemeral = keyObject(envelope.ephemeralPublicKey);
-    const shared = crypto.diffieHellman({ privateKey: await this.deps.identity.encryptionPrivateKey(), publicKey: ephemeral });
-    const wrappingKey = Buffer.from(crypto.hkdfSync('sha256', shared, Buffer.from(envelope.salt, 'base64'), Buffer.from(envelope.context), 32));
-    const unwrap = crypto.createDecipheriv('aes-256-gcm', wrappingKey, Buffer.from(envelope.iv, 'base64'));
-    unwrap.setAAD(Buffer.from(envelope.context)); unwrap.setAuthTag(Buffer.from(envelope.authTag, 'base64'));
-    const dataKey = Buffer.concat([unwrap.update(Buffer.from(envelope.wrappedKey, 'base64')), unwrap.final()]);
+    const dataKey = unwrapComputeKey(envelope, await this.deps.identity.encryptionPrivateKey(), envelope.context);
     const decipher = crypto.createDecipheriv('aes-256-gcm', dataKey, Buffer.from(header.iv || '', 'base64'));
     decipher.setAAD(Buffer.from('kubus.private-capture/1')); decipher.setAuthTag(Buffer.from(header.authTag || '', 'base64'));
     const compressed = Buffer.concat([decipher.update(bytes.subarray(second + 1)), decipher.final()]);
@@ -125,5 +118,3 @@ export class PrivatePayloadTransport {
     } catch (error) { await fs.rm(outputDirectory, { recursive: true, force: true }); throw error; }
   }
 }
-
-function exportPublic(key: crypto.KeyObject): string { return key.export({ format: 'der', type: 'spki' }).toString('base64'); }

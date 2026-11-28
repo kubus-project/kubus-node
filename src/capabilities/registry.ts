@@ -22,6 +22,8 @@ export interface SpatialWorkerHealth {
   gpu: { available: boolean; name?: string; vendor?: string; model?: string; cuda?: string; totalVramBytes?: number; usableVramBytes?: number; tier?: string };
   capabilities: string[];
   version?: string;
+  /** `kubus.spatial-output/N`, when the worker reports it (a worker that predates the protocol does not). */
+  outputProtocol?: string;
   detail?: string;
 }
 
@@ -124,6 +126,7 @@ export class CapabilityRegistry {
         gpu: body.gpu?.available ? body.gpu : { available: false },
         capabilities: Array.isArray(body.capabilities) ? body.capabilities.filter((item): item is string => typeof item === 'string') : [],
         version: typeof body.version === 'string' ? body.version : undefined,
+        outputProtocol: typeof body.outputProtocol === 'string' && /^kubus\.spatial-output\/\d{1,3}$/.test(body.outputProtocol) ? body.outputProtocol : undefined,
         detail: typeof body.detail === 'string' ? body.detail : undefined,
       };
     } catch (error) {

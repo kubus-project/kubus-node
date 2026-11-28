@@ -1,4 +1,6 @@
+import crypto from 'node:crypto';
 import { promises as fs } from 'node:fs';
+import stableStringify from 'json-stable-stringify';
 import path from 'node:path';
 import type { KubusApiClient } from '../backend/kubusApiClient.js';
 import type { ComputeCandidate, RemoteComputeJob } from '../backend/models.js';
@@ -10,6 +12,7 @@ import { localError } from '../localApi/pairingService.js';
 import type { Logger } from '../logging/logger.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
 import { validateSpatialManifest, type SpatialManifest } from '../spatial/models.js';
+import { inspectCapturePackage } from '../captures/capturePackage.js';
 import { redactSecrets } from '../logging/logBuffer.js';
 import { Backoff } from '../scheduler/backoff.js';
 import type { LocalStore } from '../state/localStore.js';
@@ -19,8 +22,54 @@ import { PrivatePayloadTransport, type ComputeKeyEnvelope } from './privatePaylo
 import { effectiveComputeProviderSettings, validateComputeProviderSettings, type ComputeProviderSettings } from './providerSettings.js';
 
 import { ProviderCleanup, type RemoteRuntimeRecord } from './providerCleanup.js';
+import { ProviderCleanupAttestor } from './providerCleanupAttestation.js';
 import { ManagedPins } from '../ipfs/managedPins.js';
+import { jobIdPattern } from '../jobs/ownedWorkDirectory.js';
+import {
+  PRIVATE_OUTPUT_PROTOCOL, openOutputBlob, outputCommitmentDigest, validatePrivateOutput, verifyingOutput, type PrivateOutputCommitment,
+} from './privateOutputTransport.js';
 
+/** Whether a requester's encrypted input pin was really released. A pin whose release is switched off stays held. */
+export interface InputReleaseOutcome { released: boolean; reason?: string }
+
+function isPrivateOutput(job: RemoteComputeJob): boolean {
+  return (job.canonicalJobSpec?.processing as { outputMode?: unknown } | undefined)?.outputMode === PRIVATE_OUTPUT_PROTOCOL;
+}
+
+function signedPrivateOutput(job: RemoteComputeJob): PrivateOutputCommitment {
+  return verifyingOutput(() => checkSignedPrivateOutput(job));
+}
+
+function checkSignedPrivateOutput(job: RemoteComputeJob): PrivateOutputCommitment {
+  if (!jobIdPattern.test(job.id) || !job.outputManifestCid) throw localError(422, 'private_output_job_invalid');
+  const receipt = job.providerReceipt as { payload?: Record<string, unknown>; signature?: unknown } | undefined;
+  const payload = receipt?.payload;
+  const key = job.verification?.providerSigningPublicKey;
+  if (!payload || typeof key !== 'string' || typeof receipt?.signature !== 'string' ||
+      payload.jobId !== job.id || payload.inputHash !== job.inputHash || payload.jobSpecHash !== job.jobSpecHash ||
+      payload.protocolVersion !== job.protocolVersion || !Array.isArray(payload.outputCids) ||
+      stableStringify([...payload.outputCids].sort()) !== stableStringify([...job.outputCids].sort())) {
+    throw localError(422, 'private_output_signature_binding_invalid');
+  }
+  const publicKey = crypto.createPublicKey({ key: Buffer.from(key, 'base64'), format: 'der', type: 'spki' });
+  if (publicKey.asymmetricKeyType !== 'ed25519' ||
+      !crypto.verify(null, Buffer.from(stableStringify(payload) ?? ''), publicKey, Buffer.from(receipt.signature, 'base64'))) {
+    throw localError(422, 'private_output_signature_invalid');
+  }
+  return validatePrivateOutput(payload.privateOutput, job.id, job.outputManifestCid, job.outputCids);
+}
+
+/** Backend states in which a provider job is over; the provider record takes the state the backend reports. */
+const PROVIDER_TERMINAL_STATES = ['CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED', 'DISPUTED'];
+/** Record states that hold one of the provider's capacity slots (`maxConcurrency + maxQueueDepth`). */
+const PROVIDER_CAPACITY_STATES = ['PREPARING', 'ACCEPTED', 'INPUT_READY', 'RUNNING'];
+/**
+ * A capacity-holding record whose job the backend no longer lists is released once its job lease ended this long ago.
+ * The backend expires every non-final job at its lease end, so a job that is neither listed nor within its lease is gone.
+ */
+const ABSENT_RECORD_GRACE_MS = 10 * 60_000;
+/** The same for a record from before the journal existed: no lease is known, so only a record this old is released. */
+const ABSENT_LEGACY_RECORD_MS = 7 * 24 * 60 * 60_000;
 const POLL_INTERVAL_MS = 5000;
 const POLL_MAX_BACKOFF_MS = 60000;
 /** Re-emit a "still failing" summary at most this often, instead of one warning per tick. */
@@ -30,6 +79,7 @@ export class RemoteComputeRuntime {
   private timer?: NodeJS.Timeout;
   private cleanupTimer?: NodeJS.Timeout;
   private readonly providerCleanup: ProviderCleanup;
+  private readonly attestor: ProviderCleanupAttestor;
   private polling = false;
   private stopped = true;
   private readonly backoff = new Backoff(POLL_INTERVAL_MS, POLL_MAX_BACKOFF_MS);
@@ -39,9 +89,16 @@ export class RemoteComputeRuntime {
   constructor(private readonly deps: {
     api: KubusApiClient; kubo: KuboClient; store: LocalStore; config: AppConfig; captures: CaptureStore; jobs: JobRuntime;
     gate: NetworkParticipationGate; identity: ComputeIdentityService; transport: PrivatePayloadTransport; logger: Logger;
-  }) { this.providerCleanup = new ProviderCleanup(deps.store, deps.jobs, deps.config.localDataPath, async (cid, owner) => {
-    await new ManagedPins(deps.kubo, deps.store, { allowUnpin: deps.config.managedPinReleaseEnabled === true }).release(cid, owner);
-  }); }
+  }) {
+    this.providerCleanup = new ProviderCleanup(deps.store, deps.jobs, deps.config.localDataPath, async (cid, owner) => {
+      await new ManagedPins(deps.kubo, deps.store, { allowUnpin: deps.config.managedPinReleaseEnabled === true }).release(cid, owner);
+    });
+    this.attestor = new ProviderCleanupAttestor({
+      store: deps.store, nodeId: () => deps.store.snapshot().nodeId, logger: deps.logger,
+      sign: payload => deps.identity.signProviderCleanup(payload),
+      submit: (jobId, body) => deps.api.submitProviderCleanupAttestation(jobId, body),
+    });
+  }
 
   start(): void {
     if (!this.cleanupTimer) {
@@ -103,7 +160,10 @@ export class RemoteComputeRuntime {
     // removal of independently owned readable source directories.
     await managed.reconcile({ ownerPrefix: 'provider-input:' }).catch(() => undefined);
     await managed.reconcile({ ownerPrefix: 'requester-input:' }).catch(() => undefined);
+    await managed.reconcile({ ownerPrefix: 'provider-output:' }).catch(() => undefined);
     await this.providerCleanup.reconcilePending();
+    // A statement the backend has not accepted yet survives a restart and is re-sent once its backoff elapses.
+    await this.attestor.retryDue().catch(() => undefined);
     return this.cleanupDiagnostics();
   }
 
@@ -226,10 +286,13 @@ export class RemoteComputeRuntime {
     return this.deps.api.getComputeCandidates(options, authorization);
   }
 
-  async requestJob(input: { authorization: string; captureId: string; provider: ComputeCandidate; requirements: Record<string, unknown>; type?: string }): Promise<RemoteComputeJob> {
+  async requestJob(input: { authorization: string; captureId: string; provider: ComputeCandidate; requirements: Record<string, unknown>; type?: string; privateOutput?: boolean }): Promise<RemoteComputeJob> {
     requireUserAuthorization(input.authorization);
     await this.deps.gate.assertUsefulOperation('remote_compute_submission');
     if (!input.provider?.nodeId || !input.provider.encryptionPublicKey) throw localError(400, 'compute_provider_invalid');
+    if (input.privateOutput && input.provider.privateOutputProtocol !== PRIVATE_OUTPUT_PROTOCOL) {
+      throw localError(409, 'private_output_provider_protocol_required');
+    }
     const encrypted = await this.deps.transport.encryptCapture(input.captureId, input.provider.nodeId, input.provider.encryptionPublicKey);
     try {
       const job = await this.deps.api.createRemoteComputeJob({
@@ -238,6 +301,7 @@ export class RemoteComputeRuntime {
         type: input.type || 'spatial.reconstruct',
         requirements: input.requirements,
         ...encrypted,
+        jobSpec: { ...encrypted.jobSpec, ...(input.privateOutput ? { outputMode: PRIVATE_OUTPUT_PROTOCOL } : {}) },
       }, input.authorization);
       await this.deps.store.update((state) => {
         (state.remoteJobs ??= {})[job.id] = { backendJobId: job.id, role: 'requester', state: job.state, updatedAt: new Date().toISOString() } satisfies RemoteRuntimeRecord;
@@ -268,6 +332,7 @@ export class RemoteComputeRuntime {
     await this.deps.gate.assertUsefulOperation('remote_compute_result_retrieval');
     const job = await this.getRequesterJob(jobId, authorization);
     if (!['OUTPUT_READY', 'VERIFYING', 'VERIFIED', 'COMPLETED'].includes(job.state) || !job.outputManifestCid) throw localError(409, 'remote_compute_output_not_ready');
+    if (isPrivateOutput(job)) return this.retrieveSealedOutput(job);
     const manifestBytes = await this.deps.kubo.cat(job.outputManifestCid);
     let manifest: SpatialManifest;
     try { manifest = validateSpatialManifest(JSON.parse(Buffer.from(manifestBytes).toString('utf8'))); } catch { throw localError(422, 'remote_compute_manifest_invalid'); }
@@ -282,15 +347,129 @@ export class RemoteComputeRuntime {
     return record;
   }
 
+  private async retrieveSealedOutput(job: RemoteComputeJob): Promise<Record<string, unknown>> {
+    const commitment = signedPrivateOutput(job);
+    const binding = outputCommitmentDigest(commitment);
+    const parent = path.join(this.deps.config.localDataPath, 'private', 'remote-results');
+    const target = path.join(parent, job.id);
+    await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+    const existing = await this.sealedResultRecord(target, binding);
+    if (existing) return existing;
+    const staging = await fs.mkdtemp(path.join(parent, `${job.id}-`));
+    try {
+      const key = await this.deps.identity.encryptionPrivateKey();
+      const manifestBlob = commitment.blobs.find(item => item.role === 'manifest')!;
+      const manifestPath = path.join(staging, 'manifest.json');
+      await openOutputBlob({ blob: manifestBlob, kubo: this.deps.kubo, recipientPrivateKey: key, jobId: job.id, destination: manifestPath });
+      // The manifest is the provider's: any shape the validator trips over (not only the ones it names) is a wrong result.
+      const manifestText = await fs.readFile(manifestPath, 'utf8');
+      const manifest = verifyingOutput(() => validateSpatialManifest(JSON.parse(manifestText)));
+      const variants = new Map(commitment.blobs.filter(item => item.role !== 'manifest').map(item => [item.role, item]));
+      if (manifest.variants.length !== variants.size) throw localError(422, 'private_output_variant_binding_invalid');
+      for (const variant of manifest.variants) {
+        const blob = variants.get(variant.role);
+        if (!blob || blob.cid !== variant.cid || blob.plaintextBytes !== variant.sizeBytes) {
+          throw localError(422, 'private_output_variant_binding_invalid');
+        }
+        await openOutputBlob({ blob, kubo: this.deps.kubo, recipientPrivateKey: key, jobId: job.id,
+          destination: path.join(staging, variant.role) });
+        variants.delete(variant.role);
+      }
+      const result = { id: manifest.id, state: 'private_staged', remoteComputeJobId: job.id, binding };
+      await fs.writeFile(path.join(staging, 'verified.json'), JSON.stringify(result), { mode: 0o600, flag: 'wx' });
+      try {
+        await fs.rename(staging, target);
+      } catch (error) {
+        if (!(await this.sealedResultRecord(target, binding))) throw error;
+      }
+      return result;
+    } finally { await fs.rm(staging, { recursive: true, force: true }); }
+  }
+
+  private async sealedResultRecord(directory: string, binding: string): Promise<Record<string, unknown> | null> {
+    try {
+      const record = JSON.parse(await fs.readFile(path.join(directory, 'verified.json'), 'utf8')) as Record<string, unknown>;
+      if (record.binding !== binding) throw localError(409, 'private_output_stage_conflict');
+      return record;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+
   async acknowledgeRequesterOutput(jobId: string, authorization: string, accepted: boolean, reason?: string): Promise<RemoteComputeJob> {
     requireUserAuthorization(authorization);
     const job = await this.deps.api.getRemoteComputeJob(jobId, authorization);
-    const payload = { jobId: job.id, inputHash: job.inputHash, jobSpecHash: job.jobSpecHash, outputCids: job.outputCids, accepted, reason: reason || null, acknowledgedAt: new Date().toISOString(), protocolVersion: job.protocolVersion };
-    const signature = await this.deps.identity.signPayload(payload);
-    const updated = await this.deps.api.acknowledgeRemoteComputeJob(jobId, { accepted, receipt: { payload, signature } }, authorization);
+    const receipt = await this.signedAcknowledgement(job, accepted, reason);
+    const updated = await this.deps.api.acknowledgeRemoteComputeJob(jobId, { accepted, receipt }, authorization);
     if (['COMPLETED', 'DISPUTED', 'FAILED', 'CANCELLED'].includes(updated.state)) await this.releaseRequesterInput(updated);
     await this.updateRecord(updated.id, 'requester', updated.state);
     return updated;
+  }
+
+  /**
+   * The requester's signed receipt for a job read by any route. An accepted private-output job is acknowledged only
+   * after its decrypted result is staged here, and the receipt commits to that exact output.
+   */
+  async signedAcknowledgement(job: RemoteComputeJob, accepted: boolean, reason?: string): Promise<{ payload: Record<string, unknown>; signature: string }> {
+    const privateOutputBinding = isPrivateOutput(job) && accepted ? outputCommitmentDigest(signedPrivateOutput(job)) : null;
+    if (privateOutputBinding && !(await this.sealedResultRecord(
+      path.join(this.deps.config.localDataPath, 'private', 'remote-results', job.id), privateOutputBinding,
+    ))) throw localError(409, 'private_output_not_staged');
+    const payload = { jobId: job.id, inputHash: job.inputHash, jobSpecHash: job.jobSpecHash, outputCids: job.outputCids, accepted, reason: reason || null, acknowledgedAt: new Date().toISOString(), protocolVersion: job.protocolVersion,
+      ...(privateOutputBinding ? { privateOutputBinding } : {}),
+    };
+    return { payload, signature: await this.deps.identity.signPayload(payload) };
+  }
+
+  /** Verifies and decrypts a private-output job's result into private staging; returns where its variants are. */
+  async stagePrivateOutput(job: RemoteComputeJob): Promise<{ directory: string; record: Record<string, unknown> }> {
+    if (!isPrivateOutput(job)) throw localError(422, 'private_output_required');
+    const record = await this.retrieveSealedOutput(job);
+    return { directory: path.join(this.deps.config.localDataPath, 'private', 'remote-results', job.id), record };
+  }
+
+  /** Releases the requester's encrypted input pin once the job is over; also used by the managed requester. */
+  async releaseInput(job: RemoteComputeJob): Promise<InputReleaseOutcome> {
+    const outcome = await this.releaseRequesterInput(job);
+    await this.updateRecord(job.id, 'requester', job.state);
+    return outcome;
+  }
+
+  /**
+   * Releases an encrypted input pin that no job holds (prepared for a provider, never sent, or replaced). Idempotent: an
+   * input that is already released, or has no managed owner, is left alone.
+   */
+  async releaseUnusedInput(inputCid: string): Promise<InputReleaseOutcome> {
+    const record = this.deps.store.snapshot().privateComputeCids?.[inputCid];
+    if (!record || record.role !== 'encrypted_input' || !record.pinOwner || record.releasedAt) return { released: true };
+    return this.releaseInputPin(inputCid, record.pinOwner);
+  }
+
+  /**
+   * Releases every encrypted input pinned under `owner`. A requester that chose the owner before it encrypted (and then
+   * died before it learned the CID) finds the pin again this way. Not released while any of them is still held.
+   */
+  async releaseInputsOwnedBy(owner: string): Promise<InputReleaseOutcome> {
+    let pending: InputReleaseOutcome | undefined;
+    for (const [cid, record] of Object.entries(this.deps.store.snapshot().privateComputeCids || {})) {
+      if (record.role !== 'encrypted_input' || record.pinOwner !== owner || record.releasedAt) continue;
+      const outcome = await this.releaseInputPin(cid, owner);
+      if (!outcome.released) pending ??= outcome;
+    }
+    return pending ?? { released: true };
+  }
+
+  /**
+   * Releases this owner's hold on an input pin and records it as released only when that happened. With pin release
+   * switched off (the default) the owner's claim is dropped but the pin is not removed, and the CID stays announced:
+   * that is reported as not released, never as done.
+   */
+  private async releaseInputPin(cid: string, owner: string): Promise<InputReleaseOutcome> {
+    const result = await new ManagedPins(this.deps.kubo, this.deps.store, { allowUnpin: this.deps.config.managedPinReleaseEnabled === true }).release(cid, owner);
+    if (result.reason === 'pin_release_activation_required') return { released: false, reason: result.reason };
+    await this.deps.store.update((state) => { const item = state.privateComputeCids?.[cid]; if (item) item.releasedAt = new Date().toISOString(); });
+    return { released: true };
   }
 
   async cancelRequesterJob(jobId: string, authorization: string): Promise<RemoteComputeJob> {
@@ -311,7 +490,10 @@ export class RemoteComputeRuntime {
     if (!nodeId) return POLL_INTERVAL_MS;
     this.polling = true;
     try {
-      const { jobs } = await this.deps.api.getProviderComputeJobs(nodeId, ['MATCHED', 'ACCEPTED', 'INPUT_READY', 'RUNNING', 'OUTPUT_READY', 'CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED']);
+      const { jobs } = await this.deps.api.getProviderComputeJobs(nodeId, ['MATCHED', 'ACCEPTED', 'INPUT_READY', 'RUNNING', 'OUTPUT_READY', 'CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED', 'DISPUTED']);
+      // What the backend reports comes first: a record that still says RUNNING for a job that ended holds a capacity slot
+      // the handling below would count against a job it is about to accept.
+      await this.reconcileProviderRecords(jobs);
       for (const job of jobs) await this.handleProviderJob(job).catch((error) => this.failProviderJob(job, error));
       this.onPollSucceeded();
       await this.recordAuthorized();
@@ -409,13 +591,26 @@ export class RemoteComputeRuntime {
   private async handleProviderJob(job: RemoteComputeJob): Promise<void> {
     const nodeId = this.deps.store.snapshot().nodeId!;
     const existing = this.deps.store.snapshot().remoteJobs?.[job.id] as RemoteRuntimeRecord | undefined;
-    if (['CANCELLED', 'FAILED', 'EXPIRED', 'DECLINED', 'COMPLETED'].includes(job.state)) {
-      if (existing?.role === 'provider' && existing.cleanup) await this.providerCleanup.request(job.id);
+    if (PROVIDER_TERMINAL_STATES.includes(job.state)) {
+      // Terminal only: the sealed result stays pinned until the requester has acknowledged it (COMPLETED) or the job ended
+      // (a DISPUTED job, whose output the requester rejected, is ended too).
+      let failure: unknown;
+      // The record states what the backend says about the job, whether or not the cleanup below succeeds: the cleanup
+      // journal keeps its own state (and `plaintextBlocked` still stops a new acceptance while it is pending), but the
+      // record must not keep a slot for a job that is over.
+      try { await this.recordTerminalState(job); } catch (error) { failure = error; }
+      try { if (existing?.role === 'provider' && existing.cleanup) await this.providerCleanup.request(job.id); } catch (error) { failure = error; }
+      try { if (existing?.role === 'provider') await this.releaseEncryptedOutput(job.id); } catch (error) { failure ??= error; }
+      // The statement says what the journals say, so a failed step is stated as failed rather than left unsaid.
+      await this.attestor.attest(job).catch(() => this.deps.logger.warn({ code: 'provider_cleanup_attestation_failed', jobId: job.id }, 'provider cleanup attestation could not be queued'));
+      if (failure) throw failure;
       return;
     }
     if (job.state === 'OUTPUT_READY' && existing?.cleanup) {
       await this.providerCleanup.request(job.id);
-      await this.updateRecord(job.id, 'provider', 'OUTPUT_READY');
+      // Idempotent like the terminal branch: a record already in OUTPUT_READY (the requester has not acknowledged yet) is
+      // not rewritten on every poll, which would move updatedAt and save the whole state file each time.
+      if (existing.state !== 'OUTPUT_READY') await this.updateRecord(job.id, 'provider', 'OUTPUT_READY');
       return;
     }
     const settingsAtDispatch = this.settings();
@@ -440,7 +635,7 @@ export class RemoteComputeRuntime {
       const settings = this.settings();
       const active = Object.values(this.deps.store.snapshot().remoteJobs || {}).filter((item) => {
         const record = item as RemoteRuntimeRecord;
-        return record.role === 'provider' && ['PREPARING', 'ACCEPTED', 'INPUT_READY', 'RUNNING'].includes(record.state);
+        return record.role === 'provider' && PROVIDER_CAPACITY_STATES.includes(record.state);
       }).length;
       if (Number(job.inputBytes || 0) > settings.maxAcceptedInputBytes) {
         await this.deps.api.transitionProviderComputeJob(job.id, { nodeId, state: 'DECLINED', metadata: { code: 'provider_input_too_large' } });
@@ -477,12 +672,17 @@ export class RemoteComputeRuntime {
         this.providerCleanup.assertPreparing(job.id);
         const encrypted = await this.deps.kubo.cat(job.inputCid);
         this.providerCleanup.assertPreparing(job.id);
-        await this.deps.transport.decryptToDirectory(encrypted, job.inputKeyEnvelope as unknown as ComputeKeyEnvelope, directory, job.inputHash);
+        await this.deps.transport.decryptToDirectory(encrypted, job.inputKeyEnvelope as unknown as ComputeKeyEnvelope, directory, job.inputHash, { nodeId, inputCid: job.inputCid });
         this.providerCleanup.assertPreparing(job.id);
         const capture = await this.readRemoteCapture(captureId, directory);
         await this.deps.captures.registerRemote(capture);
         this.providerCleanup.assertPreparing(job.id);
-        const local = await this.deps.jobs.create(job.type as 'spatial.reconstruct', { captureId, artworkId: capture.artworkId, markerId: capture.markerId, remoteComputeJobId: job.id });
+        const requesterKey = isPrivateOutput(job) ? job.verification?.requesterEncryptionPublicKey : null;
+        if (isPrivateOutput(job) && typeof requesterKey !== 'string') throw localError(422, 'private_output_requester_key_unavailable');
+        const local = await this.deps.jobs.create(job.type as 'spatial.reconstruct', {
+          captureId, artworkId: capture.artworkId, markerId: capture.markerId, remoteComputeJobId: job.id,
+          ...(requesterKey ? { privateOutputRequesterPublicKey: requesterKey } : {}),
+        });
         await this.deps.store.update(state => {
           const current = state.remoteJobs![job.id] as RemoteRuntimeRecord;
           current.localJobId = local.id; current.state = 'RUNNING'; current.updatedAt = new Date().toISOString();
@@ -504,14 +704,68 @@ export class RemoteComputeRuntime {
 
   private async submitProviderOutput(job: RemoteComputeJob, local: LocalJob, record: RemoteRuntimeRecord): Promise<void> {
     const nodeId = this.deps.store.snapshot().nodeId!;
-    const spatial = local.output as { manifestCid?: string; manifest?: SpatialManifest } | undefined;
-    if (!spatial?.manifestCid || !spatial.manifest) throw localError(500, 'remote_output_invalid');
-    const outputCids = [spatial.manifestCid, ...spatial.manifest.variants.map((variant) => variant.cid)];
-    const payload = { jobId: job.id, inputHash: job.inputHash, jobSpecHash: job.jobSpecHash, outputCids, workerVersion: String(this.deps.store.snapshot().latestHeartbeat?.agentVersion || 'unknown'), protocolVersion: job.protocolVersion, completedAt: new Date().toISOString() };
+    const spatial = local.output as { manifestCid?: string; manifest?: SpatialManifest; privateOutput?: PrivateOutputCommitment } | undefined;
+    const privateOutput = isPrivateOutput(job) ? spatial?.privateOutput : null;
+    const outputManifestCid = privateOutput?.manifestCid ?? spatial?.manifestCid;
+    const outputCids = privateOutput ? privateOutput.blobs.map(item => item.cid) :
+      outputManifestCid && spatial?.manifest ? [outputManifestCid, ...spatial.manifest.variants.map(variant => variant.cid)] : [];
+    if (!outputManifestCid || !outputCids.length || (isPrivateOutput(job) && !privateOutput)) {
+      throw localError(500, 'remote_output_invalid');
+    }
+    const payload = { jobId: job.id, inputHash: job.inputHash, jobSpecHash: job.jobSpecHash, outputCids, workerVersion: String(this.deps.store.snapshot().latestHeartbeat?.agentVersion || 'unknown'), protocolVersion: job.protocolVersion, completedAt: new Date().toISOString(),
+      ...(privateOutput ? { privateOutput } : {}),
+    };
     const signature = await this.deps.identity.signPayload(payload);
-    await this.deps.api.submitProviderComputeOutput(job.id, { nodeId, outputManifestCid: spatial.manifestCid, outputCids, receipt: { payload, signature } });
+    await this.deps.api.submitProviderComputeOutput(job.id, { nodeId, outputManifestCid, outputCids, receipt: { payload, signature } });
     await this.cleanupProvider(job, record);
     await this.updateRecord(job.id, 'provider', 'OUTPUT_READY');
+  }
+
+  /** Gives a provider record the terminal state the backend reports for its job. Idempotent: an unchanged state is not written again. */
+  private async recordTerminalState(job: RemoteComputeJob): Promise<void> {
+    const record = this.deps.store.snapshot().remoteJobs?.[job.id] as RemoteRuntimeRecord | undefined;
+    if (record?.role !== 'provider' || record.state === job.state) return;
+    await this.updateRecord(job.id, 'provider', job.state);
+  }
+
+  /**
+   * Brings provider records in line with the backend's complete list of this Node's jobs (every state is requested), so
+   * a record left behind by an older version, or by a job the backend ended while this Node could not say so, stops
+   * counting against capacity. Cleanup journals are never touched: only `state` moves, and the cleanup loop keeps its
+   * own obligations.
+   *  - A record whose job is listed as ended takes that state.
+   *  - A capacity-holding record whose job is not listed at all, and whose lease ended more than a grace period ago, is
+   *    marked EXPIRED: the backend expires every live job at its lease end, so such a job can only be gone.
+   */
+  private async reconcileProviderRecords(jobs: RemoteComputeJob[]): Promise<void> {
+    const listed = new Set<string>();
+    for (const job of jobs) {
+      listed.add(job.id);
+      if (!PROVIDER_TERMINAL_STATES.includes(job.state)) continue;
+      await this.recordTerminalState(job).catch(() => this.deps.logger.warn({ code: 'provider_record_state_not_saved', jobId: job.id }, 'provider job record could not be updated'));
+    }
+    const now = Date.now();
+    for (const item of Object.values(this.deps.store.snapshot().remoteJobs || {})) {
+      const record = item as RemoteRuntimeRecord;
+      if (record.role !== 'provider' || !PROVIDER_CAPACITY_STATES.includes(record.state) || listed.has(record.backendJobId)) continue;
+      const leaseEnd = record.cleanup ? Date.parse(record.cleanup.expiresAt) : Number.NaN;
+      const stale = Number.isFinite(leaseEnd)
+        ? now - leaseEnd > ABSENT_RECORD_GRACE_MS
+        : now - Date.parse(record.updatedAt) > ABSENT_LEGACY_RECORD_MS;
+      if (!stale) continue;
+      try {
+        await this.deps.store.update((state) => {
+          const current = state.remoteJobs?.[record.backendJobId] as RemoteRuntimeRecord | undefined;
+          if (!current || current.role !== 'provider' || !PROVIDER_CAPACITY_STATES.includes(current.state)) return;
+          current.state = 'EXPIRED';
+          current.reconciled = 'absent_past_lease';
+          current.updatedAt = new Date().toISOString();
+        });
+        this.deps.logger.warn({ code: 'provider_record_released', jobId: record.backendJobId, previousState: record.state }, 'a provider job the backend no longer lists was released from the capacity this Node counts');
+      } catch {
+        this.deps.logger.warn({ code: 'provider_record_state_not_saved', jobId: record.backendJobId }, 'provider job record could not be updated');
+      }
+    }
   }
 
   private async failProviderJob(job: RemoteComputeJob, error: unknown): Promise<void> {
@@ -528,14 +782,26 @@ export class RemoteComputeRuntime {
     await this.providerCleanup.request(job.id);
   }
 
-  private async releaseRequesterInput(job: RemoteComputeJob): Promise<void> {
+  private async releaseEncryptedOutput(jobId: string): Promise<void> {
+    const owner = `provider-output:${jobId}`;
+    const managed = new ManagedPins(this.deps.kubo, this.deps.store, { allowUnpin: this.deps.config.managedPinReleaseEnabled === true });
+    for (const [cid, record] of Object.entries(this.deps.store.snapshot().privateComputeCids || {})) {
+      if (record.role !== 'private_output' || record.jobId !== jobId || record.pinOwner !== owner || record.releasedAt) continue;
+      await managed.release(cid, owner);
+      await this.deps.store.update(state => {
+        const saved = state.privateComputeCids?.[cid];
+        if (saved?.pinOwner === owner) saved.releasedAt = new Date().toISOString();
+      });
+    }
+  }
+
+  private async releaseRequesterInput(job: RemoteComputeJob): Promise<InputReleaseOutcome> {
     if (!['COMPLETED', 'DISPUTED', 'FAILED', 'CANCELLED', 'EXPIRED', 'DECLINED'].includes(job.state)) {
       throw localError(409, 'remote_compute_not_terminal');
     }
     const owner = this.deps.store.snapshot().privateComputeCids?.[job.inputCid]?.pinOwner;
-    if (!owner) return; // Legacy/manual ownership requires a separate migration.
-    await new ManagedPins(this.deps.kubo, this.deps.store, { allowUnpin: this.deps.config.managedPinReleaseEnabled === true }).release(job.inputCid, owner);
-    await this.deps.store.update((state) => { const item = state.privateComputeCids?.[job.inputCid]; if (item) item.releasedAt = new Date().toISOString(); });
+    if (!owner) return { released: true }; // Legacy/manual ownership requires a separate migration.
+    return this.releaseInputPin(job.inputCid, owner);
   }
 
   private async readRemoteCapture(id: string, directory: string): Promise<CaptureRecord> {
@@ -543,7 +809,9 @@ export class RemoteComputeRuntime {
     const files = Array.isArray(manifest.files) ? manifest.files : [];
     let sizeBytes = 0;
     for (const item of files) { const relative = String((item as { path?: string }).path || ''); if (relative) sizeBytes += (await fs.stat(path.join(directory, relative))).size; }
-    return { id, schema: 'kubus.capture/1', state: 'stored', private: true, artworkId: String(manifest.artworkId || ''), markerId: String(manifest.markerId || '') || undefined, capturedAt: String(manifest.capturedAt || new Date().toISOString()), createdAt: new Date().toISOString(), sizeBytes, fileCount: files.length, directory };
+    // A managed requester's masked dataset is recognised from its files, so the record says it was masked upstream.
+    const prepared = (await inspectCapturePackage(directory)).kind === 'prepared';
+    return { id, schema: 'kubus.capture/1', state: 'stored', private: true, artworkId: String(manifest.artworkId || ''), markerId: String(manifest.markerId || '') || undefined, capturedAt: String(manifest.capturedAt || new Date().toISOString()), createdAt: new Date().toISOString(), sizeBytes, fileCount: files.length, directory, ...(prepared ? { kind: 'prepared' as const } : {}) };
   }
 
   private async updateRecord(jobId: string, role: 'requester' | 'provider', stateValue: string): Promise<void> {

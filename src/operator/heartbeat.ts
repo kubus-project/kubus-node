@@ -8,6 +8,7 @@ import type { CapabilityRegistry } from '../capabilities/registry.js';
 import type { NetworkParticipationGate } from '../participation/networkParticipationGate.js';
 import type { ComputeIdentityService } from '../compute/computeIdentity.js';
 import { effectiveComputeProviderSettings } from '../compute/providerSettings.js';
+import { PRIVATE_OUTPUT_PROTOCOL } from '../compute/privateOutputTransport.js';
 
 function clampRatio(value: number): number {
   return Math.min(Math.max(Number.isFinite(value) ? value : 0, 0), 1);
@@ -25,6 +26,8 @@ export async function sendHeartbeat(api: KubusApiClient, kubo: KuboClient, store
   const estimatedPublicCoverage = clampRatio(state.pinnedCids.length / Math.max(state.desiredCids.length || publicPinSetCount, 1));
   const estimatedRewardableCoverage = clampRatio(pinnedRewardableCidCount / Math.max(rewardableCidCount, 1));
   const capabilityStatuses = await capabilities.refreshIfStale();
+  const workerHealth = capabilities.getWorkerHealth();
+  const spatialOutputProtocol = workerHealth.status === 'ready' ? workerHealth.outputProtocol : undefined;
   const jobs = Object.values(state.jobs || {}) as Array<{ state?: string }>;
   const privateSpatialBytes = Object.values(state.captures || {}).reduce<number>((sum, value) => sum + Number((value as { sizeBytes?: number }).sizeBytes || 0), 0);
   const publicReplicaBytes = state.desiredCids.filter((item) => state.pinnedCids.includes(item.cid)).reduce((sum, item) => sum + Number(item.sizeBytes || 0), 0);
@@ -80,6 +83,9 @@ export async function sendHeartbeat(api: KubusApiClient, kubo: KuboClient, store
         runningJobs: jobs.filter((job) => job.state === 'running' && (job as { input?: { remoteComputeJobId?: string } }).input?.remoteComputeJobId).length,
         queuedJobs: jobs.filter((job) => job.state === 'queued' && (job as { input?: { remoteComputeJobId?: string } }).input?.remoteComputeJobId).length,
         protocolVersion: 'kubus.compute/1',
+        privateOutputProtocol: PRIVATE_OUTPUT_PROTOCOL,
+        // Only what the worker itself reports: a worker that predates the protocol keeps this node out of managed matching.
+        ...(spatialOutputProtocol ? { spatialOutputProtocol } : {}),
         encryptionPublicKey: computeIdentity?.encryptionPublicKey,
         signingPublicKey: computeIdentity?.signingPublicKey,
       },

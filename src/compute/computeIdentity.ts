@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import stableStringify from 'json-stable-stringify';
 import type { LocalStore } from '../state/localStore.js';
+import { cleanupAttestationMessage, type ProviderCleanupPayload } from './providerCleanupAttestation.js';
 
 interface StoredIdentity {
   encryptionPublicKey: string;
@@ -47,5 +48,12 @@ export class ComputeIdentityService {
     const value = await this.initialize();
     const privateKey = crypto.createPrivateKey({ key: Buffer.from(value.signingPrivateKey, 'base64'), format: 'der', type: 'pkcs8' });
     return crypto.sign(null, Buffer.from(stableStringify(payload) ?? '{}'), privateKey).toString('base64');
+  }
+
+  /** Signs a cleanup attestation under its own domain prefix, so a receipt signature can never stand for one or the reverse. */
+  async signProviderCleanup(payload: ProviderCleanupPayload): Promise<string> {
+    const value = await this.initialize();
+    const privateKey = crypto.createPrivateKey({ key: Buffer.from(value.signingPrivateKey, 'base64'), format: 'der', type: 'pkcs8' });
+    return crypto.sign(null, cleanupAttestationMessage(payload), privateKey).toString('base64');
   }
 }
