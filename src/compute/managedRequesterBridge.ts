@@ -674,7 +674,7 @@ export class ManagedRequesterBridge {
     this.deps.logger.warn({
       code: 'managed_requester_daily_cap_reached', reconstructionId, status: 429, backendCode: 'COMPUTE_RATE_LIMITED',
       ...(seen ? { quietRefusals: seen.quiet } : {}),
-    }, 'requester daily compute-job cap reached (COMPUTE_REQUESTER_DAILY_JOB_CAP on the backend); the attempt waits and retries, a new job is created once the count drops or the cap is raised');
+    }, 'requester daily compute-job cap reached (COMPUTE_REQUESTER_DAILY_JOB_CAP on the backend); the attempt waits and retries, a new job is created after 00:00 UTC, when the daily count restarts, or once COMPUTE_REQUESTER_DAILY_JOB_CAP is raised');
   }
 
   /** The per-input feedback the worker recorded in the stored dataset's `prepared.json`, mapped to the backend's file ids. */

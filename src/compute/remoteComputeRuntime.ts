@@ -608,7 +608,9 @@ export class RemoteComputeRuntime {
     }
     if (job.state === 'OUTPUT_READY' && existing?.cleanup) {
       await this.providerCleanup.request(job.id);
-      await this.updateRecord(job.id, 'provider', 'OUTPUT_READY');
+      // Idempotent like the terminal branch: a record already in OUTPUT_READY (the requester has not acknowledged yet) is
+      // not rewritten on every poll, which would move updatedAt and save the whole state file each time.
+      if (existing.state !== 'OUTPUT_READY') await this.updateRecord(job.id, 'provider', 'OUTPUT_READY');
       return;
     }
     const settingsAtDispatch = this.settings();

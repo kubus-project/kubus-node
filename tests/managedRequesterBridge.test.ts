@@ -344,6 +344,9 @@ describe('managed requester bridge', () => {
       const [fields, message] = capLogs()[0] as [Record<string, unknown>, string];
       expect(fields).toEqual({ code: 'managed_requester_daily_cap_reached', reconstructionId, status: 429, backendCode: 'COMPUTE_RATE_LIMITED' });
       expect(message).toContain('COMPUTE_REQUESTER_DAILY_JOB_CAP');
+      // The count restarts at 00:00 UTC and accepted jobs never leave it, so the line must not promise that it drops.
+      expect(message).toContain('00:00 UTC');
+      expect(message).not.toMatch(/count drops/);
       expect(JSON.stringify(capLogs()[0])).not.toMatch(/token|bearer|authorization|bafyinput|envelope/i);
     });
 

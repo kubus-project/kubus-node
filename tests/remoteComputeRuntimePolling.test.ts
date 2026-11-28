@@ -386,4 +386,33 @@ describe('RemoteComputeRuntime provider polling (Part 11 / Part 40)', () => {
     expect(update).not.toHaveBeenCalled();
     expect(record()?.updatedAt).toBe(settledAt);
   });
+
+  it('writes nothing while a job waits in OUTPUT_READY for the requester: repeated polls leave the store and updatedAt alone', async () => {
+    const jobId = '3ef91af5-5335-4595-8e8a-0618d2c1c039';
+    const waiting = { id: jobId, state: 'OUTPUT_READY', providerNodeId: 'node-1' };
+    // The local record still says RUNNING: the first poll is the real transition to OUTPUT_READY.
+    const { runtime, persisted } = buildRuntime(async () => ({ jobs: [waiting] }), {
+      initialState: { remoteJobs: { [jobId]: { backendJobId: jobId, role: 'provider', state: 'RUNNING', updatedAt: '2026-01-01T00:00:00.000Z', cleanup: { requested: false, plaintext: 'complete' } } } },
+    });
+    const inner = runtime as unknown as {
+      deps: { store: { update: (mutator: (state: Record<string, unknown>) => void) => Promise<unknown> } };
+      pollProvider: () => Promise<number>;
+    };
+    const update = vi.spyOn(inner.deps.store, 'update');
+    const record = () => (persisted.remoteJobs as Record<string, { state: string; updatedAt: string; cleanup: { requested: boolean } }>)[jobId];
+
+    await inner.pollProvider();
+    expect(update).toHaveBeenCalled();
+    expect(record()).toMatchObject({ state: 'OUTPUT_READY', cleanup: { requested: true } });
+    expect(record()?.updatedAt).not.toBe('2026-01-01T00:00:00.000Z');
+    const settledAt = record()?.updatedAt;
+
+    update.mockClear();
+    vi.setSystemTime(Date.now() + 60_000);
+    await inner.pollProvider();
+    vi.setSystemTime(Date.now() + 60_000);
+    await inner.pollProvider();
+    expect(update).not.toHaveBeenCalled();
+    expect(record()?.updatedAt).toBe(settledAt);
+  });
 });
